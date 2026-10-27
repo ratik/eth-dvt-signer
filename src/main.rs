@@ -2,7 +2,8 @@
 //!
 //! Node `i` listens for peers on `127.0.0.1:<p2p-port + i>` and for clients on
 //! `127.0.0.1:<http-port + i>`. Keys are derived from the node index, which is only suitable for
-//! local development.
+//! local development. The HTTP API (raw signing included) is bound to loopback on purpose: it has
+//! no authentication and no slashing protection, and must not be exposed to a network.
 //!
 //! ```sh
 //! cargo run --release -- --id 0
@@ -74,6 +75,12 @@ struct Args {
     /// Seconds a coordinator waits for a new authorization to be finalized.
     #[arg(long, default_value_t = 30)]
     authorization_timeout: u64,
+
+    /// Start although the consensus journal (`registry-consensus`) is missing while the node has
+    /// finalized history. The node may have voted in views it no longer remembers: use only as
+    /// the README's recovery procedure describes.
+    #[arg(long)]
+    allow_missing_consensus_journal: bool,
 }
 
 fn main() {
@@ -155,15 +162,24 @@ fn main() {
                     authorization_timeout: Duration::from_secs(args.authorization_timeout),
                     ..Default::default()
                 },
+                allow_missing_consensus_journal: args.allow_missing_consensus_journal,
             },
             channels,
         )
         .await;
+        // Inconsistent durable state: fail closed, storage kept for investigation (`StartError`).
+        let node = match node {
+            Ok(node) => node,
+            Err(err) => {
+                error!(%err, "refusing to start");
+                std::process::exit(1);
+            }
+        };
 
         let listener = ::tokio::net::TcpListener::bind(http)
             .await
             .expect("failed to bind HTTP listener");
-        let router = rpc::router(node.client, node.dkg, node.signer);
+        let router = rpc::router(node.client, node.dkg, node.signer, node.recovery);
         let rpc_handle = context.child("rpc").spawn(move |_| async move {
             if let Err(err) = axum::serve(listener, router).await {
                 error!(?err, "HTTP server failed");

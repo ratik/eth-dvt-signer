@@ -321,6 +321,17 @@ impl<E: Context> Secrets<E> {
         }
     }
 
+    /// Rounds of every stored share.
+    pub fn share_rounds(&self) -> Vec<u64> {
+        self.metadata
+            .as_ref()
+            .expect("metadata is present")
+            .keys()
+            .filter(|key| key.prefix() == SHARE_PREFIX)
+            .map(|key| key.value())
+            .collect()
+    }
+
     /// Store the final share and drop the round's seed and dealings, in one atomic write.
     /// A stored share is never replaced.
     pub async fn put_share(&mut self, share: KeyShare) -> Result<(), Error> {

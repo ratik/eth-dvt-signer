@@ -7,7 +7,7 @@
 
 use crate::{
     application::{Application, MAX_IDLE, Mempool, Scheme},
-    dkg::{self, secrets::Secrets},
+    dkg::{self, DkgStatus, secrets::Secrets},
     executor::{self, Client, Executor},
     signer::coordinator::{self, Coordinator, Pending},
     storage::Store,
@@ -15,6 +15,7 @@ use crate::{
 };
 use commonware_broadcast::buffered;
 use commonware_consensus::{
+    Viewable as _,
     marshal::{self, core::Actor as Marshal, resolver::p2p as marshal_resolver, standard::Inline},
     simplex::{self, ForwardPolicy, SkipPolicy, elector::RoundRobin},
     types::{Epoch, FixedEpocher, ViewDelta},
@@ -27,7 +28,8 @@ use commonware_cryptography::{
 use commonware_p2p::{Blocker, Provider, Receiver, Sender};
 use commonware_parallel::Sequential;
 use commonware_runtime::{
-    BufferPooler, Clock, Handle, Metrics, Spawner, Storage, buffer::paged::CacheRef,
+    Blob as _, BufferPooler, Clock, Handle, Metrics, ReadOptions, Spawner, Storage, WriteOptions,
+    buffer::paged::CacheRef,
 };
 use commonware_storage::{archive::prunable, translator::TwoCap};
 use commonware_utils::{NZU16, NZU64, NZUsize, channel::mpsc, ordered::Set};
@@ -37,6 +39,7 @@ use std::{
     sync::{Arc, atomic::AtomicU64},
     time::Duration,
 };
+use tracing::{info, warn};
 
 /// Unique namespace to avoid replaying signatures across applications.
 pub const NAMESPACE: &[u8] = b"_ETH_MPC_SIGNER";
@@ -101,6 +104,8 @@ pub struct Config<B, P> {
     pub retention: Retention,
     /// Signing coordinator timeouts and limits.
     pub signing: coordinator::Config,
+    /// Start even though the consensus journal is missing (an operator decision, see the README).
+    pub allow_missing_consensus_journal: bool,
 }
 
 /// Registered p2p channels, one `(sender, receiver)` pair per purpose.
@@ -121,15 +126,173 @@ pub struct Node {
     pub client: Client,
     pub dkg: dkg::actor::Client,
     pub signer: coordinator::Client,
+    /// How the node resumed (decided at startup).
+    pub recovery: Recovery,
     /// Resolves when any actor of the node stops. Dropping it stops the node.
     pub handle: Handle<()>,
+}
+
+/// How a node resumed, decided at startup from its durable state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Recovery {
+    /// Height of the replicated state at startup.
+    pub state_height: u64,
+    /// Finalized `(height, view)` consensus resumed above (`None`: genesis). The voter never votes
+    /// at or below that view again, whatever its journal holds.
+    pub floor: Option<(u64, u64)>,
+    /// The consensus journal was missing and the operator allowed starting anyway.
+    pub journal_missing: bool,
+}
+
+/// Why a node refuses to start. The storage is kept for investigation: nothing is reset or
+/// deleted, no key share is regenerated, and the state, secret store and consensus journal are not
+/// written (the block archives, opened to read marshal's progress, rewrite their own metadata and
+/// repair torn tails as on any start).
+#[derive(Debug, thiserror::Error)]
+pub enum StartError {
+    #[error("failed to open replicated state: {0}")]
+    State(#[from] crate::storage::Error),
+    #[error("failed to open secret store: {0}")]
+    Secrets(#[from] dkg::secrets::Error),
+    #[error(
+        "replicated state is at height {state} but marshal already processed finalized blocks up \
+         to height {processed}: blocks are missing from the state (restored, corrupted or deleted \
+         storage?); refusing to start"
+    )]
+    MissingBlocks { state: u64, processed: u64 },
+    #[error(
+        "a key share of ceremony round {round} is stored but the replicated state has no \
+         completed ceremony at that round: the state was lost or rolled back; refusing to start \
+         with a share whose authorization history is gone"
+    )]
+    ShareWithoutCeremony { round: u64 },
+    #[error(
+        "consensus journal (partition {partition}) is missing although this node has finalized \
+         history (height {height}): it may have voted in views it no longer remembers, and voting \
+         again could equivocate; refusing to start (see the README, Recovery, before using \
+         --allow-missing-consensus-journal)"
+    )]
+    MissingJournal { partition: String, height: u64 },
+}
+
+/// Refuse durable state that contradicts itself: running on it could skip finalized blocks, keep
+/// signing with a share whose authorization history is gone, or vote against this node's own
+/// forgotten votes. Returns whether the consensus journal is missing (and allowed to be).
+///
+/// What cannot be detected here: a whole node directory restored from one older, internally
+/// consistent snapshot looks like a node that was simply offline (see docs/audit.md, L-7).
+fn check_recovery<E: commonware_storage::Context>(
+    store: &Store<E>,
+    secrets: &Secrets<E>,
+    processed: u64,
+    journal: &str,
+    journal_present: bool,
+    allow_missing_journal: bool,
+) -> Result<bool, StartError> {
+    // Marshal hands every finalized block over once and resumes after the last one acknowledged,
+    // which the executor does only after the state commit: the state can be ahead of marshal (a
+    // crash before the acknowledgement, replayed and skipped), never behind.
+    if store.height() < processed {
+        return Err(StartError::MissingBlocks {
+            state: store.height(),
+            processed,
+        });
+    }
+    // A share is stored only after its ceremony's completion was durably applied.
+    for round in secrets.share_rounds() {
+        let completed = store
+            .ceremonies()
+            .iter()
+            .any(|ceremony| ceremony.round == round && ceremony.status == DkgStatus::Completed);
+        if !completed {
+            return Err(StartError::ShareWithoutCeremony { round });
+        }
+    }
+    let history = store.height().max(processed);
+    if !journal_present && history > 0 {
+        if !allow_missing_journal {
+            return Err(StartError::MissingJournal {
+                partition: journal.to_string(),
+                height: history,
+            });
+        }
+        warn!(
+            partition = journal,
+            height = history,
+            "consensus journal missing: starting anyway as the operator allowed"
+        );
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Raw bytes of the metadata stores opened before the startup checks. Opening such a store
+/// truncates a copy that fails its checksum (commonware repairs it from the other copy); if the
+/// node then refuses to start, the bytes are put back so the damaged copy stays available for
+/// investigation.
+struct Originals(Vec<(String, Vec<u8>, Vec<u8>)>);
+
+impl Originals {
+    async fn capture<E: Storage>(context: &E, partitions: &[String]) -> Self {
+        let mut blobs = Vec::new();
+        for partition in partitions {
+            let Ok(names) = context.scan(partition).await else {
+                continue;
+            };
+            for name in names {
+                let bytes = read_blob(context, partition, &name).await;
+                blobs.push((partition.clone(), name, bytes));
+            }
+        }
+        Self(blobs)
+    }
+
+    async fn restore<E: Storage>(self, context: &E) {
+        for (partition, name, original) in self.0 {
+            if read_blob(context, &partition, &name).await == original {
+                continue;
+            }
+            let (blob, _) = context
+                .open(&partition, &name)
+                .await
+                .expect("failed to reopen blob");
+            blob.resize(original.len() as u64)
+                .await
+                .expect("failed to restore blob");
+            blob.write_at(0, original, WriteOptions::DONT_CACHE)
+                .await
+                .expect("failed to restore blob");
+            blob.sync().await.expect("failed to restore blob");
+            warn!(partition, "put back storage that failed the startup checks");
+        }
+    }
+}
+
+async fn read_blob<E: Storage>(context: &E, partition: &str, name: &[u8]) -> Vec<u8> {
+    let (blob, len) = context
+        .open(partition, name)
+        .await
+        .expect("failed to open blob");
+    if len == 0 {
+        return Vec::new();
+    }
+    blob.read_at(
+        0,
+        len.try_into().expect("blob too large"),
+        ReadOptions::DONT_CACHE,
+    )
+    .await
+    .expect("failed to read blob")
+    .coalesce()
+    .as_ref()
+    .to_vec()
 }
 
 pub async fn start<E, S, R, DS, DR, B, P>(
     context: E,
     config: Config<B, P>,
     channels: Channels<S, R, DS, DR>,
-) -> Node
+) -> Result<Node, StartError>
 where
     E: BufferPooler + Clock + CryptoRng + Spawner + Storage + Metrics,
     S: Sender<PublicKey = PublicKey>,
@@ -147,6 +310,89 @@ where
     let page_cache = CacheRef::from_pooler(&context, NZU16!(16_384), NZUsize!(10_000));
     let scheme = Scheme::signer(NAMESPACE, config.participants, config.signer)
         .expect("signer must be a participant");
+
+    // Durable state first, checked against itself before anything runs.
+    let state_partition = format!("{prefix}-state");
+    let secrets_partition = format!("{prefix}-secrets");
+    let originals = Originals::capture(
+        &context,
+        &[
+            format!("{prefix}-marshal-application-metadata"),
+            state_partition.clone(),
+            secrets_partition.clone(),
+        ],
+    )
+    .await;
+    let finalizations = prunable::Archive::init(
+        context.child("finalizations"),
+        archive_config(
+            &prefix,
+            "finalizations",
+            retention.section,
+            page_cache.clone(),
+            Scheme::certificate_codec_config_unbounded(),
+        ),
+    )
+    .await
+    .expect("failed to open finalizations archive");
+    let blocks = prunable::Archive::init(
+        context.child("blocks"),
+        archive_config(&prefix, "blocks", retention.section, page_cache.clone(), ()),
+    )
+    .await
+    .expect("failed to open blocks archive");
+    let genesis = Block::genesis();
+    let (marshal_actor, marshal, marshal_floor) = Marshal::init(
+        context.child("marshal"),
+        finalizations,
+        blocks,
+        marshal::Config {
+            provider: ConstantProvider::<_, Epoch>::new(scheme.clone()),
+            epocher: FixedEpocher::new(EPOCH_LENGTH),
+            start: marshal::Start::Genesis(genesis.clone()),
+            partition_prefix: format!("{prefix}-marshal"),
+            mailbox_size: MAILBOX_SIZE,
+            view_retention: ViewDelta::new(10),
+            prunable_items_per_section: NZU64!(10),
+            page_cache: page_cache.clone(),
+            replay_buffer: IO_BUFFER_SIZE,
+            key_write_buffer: IO_BUFFER_SIZE,
+            value_write_buffer: IO_BUFFER_SIZE,
+            block_codec_config: (),
+            max_repair: NZUsize!(10),
+            max_pending_acks: NZUsize!(1),
+            strategy: Sequential,
+        },
+    )
+    .await;
+    let journal = format!("{prefix}-consensus");
+    let checked = async {
+        let store = Store::init(context.child("store"), &prefix, committee.clone()).await?;
+        // A secret store that cannot be read is fatal: the node must not run with lost or
+        // inconsistent shares.
+        let secrets = Secrets::init(context.child("secrets"), secrets_partition).await?;
+        let journal_present =
+            matches!(context.scan(&journal).await, Ok(blobs) if !blobs.is_empty());
+        let journal_missing = check_recovery(
+            &store,
+            &secrets,
+            marshal_floor.height().map_or(0, |height| height.get()),
+            &journal,
+            journal_present,
+            config.allow_missing_consensus_journal,
+        )?;
+        Ok::<_, StartError>((store, secrets, journal_missing))
+    }
+    .await;
+    let (store, secrets, journal_missing) = match checked {
+        Ok(checked) => checked,
+        Err(err) => {
+            drop((marshal_actor, marshal));
+            originals.restore(&context).await;
+            return Err(err);
+        }
+    };
+    let state_height = store.height();
 
     // Backfill of missing finalized blocks.
     let resolver = marshal_resolver::init(
@@ -178,59 +424,12 @@ where
     );
     let broadcast_handle = broadcast.start(channels.blocks);
 
-    // Finalized blocks and their certificates, persisted by marshal.
-    let finalizations = prunable::Archive::init(
-        context.child("finalizations"),
-        archive_config(
-            &prefix,
-            "finalizations",
-            retention.section,
-            page_cache.clone(),
-            Scheme::certificate_codec_config_unbounded(),
-        ),
-    )
-    .await
-    .expect("failed to open finalizations archive");
-    let blocks = prunable::Archive::init(
-        context.child("blocks"),
-        archive_config(&prefix, "blocks", retention.section, page_cache.clone(), ()),
-    )
-    .await
-    .expect("failed to open blocks archive");
-
-    let genesis = Block::genesis();
-    let (marshal_actor, marshal, _) = Marshal::init(
-        context.child("marshal"),
-        finalizations,
-        blocks,
-        marshal::Config {
-            provider: ConstantProvider::<_, Epoch>::new(scheme.clone()),
-            epocher: FixedEpocher::new(EPOCH_LENGTH),
-            start: marshal::Start::Genesis(genesis.clone()),
-            partition_prefix: format!("{prefix}-marshal"),
-            mailbox_size: MAILBOX_SIZE,
-            view_retention: ViewDelta::new(10),
-            prunable_items_per_section: NZU64!(10),
-            page_cache: page_cache.clone(),
-            replay_buffer: IO_BUFFER_SIZE,
-            key_write_buffer: IO_BUFFER_SIZE,
-            value_write_buffer: IO_BUFFER_SIZE,
-            block_codec_config: (),
-            max_repair: NZUsize!(10),
-            max_pending_acks: NZUsize!(1),
-            strategy: Sequential,
-        },
-    )
-    .await;
-
     // State machine.
-    let store = Store::init(context.child("store"), &prefix, committee.clone())
-        .await
-        .expect("failed to open replicated state");
     let ceremonies = store.ceremonies().iter().cloned().collect();
     let authorizations = store.authorizations();
     let mempool = Mempool::default();
     let executed = Arc::new(AtomicU64::new(0));
+    let tip = Arc::new(AtomicU64::new(0));
     let (mempool_sender, mempool_receiver) = channels.mempool;
     let (dkg_sender, dkg_mailbox) = mpsc::unbounded_channel();
     let (executor, executor_mailbox, client) = Executor::new(
@@ -238,6 +437,7 @@ where
         store,
         mempool.clone(),
         executed.clone(),
+        tip.clone(),
         mempool_sender,
         marshal.clone(),
         retention,
@@ -249,11 +449,7 @@ where
         move |_| executor::receive_gossip(mempool_receiver, mempool)
     });
 
-    // DKG: this node's dealer and player, and its secret store. A secret store that cannot be
-    // read is a fatal error: the node must not run with lost or inconsistent shares.
-    let secrets = Secrets::init(context.child("secrets"), format!("{prefix}-secrets"))
-        .await
-        .expect("failed to open secret store");
+    // DKG: this node's dealer and player, and its secret store.
     let (dkg_p2p_sender, dkg_p2p_receiver) = channels.dkg;
     let (signing_sender, signing_receiver) = channels.signing;
     let dkg_client = dkg::actor::Client::new(
@@ -298,13 +494,38 @@ where
     // Marshal adapter: verifies blocks inline and feeds finalized ones to the application.
     let application = Inline::new(
         context.child("application"),
-        Application::new(mempool, executed, executor_mailbox),
+        Application::new(mempool, executed, tip, executor_mailbox),
         marshal.clone(),
         FixedEpocher::new(EPOCH_LENGTH),
     );
     let marshal_handle = marshal_actor.start(application.clone(), buffer, resolver);
 
-    // Consensus.
+    // Consensus resumes above the last finalization this node durably processed: whatever its
+    // journal holds (or lost), it never votes again in a view at or below it. Marshal's processed
+    // height only moves forward, as the floor must; genesis is the lowest floor there is.
+    let (floor, floor_at) = match marshal_floor.height().filter(|height| height.get() > 0) {
+        Some(height) => match marshal.get_finalization(height).await {
+            Some(finalization) => {
+                let view = finalization.view().get();
+                info!(
+                    height = height.get(),
+                    view, "consensus resumes above the durable finalized floor"
+                );
+                (
+                    simplex::Floor::Finalized(finalization),
+                    Some((height.get(), view)),
+                )
+            }
+            None => {
+                warn!(
+                    height = height.get(),
+                    "no finalization stored at the processed height: consensus resumes from genesis"
+                );
+                (simplex::Floor::Genesis(genesis.digest()), None)
+            }
+        },
+        None => (simplex::Floor::Genesis(genesis.digest()), None),
+    };
     let consensus = simplex::Engine::new(
         context.child("consensus"),
         simplex::Config {
@@ -314,10 +535,10 @@ where
             automaton: application.clone(),
             relay: application,
             reporter: marshal,
-            partition: format!("{prefix}-consensus"),
+            partition: journal,
             mailbox_size: MAILBOX_SIZE,
             epoch: Epoch::zero(),
-            floor: simplex::Floor::Genesis(genesis.digest()),
+            floor,
             replay_buffer: IO_BUFFER_SIZE,
             write_buffer: IO_BUFFER_SIZE,
             // A leader may wait up to `MAX_IDLE` (< `LEADER_TIMEOUT`) for transactions.
@@ -350,12 +571,17 @@ where
         signing_receiver_handle,
         consensus_handle,
     ]));
-    Node {
+    Ok(Node {
         client,
         dkg: dkg_client,
         signer: signer_client,
+        recovery: Recovery {
+            state_height,
+            floor: floor_at,
+            journal_missing,
+        },
         handle,
-    }
+    })
 }
 
 fn archive_config<C>(

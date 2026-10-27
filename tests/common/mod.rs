@@ -235,10 +235,12 @@ pub async fn start_network_with(
                 partition_prefix: format!("node-{index}"),
                 retention,
                 signing: coordinator::Config::default(),
+                allow_missing_consensus_journal: false,
             },
             channels,
         )
-        .await;
+        .await
+        .expect("node refused to start");
         clients.push(node.client);
         dkg.push(node.dkg);
         coordinators.push(node.signer);

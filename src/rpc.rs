@@ -4,7 +4,9 @@
 //!   authorizes (through consensus, once per `(ceremony_id, nonce)`) and signs the 32-byte
 //!   Ethereum signing root with the ceremony's threshold key. Returns the 96-byte signature.
 //! - `GET /authorizations/{ceremony_id}/{nonce}`: the finalized authorization, if any.
-//! - `GET /status`: last applied height, number of authorizations and mempool size.
+//! - `GET /status`: last applied height, number of authorizations, mempool size, signing load and
+//!   readiness (see `readiness`).
+//! - `GET /ready`: the readiness alone; `200` when ready, `503` otherwise (same body).
 //! - `POST /dkg/start` `{"ceremony_id": "validator-001"}`: starts one distributed DKG ceremony
 //!   (idempotent; a different configuration under a used id is rejected with 409).
 //! - `GET /dkg/status/{ceremony_id}`: ceremony status, and the group public key once completed.
@@ -12,15 +14,20 @@
 //!
 //! No endpoint ever returns or accepts private key shares or partial signatures. Request parsing
 //! (hex, JSON) stays here: the signer core only sees [SignRequest].
+//!
+//! This API is for development and tests: it has no authentication and signs any root it is
+//! given (no slashing protection). The node binds it to loopback only.
 
 use crate::{
     dkg::{
         CeremonyId, DkgStatus,
-        actor::{self as dkg, ShareStatus},
+        actor::{self as dkg, Health, ShareStatus},
         ceremony::{Ceremony, StartOutcome},
         format_key,
     },
-    executor::{Client, Stopped},
+    engine::Recovery,
+    executor::{Client, Status, Stopped},
+    readiness::{Readiness, Reason, State as ReadinessState},
     signer::{
         coordinator::{self, AuthorizationKind, SignError, Timings},
         wire::Refusal,
@@ -37,7 +44,10 @@ use axum::{
 use commonware_codec::Encode as _;
 use commonware_utils::ordered::Quorum as _;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, SystemTime},
+};
 
 /// How long `POST /dkg/start` waits for finalization.
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -89,6 +99,9 @@ struct SignFailure {
     valid_partials: Option<usize>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     refusals: BTreeMap<u32, Refusal>,
+    /// Why this node does not authorize new requests now (`NOT_READY`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    reasons: Vec<Reason>,
 }
 
 #[derive(Serialize)]
@@ -110,6 +123,43 @@ struct StatusResponse {
     signing_sessions: usize,
     /// Peer signing requests waiting for their authorization here.
     parked_requests: usize,
+    readiness: ReadinessResponse,
+}
+
+#[derive(Serialize)]
+struct ReadinessResponse {
+    #[serde(flatten)]
+    readiness: Readiness,
+    /// A node whose durable state fails the startup checks does not run, so this is always
+    /// `passed` when there is an answer.
+    startup_checks: &'static str,
+    /// Height of the last block applied to the replicated state.
+    applied_height: u64,
+    /// Highest finalized height this node knows of. Not a claim about the rest of the network:
+    /// a node only knows what its peers told it.
+    known_finalized_height: u64,
+    /// Milliseconds since this process last applied a new block (absent: none yet).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_block_age_ms: Option<u64>,
+    /// Height of the replicated state when this process started.
+    state_height_at_start: u64,
+    /// Completed ceremonies without a usable share here.
+    unavailable_shares: Vec<String>,
+    consensus: ConsensusResponse,
+}
+
+#[derive(Serialize)]
+struct ConsensusResponse {
+    /// This node votes. Decided at startup (consensus journal checks); never disabled at run time.
+    voting: bool,
+    /// Finalized height and view consensus resumed above: it never votes at or below that view.
+    /// Absent: it resumed from genesis.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    floor_height: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    floor_view: Option<u64>,
+    /// The journal was missing at startup and the operator allowed starting anyway.
+    journal_missing_at_start: bool,
 }
 
 #[derive(Deserialize)]
@@ -159,13 +209,20 @@ struct Api {
     client: Client,
     dkg: dkg::Client,
     signer: coordinator::Client,
+    recovery: Recovery,
 }
 
-pub fn router(client: Client, dkg: dkg::Client, signer: coordinator::Client) -> Router {
+pub fn router(
+    client: Client,
+    dkg: dkg::Client,
+    signer: coordinator::Client,
+    recovery: Recovery,
+) -> Router {
     Router::new()
         .route("/sign", post(sign))
         .route("/authorizations/{ceremony_id}/{nonce}", get(authorization))
         .route("/status", get(status))
+        .route("/ready", get(ready))
         .route("/dkg/start", post(dkg_start))
         .route("/dkg/status/{ceremony_id}", get(dkg_status))
         .route("/dkg/public-key/{ceremony_id}", get(dkg_public_key))
@@ -173,6 +230,7 @@ pub fn router(client: Client, dkg: dkg::Client, signer: coordinator::Client) -> 
             client,
             dkg,
             signer,
+            recovery,
         })
 }
 
@@ -191,6 +249,7 @@ async fn sign(State(api): State<Api>, body: Result<Json<SignBody>, JsonRejection
             height: None,
             valid_partials: None,
             refusals: BTreeMap::new(),
+            reasons: Vec::new(),
         };
         (status, response)
     };
@@ -243,6 +302,7 @@ async fn sign(State(api): State<Api>, body: Result<Json<SignBody>, JsonRejection
         SignError::NotCompleted(_) => (StatusCode::CONFLICT, "CEREMONY_NOT_COMPLETED"),
         SignError::Conflict(_) => (StatusCode::CONFLICT, "REJECTED"),
         SignError::AuthorizationTimeout => (StatusCode::GATEWAY_TIMEOUT, "AUTHORIZATION_TIMEOUT"),
+        SignError::NotReady(_) => (StatusCode::SERVICE_UNAVAILABLE, "NOT_READY"),
         SignError::InsufficientSigners { .. } => {
             (StatusCode::SERVICE_UNAVAILABLE, "INSUFFICIENT_SIGNERS")
         }
@@ -267,6 +327,7 @@ async fn sign(State(api): State<Api>, body: Result<Json<SignBody>, JsonRejection
             response.valid_partials = Some(valid);
             response.refusals = refusals;
         }
+        SignError::NotReady(reasons) => response.reasons = reasons,
         _ => {}
     }
     (status, Json(response)).into_response()
@@ -295,9 +356,39 @@ async fn authorization(
     }
 }
 
-async fn status(State(api): State<Api>) -> Result<Json<StatusResponse>, ApiError> {
+/// The executor's progress and the keyholder's health, and what they allow.
+async fn observe(api: &Api) -> Result<(Status, Health, ReadinessResponse), ApiError> {
     let status = api.client.status().await.map_err(unavailable)?;
-    let parked = api.dkg.parked().await.map_err(unavailable)?;
+    // Answered only once the keyholder has loaded its shares.
+    let health = api.dkg.health().await.map_err(unavailable)?;
+    let now = SystemTime::now();
+    let progress = status.progress;
+    let readiness = ReadinessResponse {
+        readiness: Readiness::evaluate(progress, health.unavailable.len(), now),
+        startup_checks: "passed",
+        applied_height: progress.applied,
+        known_finalized_height: progress.known_finalized,
+        last_block_age_ms: progress.last_applied.map(|at| {
+            now.duration_since(at)
+                .unwrap_or_default()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX)
+        }),
+        state_height_at_start: api.recovery.state_height,
+        unavailable_shares: health.unavailable.iter().map(ToString::to_string).collect(),
+        consensus: ConsensusResponse {
+            voting: true,
+            floor_height: api.recovery.floor.map(|(height, _)| height),
+            floor_view: api.recovery.floor.map(|(_, view)| view),
+            journal_missing_at_start: api.recovery.journal_missing,
+        },
+    };
+    Ok((status, health, readiness))
+}
+
+async fn status(State(api): State<Api>) -> Result<Json<StatusResponse>, ApiError> {
+    let (status, health, readiness) = observe(&api).await?;
     let signing = api.signer.stats();
     Ok(Json(StatusResponse {
         height: status.height,
@@ -305,8 +396,23 @@ async fn status(State(api): State<Api>) -> Result<Json<StatusResponse>, ApiError
         mempool: status.mempool,
         signing_in_flight: signing.in_flight,
         signing_sessions: signing.sessions,
-        parked_requests: parked,
+        parked_requests: health.parked,
+        readiness,
     }))
+}
+
+async fn ready(State(api): State<Api>) -> Response {
+    match observe(&api).await {
+        Ok((_, _, readiness)) => {
+            let code = if readiness.readiness.state == ReadinessState::Ready {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            (code, Json(readiness)).into_response()
+        }
+        Err(err) => err.into_response(),
+    }
 }
 
 async fn dkg_start(

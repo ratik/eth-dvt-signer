@@ -5,7 +5,7 @@
 //!
 //! - builds a block from the local mempool when this node leads a view (`propose`),
 //! - accepts any well-formed block (`verify`; size limits are enforced by the codec),
-//! - forwards finalized blocks to the executor (`report`).
+//! - forwards finalized blocks to the executor, and records the finalized tip (`report`).
 
 use crate::{
     executor::Message,
@@ -108,6 +108,8 @@ pub struct Application {
     mempool: Mempool,
     /// Height of the last block applied by the executor.
     executed: Arc<AtomicU64>,
+    /// Highest finalized height marshal knows of (it may not have every block below it yet).
+    tip: Arc<AtomicU64>,
     executor: mpsc::UnboundedSender<Message>,
 }
 
@@ -115,11 +117,13 @@ impl Application {
     pub const fn new(
         mempool: Mempool,
         executed: Arc<AtomicU64>,
+        tip: Arc<AtomicU64>,
         executor: mpsc::UnboundedSender<Message>,
     ) -> Self {
         Self {
             mempool,
             executed,
+            tip,
             executor,
         }
     }
@@ -176,9 +180,15 @@ impl Reporter for Application {
     type Activity = Update<Block>;
 
     fn report(&mut self, update: Self::Activity) -> Feedback {
-        if let Update::Block(block, ack) = update {
-            // If the executor is gone the node is shutting down; dropping `ack` stops marshal.
-            let _ = self.executor.send(Message::Finalized { block, ack });
+        match update {
+            Update::Block(block, ack) => {
+                // If the executor is gone the node is shutting down; dropping `ack` stops marshal.
+                let _ = self.executor.send(Message::Finalized { block, ack });
+            }
+            // Knowledge only (not durable yet): what the executor has not applied is a backlog.
+            Update::Tip(_, height, _) => {
+                self.tip.fetch_max(height.get(), Ordering::Release);
+            }
         }
         Feedback::Ok
     }

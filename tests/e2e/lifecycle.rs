@@ -1,12 +1,14 @@
-//! Audit F1, F2, F4: process lifecycle, port reservation, corrupted storage.
+//! Audit F1, F2, F4 and R5: process lifecycle, port reservation, corrupted or inconsistent
+//! storage.
 
 use crate::{
     KEY,
-    failures::wait_applied,
+    failures::{index_of, wait_applied},
     harness::{NODES, Ports, TestNetwork, root},
     signing::network_with_key,
 };
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -227,12 +229,58 @@ fn flip_last_byte(path: &Path) {
     fs::write(path, bytes).unwrap();
 }
 
-/// After a damaged restart, node 3 must stop (fail closed) instead of running with replicated
-/// state that does not match the finalized history.
+/// Every file under `dir`, with its contents.
+fn files(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            files.extend(self::files(&path));
+        } else {
+            files.insert(path.clone(), fs::read(&path).unwrap());
+        }
+    }
+    files
+}
+
+/// Partitions a refused start leaves byte for byte: the replicated state, the key shares, the
+/// consensus journal and marshal's progress. (Opening the block archives, needed to read marshal's
+/// progress, rewrites their own metadata and repairs torn tails, as on any start.)
+const EVIDENCE: [&str; 4] = [
+    "registry-state",
+    "registry-secrets",
+    "registry-consensus",
+    "registry-marshal-application-metadata",
+];
+
+/// After a damaged restart, node 3 must stop (fail closed, exit status not 0) instead of running
+/// with durable state that contradicts itself, delete no file, and leave [EVIDENCE] as it was.
 fn assert_fails_closed(network: &TestNetwork, why: &str) {
+    let data = network.data_dir(3);
+    let before = files(&data);
     network.restart_node(3);
     let status = network.wait_exit(3);
     assert!(!status.success(), "{why}: node 3 exited with {status}");
+    assert!(network.count(3, "refusing to start") > 0, "{why}");
+    let after = files(&data);
+    let relative = |path: &Path| path.strip_prefix(&data).unwrap().to_path_buf();
+    let removed: Vec<PathBuf> = before
+        .keys()
+        .filter(|path| !after.contains_key(*path))
+        .map(|path| relative(path))
+        .collect();
+    assert!(removed.is_empty(), "{why}: removed {removed:?}");
+    let changed: Vec<PathBuf> = before
+        .iter()
+        .filter(|(path, contents)| {
+            EVIDENCE
+                .iter()
+                .any(|partition| relative(path).starts_with(partition))
+                && after.get(*path) != Some(contents)
+        })
+        .map(|(path, _)| relative(path))
+        .collect();
+    assert!(changed.is_empty(), "{why}: changed {changed:?}");
 }
 
 /// F4: the copy of the replicated state written last is damaged after its block was acknowledged
@@ -331,4 +379,70 @@ fn f4_both_copies_corrupted_fails_closed() {
     }
     assert_fails_closed(&network, "both state copies corrupted");
     assert!(network.count(3, "failed to open replicated state") > 0);
+}
+
+/// R5: the consensus journal is gone while the node has finalized history. It may have voted in
+/// views it no longer remembers, so it refuses to start. The README's operator procedure lets it
+/// start once the network is well past those views, explicitly.
+#[test]
+fn r5_missing_consensus_journal_fails_closed() {
+    let (network, _) = network_with_key();
+    let (status, signed) = network.sign(0, KEY, 100, root(0xaa));
+    assert_eq!(status, 200, "{signed}");
+    wait_applied(&network, &network.all(), 100);
+    let index_3 = index_of(&network, 3);
+
+    network.stop_node(3);
+    let journal = network.data_dir(3).join("registry-consensus");
+    fs::remove_dir_all(&journal).unwrap();
+    assert_fails_closed(&network, "consensus journal deleted");
+    assert!(
+        network.count(
+            3,
+            "consensus journal (partition registry-consensus) is missing"
+        ) > 0
+    );
+    assert!(!journal.exists(), "nothing was recreated");
+
+    // The procedure: let the others finalize more views than peers keep (10) past anything node 3
+    // can have voted in, then allow the start.
+    let stopped_at = network.height(0).unwrap();
+    network.wait_until("the network to move past node 3's last views", || {
+        network.height(0).unwrap() >= stopped_at + 15
+    });
+    network.restart_node_with_args(3, &["--allow-missing-consensus-journal"]);
+    network.wait_for_ready(&[3]);
+    let readiness = network.readiness(3);
+    assert_eq!(readiness["consensus"]["journal_missing_at_start"], true);
+
+    network.freeze(1);
+    let (status, again) = network.sign(0, KEY, 100, root(0xaa));
+    network.thaw(1);
+    assert_eq!(status, 200, "{again}");
+    assert!(
+        again["signers"]
+            .as_array()
+            .unwrap()
+            .contains(&index_3.into()),
+        "{again}"
+    );
+    assert_eq!(again["signature"], signed["signature"]);
+    assert_eq!(network.blocked_for_equivocation(3), Vec::<usize>::new());
+}
+
+/// R5: the replicated state and the finalized history are gone but the key share remains: the
+/// node would hold a share without the authorizations it signs under. It refuses to start.
+#[test]
+fn r5_share_without_state_fails_closed() {
+    let (network, _) = network_with_key();
+    network.stop_node(3);
+    for entry in fs::read_dir(network.data_dir(3)).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_str().unwrap().to_string();
+        if path.is_dir() && name != "registry-secrets" && name != "registry-consensus" {
+            fs::remove_dir_all(&path).unwrap();
+        }
+    }
+    assert_fails_closed(&network, "state and history deleted, key share kept");
+    assert!(network.count(3, "a key share of ceremony round 0 is stored") > 0);
 }

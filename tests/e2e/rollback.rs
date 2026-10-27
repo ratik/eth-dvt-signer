@@ -10,7 +10,7 @@ use crate::{
     KEY,
     failures::{index_of, request, wait_applied},
     harness::{
-        TestNetwork, ethereum_verify,
+        NODES, TestNetwork, ethereum_verify,
         peer::{FakePeer, Responder},
         root, unhex,
     },
@@ -45,6 +45,22 @@ fn hold_env(network: &TestNetwork, node: usize) -> (std::path::PathBuf, Vec<(Str
             hold.display().to_string(),
         )],
     )
+}
+
+/// Node `node` refuses new authorizations, for (at least) `reason`.
+pub fn assert_not_ready(network: &TestNetwork, node: usize, reason: &str) {
+    let readiness = network.readiness(node);
+    assert_ne!(readiness["state"], "ready", "{readiness}");
+    assert_eq!(readiness["can_submit_authorization"], false, "{readiness}");
+    assert_eq!(readiness["can_sign_authorized"], true, "{readiness}");
+    assert!(
+        readiness["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r == reason),
+        "{readiness}"
+    );
 }
 
 fn authorization(network: &TestNetwork, node: usize, nonce: u64) -> Option<(Vec<u8>, u64)> {
@@ -98,10 +114,12 @@ fn a1_single_node_rollback() {
         "{body}"
     );
 
-    // As a coordinator, the stale node cannot get B authorized: consensus orders its command after
-    // A and rejects it (it only learns that once it catches up, so it answers with a timeout).
+    // As a coordinator, the stale node does not submit B: it has applied nothing since it started,
+    // so it cannot see the outcome of a command, and says so instead of waiting for one.
+    assert_not_ready(&network, 3, "no_block_since_start");
     let (status, body) = network.sign(3, KEY, 100, root(0xbb));
-    assert_ne!(status, 200, "{body}");
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["result"], "NOT_READY", "{body}");
     assert!(body.get("signature").is_none(), "{body}");
 
     // A peer (node 2's identity) asks the stale node directly for B and for A.
@@ -158,6 +176,9 @@ fn a1_single_node_rollback() {
         wire::Message::Partial { .. }
     ));
 
+    // Recovered: it reports itself ready (it applies what consensus finalizes).
+    network.wait_for_ready(&[3]);
+
     // Through HTTP, B is rejected everywhere and A still signs, identically, including through
     // node 3 (which now needs nodes 0 and 1).
     for node in [0, 1, 3] {
@@ -200,8 +221,9 @@ fn a1_full_restore_never_signs_conflict() {
     );
 
     // Stale, and possibly cut off: B through node 3 is not signed; the intact nodes sign A.
+    assert_not_ready(&network, 3, "no_block_since_start");
     let (status, body) = network.sign(3, KEY, 100, root(0xbb));
-    assert_ne!(status, 200, "{body}");
+    assert_eq!(status, 503, "{body}");
     assert!(body.get("signature").is_none(), "{body}");
     let (status, again) = network.sign(0, KEY, 100, root(0xaa));
     assert_eq!(status, 200, "{again}");
@@ -226,9 +248,15 @@ fn a1_full_restore_never_signs_conflict() {
     let blocked = network.blocked_for_equivocation(3);
     println!("a1 full restore: node 3 blocked for equivocation by {blocked:?}");
     if blocked.is_empty() {
+        network.wait_for_ready(&[3]);
         let (status, again) = network.sign(3, KEY, 100, root(0xaa));
         assert_eq!(status, 200, "{again}");
         assert_eq!(again["signature"], signed_a["signature"]);
+    } else if blocked.len() == NODES - 1 {
+        // Cut off from every peer: it must not keep claiming that it follows consensus.
+        network.wait_until("cut-off node 3 to report that it is not ready", || {
+            network.readiness(3)["state"] != "ready"
+        });
     }
     let (status, again) = network.sign(1, KEY, 100, root(0xaa));
     assert_eq!(status, 200, "{again}");
@@ -306,7 +334,9 @@ fn a2_two_node_rollback() {
     assert_eq!(status, 200, "{again}");
     assert_eq!(again["signature"], signed_a["signature"]);
 
-    // Consensus is still live and every node agrees on the state.
+    // Consensus is still live and every node agrees on the state. Node 3 authorizes once it has
+    // applied everything it knows of (until then it answers `NOT_READY`).
+    network.wait_for_ready(&network.all());
     let (status, new) = network.sign(3, KEY, 101, root(0xcc));
     assert_eq!(status, 200, "{new}");
     assert!(ethereum_verify(&key, &root(0xcc), &new["signature"]));

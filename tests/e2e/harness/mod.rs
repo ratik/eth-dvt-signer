@@ -63,6 +63,8 @@ struct Node {
     /// Kept open: the node exits when it closes.
     stdin: Option<ChildStdin>,
     env: Vec<(String, String)>,
+    /// Command-line arguments of this node only (after the network's).
+    args: Vec<String>,
 }
 
 /// Networks allowed to run at once in this process (`E2E_MAX_NETWORKS`, default 4): the suite's
@@ -232,6 +234,7 @@ impl TestNetwork {
                         child: None,
                         stdin: None,
                         env: env(i),
+                        args: Vec::new(),
                     })
                     .collect(),
             ),
@@ -269,6 +272,7 @@ impl TestNetwork {
             .arg("--data-dir")
             .arg(self.dir.join("data"))
             .args(&self.args)
+            .args(&nodes[id].args)
             .env(
                 "RUST_LOG",
                 std::env::var("E2E_RUST_LOG")
@@ -306,6 +310,14 @@ impl TestNetwork {
     pub fn restart_node_with(&self, id: usize, env: Vec<(String, String)>) {
         self.stop_node(id);
         self.nodes.lock().unwrap()[id].env = env;
+        self.spawn(id);
+        self.wait_until(&format!("node {id} to serve HTTP"), || self.serves(id));
+    }
+
+    /// Restart node `id` with extra command-line arguments (kept for later restarts).
+    pub fn restart_node_with_args(&self, id: usize, args: &[&str]) {
+        self.stop_node(id);
+        self.nodes.lock().unwrap()[id].args = args.iter().map(ToString::to_string).collect();
         self.spawn(id);
         self.wait_until(&format!("node {id} to serve HTTP"), || self.serves(id));
     }
@@ -504,11 +516,22 @@ impl TestNetwork {
     }
 
     /// Every given node serves HTTP and has finalized blocks (so p2p and consensus work).
+    /// Wait until every given node reports itself ready (`GET /ready` is `200`): it applied a
+    /// block since it started, knows of no finalized block it has not applied, and sees consensus
+    /// progress.
     pub fn wait_for_ready(&self, nodes: &[usize]) {
         for &id in nodes {
             self.wait_until(&format!("node {id} ready"), || {
-                self.height(id).is_some_and(|height| height >= 2)
+                matches!(self.try_call(id, "GET", "/ready", None), Ok((200, _)))
             });
+        }
+    }
+
+    /// Readiness of node `id` (`GET /ready`, whatever its code).
+    pub fn readiness(&self, id: usize) -> Value {
+        match self.try_call(id, "GET", "/ready", None) {
+            Ok((200 | 503, body)) => body,
+            other => panic!("node {id}: no readiness: {other:?}"),
         }
     }
 

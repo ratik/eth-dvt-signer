@@ -24,6 +24,7 @@
 
 pub mod actor;
 pub mod ceremony;
+pub mod parked;
 pub mod secrets;
 pub mod signing;
 pub mod wire;

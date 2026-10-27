@@ -14,12 +14,18 @@ use crate::{
 use blst::min_pk::Signature as EthSignature;
 use commonware_codec::Encode as _;
 use eth_mpc_signer::{
-    dkg::{CeremonyId, signing::Message},
+    dkg::{CeremonyId, parked::PER_PEER, signing::Message},
     signer::wire::{self, Refusal, Request},
 };
 use rand::{Rng as _, SeedableRng as _, rngs::StdRng};
 use serde_json::Value;
-use std::time::{Duration, Instant};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 fn signers(body: &Value) -> Vec<u32> {
     body["signers"]
@@ -246,7 +252,7 @@ fn d1_d3_malformed_and_duplicate_responses() {
 }
 
 /// D4: three invalid answers ban a participant for the request, even if it then sends its genuine
-/// partial; honest participants still complete.
+/// partial; honest participants still complete. A banned participant is not asked again (L-5).
 #[test]
 fn d4_strike_limit() {
     let (network, _) = network_with_key();
@@ -256,10 +262,13 @@ fn d4_strike_limit() {
     let index_3 = index_of(&network, 3);
 
     network.stop_node(3);
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counter = asked.clone();
     let responder: Responder = Box::new(move |shares, from, message| {
         let wire::Message::Request(request) = message else {
             return Vec::new();
         };
+        counter.fetch_add(1, Ordering::SeqCst);
         let encode = |partial| {
             wire::Message::Partial {
                 request: request.id,
@@ -288,14 +297,18 @@ fn d4_strike_limit() {
         wire::Message::Partial { .. }
     ));
 
-    // Node 2 frozen: node 0 would need node 3, which banned itself.
+    // Node 2 frozen: node 0 would need node 3, which banned itself. Node 0 asked it once: the
+    // retransmissions of the next 5 seconds go to node 2 only.
     let ignored = network.count(0, "ignored signing response");
     network.freeze(2);
+    let before = asked.load(Ordering::SeqCst);
     let (status, body) = network.sign(0, KEY, 100, root(0xaa));
+    let during = asked.load(Ordering::SeqCst) - before;
     network.thaw(2);
     assert_eq!(status, 504, "{body}");
     assert_eq!(body["valid_partials"], 2);
     assert!(network.count(0, "ignored signing response") > ignored);
+    assert_eq!(during, 1, "requests sent to the banned participant");
 
     let (status, signed) = network.sign(0, KEY, 100, root(0xaa));
     assert_eq!(status, 200, "{signed}");
@@ -402,7 +415,9 @@ fn d5_d6_replay_and_cross_ceremony() {
     assert!(!ethereum_verify(&key, &root(0xbb), &theirs["signature"]));
 }
 
-/// E4/E5: more unauthorized requests than the parked queue holds (256), then expiry.
+/// E4/E5: one peer sends more unauthorized requests than its share of the parked queue (64 of
+/// 256): it only evicts its own oldest ones (fairness between peers: `dkg::parked` unit tests).
+/// Then expiry.
 #[test]
 fn e4_e5_parked_overflow_and_expiry() {
     let (network, _) = network_with_key();
@@ -420,8 +435,8 @@ fn e4_e5_parked_overflow_and_expiry() {
                 .to_vec(),
         );
     }
-    network.wait_until("the parked queue to fill", || {
-        network.status(0)["parked_requests"] == 256
+    network.wait_until("the peer's share of the parked queue to fill", || {
+        network.status(0)["parked_requests"] == PER_PEER
     });
     let rss_full = network.rss_kib(0);
 
@@ -460,5 +475,5 @@ fn e4_e5_parked_overflow_and_expiry() {
         &request(10_100, root(0xaa)).id,
         Duration::from_secs(3)
     ));
-    println!("e4: rss before {rss_before} KiB, with 256 parked {rss_full} KiB");
+    println!("e4: rss before {rss_before} KiB, with {PER_PEER} parked {rss_full} KiB");
 }

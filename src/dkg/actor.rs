@@ -13,6 +13,7 @@ use super::{
     CeremonyConfig, CeremonyId, DkgStatus, Faults, Variant,
     ceremony::{Ceremony, SignedLog},
     format_key,
+    parked::Parked,
     secrets::{KeyShare, Secrets},
     signing, wire,
 };
@@ -45,7 +46,7 @@ use commonware_utils::{
 };
 use rand_core::CryptoRng;
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use tracing::{debug, error, info, warn};
 
 /// Label of the dealer's randomness stream (derived from its persisted seed).
@@ -53,12 +54,6 @@ const DEALER_NOISE: &[u8] = b"dealer";
 
 /// A submitted dealer log missing from finalized state after this many blocks is submitted again.
 const RESUBMIT_BLOCKS: u64 = 8;
-
-/// Signing requests waiting for their authorization to be applied here (bounded, oldest dropped).
-const MAX_PARKED: usize = 256;
-
-/// A parked signing request is dropped after this many applied blocks.
-const PARK_BLOCKS: u64 = 16;
 
 pub enum Message {
     /// A ceremony changed in finalized state (started, gained a log, completed or failed).
@@ -88,8 +83,17 @@ pub enum Message {
         from: PublicKey,
         request: sign_wire::Request,
     },
-    /// Number of parked signing requests.
-    Parked { response: oneshot::Sender<usize> },
+    /// Parked requests and shares that cannot be used.
+    Health { response: oneshot::Sender<Health> },
+}
+
+/// What this node's keyholder can serve.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Health {
+    /// Signing requests waiting for their authorization here.
+    pub parked: usize,
+    /// Completed ceremonies without a usable share on this node.
+    pub unavailable: Vec<CeremonyId>,
 }
 
 /// State of this node's share of a ceremony.
@@ -191,11 +195,12 @@ impl Client {
         receiver.await.map_err(|_| Stopped)
     }
 
-    /// Number of signing requests waiting for their authorization here.
-    pub async fn parked(&self) -> Result<usize, Stopped> {
+    /// Parked requests and unusable shares. Answered only once the shares are loaded (the actor
+    /// loads them before reading its mailbox).
+    pub async fn health(&self) -> Result<Health, Stopped> {
         let (response, receiver) = oneshot::channel();
         self.actor
-            .send(Message::Parked { response })
+            .send(Message::Health { response })
             .map_err(|_| Stopped)?;
         receiver.await.map_err(|_| Stopped)
     }
@@ -232,14 +237,6 @@ struct Session {
     acks: BTreeMap<PublicKey, PlayerAck<PublicKey>>,
 }
 
-/// A signing request that arrived before its authorization was applied here.
-struct Parked {
-    from: PublicKey,
-    request: sign_wire::Request,
-    /// Applied blocks counter when it was parked.
-    since: u64,
-}
-
 pub struct Actor<
     E: CryptoRng + Spawner + Context,
     S: Sender<PublicKey = PublicKey>,
@@ -268,7 +265,7 @@ pub struct Actor<
     participants: BTreeMap<u64, Set<PublicKey>>,
     /// Signing authorizations committed on this node, by `(round, nonce)`.
     authorizations: HashMap<(u64, u64), Committed>,
-    parked: VecDeque<Parked>,
+    parked: Parked,
     /// Blocks applied since start.
     blocks: u64,
 }
@@ -310,7 +307,7 @@ impl<
                 .into_iter()
                 .map(|committed| ((committed.round(), committed.nonce()), committed))
                 .collect(),
-            parked: VecDeque::new(),
+            parked: Parked::default(),
             blocks: 0,
         }
     }
@@ -348,8 +345,16 @@ impl<
                     let _ = response.send(self.partial(&ceremony, nonce, &payload_hash));
                 }
                 Message::SignRequest { from, request } => self.on_sign_request(from, request),
-                Message::Parked { response } => {
-                    let _ = response.send(self.parked.len());
+                Message::Health { response } => {
+                    let _ = response.send(Health {
+                        parked: self.parked.len(),
+                        unavailable: self
+                            .ids
+                            .iter()
+                            .filter(|(_, round)| self.unavailable.contains(round))
+                            .map(|(id, _)| id.clone())
+                            .collect(),
+                    });
                 }
             }
         }
@@ -571,8 +576,7 @@ impl<
     fn tick(&mut self) {
         self.blocks += 1;
         let blocks = self.blocks;
-        self.parked
-            .retain(|parked| blocks - parked.since < PARK_BLOCKS);
+        self.parked.expire(blocks);
         let rounds: Vec<u64> = self.sessions.keys().copied().collect();
         for round in rounds {
             self.send_dealings(round);
@@ -750,21 +754,7 @@ impl<
     }
 
     fn park(&mut self, from: PublicKey, request: sign_wire::Request) {
-        if self
-            .parked
-            .iter()
-            .any(|parked| parked.from == from && parked.request.id == request.id)
-        {
-            return;
-        }
-        if self.parked.len() >= MAX_PARKED {
-            self.parked.pop_front();
-        }
-        self.parked.push_back(Parked {
-            from,
-            request,
-            since: self.blocks,
-        });
+        self.parked.park(from, request, self.blocks);
     }
 
     /// Record durably committed authorizations, then answer the requests that waited for them.
@@ -775,17 +765,13 @@ impl<
                 authorization,
             );
         }
-        let (ready, waiting): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut self.parked)
-            .into_iter()
-            .partition(|parked| {
-                self.ids.get(&parked.request.ceremony).is_some_and(|round| {
-                    self.authorizations
-                        .contains_key(&(*round, parked.request.nonce))
-                })
-            });
-        self.parked = waiting;
-        for parked in ready {
-            self.on_sign_request(parked.from, parked.request);
+        let (ids, authorizations) = (&self.ids, &self.authorizations);
+        let ready = self.parked.take(|request| {
+            ids.get(&request.ceremony)
+                .is_some_and(|round| authorizations.contains_key(&(*round, request.nonce)))
+        });
+        for (from, request) in ready {
+            self.on_sign_request(from, request);
         }
     }
 }

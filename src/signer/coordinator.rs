@@ -2,8 +2,8 @@
 //!
 //! For each request it:
 //!
-//! 1. reads the finalized authorization of `(ceremony, nonce)` and, only if there is none, has
-//!    consensus decide one (a command in a block);
+//! 1. reads the finalized authorization of `(ceremony, nonce)` and, only if there is none and this
+//!    node follows consensus (`readiness`), has consensus decide one (a command in a block);
 //! 2. asks every participant, itself included, for its partial signature (participants check the
 //!    request against their own committed state, see `dkg::actor`);
 //! 3. keeps only valid partials (authenticated sender, matching index, verifying signature), one per
@@ -12,13 +12,16 @@
 //!
 //! Only step 1 involves consensus. Partial signatures are deterministic and nothing is persisted:
 //! retrying a request (on any node) collects them again. Identical requests arriving at one node
-//! while it already works on that request wait for the same result instead of starting over.
+//! while it already works on that request wait for the same result instead of starting over. This
+//! is an optimization only: coordinators on different nodes may aggregate the same authorized
+//! payload independently, and consensus alone decides what is authorized.
 
 use super::wire::{self, Refusal, Request};
 use crate::{
     dkg::{self, CeremonyId, DkgStatus, Variant, ceremony::Ceremony, signing},
     executor::{self, Lookup, Receipt},
     hooks,
+    readiness::{Readiness, Reason},
     state::Authorization,
     types::{Outcome, SignRequest},
 };
@@ -128,6 +131,9 @@ pub enum SignError {
     Conflict(Authorization),
     #[error("authorization not finalized in time (it may still be)")]
     AuthorizationTimeout,
+    /// This node does not follow consensus closely enough to authorize (see `readiness`).
+    #[error("not ready to authorize new requests")]
+    NotReady(Vec<Reason>),
     #[error("not enough participants can sign")]
     InsufficientSigners {
         authorization: Authorization,
@@ -387,6 +393,20 @@ async fn lookup(
     receiver.await.map_err(|_| SignError::Stopped)
 }
 
+/// Readiness to submit a new authorization. Shares do not matter for it: the DKG actor checks them
+/// for every partial signature.
+async fn submission_readiness<E: Clock>(
+    context: &E,
+    executor: &mpsc::UnboundedSender<executor::Message>,
+) -> Result<Readiness, SignError> {
+    let (response, receiver) = oneshot::channel();
+    executor
+        .send(executor::Message::Status { response })
+        .map_err(|_| SignError::Stopped)?;
+    let status = receiver.await.map_err(|_| SignError::Stopped)?;
+    Ok(Readiness::evaluate(status.progress, 0, context.current()))
+}
+
 async fn authorize(
     executor: &mpsc::UnboundedSender<executor::Message>,
     request: SignRequest,
@@ -419,6 +439,14 @@ async fn sign<E: Clock, S: Sender<PublicKey = PublicKey>>(
         }
         Some(existing) => return Err(SignError::Conflict(existing)),
         None => {
+            // An applied authorization is signed whatever this node's progress (above); a new one
+            // is submitted only by a node that follows consensus.
+            let blockers = submission_readiness(context, &deps.executor)
+                .await?
+                .submission_blockers();
+            if !blockers.is_empty() {
+                return Err(SignError::NotReady(blockers));
+            }
             let submitted = context.current();
             let receipt = select! {
                 receipt = authorize(&deps.executor, request.clone()) => { receipt? },
@@ -640,7 +668,8 @@ async fn collect<E: Clock, S: Sender<PublicKey = PublicKey>>(
             });
         }
 
-        // (Re)send the request, every `retry`, to the participants that have not answered for good.
+        // (Re)send the request, every `retry`, to the participants that have not answered for good
+        // and are not banned (their answers would be ignored anyway).
         if now >= resend_at {
             resend_at = now + deps.config.retry;
             let silent: Vec<PublicKey> = participants
@@ -652,6 +681,9 @@ async fn collect<E: Clock, S: Sender<PublicKey = PublicKey>>(
                             && !refusals
                                 .get(&index.get())
                                 .is_some_and(|reason| reason.is_final())
+                            && !strikes
+                                .get(&index.get())
+                                .is_some_and(|strikes| *strikes >= MAX_STRIKES)
                     })
                 })
                 .cloned()

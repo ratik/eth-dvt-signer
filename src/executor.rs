@@ -9,6 +9,7 @@ use crate::{
     },
     engine::Retention,
     hooks,
+    readiness::Progress,
     state::Authorization,
     storage::{Effect, Store},
     types::{Block, Command, Outcome, SignRequest, Transaction, format_hash},
@@ -80,6 +81,8 @@ pub struct Status {
     pub authorizations: usize,
     /// Requests waiting for a block.
     pub mempool: usize,
+    /// What this node applied and knows of (for readiness).
+    pub progress: Progress,
 }
 
 pub enum Message {
@@ -169,6 +172,10 @@ pub struct Executor<E: CryptoRng + Spawner + Context, S: Sender> {
     store: Store<E>,
     mempool: Mempool,
     executed: Arc<AtomicU64>,
+    /// Highest finalized height marshal knows of.
+    tip: Arc<AtomicU64>,
+    /// When this process last applied a new block.
+    last_applied: Option<SystemTime>,
     /// Gossips locally submitted transactions so whichever node leads next can include them.
     gossip: S,
     mailbox: mpsc::UnboundedReceiver<Message>,
@@ -188,6 +195,7 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
         store: Store<E>,
         mempool: Mempool,
         executed: Arc<AtomicU64>,
+        tip: Arc<AtomicU64>,
         gossip: S,
         marshal: Marshal<Scheme, Standard<Block>>,
         retention: Retention,
@@ -200,6 +208,8 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
             store,
             mempool,
             executed,
+            tip,
+            last_applied: None,
             gossip,
             mailbox,
             waiters: HashMap::new(),
@@ -274,10 +284,16 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                     let _ = response.send(self.store.ceremonies().get(&id).cloned());
                 }
                 Message::Status { response } => {
+                    let height = self.store.height();
                     let _ = response.send(Status {
-                        height: self.store.height(),
+                        height,
                         authorizations: self.store.authorization_count(),
                         mempool: self.mempool.len(),
+                        progress: Progress {
+                            applied: height,
+                            known_finalized: self.tip.load(Ordering::Acquire).max(height),
+                            last_applied: self.last_applied,
+                        },
                     });
                 }
                 Message::Finalized { block, ack } => {
@@ -348,6 +364,7 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
             hooks::crash_point("after-apply-authorization");
         }
         self.executed.store(height, Ordering::Release);
+        self.last_applied = Some(applied_at);
         self.mempool.remove_all(&block.transactions);
 
         // The DKG actor (which holds the shares) learns about committed changes before any client

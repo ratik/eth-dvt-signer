@@ -14,6 +14,7 @@ mod failures;
 mod harness;
 mod lifecycle;
 mod limits;
+mod readiness;
 mod recovery;
 mod rollback;
 mod signing;

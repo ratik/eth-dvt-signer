@@ -118,13 +118,27 @@ Notes:
   finds it refuses to start with an explicit error rather than ignoring it. Block encoding also
   changed. To upgrade a local network, stop it and start from an empty data directory (back up
   `data/` first if it matters; nothing is deleted automatically).
-- **Damaged state fails closed.** If the replicated state is behind the finalized blocks the node
-  already acknowledged (a damaged newest copy, a state partition deleted or restored on its own),
-  the node stops with an error (exit status 1) instead of skipping blocks. Restore the node's
-  directory from one consistent backup instead, but keep its current consensus journal
-  (`registry-consensus`): with an older journal the node forgets its own votes, may vote twice in a
-  view, and its peers then block it for an hour ([audit](docs/audit.md), L-7). If both copies of
-  the state are damaged, it refuses to start.
+- **Inconsistent storage fails closed.** Before anything runs, a node checks its durable state
+  against itself and refuses to start (log `refusing to start`, exit status 1) when:
+  - the replicated state is behind the finalized blocks it already acknowledged (a damaged newest
+    copy, a state partition deleted or restored on its own);
+  - a key share is stored for a ceremony the state does not have as completed (state lost or
+    rolled back, share kept);
+  - the consensus journal (`registry-consensus`) is missing while it has finalized history;
+  - both copies of the state or of the secret store are damaged.
+
+  Nothing is deleted or reset, and the state, secret store and journal are left as found (a damaged
+  copy that opening the store would truncate is put back). Restore the node's directory from one
+  consistent backup instead, but keep its current consensus journal: with an older journal the
+  node forgets its own votes, may vote twice in a view, and its peers then block it for an hour
+  ([audit](docs/audit.md), L-7). Consensus resumes above the last finalization the node processed,
+  so it never votes again at or below it, whatever its journal holds.
+- **Lost consensus journal.** Start the node only after the other three have finalized at least 15
+  blocks (more views than peers keep, 10) since it stopped, with
+  `--allow-missing-consensus-journal`; votes it forgot are then in views its peers no longer
+  consider. Never restore an old journal instead.
+- Readiness, the startup checks, the supported and unsupported recovery procedures and why a
+  whole-network rollback cannot be detected: [docs/recovery.md](docs/recovery.md).
 
 ## DKG
 
@@ -309,8 +323,27 @@ curl -s localhost:8081/sign -H 'content-type: application/json' -d '{"ceremony_i
 
 curl -s localhost:8083/authorizations/validator-001/100   # {"ceremony_id":..,"payload_hash":..,"height":10}
 curl -s localhost:8082/status
-# {"height":11,"authorizations":1,"mempool":0,"signing_in_flight":0,"signing_sessions":0,"parked_requests":0}
+# {"height":11,"authorizations":1,"mempool":0,"signing_in_flight":0,"signing_sessions":0,
+#  "parked_requests":0,"readiness":{"state":"ready","reasons":[],"can_submit_authorization":true,
+#  "can_sign_authorized":true,"startup_checks":"passed","applied_height":11,
+#  "known_finalized_height":11,"last_block_age_ms":640,"state_height_at_start":0,
+#  "unavailable_shares":[],"consensus":{"voting":true,"journal_missing_at_start":false}}}
+curl -s localhost:8082/ready   # the readiness alone: 200 when ready, 503 otherwise
 ```
+
+Readiness is computed from what the node observes, never from a startup delay, and never claims
+that the node has the network's latest block ([docs/recovery.md](docs/recovery.md)):
+
+| `reasons` | Meaning | `state` |
+| --------- | ------- | ------- |
+| `no_block_since_start` | nothing applied since this process started | `syncing` |
+| `local_backlog` | more than 2 finalized blocks known here are not applied | `syncing` |
+| `no_recent_finalization` | no block applied for 10 s: consensus stalled or unreachable from here | `degraded` |
+| `share_unavailable` | a completed ceremony has no usable share here | `degraded` |
+
+A node that is not ready still signs authorizations it has applied (each partial is checked by
+its keyholder); it refuses to submit new ones (`NOT_READY`). `consensus.floor_height` and
+`floor_view` show the finalization consensus resumed above after a restart.
 
 | `POST /sign` | HTTP | `result` |
 | ------------ | ---- | -------- |
@@ -321,6 +354,7 @@ curl -s localhost:8082/status
 | `(ceremony_id, nonce)` authorized for another payload | 409 | `REJECTED` (with the authorization `height`) |
 | participants refused for good (3 cannot sign) | 503 | `INSUFFICIENT_SIGNERS` |
 | too many requests in flight, node stopping | 503 | `UNAVAILABLE` |
+| a new authorization is needed but this node is not ready | 503 | `NOT_READY` (with `reasons`) |
 | authorization not finalized within 30 s | 504 | `AUTHORIZATION_TIMEOUT` (it may still finalize) |
 | fewer than 3 valid partials within `--signing-timeout` | 504 | `SIGNING_TIMEOUT` |
 
@@ -373,7 +407,9 @@ node; a full restart; byzantine responses on the signing channel; refused unauth
 
 `tests/e2e` (real processes): E2E-1 to E2E-9 below, plus the audit scenarios of
 [docs/audit.md](docs/audit.md) (rollback, crash boundaries, concurrency, cancellation, byzantine
-traffic, limits, lifecycle, corrupted storage). E2E-1 to E2E-9: cold start to a blst-verified signature,
+traffic, limits, lifecycle, corrupted storage) and the recovery scenarios R1-R6 of
+[docs/recovery.md](docs/recovery.md) (readiness after restarts, rollbacks, a lagging node,
+inconsistent storage, an offline peer). E2E-1 to E2E-9: cold start to a blst-verified signature,
 idempotency, conflicting requests, one node offline, coordinator crash (after authorization and
 after 2 partials, through test hooks), full network restart, unauthorized p2p signing requests and
 byzantine partial signatures (from a scripted peer that takes a stopped node's identity on the real
@@ -393,12 +429,12 @@ MacBook, 4 processes on loopback: protocol overhead, not production numbers.
 
 | ms, 100 requests each | p50 | p95 | p99 | min | max | mean |
 | --- | --- | --- | --- | --- | --- | --- |
-| new authorization, client round trip | 411 | 651 | 742 | 192 | 759 | 420 |
-| &nbsp;&nbsp;of which consensus (`authorization_ms`) | 369 | 619 | 718 | 152 | 743 | 382 |
-| &nbsp;&nbsp;of which apply (`apply_ms`) | 13 | 33 | 42 | 3 | 42 | 15 |
-| &nbsp;&nbsp;of which partials (`collect_ms`) | 9 | 23 | 34 | 4 | 41 | 11 |
-| already authorized, client round trip | 6.7 | 9.1 | 23.8 | 6.3 | 24.8 | 7.3 |
-| new authorization, one node offline | 329 | 582 | 2345 | 178 | 2364 | 423 |
+| new authorization, client round trip | 337 | 582 | 639 | 215 | 682 | 369 |
+| &nbsp;&nbsp;of which consensus (`authorization_ms`) | 303 | 550 | 588 | 184 | 605 | 329 |
+| &nbsp;&nbsp;of which apply (`apply_ms`) | 13 | 27 | 30 | 6 | 31 | 15 |
+| &nbsp;&nbsp;of which partials (`collect_ms`) | 8 | 29 | 39 | 4 | 46 | 11 |
+| already authorized, client round trip | 6.6 | 13.0 | 17.9 | 6.3 | 18.6 | 7.3 |
+| new authorization, one node offline | 344 | 590 | 2252 | 177 | 2352 | 431 |
 
 Authorization is one or two consensus views; each view is dominated by disk syncs (consensus
 journal, marshal archives, the state commit), not by the network. With a node offline, the requests
@@ -408,7 +444,11 @@ Signing an existing authorization costs one p2p round trip and four pairings.
 ## Limitations (next steps)
 
 - Static validator set, development keys, **no client authentication or rate limiting**: anyone who
-  can reach the HTTP port can authorize and sign.
+  can reach the HTTP port can authorize and sign. The HTTP API therefore binds to `127.0.0.1` only;
+  `POST /sign` is for development and tests, not a validator API (that needs authentication and
+  slashing protection first).
+- A whole-network rollback (every node restored to older storage) signs a conflicting payload and
+  cannot be detected without state outside the nodes ([docs/recovery.md](docs/recovery.md), §6).
 - Generic authorization, not Ethereum slashing protection: the nonce is caller-chosen, and two
   nonces can authorize conflicting Ethereum messages. The signing root (fork, domain) is computed by
   the caller.

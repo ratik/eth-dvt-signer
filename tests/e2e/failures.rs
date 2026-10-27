@@ -226,8 +226,8 @@ fn byzantine_responses_never_count() {
     assert!(network.count(0, "invalid signing message") >= 1);
 }
 
-/// E2E-9: a node that has not applied an authorization refuses to sign it, then signs once it
-/// catches up.
+/// E2E-9 / R4: a node that has not applied an authorization refuses to sign it, reports why it is
+/// not ready and does not authorize, while the others go on; it signs once it catches up.
 #[test]
 fn lagging_signer_refuses_until_applied() {
     let (network, key) = network_with_key();
@@ -260,6 +260,27 @@ fn lagging_signer_refuses_until_applied() {
     let (status, _) = network.get(3, &format!("/authorizations/{KEY}/100"));
     assert_eq!(status, 404, "node 3 has not applied the authorization");
 
+    // It knows of finalized blocks it has not applied: it says so, and does not authorize.
+    network.wait_until("node 3 to report its backlog", || {
+        let readiness = network.readiness(3);
+        readiness["state"] == "syncing"
+            && readiness["reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason == "local_backlog")
+            && readiness["known_finalized_height"].as_u64() > readiness["applied_height"].as_u64()
+    });
+    crate::rollback::assert_not_ready(&network, 3, "local_backlog");
+    let (status, body) = network.sign(3, KEY, 101, root(0xbb));
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["result"], "NOT_READY");
+    assert_eq!(network.get(0, &format!("/authorizations/{KEY}/101")).0, 404);
+    // The others are ready and keep authorizing.
+    network.wait_for_ready(&[0, 1, 2]);
+    let (status, other) = network.sign(1, KEY, 102, root(0xcc));
+    assert_eq!(status, 200, "{other}");
+
     // With node 2 down, node 0 needs node 3, which refuses: not enough signers.
     network.stop_node(2);
     let (status, failed) = network.sign(0, KEY, 100, root(0xaa));
@@ -272,6 +293,7 @@ fn lagging_signer_refuses_until_applied() {
     // Node 3 catches up; the same request now succeeds with it, identically.
     std::fs::remove_file(&hold).unwrap();
     wait_applied(&network, &[3], 100);
+    network.wait_for_ready(&[3]);
     let (status, again) = network.sign(0, KEY, 100, root(0xaa));
     assert_eq!(status, 200, "{again}");
     assert_eq!(again["signature"], signed["signature"]);

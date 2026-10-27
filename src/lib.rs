@@ -6,6 +6,7 @@ pub mod dkg;
 pub mod engine;
 pub mod executor;
 pub mod hooks;
+pub mod readiness;
 pub mod rpc;
 pub mod signer;
 pub mod state;

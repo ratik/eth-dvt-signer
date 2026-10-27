@@ -9,6 +9,7 @@ use blst::{
 };
 use common::{
     Cluster, Injector, RETENTION, complete_dkg, id, request, start_network, start_network_with,
+    wait_for_height,
 };
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::{
@@ -348,6 +349,10 @@ fn state_and_shares_survive_a_full_restart() {
             sign(&cluster, 2, 1, 0x0b).await,
             Err(SignError::Conflict(_))
         ));
+        // New authorizations wait until the node follows consensus again (a block applied since
+        // the restart).
+        let restarted_at = cluster.clients[1].status().await.unwrap().height;
+        wait_for_height(&context, &cluster.clients, restarted_at + 1).await;
         let new = sign(&cluster, 1, 2, 0x0c).await.unwrap();
         assert_eq!(new.kind, AuthorizationKind::New);
         assert!(ethereum_verify(&key, &root(0x0c), &new.signature.encode()));
