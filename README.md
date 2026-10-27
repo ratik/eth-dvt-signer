@@ -1,38 +1,41 @@
 # eth-mpc-signer
 
-A 4-node network built on [commonware](https://github.com/commonwarexyz/monorepo) `v2026.9.0`:
+A 4-node threshold signer built on [commonware](https://github.com/commonwarexyz/monorepo)
+`v2026.9.0`:
 
-- a BFT-replicated registry `nonce -> payload_hash` (stage 1);
-- distributed key generation (DKG) of a 3-of-4 BLS12-381 threshold key, with no trusted dealer
-  (stage 2, see [DKG](#dkg)).
+- distributed key generation (DKG) of a 3-of-4 BLS12-381 key, with no trusted dealer
+  (see [DKG](#dkg));
+- consensus-backed signing: `POST /sign` authorizes `(ceremony_id, nonce) -> payload_hash` once,
+  through consensus, and returns the 3-of-4 threshold signature of the payload, a 32-byte Ethereum
+  signing root (see [Signing](#signing)).
 
-Requests to `/sign` are not signed yet. Threshold signing (Ethereum-compatible, see
-[Ethereum compatibility](#ethereum-compatibility)) is only exposed internally and in tests.
+Design notes: [docs/architecture.md](docs/architecture.md) (signing, E2E harness, future Ethereum
+integration), [docs/security-review.md](docs/security-review.md) and the adversarial audit
+[docs/audit.md](docs/audit.md) (findings, fault model, coverage).
 
 ## Model
 
-One command:
+One signing command, decided by consensus:
 
 ```rust
 struct SignRequest {
-    nonce: u64,
+    ceremony: CeremonyId, // a completed DKG ceremony: whose key signs
+    nonce: u64,           // caller-chosen id, not an Ethereum slot/epoch
     payload_hash: [u8; 32],
 }
 ```
 
-One state (`src/state.rs`):
+Replicated state (`src/state.rs`): `(ceremony, nonce) -> {payload_hash, height}`.
 
-```rust
-struct State {
-    requests: BTreeMap<u64, [u8; 32]>,
-}
-```
+| Request                                     | Result                   |
+| ------------------------------------------- | ------------------------ |
+| unknown ceremony                            | `UNKNOWN_CEREMONY`       |
+| ceremony in progress or failed              | `CEREMONY_NOT_COMPLETED` |
+| new `(ceremony, nonce)`                     | `ACCEPTED`               |
+| same `(ceremony, nonce)`, same hash         | `ALREADY_ACCEPTED`       |
+| same `(ceremony, nonce)`, different hash    | `REJECTED`               |
 
-| Request                          | Result             |
-| -------------------------------- | ------------------ |
-| new nonce                        | `ACCEPTED`         |
-| same nonce, same hash            | `ALREADY_ACCEPTED` |
-| same nonce, different hash       | `REJECTED`         |
+An authorization never changes once finalized. Only an authorized payload is ever signed.
 
 ## Architecture
 
@@ -45,32 +48,36 @@ Client ──HTTP──> Node i ──p2p gossip (mempool)──> all nodes
                                                      │
                  marshal: finalized blocks, in order, persisted, backfilled
                                                      │
-                     executor: apply() each request -> State -> Metadata store
+                executor: apply() each command -> State -> Metadata store (one sync)
                                                      │
-                     the client that submitted the request gets its result
+          committed changes -> DKG actor (keys, partial signatures); then client answers
 ```
 
-| Module               | Role | commonware |
-| -------------------- | ---- | ---------- |
-| `src/main.rs`        | CLI, tokio runtime, authenticated p2p (`lookup`), HTTP server | `runtime`, `p2p` |
-| `src/engine.rs`      | wires one node together | `consensus::simplex`, `consensus::marshal`, `broadcast::buffered`, `storage::archive` |
-| `src/application.rs` | mempool, block proposal (`propose`/`verify`), hands finalized blocks to the executor | `consensus::Application` (wrapped by marshal `Inline`) |
-| `src/executor.rs`    | the state machine actor: applies finalized blocks, answers clients | |
-| `src/state.rs`       | `State` + `apply()` (pure, deterministic) | |
-| `src/storage.rs`     | persistent `State`: atomic commit per block | `storage::metadata` |
-| `src/types.rs`       | `SignRequest`, `Transaction`, `Block`, codecs | `codec` |
-| `src/rpc.rs`         | HTTP API | |
-| `src/dkg/ceremony.rs`| replicated ceremony state: configs, dealer logs, public result | `cryptography::bls12381::dkg::feldman_desmedt` (`observe`) |
-| `src/dkg/actor.rs`   | this node's dealer and player, shares, partial signatures | `feldman_desmedt` (`Dealer`, `Player`), `primitives::ops::threshold` |
-| `src/dkg/wire.rs`    | private dealer/player messages (p2p channel 6) | `p2p` |
-| `src/dkg/secrets.rs` | this node's secret store: dealer seed, received dealings, final share | `storage::metadata` |
+| Module                     | Role | commonware |
+| -------------------------- | ---- | ---------- |
+| `src/main.rs`              | CLI, tokio runtime, authenticated p2p (`lookup`), HTTP server | `runtime`, `p2p` |
+| `src/engine.rs`            | wires one node together | `consensus::simplex`, `consensus::marshal`, `broadcast::buffered`, `storage::archive` |
+| `src/application.rs`       | mempool, block proposal (`propose`/`verify`), hands finalized blocks to the executor | `consensus::Application` (wrapped by marshal `Inline`) |
+| `src/executor.rs`          | the state machine actor: applies finalized blocks, answers clients | |
+| `src/state.rs`             | authorization rules (pure, deterministic) | |
+| `src/storage.rs`           | persistent replicated state: atomic commit per block, `Committed` authorizations | `storage::metadata` |
+| `src/types.rs`             | `SignRequest`, `Command`, `Transaction`, `Block`, codecs | `codec` |
+| `src/rpc.rs`               | HTTP API (request parsing stays here) | |
+| `src/dkg/ceremony.rs`      | replicated ceremony state: configs, dealer logs, public result | `cryptography::bls12381::dkg::feldman_desmedt` (`observe`) |
+| `src/dkg/actor.rs`         | this node's dealer, player and shares; the only producer of partial signatures | `feldman_desmedt` (`Dealer`, `Player`) |
+| `src/dkg/signing.rs`       | BLS threshold signing domains (Ethereum, internal) | `primitives::ops`, `ops::threshold` |
+| `src/dkg/wire.rs`          | private dealer/player messages (p2p channel 6) | `p2p` |
+| `src/dkg/secrets.rs`       | this node's secret store: dealer seed, received dealings, final share | `storage::metadata` |
+| `src/signer/coordinator.rs`| per-request coordinator: authorization, partial collection, recovery | `p2p` |
+| `src/signer/wire.rs`       | signing protocol messages (p2p channel 7) | `p2p` |
+| `src/hooks.rs`             | fault injection for E2E tests (`test-hooks` feature only) | |
 
 Notes:
 
-- Every request goes through consensus, so all nodes apply the same requests in the same order and
+- Every command goes through consensus, so all nodes apply the same commands in the same order and
   end up with the same state.
-- A client request is wrapped in a `Transaction` with a random `id`. Two submissions of the same
-  request are different transactions: the first one is `ACCEPTED`, the second `ALREADY_ACCEPTED`.
+- A command is wrapped in a `Transaction` with a random `id`. Two submissions of the same request
+  are different transactions: the first is `ACCEPTED`, the second `ALREADY_ACCEPTED`.
 - The leader rotates every view (round robin). Any node can take requests: it gossips them to the
   others, so the next leader includes them.
 - State and the height of the last applied block are written in one atomic `sync`, so a crash never
@@ -81,17 +88,43 @@ Notes:
 
 | What | Kept |
 | ---- | ---- |
-| Registry state (`nonce -> payload_hash`, ~40 B per nonce) | forever |
-| Finalized blocks and their certificates (~400 B per block) | the last `--retain-blocks` blocks (default 100 000) |
+| Authorizations (~60 B each) and ceremonies | forever |
+| Finalized blocks and their certificates | the last `--retain-blocks` blocks (default 100 000) |
 | Consensus journal, marshal cache | a few recent views |
+| Key shares (secret store) | forever |
 
-- While idle, a leader waits up to 4 s for transactions before proposing an empty block, so an idle
-  network produces ~1 block per 4 s. A request is proposed as soon as the leader sees it.
+- While idle, a leader waits up to 1.5 s for transactions before proposing an empty block, so an
+  idle network produces ~1 block per 1.6 s (37 per minute measured). A request is proposed as soon
+  as the leader sees it. The wait must stay below the leader timeout (2 s): the others give up on
+  a leader that has not proposed by then, which is also what an offline leader costs per turn.
 - History is pruned once every 4096 blocks (one archive section), keeping between
-  `--retain-blocks` and `--retain-blocks + 4096` blocks. With the default window a node uses at
-  most ~40 MB of history.
+  `--retain-blocks` and `--retain-blocks + 4096` blocks. The window is counted in blocks, empty
+  ones included: the default is about 45 hours of an idle network (0.61 blocks/s measured).
 - A node that was offline for longer than the window cannot backfill the missing blocks from its
-  peers; restart it from a copy of a healthy node's `data/node-i`.
+  peers. Recover it by hand from a healthy node:
+  1. stop the lagging node and the healthy one (with one node already down, consensus pauses
+     until the healthy one is back);
+  2. replace every partition of the lagging node's `data/node-i` with the healthy node's copy,
+     **except `registry-secrets` and `registry-consensus`**, which stay the lagging node's own;
+  3. restart both.
+
+  Never take those two from another node, and never take `registry-consensus` from an old backup:
+  another node's key share makes this node's partial signatures invalid, and another or an older
+  consensus journal makes it vote twice in a view, after which its peers block it for an hour
+  ([audit](docs/audit.md), L-7).
+  Tested by `recovery::lagging_node_restored_from_peer_copy`.
+- **Format 2.** The replicated state lives in partition `registry-state` with a format version.
+  Format 1 (the global nonce registry, partition `registry-registry`) is not migrated: a node that
+  finds it refuses to start with an explicit error rather than ignoring it. Block encoding also
+  changed. To upgrade a local network, stop it and start from an empty data directory (back up
+  `data/` first if it matters; nothing is deleted automatically).
+- **Damaged state fails closed.** If the replicated state is behind the finalized blocks the node
+  already acknowledged (a damaged newest copy, a state partition deleted or restored on its own),
+  the node stops with an error (exit status 1) instead of skipping blocks. Restore the node's
+  directory from one consistent backup instead, but keep its current consensus journal
+  (`registry-consensus`): with an older journal the node forgets its own votes, may vote twice in a
+  view, and its peers then block it for an hour ([audit](docs/audit.md), L-7). If both copies of
+  the state are damaged, it refuses to start.
 
 ## DKG
 
@@ -159,7 +192,8 @@ consensus and atomic `Metadata` writes. Guarantees from this application:
 
 ### Ethereum compatibility
 
-Checked against Ethereum consensus BLS (`src/dkg/signing.rs`, `tests/dkg.rs`):
+`POST /sign` returns signatures in Ethereum consensus format. Checked against Ethereum consensus BLS
+(`src/dkg/signing.rs`, `tests/dkg.rs`, `tests/signing.rs`, `tests/e2e`):
 
 | Property | Ethereum | Here |
 | -------- | -------- | ---- |
@@ -172,16 +206,48 @@ Checked against Ethereum consensus BLS (`src/dkg/signing.rs`, `tests/dkg.rs`):
 - **Official vector.** Ethereum vector `sign_case_8cd3d4d0d9a5b265` (bls12-381-tests v0.1.2): its
   secret key is split 3-of-4, and every 3 of the 4 partial signatures recover exactly the official
   signature bytes.
-- **Independent check.** A DKG-generated group key and threshold signature pass blst
+- **Independent check.** A DKG-generated group key and every signature returned by `/sign` pass blst
   `key_validate`, `sig_validate` and `verify` with the Ethereum DST, the checks an Ethereum client
-  does.
+  does. Another root, or the key of another ceremony, fails.
 - **Domains.** commonware's convenience `sign_message` prefixes a namespace to the message, which
   Ethereum does not, so it is not used for Ethereum. Internal messages use their own DST
-  (`signing::INTERNAL_DST`), so they can never verify as Ethereum signatures.
+  (`signing::INTERNAL_DST`), so they can never verify as Ethereum signatures; nothing exposed
+  signs in the internal domain today.
 - **Not covered:**
-  - signing roots and domains (fork version, `DOMAIN_*`), deposits (the deposit signature is a
-    regular signature over the deposit signing root, so it would go through `Message::Ethereum`);
-  - slashing protection: nothing stops two conflicting signatures today.
+  - signing roots and domains (fork version, `DOMAIN_*`): the caller sends the signing root;
+  - deposits (a regular signature over the deposit signing root);
+  - slashing protection: the nonce is not a slot or epoch, and two different nonces may authorize
+    conflicting Ethereum messages.
+
+## Signing
+
+```
+POST /sign {ceremony_id, nonce, payload_hash} ──> any node: the coordinator
+  1. finalized authorization of (ceremony_id, nonce)?
+       same payload ──> reuse it (no consensus)          other payload ──> 409
+       none ──> Sign command ──consensus──> finalized ──> applied durably on each node
+  2. Request{id, ceremony_id, nonce, payload} ──p2p channel 7──> every participant (itself too)
+       each participant signs only if (ceremony_id, nonce) -> payload is committed in its own state
+  3. first 3 valid partials (authenticated sender = share index, signature verifies)
+  4. recover (interpolation, no private key) ──> verify against the group key ──> 96-byte signature
+```
+
+- **Only authorization needs consensus.** Collecting partials and recovering the signature does
+  not: a retry, on any node, just collects them again. BLS signatures are deterministic, so any 3
+  signers give the same signature. Nothing (partials, signatures) is persisted.
+- **The signing gate.** A partial signature is produced by one function (`dkg::actor`), for an
+  authorization that exists as a `storage::Committed` value: created only by the store, from state it
+  synced to disk. The executor hands them to the DKG actor after the sync and before answering any
+  client. A request (HTTP or p2p) never authorizes anything: a node with no committed authorization
+  answers `not_authorized` (and signs later if the authorization arrives), a different payload gets
+  `conflict`. The authorized payload is what gets signed.
+- **No leader.** Any node coordinates; it asks all participants, completes with the first 3 valid
+  partials, re-asks silent ones every 500 ms, stops at `--signing-timeout` (default 10 s). A slow or
+  offline node does not block it. One coordinator handles at most 256 requests at once.
+- **Byzantine responses.** A partial counts only if its index is the authenticated sender's own
+  index, it verifies against that index's public share, and that index has not answered yet. A
+  participant sending 3 invalid responses is ignored for that request. Responses for other requests
+  or ceremonies never reach this one.
 
 ## Run
 
@@ -190,35 +256,25 @@ Checked against Ethereum consensus BLS (`src/dkg/signing.rs`, `tests/dkg.rs`):
 ```
 
 Node `i` serves p2p on `127.0.0.1:300i` and HTTP on `127.0.0.1:808i`. Data is in `data/node-i`
-(delete it to start from genesis; data from before the DKG stage is not compatible). To run a single
-node by hand: `cargo run --release -- --id 0`.
+(see [Storage](#storage) about older data). To run a single node by hand:
+`cargo run --release -- --id 0`.
 
 Development keys come from the node index (`ed25519::PrivateKey::from_seed(i)`). Do not use them
 outside a local network.
 
-Logs are in `data/node-i.log`. The node that took a request logs `received request`; every node
-logs `applied transaction` with the nonce, payload hash and outcome once the request is finalized:
+Logs are in `data/node-i.log`. The coordinator logs `submitted signing authorization` and, once
+done, `signed` with the phase timings; every node logs `applied signing authorization` with the
+ceremony, nonce, payload hash and outcome:
 
 ```bash
-grep -E 'received request|applied transaction' data/node-0.log
+grep -E 'submitted signing|applied signing|signed' data/node-0.log
 ```
 
 Set `RUST_LOG=debug` for consensus internals.
 
 ## API
 
-```bash
-curl -s localhost:8080/sign -H 'content-type: application/json' \
-  -d '{"nonce": 1, "payload_hash": "0x1111111111111111111111111111111111111111111111111111111111111111"}'
-# {"nonce":1,"payload_hash":"0x11..11","result":"ACCEPTED","height":12}
-
-curl -s localhost:8081/nonces/1     # the same binding from any node
-curl -s localhost:8082/status       # {"height":40,"nonces":1,"mempool":0}
-```
-
-`POST /sign` returns after the request is finalized (timeout 30 s).
-
-DKG:
+DKG first:
 
 ```bash
 curl -s localhost:8080/dkg/start -H 'content-type: application/json' -d '{"ceremony_id": "validator-001"}'
@@ -241,15 +297,61 @@ for i in 0 1 2 3; do curl -s localhost:808$i/dkg/public-key/validator-001; echo;
   the share.
 - `GET /dkg/public-key/{id}`: `404` if unknown, `409` until completed.
 
+Then signing:
+
+```bash
+curl -s localhost:8081/sign -H 'content-type: application/json' -d '{"ceremony_id": "validator-001",
+  "nonce": 100, "payload_hash": "0xabababababababababababababababababababababababababababababababab"}'
+# {"ceremony_id":"validator-001","nonce":100,"payload_hash":"0xabab..","result":"SIGNED",
+#  "authorization":"NEW","height":10,"signature":"0x9334..(96 bytes)","signers":[0,2,3],
+#  "timings_ms":{"authorization_ms":389.2,"apply_ms":10.8,"first_partial_ms":1.7,"collect_ms":5.9,
+#  "recover_ms":1.7,"total_ms":416.2}}
+
+curl -s localhost:8083/authorizations/validator-001/100   # {"ceremony_id":..,"payload_hash":..,"height":10}
+curl -s localhost:8082/status
+# {"height":11,"authorizations":1,"mempool":0,"signing_in_flight":0,"signing_sessions":0,"parked_requests":0}
+```
+
+| `POST /sign` | HTTP | `result` |
+| ------------ | ---- | -------- |
+| signed | 200 | `SIGNED` (`authorization`: `NEW` or `EXISTING`) |
+| bad JSON, id, nonce or hash (exactly 32 bytes, hex) | 400 | `INVALID` |
+| unknown ceremony | 404 | `UNKNOWN_CEREMONY` |
+| ceremony in progress or failed | 409 | `CEREMONY_NOT_COMPLETED` |
+| `(ceremony_id, nonce)` authorized for another payload | 409 | `REJECTED` (with the authorization `height`) |
+| participants refused for good (3 cannot sign) | 503 | `INSUFFICIENT_SIGNERS` |
+| too many requests in flight, node stopping | 503 | `UNAVAILABLE` |
+| authorization not finalized within 30 s | 504 | `AUTHORIZATION_TIMEOUT` (it may still finalize) |
+| fewer than 3 valid partials within `--signing-timeout` | 504 | `SIGNING_TIMEOUT` |
+
+After a failure past authorization, the authorization stays: the same request retries the signing.
+Errors carry `height`, `valid_partials` and per-participant `refusals` when known, never key
+material. `POST /sign` changed with this stage: `ceremony_id` is required, and `GET /nonces/{nonce}`
+became `GET /authorizations/{ceremony_id}/{nonce}`.
+
 ## Tests
+
+Fast (unit tests and 4-node simulations in commonware's deterministic runtime, ~40 s):
 
 ```bash
 cargo test
 ```
 
-`tests/network.rs` runs 4 full nodes in commonware's deterministic runtime over a simulated network:
-the three rules across nodes, concurrent conflicting requests, duplicate submissions, a restart of
-every node from disk, and pruning of old history.
+Real processes (the actual binary, 4 OS processes, real p2p, HTTP and storage, ~1 min), built only
+with the `test-hooks` feature:
+
+```bash
+cargo test --features test-hooks --test e2e
+```
+
+Latency benchmark (100 sequential requests per scenario, `BENCH_REQUESTS` to change):
+
+```bash
+cargo test --release --features test-hooks --test e2e latency -- --ignored --nocapture
+```
+
+`tests/network.rs`: the authorization rules across nodes, concurrent conflicting requests,
+duplicate submissions, a restart of every node from disk, pruning of old history.
 
 `tests/dkg.rs` does the same for the DKG:
 - a full ceremony, then threshold signing over an Ethereum signing root (also verified with blst):
@@ -264,16 +366,53 @@ every node from disk, and pruning of old history.
   acks;
 - a share write torn by a crash.
 
-Unit tests cover log validation, a late or extra fourth log, the deadline, codecs, the secret store
-and the official Ethereum signature vector.
+`tests/signing.rs`: signing through the coordinator, verified with blst (combinations of signers,
+another root, another ceremony's key); concurrent identical and conflicting requests; a
+coordinator dying after the authorization or holding partials; one node offline and a lagging
+node; a full restart; byzantine responses on the signing channel; refused unauthorized requests.
+
+`tests/e2e` (real processes): E2E-1 to E2E-9 below, plus the audit scenarios of
+[docs/audit.md](docs/audit.md) (rollback, crash boundaries, concurrency, cancellation, byzantine
+traffic, limits, lifecycle, corrupted storage). E2E-1 to E2E-9: cold start to a blst-verified signature,
+idempotency, conflicting requests, one node offline, coordinator crash (after authorization and
+after 2 partials, through test hooks), full network restart, unauthorized p2p signing requests and
+byzantine partial signatures (from a scripted peer that takes a stopped node's identity on the real
+authenticated p2p), and a lagging signer; plus the manual recovery of a node behind the retained
+history. The harness picks free ports, uses a temporary
+directory, kills the nodes when the test ends (they also exit if the test process dies) and prints
+every node's log tail on failure. Set `E2E_KEEP=1` to keep the directory. Ports come from blocks
+reserved with lock files shared by all test processes.
+
+Unit tests cover log validation, a late or extra fourth log, the deadline, codecs, the secret store,
+the storage format check, the request id and the official Ethereum signature vector.
+
+## Latency
+
+`cargo test --release --features test-hooks --test e2e latency -- --ignored --nocapture`, one
+MacBook, 4 processes on loopback: protocol overhead, not production numbers.
+
+| ms, 100 requests each | p50 | p95 | p99 | min | max | mean |
+| --- | --- | --- | --- | --- | --- | --- |
+| new authorization, client round trip | 411 | 651 | 742 | 192 | 759 | 420 |
+| &nbsp;&nbsp;of which consensus (`authorization_ms`) | 369 | 619 | 718 | 152 | 743 | 382 |
+| &nbsp;&nbsp;of which apply (`apply_ms`) | 13 | 33 | 42 | 3 | 42 | 15 |
+| &nbsp;&nbsp;of which partials (`collect_ms`) | 9 | 23 | 34 | 4 | 41 | 11 |
+| already authorized, client round trip | 6.7 | 9.1 | 23.8 | 6.3 | 24.8 | 7.3 |
+| new authorization, one node offline | 329 | 582 | 2345 | 178 | 2364 | 423 |
+
+Authorization is one or two consensus views; each view is dominated by disk syncs (consensus
+journal, marshal archives, the state commit), not by the network. With a node offline, the requests
+that land on its turn as leader wait for the leader timeout (2 s; it was 5 s, with a p99 of 5160 ms).
+Signing an existing authorization costs one p2p round trip and four pairings.
 
 ## Limitations (next steps)
 
-- Static validator set, development keys, no client authentication.
-- No real signing yet: `ACCEPTED` is where a threshold signature would be produced. Threshold
-  partial signatures exist only as an internal interface (`dkg::actor::Client::partial_sign`). It
-  takes an Ethereum signing root, but the root (fork, domain) is computed by the caller, and there
-  is no slashing protection.
+- Static validator set, development keys, **no client authentication or rate limiting**: anyone who
+  can reach the HTTP port can authorize and sign.
+- Generic authorization, not Ethereum slashing protection: the nonce is caller-chosen, and two
+  nonces can authorize conflicting Ethereum messages. The signing root (fork, domain) is computed by
+  the caller.
+- Authorizations are kept forever and every new one rewrites the state partition (O(n) per block).
 - DKG: the committee is the 4 configured nodes and the threshold is fixed (`n - f`). There is no
   resharing, no committee change and no key import.
   - Liveness: every participant must be online, and a single non-cooperating player can make a
@@ -282,7 +421,7 @@ and the official Ethereum signature vector.
   - Shares are not encrypted at rest (only directory permissions); `src/dkg/secrets.rs` is the place
     for encryption or an HSM.
   - A node whose share is lost (both store copies) cannot recover it; run a new ceremony.
-- Not production-ready: no audit, no slashing protection, dev keys, no rate limits on DKG
-  messages.
+- Not production-ready: no audit, no slashing protection, dev keys, no rate limits on DKG or
+  signing traffic beyond the p2p quotas.
 - The mempool is not persisted: requests not yet in a block are lost if their node crashes.
 - No state sync: a node behind by more than the retention window must be restored by hand.

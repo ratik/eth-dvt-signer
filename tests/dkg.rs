@@ -24,13 +24,15 @@ use commonware_runtime::{Clock as _, IoBuf, Runner as _, Supervisor as _, determ
 use eth_mpc_signer::{
     dkg::{
         CeremonyId, DkgStatus, Faults, Unsupported, Variant,
-        actor::{ShareStatus, SignError},
+        actor::ShareStatus,
         ceremony::{Ceremony, StartOutcome},
         secrets::Secrets,
         signing::{self, ETHEREUM_DST, Message},
         wire,
     },
-    types::Outcome,
+    engine,
+    signer::wire::Refusal,
+    types::{Outcome, SignRequest},
 };
 use futures::future::join_all;
 use rand::{SeedableRng as _, rngs::StdRng};
@@ -44,7 +46,8 @@ use std::{
 };
 
 /// An Ethereum signing root (any 32 bytes: the protocol does not care what it commits to).
-const MESSAGE: Message = Message::Ethereum([0x56; 32]);
+const ROOT: [u8; 32] = [0x56; 32];
+const MESSAGE: Message = Message::Ethereum(ROOT);
 
 fn id(name: &str) -> CeremonyId {
     CeremonyId::new(name).unwrap()
@@ -83,21 +86,46 @@ async fn wait_for(
     views
 }
 
-/// Partial signatures of `message` by the given nodes.
+/// Partial signatures of `root` by the given nodes, under the authorization `(name, nonce)`.
+/// Consensus decides the authorization first (through the first node); each node signs once it
+/// has applied it.
 async fn partials(
+    context: &deterministic::Context,
     cluster: &Cluster,
     nodes: &[usize],
     name: &str,
-    message: Message,
+    nonce: u64,
+    root: [u8; 32],
 ) -> Vec<PartialSignature<Variant>> {
+    let request = SignRequest {
+        ceremony: id(name),
+        nonce,
+        payload_hash: root,
+    };
+    let receipt = cluster.clients[nodes[0]].submit(request).await.unwrap();
+    assert!(
+        matches!(
+            receipt.outcome,
+            Outcome::Accepted | Outcome::AlreadyAccepted
+        ),
+        "{receipt:?}"
+    );
     let mut out = Vec::new();
     for &node in nodes {
-        out.push(
-            cluster.dkg[node]
-                .partial_sign(id(name), message.clone())
+        loop {
+            match cluster.dkg[node]
+                .partial(id(name), nonce, root)
                 .await
-                .unwrap(),
-        );
+                .unwrap()
+            {
+                Ok(partial) => {
+                    out.push(partial);
+                    break;
+                }
+                Err(Refusal::NotAuthorized) => context.sleep(Duration::from_millis(50)).await,
+                Err(refusal) => panic!("node {node} refused: {refusal}"),
+            }
+        }
     }
     out
 }
@@ -132,9 +160,12 @@ fn dkg_produces_a_threshold_key() {
     deterministic::Runner::timed(Duration::from_secs(300)).start(|context| async move {
         let cluster = start_network(&context, RETENTION).await;
 
-        // The registry keeps working next to the DKG.
-        let receipt = cluster.clients[0].submit(request(1, 0xaa)).await.unwrap();
-        assert_eq!(receipt.outcome, Outcome::Accepted);
+        // Nothing can be authorized before the key exists.
+        let receipt = cluster.clients[0]
+            .submit(request("validator-001", 1, 0x56))
+            .await
+            .unwrap();
+        assert_eq!(receipt.outcome, Outcome::UnknownCeremony);
 
         assert_eq!(
             start(&cluster, 1, "validator-001").await,
@@ -167,7 +198,7 @@ fn dkg_produces_a_threshold_key() {
                 ShareStatus::Stored
             );
         }
-        let all = partials(&cluster, &[0, 1, 2, 3], "validator-001", MESSAGE).await;
+        let all = partials(&context, &cluster, &[0, 1, 2, 3], "validator-001", 1, ROOT).await;
         let indices: BTreeSet<u32> = all.iter().map(|partial| partial.index.get()).collect();
         assert_eq!(indices.len(), 4);
         let mut partial_publics = BTreeSet::new();
@@ -210,19 +241,6 @@ fn dkg_produces_a_threshold_key() {
             ethereum_verify(&key, &[0x57; 32], signature),
             BLST_ERROR::BLST_SUCCESS
         );
-        // A signature of the internal domain is not an Ethereum signature, even over the same bytes.
-        let internal = partials(
-            &cluster,
-            &[0, 1, 2],
-            "validator-001",
-            Message::Internal(root.to_vec()),
-        )
-        .await;
-        let internal = signing::recover(output.public(), &internal).unwrap();
-        assert_ne!(
-            ethereum_verify(&key, &root, &internal.encode()),
-            BLST_ERROR::BLST_SUCCESS
-        );
 
         // Two participants cannot: recovery refuses, and passing one partial off as the missing
         // third participant's yields a signature that does not verify.
@@ -240,23 +258,37 @@ fn dkg_produces_a_threshold_key() {
         assert!(MESSAGE.verify_partial(output.public(), &forged).is_err());
 
         // A partial signature over another message cannot be substituted.
-        let other = partials(
-            &cluster,
-            &[2],
-            "validator-001",
-            Message::Ethereum([0x57; 32]),
-        )
-        .await;
+        let other = partials(&context, &cluster, &[2], "validator-001", 2, [0x57; 32]).await;
         assert!(MESSAGE.verify_partial(output.public(), &other[0]).is_err());
         assert!(recover_and_verify(&output, &[&all[0], &all[1], &other[0]], MESSAGE).is_err());
 
-        // Unknown ceremonies have no share.
-        assert!(matches!(
-            cluster.dkg[0].partial_sign(id("unknown"), MESSAGE).await,
-            Err(SignError::UnknownCeremony)
-        ));
+        // Nothing is signed without an authorization, or for another payload.
+        assert_eq!(
+            cluster.dkg[0]
+                .partial(id("unknown"), 1, ROOT)
+                .await
+                .unwrap(),
+            Err(Refusal::UnknownCeremony)
+        );
+        assert_eq!(
+            cluster.dkg[0]
+                .partial(id("validator-001"), 3, ROOT)
+                .await
+                .unwrap(),
+            Err(Refusal::NotAuthorized)
+        );
+        assert_eq!(
+            cluster.dkg[0]
+                .partial(id("validator-001"), 1, [0x57; 32])
+                .await
+                .unwrap(),
+            Err(Refusal::Conflict)
+        );
 
-        let again = cluster.clients[3].submit(request(1, 0xaa)).await.unwrap();
+        let again = cluster.clients[3]
+            .submit(request("validator-001", 1, 0x56))
+            .await
+            .unwrap();
         assert_eq!(again.outcome, Outcome::AlreadyAccepted);
     });
 }
@@ -337,7 +369,7 @@ fn late_dealer_log_changes_nothing() {
             );
             assert_eq!(dkg.share(id("late")).await.unwrap(), ShareStatus::Stored);
         }
-        let all = partials(&cluster, &[0, 1, 2, 3], "late", MESSAGE).await;
+        let all = partials(&context, &cluster, &[0, 1, 2, 3], "late", 1, ROOT).await;
         for partial in &all {
             MESSAGE.verify_partial(output.public(), partial).unwrap();
         }
@@ -475,10 +507,13 @@ fn ceremony_fails_safely_without_every_participant() {
                 cluster.dkg[node].share(id("offline")).await.unwrap(),
                 ShareStatus::Pending
             );
-            assert!(matches!(
-                cluster.dkg[node].partial_sign(id("offline"), MESSAGE).await,
-                Err(SignError::NoShare)
-            ));
+            assert_eq!(
+                cluster.dkg[node]
+                    .partial(id("offline"), 1, ROOT)
+                    .await
+                    .unwrap(),
+                Err(Refusal::NotCompleted)
+            );
         }
         // A failed id stays used: retrying it does not restart it with fresh randomness.
         assert_eq!(start(&cluster, 1, "offline").await, StartOutcome::Exists(0));
@@ -496,7 +531,7 @@ fn ceremony_fails_safely_without_every_participant() {
         )
         .await;
         let output = views[0].output.clone().unwrap();
-        let all = partials(&cluster, &[3, 0, 1], "online", MESSAGE).await;
+        let all = partials(&context, &cluster, &[3, 0, 1], "online", 1, ROOT).await;
         recover_and_verify(&output, &all.iter().collect::<Vec<_>>(), MESSAGE).unwrap();
     });
 }
@@ -540,7 +575,7 @@ fn shares_survive_restart() {
         );
 
         // The restored shares still sign.
-        let all = partials(&cluster, &[0, 2, 3], "validator-001", MESSAGE).await;
+        let all = partials(&context, &cluster, &[0, 2, 3], "validator-001", 1, ROOT).await;
         recover_and_verify(&output, &all.iter().collect::<Vec<_>>(), MESSAGE).unwrap();
     });
 }
@@ -554,8 +589,8 @@ fn invalid_dkg_messages_cannot_break_agreement() {
         let byzantine = PrivateKey::from_seed(3);
         let ceremony: Arc<Mutex<Option<Ceremony>>> = Arc::default();
         let conflicts = Arc::new(AtomicUsize::new(0));
-        let cluster = start_network_with(&context, RETENTION, |node| {
-            if node == 3 {
+        let cluster = start_network_with(&context, RETENTION, |node, channel| {
+            if node == 3 || channel != engine::DKG_CHANNEL {
                 return None;
             }
             let me = PrivateKey::from_seed(node as u64).public_key();
@@ -664,7 +699,7 @@ fn invalid_dkg_messages_cannot_break_agreement() {
                 ShareStatus::Stored
             );
         }
-        let all = partials(&cluster, &[1, 2, 3], "byzantine", MESSAGE).await;
+        let all = partials(&context, &cluster, &[1, 2, 3], "byzantine", 1, ROOT).await;
         recover_and_verify(&output, &all.iter().collect::<Vec<_>>(), MESSAGE).unwrap();
     });
 }
@@ -708,7 +743,7 @@ fn interrupted_share_write_is_never_used() {
             cluster.dkg[2].share(id("validator-001")).await.unwrap(),
             ShareStatus::Stored
         );
-        let all = partials(&cluster, &[2, 0, 3], "validator-001", MESSAGE).await;
+        let all = partials(&context, &cluster, &[2, 0, 3], "validator-001", 1, ROOT).await;
         MESSAGE.verify_partial(output.public(), &all[0]).unwrap();
         recover_and_verify(&output, &all.iter().collect::<Vec<_>>(), MESSAGE).unwrap();
     });

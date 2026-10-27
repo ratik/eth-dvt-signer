@@ -1,15 +1,17 @@
 //! HTTP API for clients.
 //!
-//! - `POST /sign` `{"nonce": 1, "payload_hash": "0x<64 hex>"}`: waits until the request is
-//!   finalized and returns `ACCEPTED`, `ALREADY_ACCEPTED` or `REJECTED`.
-//! - `GET /nonces/{nonce}`: the payload hash reserved for a nonce.
-//! - `GET /status`: last applied height, number of nonces and mempool size.
+//! - `POST /sign` `{"ceremony_id": "validator-001", "nonce": 100, "payload_hash": "0x<64 hex>"}`:
+//!   authorizes (through consensus, once per `(ceremony_id, nonce)`) and signs the 32-byte
+//!   Ethereum signing root with the ceremony's threshold key. Returns the 96-byte signature.
+//! - `GET /authorizations/{ceremony_id}/{nonce}`: the finalized authorization, if any.
+//! - `GET /status`: last applied height, number of authorizations and mempool size.
 //! - `POST /dkg/start` `{"ceremony_id": "validator-001"}`: starts one distributed DKG ceremony
 //!   (idempotent; a different configuration under a used id is rejected with 409).
 //! - `GET /dkg/status/{ceremony_id}`: ceremony status, and the group public key once completed.
 //! - `GET /dkg/public-key/{ceremony_id}`: the group public key of a completed ceremony.
 //!
-//! No endpoint ever returns or accepts private key shares.
+//! No endpoint ever returns or accepts private key shares or partial signatures. Request parsing
+//! (hex, JSON) stays here: the signer core only sees [SignRequest].
 
 use crate::{
     dkg::{
@@ -19,11 +21,15 @@ use crate::{
         format_key,
     },
     executor::{Client, Stopped},
-    types::{Outcome, PayloadHash, SignRequest, format_hash},
+    signer::{
+        coordinator::{self, AuthorizationKind, SignError, Timings},
+        wire::Refusal,
+    },
+    types::{PayloadHash, SignRequest, format_hash},
 };
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, State, rejection::JsonRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -31,38 +37,79 @@ use axum::{
 use commonware_codec::Encode as _;
 use commonware_utils::ordered::Quorum as _;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
-/// How long `POST /sign` waits for finalization.
+/// How long `POST /dkg/start` waits for finalization.
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Upper bound on `POST /sign` (the coordinator has its own, shorter, timeouts).
+const SIGN_TIMEOUT: Duration = Duration::from_secs(60);
 
 type ApiError = (StatusCode, String);
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SignBody {
+    ceremony_id: String,
     nonce: u64,
+    /// 32-byte Ethereum signing root, hex (`0x` optional).
     payload_hash: String,
 }
 
 #[derive(Serialize)]
 struct SignResponse {
+    ceremony_id: String,
     nonce: u64,
     payload_hash: String,
-    result: Outcome,
+    /// `SIGNED`.
+    result: &'static str,
+    /// `NEW` if this request created the authorization, `EXISTING` if it was already finalized.
+    authorization: AuthorizationKind,
+    /// Height of the block that authorized `(ceremony_id, nonce)`.
     height: u64,
+    /// Compressed 96-byte BLS12-381 G2 signature (Ethereum `BLSSignature`).
+    signature: String,
+    /// Share indices of the partial signatures used.
+    signers: Vec<u32>,
+    timings_ms: Timings,
 }
 
 #[derive(Serialize)]
-struct NonceResponse {
+struct SignFailure {
+    ceremony_id: String,
     nonce: u64,
     payload_hash: String,
+    result: &'static str,
+    error: String,
+    /// Height of the authorization of `(ceremony_id, nonce)`, when there is one: it stays valid,
+    /// and an identical request retries the signing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    height: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    valid_partials: Option<usize>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    refusals: BTreeMap<u32, Refusal>,
+}
+
+#[derive(Serialize)]
+struct AuthorizationResponse {
+    ceremony_id: String,
+    nonce: u64,
+    payload_hash: String,
+    height: u64,
 }
 
 #[derive(Serialize)]
 struct StatusResponse {
     height: u64,
-    nonces: usize,
+    authorizations: usize,
     mempool: usize,
+    /// Signing requests this node is coordinating.
+    signing_in_flight: usize,
+    /// Of those, the ones collecting partial signatures.
+    signing_sessions: usize,
+    /// Peer signing requests waiting for their authorization here.
+    parked_requests: usize,
 }
 
 #[derive(Deserialize)]
@@ -111,64 +158,154 @@ struct PublicKeyResponse {
 struct Api {
     client: Client,
     dkg: dkg::Client,
+    signer: coordinator::Client,
 }
 
-pub fn router(client: Client, dkg: dkg::Client) -> Router {
+pub fn router(client: Client, dkg: dkg::Client, signer: coordinator::Client) -> Router {
     Router::new()
         .route("/sign", post(sign))
-        .route("/nonces/{nonce}", get(nonce))
+        .route("/authorizations/{ceremony_id}/{nonce}", get(authorization))
         .route("/status", get(status))
         .route("/dkg/start", post(dkg_start))
         .route("/dkg/status/{ceremony_id}", get(dkg_status))
         .route("/dkg/public-key/{ceremony_id}", get(dkg_public_key))
-        .with_state(Api { client, dkg })
+        .with_state(Api {
+            client,
+            dkg,
+            signer,
+        })
 }
 
-async fn sign(
-    State(Api { client, .. }): State<Api>,
-    Json(body): Json<SignBody>,
-) -> Result<Json<SignResponse>, ApiError> {
-    let payload_hash = parse_hash(&body.payload_hash)?;
-    let request = SignRequest {
-        nonce: body.nonce,
-        payload_hash,
+async fn sign(State(api): State<Api>, body: Result<Json<SignBody>, JsonRejection>) -> Response {
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return (StatusCode::BAD_REQUEST, rejection.body_text()).into_response(),
     };
-    let receipt = tokio::time::timeout(SUBMIT_TIMEOUT, client.submit(request))
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::GATEWAY_TIMEOUT,
-                "request not finalized in time".to_string(),
-            )
-        })?
-        .map_err(unavailable)?;
-    Ok(Json(SignResponse {
-        nonce: request.nonce,
-        payload_hash: format_hash(&payload_hash),
-        result: receipt.outcome,
-        height: receipt.height,
-    }))
+    let failure = |status: StatusCode, result: &'static str, error: String| {
+        let response = SignFailure {
+            ceremony_id: body.ceremony_id.clone(),
+            nonce: body.nonce,
+            payload_hash: body.payload_hash.clone(),
+            result,
+            error,
+            height: None,
+            valid_partials: None,
+            refusals: BTreeMap::new(),
+        };
+        (status, response)
+    };
+    let request = match (
+        CeremonyId::new(body.ceremony_id.clone()),
+        parse_hash(&body.payload_hash),
+    ) {
+        (Ok(ceremony), Ok(payload_hash)) => SignRequest {
+            ceremony,
+            nonce: body.nonce,
+            payload_hash,
+        },
+        (Err(err), _) => {
+            let (status, response) = failure(StatusCode::BAD_REQUEST, "INVALID", err.to_string());
+            return (status, Json(response)).into_response();
+        }
+        (_, Err((_, err))) => {
+            let (status, response) = failure(StatusCode::BAD_REQUEST, "INVALID", err);
+            return (status, Json(response)).into_response();
+        }
+    };
+
+    let result = tokio::time::timeout(SIGN_TIMEOUT, api.signer.sign(request)).await;
+    let error = match result {
+        Ok(Ok(signed)) => {
+            return Json(SignResponse {
+                ceremony_id: signed.request.ceremony.to_string(),
+                nonce: signed.request.nonce,
+                payload_hash: format_hash(&signed.request.payload_hash),
+                result: "SIGNED",
+                authorization: signed.kind,
+                height: signed.authorization.height,
+                signature: format!("0x{}", hex::encode(signed.signature.encode())),
+                signers: signed.signers,
+                timings_ms: signed.timings,
+            })
+            .into_response();
+        }
+        Ok(Err(error)) => error,
+        Err(_) => {
+            let message = "signing did not finish in time".to_string();
+            let (status, response) =
+                failure(StatusCode::GATEWAY_TIMEOUT, "SIGNING_TIMEOUT", message);
+            return (status, Json(response)).into_response();
+        }
+    };
+    let message = error.to_string();
+    let (status, result) = match &error {
+        SignError::UnknownCeremony => (StatusCode::NOT_FOUND, "UNKNOWN_CEREMONY"),
+        SignError::NotCompleted(_) => (StatusCode::CONFLICT, "CEREMONY_NOT_COMPLETED"),
+        SignError::Conflict(_) => (StatusCode::CONFLICT, "REJECTED"),
+        SignError::AuthorizationTimeout => (StatusCode::GATEWAY_TIMEOUT, "AUTHORIZATION_TIMEOUT"),
+        SignError::InsufficientSigners { .. } => {
+            (StatusCode::SERVICE_UNAVAILABLE, "INSUFFICIENT_SIGNERS")
+        }
+        SignError::Timeout { .. } => (StatusCode::GATEWAY_TIMEOUT, "SIGNING_TIMEOUT"),
+        SignError::Busy | SignError::Stopped => (StatusCode::SERVICE_UNAVAILABLE, "UNAVAILABLE"),
+        SignError::Invalid => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL"),
+    };
+    let (status, mut response) = failure(status, result, message);
+    match error {
+        SignError::Conflict(authorization) => response.height = Some(authorization.height),
+        SignError::InsufficientSigners {
+            authorization,
+            valid,
+            refusals,
+        }
+        | SignError::Timeout {
+            authorization,
+            valid,
+            refusals,
+        } => {
+            response.height = Some(authorization.height);
+            response.valid_partials = Some(valid);
+            response.refusals = refusals;
+        }
+        _ => {}
+    }
+    (status, Json(response)).into_response()
 }
 
-async fn nonce(
+async fn authorization(
     State(Api { client, .. }): State<Api>,
-    Path(nonce): Path<u64>,
-) -> Result<Json<NonceResponse>, ApiError> {
-    match client.get(nonce).await.map_err(unavailable)? {
-        Some(hash) => Ok(Json(NonceResponse {
+    Path((ceremony_id, nonce)): Path<(String, u64)>,
+) -> Result<Json<AuthorizationResponse>, ApiError> {
+    let id = parse_id(ceremony_id)?;
+    let lookup = client
+        .authorization(id.clone(), nonce)
+        .await
+        .map_err(unavailable)?;
+    match lookup.authorization {
+        Some(authorization) => Ok(Json(AuthorizationResponse {
+            ceremony_id: id.to_string(),
             nonce,
-            payload_hash: format_hash(&hash),
+            payload_hash: format_hash(&authorization.payload_hash),
+            height: authorization.height,
         })),
-        None => Err((StatusCode::NOT_FOUND, format!("nonce {nonce} is free"))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            format!("no authorization for ({id}, {nonce})"),
+        )),
     }
 }
 
-async fn status(State(Api { client, .. }): State<Api>) -> Result<Json<StatusResponse>, ApiError> {
-    let status = client.status().await.map_err(unavailable)?;
+async fn status(State(api): State<Api>) -> Result<Json<StatusResponse>, ApiError> {
+    let status = api.client.status().await.map_err(unavailable)?;
+    let parked = api.dkg.parked().await.map_err(unavailable)?;
+    let signing = api.signer.stats();
     Ok(Json(StatusResponse {
         height: status.height,
-        nonces: status.nonces,
+        authorizations: status.authorizations,
         mempool: status.mempool,
+        signing_in_flight: signing.in_flight,
+        signing_sessions: signing.sessions,
+        parked_requests: parked,
     }))
 }
 
@@ -304,7 +441,7 @@ fn parse_hash(value: &str) -> Result<PayloadHash, ApiError> {
     bytes.try_into().map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
-            "payload_hash must be 32 bytes".to_string(),
+            "payload_hash must be exactly 32 bytes".to_string(),
         )
     })
 }

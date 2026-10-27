@@ -1,13 +1,13 @@
 //! Wire types shared by every node: the command, its outcome and the block that orders commands.
 
-use crate::dkg::{CeremonyConfig, MAX_PARTICIPANTS, ceremony::SignedLog};
+use crate::dkg::{CeremonyConfig, CeremonyId, MAX_PARTICIPANTS, ceremony::SignedLog};
 use bytes::{Buf, BufMut};
-use commonware_codec::{Encode, EncodeSize, Error, FixedSize, Read, ReadExt, Write, varint::UInt};
+use commonware_codec::{Encode, EncodeSize, Error, Read, ReadExt, Write, varint::UInt};
 use commonware_consensus::{Heightable, types::Height};
 use commonware_cryptography::{Digestible, Hasher, Sha256, sha256::Digest};
 use serde::Serialize;
 
-/// Hash of the payload a client wants signed.
+/// What a client wants signed: a 32-byte Ethereum signing root.
 pub type PayloadHash = [u8; 32];
 
 /// `0x`-prefixed hex, as used by the HTTP API and the logs.
@@ -21,15 +21,20 @@ pub const MAX_TRANSACTIONS_PER_BLOCK: usize = 1024;
 /// Maximum encoded size of the transactions of a proposed block (well below the p2p limit).
 pub const MAX_BLOCK_BYTES: usize = 512 * 1024;
 
-/// The only command of the registry: reserve `nonce` for `payload_hash`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// Authorize signing `payload_hash` with the key of `ceremony`, under `nonce`.
+///
+/// `(ceremony, nonce)` identifies the authorization and binds exactly one payload. The nonce is a
+/// caller-chosen identifier, not an Ethereum slot or epoch, and this is not slashing protection.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SignRequest {
+    pub ceremony: CeremonyId,
     pub nonce: u64,
     pub payload_hash: PayloadHash,
 }
 
 impl Write for SignRequest {
     fn write(&self, buf: &mut impl BufMut) {
+        self.ceremony.write(buf);
         self.nonce.write(buf);
         self.payload_hash.write(buf);
     }
@@ -40,20 +45,23 @@ impl Read for SignRequest {
 
     fn read_cfg(buf: &mut impl Buf, _: &()) -> Result<Self, Error> {
         Ok(Self {
+            ceremony: CeremonyId::read(buf)?,
             nonce: u64::read(buf)?,
             payload_hash: PayloadHash::read(buf)?,
         })
     }
 }
 
-impl FixedSize for SignRequest {
-    const SIZE: usize = u64::SIZE + PayloadHash::SIZE;
+impl EncodeSize for SignRequest {
+    fn encode_size(&self) -> usize {
+        self.ceremony.encode_size() + self.nonce.encode_size() + self.payload_hash.encode_size()
+    }
 }
 
 /// A command ordered by consensus.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
-    /// Reserve a nonce (the registry).
+    /// Authorize a signature.
     Sign(SignRequest),
     /// Start a DKG ceremony.
     StartCeremony(CeremonyConfig),
@@ -156,12 +164,16 @@ impl EncodeSize for Transaction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Outcome {
-    /// The nonce was free and is now bound to the payload hash.
+    /// `(ceremony, nonce)` was free and is now bound to the payload hash.
     Accepted,
-    /// The nonce was already bound to the same payload hash.
+    /// `(ceremony, nonce)` was already bound to the same payload hash.
     AlreadyAccepted,
-    /// The nonce is bound to a different payload hash.
+    /// `(ceremony, nonce)` is bound to a different payload hash.
     Rejected,
+    /// No ceremony with this id.
+    UnknownCeremony,
+    /// The ceremony is in progress or failed: there is no group key to sign with.
+    CeremonyNotCompleted,
 }
 
 /// A batch of transactions ordered by consensus.
@@ -279,6 +291,7 @@ mod tests {
         let transaction = Transaction {
             id: 1,
             command: Command::Sign(SignRequest {
+                ceremony: CeremonyId::new("c").unwrap(),
                 nonce: 7,
                 payload_hash: [9; 32],
             }),

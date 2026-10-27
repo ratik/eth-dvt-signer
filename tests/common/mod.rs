@@ -16,9 +16,10 @@ use commonware_runtime::{
 };
 use commonware_utils::{NZU64, NZUsize, TryCollect as _, ordered::Set, probability};
 use eth_mpc_signer::{
-    dkg,
+    dkg::{self, CeremonyId, DkgStatus, actor::ShareStatus, ceremony::Ceremony},
     engine::{self, Channels, Retention},
     executor::Client,
+    signer::coordinator,
     types::SignRequest,
 };
 use std::{collections::VecDeque, fmt, num::NonZeroU32, time::Duration};
@@ -36,18 +37,23 @@ const LINK: Link = Link {
     success_rate: probability!(1.0),
 };
 
-pub fn request(nonce: u64, byte: u8) -> SignRequest {
+pub fn id(name: &str) -> CeremonyId {
+    CeremonyId::new(name).unwrap()
+}
+
+pub fn request(ceremony: &str, nonce: u64, byte: u8) -> SignRequest {
     SignRequest {
+        ceremony: id(ceremony),
         nonce,
         payload_hash: [byte; 32],
     }
 }
 
-/// Rewrites what a node receives on the DKG channel: given the (authenticated) sender and a genuine
+/// Rewrites what a node receives on a channel: given the (authenticated) sender and a genuine
 /// message, returns the messages to deliver instead, in order.
 pub type Injector = Box<dyn FnMut(&PublicKey, IoBuf) -> Vec<IoBuf> + Send>;
 
-/// A DKG receiver whose input can be rewritten by an [Injector].
+/// A receiver whose input can be rewritten by an [Injector].
 pub struct Tap<R> {
     inner: R,
     injector: Option<Injector>,
@@ -83,6 +89,7 @@ impl<R: Receiver<PublicKey = PublicKey>> Receiver for Tap<R> {
 pub struct Cluster {
     pub clients: Vec<Client>,
     pub dkg: Vec<dkg::actor::Client>,
+    pub signers: Vec<coordinator::Client>,
     pub keys: Vec<PublicKey>,
     oracle: Oracle<PublicKey, deterministic::Context>,
     /// Dropping a node's handle stops the node.
@@ -121,14 +128,15 @@ impl Cluster {
 
 /// Start every node over a fully connected simulated network.
 pub async fn start_network(context: &deterministic::Context, retention: Retention) -> Cluster {
-    start_network_with(context, retention, |_| None).await
+    start_network_with(context, retention, |_, _| None).await
 }
 
-/// Like [start_network], with the DKG input of node `i` rewritten by `injector(i)`.
+/// Like [start_network], with what node `i` receives on `channel` (`engine::DKG_CHANNEL` or
+/// `engine::SIGNING_CHANNEL`) rewritten by `injector(i, channel)`.
 pub async fn start_network_with(
     context: &deterministic::Context,
     retention: Retention,
-    mut injector: impl FnMut(usize) -> Option<Injector>,
+    mut injector: impl FnMut(usize, u64) -> Option<Injector>,
 ) -> Cluster {
     // Node logs, with `RUST_LOG=... cargo test -- --nocapture`.
     let _ = tracing_subscriber::fmt()
@@ -165,11 +173,16 @@ pub async fn start_network_with(
     let quota = Quota::per_second(NonZeroU32::MAX);
     let mut clients = Vec::new();
     let mut dkg = Vec::new();
+    let mut coordinators = Vec::new();
     let mut handles = Vec::new();
     for (index, signer) in signers.into_iter().enumerate() {
         let control = oracle.control(signer.public_key());
         let (dkg_sender, dkg_receiver) =
             control.register(engine::DKG_CHANNEL, quota).await.unwrap();
+        let (signing_sender, signing_receiver) = control
+            .register(engine::SIGNING_CHANNEL, quota)
+            .await
+            .unwrap();
         let channels = Channels {
             votes: control
                 .register(engine::VOTES_CHANNEL, quota)
@@ -199,7 +212,15 @@ pub async fn start_network_with(
                 dkg_sender,
                 Tap {
                     inner: dkg_receiver,
-                    injector: injector(index),
+                    injector: injector(index, engine::DKG_CHANNEL),
+                    queue: VecDeque::new(),
+                },
+            ),
+            signing: (
+                signing_sender,
+                Tap {
+                    inner: signing_receiver,
+                    injector: injector(index, engine::SIGNING_CHANNEL),
                     queue: VecDeque::new(),
                 },
             ),
@@ -213,21 +234,48 @@ pub async fn start_network_with(
                 peer_provider: oracle.manager(),
                 partition_prefix: format!("node-{index}"),
                 retention,
+                signing: coordinator::Config::default(),
             },
             channels,
         )
         .await;
         clients.push(node.client);
         dkg.push(node.dkg);
+        coordinators.push(node.signer);
         handles.push(node.handle);
     }
     Cluster {
         clients,
         dkg,
+        signers: coordinators,
         keys,
         oracle,
         _handles: handles,
     }
+}
+
+/// Run the DKG ceremony `name` through node 0 and wait until every node holds its share.
+pub async fn complete_dkg(
+    context: &deterministic::Context,
+    cluster: &Cluster,
+    name: &str,
+) -> Ceremony {
+    let dkg = &cluster.dkg[0];
+    dkg.start(dkg.config(id(name))).await.unwrap();
+    let mut completed = None;
+    for dkg in &cluster.dkg {
+        loop {
+            if let Some(ceremony) = dkg.ceremony(id(name)).await.unwrap()
+                && ceremony.status == DkgStatus::Completed
+                && dkg.share(id(name)).await.unwrap() == ShareStatus::Stored
+            {
+                completed = Some(ceremony);
+                break;
+            }
+            context.sleep(Duration::from_millis(100)).await;
+        }
+    }
+    completed.unwrap()
 }
 
 /// Wait until every node applied at least `height` blocks.

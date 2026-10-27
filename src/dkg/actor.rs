@@ -4,6 +4,10 @@
 //! and acknowledgements with the other participants over the DKG p2p channel, and submits its
 //! dealer log through consensus. A share is used only after its ceremony is finalized as completed
 //! and the share is durably stored and verified against the agreed public polynomial.
+//!
+//! It is also the only place that produces partial signatures, and only for signing
+//! authorizations that are [Committed] on this node (see [Actor::partial]): a request, local or
+//! from the network, never authorizes anything by itself.
 
 use super::{
     CeremonyConfig, CeremonyId, DkgStatus, Faults, Variant,
@@ -12,7 +16,12 @@ use super::{
     secrets::{KeyShare, Secrets},
     signing, wire,
 };
-use crate::executor::{self, StartReceipt, Stopped};
+use crate::{
+    executor::{self, StartReceipt, Stopped},
+    signer::wire::{self as sign_wire, Refusal},
+    storage::Committed,
+    types::PayloadHash,
+};
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::{
     Signer as _,
@@ -36,7 +45,7 @@ use commonware_utils::{
 };
 use rand_core::CryptoRng;
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use tracing::{debug, error, info, warn};
 
 /// Label of the dealer's randomness stream (derived from its persisted seed).
@@ -44,6 +53,12 @@ const DEALER_NOISE: &[u8] = b"dealer";
 
 /// A submitted dealer log missing from finalized state after this many blocks is submitted again.
 const RESUBMIT_BLOCKS: u64 = 8;
+
+/// Signing requests waiting for their authorization to be applied here (bounded, oldest dropped).
+const MAX_PARKED: usize = 256;
+
+/// A parked signing request is dropped after this many applied blocks.
+const PARK_BLOCKS: u64 = 16;
 
 pub enum Message {
     /// A ceremony changed in finalized state (started, gained a log, completed or failed).
@@ -59,11 +74,22 @@ pub enum Message {
         id: CeremonyId,
         response: oneshot::Sender<ShareStatus>,
     },
-    Sign {
-        id: CeremonyId,
-        message: signing::Message,
-        response: oneshot::Sender<Result<PartialSignature<Variant>, SignError>>,
+    /// Authorizations of a block, sent by the executor once the block is durably committed.
+    Authorized(Vec<Committed>),
+    /// This node's partial signature for an authorization (from its own coordinator).
+    Partial {
+        ceremony: CeremonyId,
+        nonce: u64,
+        payload_hash: PayloadHash,
+        response: oneshot::Sender<Result<PartialSignature<Variant>, Refusal>>,
     },
+    /// A signing request from a peer (the sender is authenticated by p2p).
+    SignRequest {
+        from: PublicKey,
+        request: sign_wire::Request,
+    },
+    /// Number of parked signing requests.
+    Parked { response: oneshot::Sender<usize> },
 }
 
 /// State of this node's share of a ceremony.
@@ -76,16 +102,6 @@ pub enum ShareStatus {
     Stored,
     /// The ceremony completed but this node has no usable share (lost or inconsistent).
     Unavailable,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum SignError {
-    #[error("unknown ceremony")]
-    UnknownCeremony,
-    #[error("no usable share for this ceremony")]
-    NoShare,
-    #[error("node stopped")]
-    Stopped,
 }
 
 /// Interface to this node's DKG (ceremony lifecycle and threshold partial signatures).
@@ -154,23 +170,34 @@ impl Client {
         receiver.await.map_err(|_| Stopped)
     }
 
-    /// Partial signature of `message` with this node's share (internal interface: the share never
-    /// leaves the node, only the partial signature does). There is no slashing protection: callers
-    /// must not request conflicting Ethereum signatures.
-    pub async fn partial_sign(
+    /// This node's partial signature of `payload_hash` under the authorization
+    /// `(ceremony, nonce)`. Refused unless that exact authorization is committed on this node: it
+    /// is the same check a signing request from the network goes through.
+    pub async fn partial(
         &self,
-        id: CeremonyId,
-        message: signing::Message,
-    ) -> Result<PartialSignature<Variant>, SignError> {
+        ceremony: CeremonyId,
+        nonce: u64,
+        payload_hash: PayloadHash,
+    ) -> Result<Result<PartialSignature<Variant>, Refusal>, Stopped> {
         let (response, receiver) = oneshot::channel();
         self.actor
-            .send(Message::Sign {
-                id,
-                message,
+            .send(Message::Partial {
+                ceremony,
+                nonce,
+                payload_hash,
                 response,
             })
-            .map_err(|_| SignError::Stopped)?;
-        receiver.await.map_err(|_| SignError::Stopped)?
+            .map_err(|_| Stopped)?;
+        receiver.await.map_err(|_| Stopped)
+    }
+
+    /// Number of signing requests waiting for their authorization here.
+    pub async fn parked(&self) -> Result<usize, Stopped> {
+        let (response, receiver) = oneshot::channel();
+        self.actor
+            .send(Message::Parked { response })
+            .map_err(|_| Stopped)?;
+        receiver.await.map_err(|_| Stopped)
     }
 
     /// Submit a dealer log to consensus. The actor submits its own; this is for logs of other
@@ -205,13 +232,27 @@ struct Session {
     acks: BTreeMap<PublicKey, PlayerAck<PublicKey>>,
 }
 
-pub struct Actor<E: CryptoRng + Spawner + Context, S: Sender<PublicKey = PublicKey>> {
+/// A signing request that arrived before its authorization was applied here.
+struct Parked {
+    from: PublicKey,
+    request: sign_wire::Request,
+    /// Applied blocks counter when it was parked.
+    since: u64,
+}
+
+pub struct Actor<
+    E: CryptoRng + Spawner + Context,
+    S: Sender<PublicKey = PublicKey>,
+    SS: Sender<PublicKey = PublicKey>,
+> {
     context: ContextCell<E>,
     signer: PrivateKey,
     me: PublicKey,
     secrets: Secrets<E>,
     /// DKG p2p channel.
     sender: S,
+    /// Signing p2p channel (answers to signing requests).
+    signing: SS,
     /// Submits dealer logs to consensus.
     executor: mpsc::UnboundedSender<executor::Message>,
     mailbox: mpsc::UnboundedReceiver<Message>,
@@ -223,17 +264,32 @@ pub struct Actor<E: CryptoRng + Spawner + Context, S: Sender<PublicKey = PublicK
     shares: BTreeMap<u64, Share>,
     /// Completed ceremonies without a usable share on this node.
     unavailable: BTreeSet<u64>,
+    /// Participants of each ceremony, by round.
+    participants: BTreeMap<u64, Set<PublicKey>>,
+    /// Signing authorizations committed on this node, by `(round, nonce)`.
+    authorizations: HashMap<(u64, u64), Committed>,
+    parked: VecDeque<Parked>,
+    /// Blocks applied since start.
+    blocks: u64,
 }
 
-impl<E: CryptoRng + Spawner + Context, S: Sender<PublicKey = PublicKey>> Actor<E, S> {
+impl<
+    E: CryptoRng + Spawner + Context,
+    S: Sender<PublicKey = PublicKey>,
+    SS: Sender<PublicKey = PublicKey>,
+> Actor<E, S, SS>
+{
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         context: E,
         signer: PrivateKey,
         secrets: Secrets<E>,
         sender: S,
+        signing: SS,
         executor: mpsc::UnboundedSender<executor::Message>,
         mailbox: mpsc::UnboundedReceiver<Message>,
         initial: Vec<Ceremony>,
+        authorizations: Vec<Committed>,
     ) -> Self {
         Self {
             context: ContextCell::new(context),
@@ -241,6 +297,7 @@ impl<E: CryptoRng + Spawner + Context, S: Sender<PublicKey = PublicKey>> Actor<E
             signer,
             secrets,
             sender,
+            signing,
             executor,
             mailbox,
             initial,
@@ -248,6 +305,13 @@ impl<E: CryptoRng + Spawner + Context, S: Sender<PublicKey = PublicKey>> Actor<E
             sessions: BTreeMap::new(),
             shares: BTreeMap::new(),
             unavailable: BTreeSet::new(),
+            participants: BTreeMap::new(),
+            authorizations: authorizations
+                .into_iter()
+                .map(|committed| ((committed.round(), committed.nonce()), committed))
+                .collect(),
+            parked: VecDeque::new(),
+            blocks: 0,
         }
     }
 
@@ -274,12 +338,18 @@ impl<E: CryptoRng + Spawner + Context, S: Sender<PublicKey = PublicKey>> Actor<E
                 Message::Share { id, response } => {
                     let _ = response.send(self.share_status(&id));
                 }
-                Message::Sign {
-                    id,
-                    message,
+                Message::Authorized(committed) => self.authorized(committed),
+                Message::Partial {
+                    ceremony,
+                    nonce,
+                    payload_hash,
                     response,
                 } => {
-                    let _ = response.send(self.sign(&id, &message));
+                    let _ = response.send(self.partial(&ceremony, nonce, &payload_hash));
+                }
+                Message::SignRequest { from, request } => self.on_sign_request(from, request),
+                Message::Parked { response } => {
+                    let _ = response.send(self.parked.len());
                 }
             }
         }
@@ -288,6 +358,8 @@ impl<E: CryptoRng + Spawner + Context, S: Sender<PublicKey = PublicKey>> Actor<E
     async fn update(&mut self, ceremony: Ceremony) {
         let round = ceremony.round;
         self.ids.insert(ceremony.config.id.clone(), round);
+        self.participants
+            .insert(round, ceremony.config.participants.clone());
         if ceremony.config.participants.position(&self.me).is_none() {
             return;
         }
@@ -497,6 +569,10 @@ impl<E: CryptoRng + Spawner + Context, S: Sender<PublicKey = PublicKey>> Actor<E
     }
 
     fn tick(&mut self) {
+        self.blocks += 1;
+        let blocks = self.blocks;
+        self.parked
+            .retain(|parked| blocks - parked.since < PARK_BLOCKS);
         let rounds: Vec<u64> = self.sessions.keys().copied().collect();
         for round in rounds {
             self.send_dealings(round);
@@ -597,14 +673,120 @@ impl<E: CryptoRng + Spawner + Context, S: Sender<PublicKey = PublicKey>> Actor<E
         }
     }
 
-    fn sign(
+    /// The only way to a partial signature: `(ceremony, nonce)` must be authorized in this node's
+    /// committed state, for exactly `payload_hash`, and the node must hold a verified share.
+    fn partial(
         &self,
-        id: &CeremonyId,
-        message: &signing::Message,
-    ) -> Result<PartialSignature<Variant>, SignError> {
-        let round = self.ids.get(id).ok_or(SignError::UnknownCeremony)?;
-        let share = self.shares.get(round).ok_or(SignError::NoShare)?;
-        Ok(message.partial_sign(share))
+        ceremony: &CeremonyId,
+        nonce: u64,
+        payload_hash: &PayloadHash,
+    ) -> Result<PartialSignature<Variant>, Refusal> {
+        let &round = self.ids.get(ceremony).ok_or(Refusal::UnknownCeremony)?;
+        let Some(share) = self.shares.get(&round) else {
+            return Err(if self.unavailable.contains(&round) {
+                Refusal::NoShare
+            } else {
+                Refusal::NotCompleted
+            });
+        };
+        let authorization = self
+            .authorizations
+            .get(&(round, nonce))
+            .ok_or(Refusal::NotAuthorized)?;
+        if authorization.payload_hash() != payload_hash {
+            return Err(Refusal::Conflict);
+        }
+        // Sign what consensus authorized, as an Ethereum signing root.
+        Ok(signing::Message::Ethereum(*authorization.payload_hash()).partial_sign(share))
+    }
+
+    /// Answer a peer's signing request: a partial signature or a refusal. A request whose
+    /// authorization is not applied here yet is parked and answered once it is.
+    fn on_sign_request(&mut self, from: PublicKey, request: sign_wire::Request) {
+        if !request.is_consistent() {
+            warn!(peer = ?from, "signing request with an inconsistent id");
+            return;
+        }
+        let member = self.ids.get(&request.ceremony).is_none_or(|round| {
+            self.participants
+                .get(round)
+                .is_some_and(|participants| participants.position(&from).is_some())
+        });
+        let result = if member {
+            self.partial(&request.ceremony, request.nonce, &request.payload_hash)
+        } else {
+            Err(Refusal::NotParticipant)
+        };
+        let signed = result.is_ok();
+        let reply = match result {
+            Ok(partial) => {
+                crate::hooks::crash_point("before-partial-send");
+                sign_wire::Message::Partial {
+                    request: request.id,
+                    partial,
+                }
+            }
+            Err(reason) => {
+                match reason {
+                    Refusal::NotAuthorized => {
+                        debug!(peer = ?from, ceremony = %request.ceremony, nonce = request.nonce, "signing request not authorized here (yet)");
+                        self.park(from.clone(), request.clone());
+                    }
+                    _ => {
+                        info!(peer = ?from, ceremony = %request.ceremony, nonce = request.nonce, %reason, "refused signing request");
+                    }
+                }
+                sign_wire::Message::Refused {
+                    request: request.id,
+                    reason,
+                }
+            }
+        };
+        self.signing
+            .send(Recipients::One(from), reply.encode(), false);
+        if signed {
+            crate::hooks::crash_point("after-partial-send");
+        }
+    }
+
+    fn park(&mut self, from: PublicKey, request: sign_wire::Request) {
+        if self
+            .parked
+            .iter()
+            .any(|parked| parked.from == from && parked.request.id == request.id)
+        {
+            return;
+        }
+        if self.parked.len() >= MAX_PARKED {
+            self.parked.pop_front();
+        }
+        self.parked.push_back(Parked {
+            from,
+            request,
+            since: self.blocks,
+        });
+    }
+
+    /// Record durably committed authorizations, then answer the requests that waited for them.
+    fn authorized(&mut self, committed: Vec<Committed>) {
+        for authorization in committed {
+            self.authorizations.insert(
+                (authorization.round(), authorization.nonce()),
+                authorization,
+            );
+        }
+        let (ready, waiting): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut self.parked)
+            .into_iter()
+            .partition(|parked| {
+                self.ids.get(&parked.request.ceremony).is_some_and(|round| {
+                    self.authorizations
+                        .contains_key(&(*round, parked.request.nonce))
+                })
+            });
+        self.parked = waiting;
+        for parked in ready {
+            self.on_sign_request(parked.from, parked.request);
+        }
     }
 }
 

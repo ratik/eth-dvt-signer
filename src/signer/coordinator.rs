@@ -1,0 +1,711 @@
+//! Signing coordinator: any node can coordinate a request, there is no signing leader.
+//!
+//! For each request it:
+//!
+//! 1. reads the finalized authorization of `(ceremony, nonce)` and, only if there is none, has
+//!    consensus decide one (a command in a block);
+//! 2. asks every participant, itself included, for its partial signature (participants check the
+//!    request against their own committed state, see `dkg::actor`);
+//! 3. keeps only valid partials (authenticated sender, matching index, verifying signature), one per
+//!    participant, re-asking the silent ones until `threshold` are collected or time runs out;
+//! 4. recovers the group signature (interpolation, no private key involved) and verifies it.
+//!
+//! Only step 1 involves consensus. Partial signatures are deterministic and nothing is persisted:
+//! retrying a request (on any node) collects them again. Identical requests arriving at one node
+//! while it already works on that request wait for the same result instead of starting over.
+
+use super::wire::{self, Refusal, Request};
+use crate::{
+    dkg::{self, CeremonyId, DkgStatus, Variant, ceremony::Ceremony, signing},
+    executor::{self, Lookup, Receipt},
+    hooks,
+    state::Authorization,
+    types::{Outcome, SignRequest},
+};
+use commonware_codec::Encode as _;
+use commonware_cryptography::{
+    bls12381::{dkg::feldman_desmedt::Output, primitives::variant::PartialSignature},
+    ed25519::PublicKey,
+    sha256::Digest,
+};
+use commonware_macros::select;
+use commonware_p2p::{Recipients, Sender};
+use commonware_runtime::{Clock, ContextCell, Handle, Spawner, spawn_cell};
+use commonware_utils::{
+    channel::{mpsc, oneshot},
+    ordered::Quorum as _,
+};
+use serde::Serialize;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, SystemTime},
+};
+use tracing::{debug, info, warn};
+
+/// Responses buffered per pending request (beyond that, responses are dropped).
+const RESPONSE_BUFFER: usize = 64;
+
+/// Invalid responses tolerated from one participant per request before ignoring it.
+const MAX_STRIKES: u32 = 3;
+
+/// Identical requests that may wait for one request in flight.
+const MAX_WAITERS: usize = 1024;
+
+#[derive(Clone, Copy, Debug)]
+pub struct Config {
+    /// How long to wait for a new authorization to be finalized.
+    pub authorization_timeout: Duration,
+    /// How long to collect partial signatures.
+    pub collect_timeout: Duration,
+    /// Interval between requests to participants that have not answered.
+    pub retry: Duration,
+    /// Maximum signing requests in flight on this node.
+    pub max_active: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            authorization_timeout: Duration::from_secs(30),
+            collect_timeout: Duration::from_secs(10),
+            retry: Duration::from_millis(500),
+            max_active: 256,
+        }
+    }
+}
+
+/// Whether this request created the authorization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AuthorizationKind {
+    /// Decided by consensus for this request.
+    New,
+    /// Already finalized (by an earlier or concurrent identical request).
+    Existing,
+}
+
+/// Duration of each phase, in milliseconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct Timings {
+    /// Command submitted to the mempool to its block finalized (new authorizations only).
+    pub authorization_ms: Option<f64>,
+    /// Block finalized to block durably applied (new authorizations only).
+    pub apply_ms: Option<f64>,
+    /// Partial-signature requests sent to the first valid partial.
+    pub first_partial_ms: Option<f64>,
+    /// Partial-signature requests sent to the threshold reached.
+    pub collect_ms: f64,
+    /// Threshold reached to signature recovered and verified.
+    pub recover_ms: f64,
+    /// Request received to signature ready.
+    pub total_ms: f64,
+}
+
+/// A recovered and verified group signature.
+#[derive(Clone, Debug)]
+pub struct Signed {
+    pub request: SignRequest,
+    pub authorization: Authorization,
+    pub kind: AuthorizationKind,
+    /// 96-byte compressed G2 signature, valid for the ceremony's group key.
+    pub signature: signing::Signature,
+    /// Share indices of the partial signatures used.
+    pub signers: Vec<u32>,
+    pub timings: Timings,
+}
+
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum SignError {
+    #[error("unknown ceremony")]
+    UnknownCeremony,
+    #[error("ceremony is not completed")]
+    NotCompleted(DkgStatus),
+    #[error("(ceremony_id, nonce) is authorized for another payload")]
+    Conflict(Authorization),
+    #[error("authorization not finalized in time (it may still be)")]
+    AuthorizationTimeout,
+    #[error("not enough participants can sign")]
+    InsufficientSigners {
+        authorization: Authorization,
+        valid: usize,
+        refusals: BTreeMap<u32, Refusal>,
+    },
+    #[error("partial signatures not collected in time")]
+    Timeout {
+        authorization: Authorization,
+        valid: usize,
+        refusals: BTreeMap<u32, Refusal>,
+    },
+    #[error("too many signing requests in flight")]
+    Busy,
+    #[error("node stopped")]
+    Stopped,
+    #[error("recovered signature does not verify")]
+    Invalid,
+}
+
+struct Job {
+    request: SignRequest,
+    response: oneshot::Sender<Result<Signed, SignError>>,
+}
+
+/// Interface to this node's coordinator.
+#[derive(Clone)]
+pub struct Client {
+    sender: mpsc::UnboundedSender<Job>,
+    active: Arc<AtomicUsize>,
+    pending: Pending,
+}
+
+/// Coordinator resources in use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stats {
+    /// Signing requests being processed.
+    pub in_flight: usize,
+    /// Requests waiting for partial signatures.
+    pub sessions: usize,
+}
+
+impl Client {
+    pub fn stats(&self) -> Stats {
+        Stats {
+            in_flight: self.active.load(Ordering::Acquire),
+            sessions: self.pending.sessions(),
+        }
+    }
+
+    /// Authorize (if needed) and sign `request.payload_hash` with the ceremony's group key.
+    pub async fn sign(&self, request: SignRequest) -> Result<Signed, SignError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(Job { request, response })
+            .map_err(|_| SignError::Stopped)?;
+        receiver.await.map_err(|_| SignError::Stopped)?
+    }
+}
+
+type Response = (PublicKey, wire::Message);
+
+/// Routes partial-signature responses to the requests waiting for them.
+#[derive(Clone, Default)]
+pub struct Pending(Arc<Mutex<Sessions>>);
+
+#[derive(Default)]
+struct Sessions {
+    next: u64,
+    by_request: HashMap<Digest, Vec<(u64, mpsc::Sender<Response>)>>,
+}
+
+impl Pending {
+    fn register(&self, request: Digest) -> (u64, mpsc::Receiver<Response>) {
+        let (sender, receiver) = mpsc::channel(RESPONSE_BUFFER);
+        let mut sessions = self.0.lock().unwrap();
+        sessions.next += 1;
+        let token = sessions.next;
+        sessions
+            .by_request
+            .entry(request)
+            .or_default()
+            .push((token, sender));
+        (token, receiver)
+    }
+
+    fn unregister(&self, request: &Digest, token: u64) {
+        let mut sessions = self.0.lock().unwrap();
+        if let Some(waiting) = sessions.by_request.get_mut(request) {
+            waiting.retain(|(t, _)| *t != token);
+            if waiting.is_empty() {
+                sessions.by_request.remove(request);
+            }
+        }
+    }
+
+    fn sessions(&self) -> usize {
+        self.0
+            .lock()
+            .unwrap()
+            .by_request
+            .values()
+            .map(Vec::len)
+            .sum()
+    }
+
+    /// Deliver a response to every session waiting for `request`. Returns false if none is.
+    pub fn dispatch(&self, request: &Digest, response: Response) -> bool {
+        let sessions = self.0.lock().unwrap();
+        let Some(waiting) = sessions.by_request.get(request) else {
+            return false;
+        };
+        for (_, sender) in waiting {
+            let _ = sender.try_send(response.clone());
+        }
+        true
+    }
+}
+
+/// Unregisters a session when the request ends, however it ends.
+struct Registration<'a> {
+    pending: &'a Pending,
+    request: Digest,
+    token: u64,
+}
+
+impl Drop for Registration<'_> {
+    fn drop(&mut self) {
+        self.pending.unregister(&self.request, self.token);
+    }
+}
+
+#[derive(Clone)]
+struct Deps<S> {
+    me: PublicKey,
+    config: Config,
+    executor: mpsc::UnboundedSender<executor::Message>,
+    keyholder: mpsc::UnboundedSender<dkg::actor::Message>,
+    sender: S,
+    pending: Pending,
+}
+
+/// Clients waiting for each request in flight.
+type Waiters = Arc<Mutex<HashMap<SignRequest, Vec<oneshot::Sender<Result<Signed, SignError>>>>>>;
+
+pub struct Coordinator<E: Clock + Spawner, S: Sender<PublicKey = PublicKey>> {
+    context: ContextCell<E>,
+    mailbox: mpsc::UnboundedReceiver<Job>,
+    deps: Deps<S>,
+    active: Arc<AtomicUsize>,
+    waiters: Waiters,
+}
+
+impl<E: Clock + Spawner, S: Sender<PublicKey = PublicKey>> Coordinator<E, S> {
+    pub fn new(
+        context: E,
+        me: PublicKey,
+        config: Config,
+        executor: mpsc::UnboundedSender<executor::Message>,
+        keyholder: mpsc::UnboundedSender<dkg::actor::Message>,
+        sender: S,
+        pending: Pending,
+    ) -> (Self, Client) {
+        let (jobs, mailbox) = mpsc::unbounded_channel();
+        let active = Arc::new(AtomicUsize::new(0));
+        let client = Client {
+            sender: jobs,
+            active: active.clone(),
+            pending: pending.clone(),
+        };
+        let coordinator = Self {
+            context: ContextCell::new(context),
+            mailbox,
+            deps: Deps {
+                me,
+                config,
+                executor,
+                keyholder,
+                sender,
+                pending,
+            },
+            active,
+            waiters: Waiters::default(),
+        };
+        (coordinator, client)
+    }
+
+    pub fn start(mut self) -> Handle<()> {
+        spawn_cell!(self.context, self.run())
+    }
+
+    async fn run(mut self) {
+        while let Some(job) = self.mailbox.recv().await {
+            let mut waiters = self.waiters.lock().unwrap();
+            // The same request is already in flight: share its result (no second authorization,
+            // no second collection).
+            if let Some(waiting) = waiters.get_mut(&job.request) {
+                if waiting.len() < MAX_WAITERS {
+                    waiting.push(job.response);
+                } else {
+                    let _ = job.response.send(Err(SignError::Busy));
+                }
+                continue;
+            }
+            if self.active.load(Ordering::Acquire) >= self.deps.config.max_active {
+                let _ = job.response.send(Err(SignError::Busy));
+                continue;
+            }
+            waiters.insert(job.request.clone(), vec![job.response]);
+            drop(waiters);
+            self.active.fetch_add(1, Ordering::AcqRel);
+            let deps = self.deps.clone();
+            let active = InFlight(self.active.clone());
+            let waiters = self.waiters.clone();
+            self.context.child("sign").spawn(move |context| async move {
+                let result = sign(&context, &deps, job.request.clone()).await;
+                drop(active);
+                let waiting = waiters
+                    .lock()
+                    .unwrap()
+                    .remove(&job.request)
+                    .unwrap_or_default();
+                for waiter in waiting {
+                    let _ = waiter.send(result.clone());
+                }
+            });
+        }
+    }
+}
+
+/// Counts a request in flight until dropped, however its task ends.
+struct InFlight(Arc<AtomicUsize>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn millis(from: SystemTime, to: SystemTime) -> f64 {
+    to.duration_since(from).unwrap_or_default().as_secs_f64() * 1000.0
+}
+
+async fn lookup(
+    executor: &mpsc::UnboundedSender<executor::Message>,
+    ceremony: CeremonyId,
+    nonce: u64,
+) -> Result<Lookup, SignError> {
+    let (response, receiver) = oneshot::channel();
+    executor
+        .send(executor::Message::Authorization {
+            ceremony,
+            nonce,
+            response,
+        })
+        .map_err(|_| SignError::Stopped)?;
+    receiver.await.map_err(|_| SignError::Stopped)
+}
+
+async fn authorize(
+    executor: &mpsc::UnboundedSender<executor::Message>,
+    request: SignRequest,
+) -> Result<Receipt, SignError> {
+    let (response, receiver) = oneshot::channel();
+    executor
+        .send(executor::Message::Submit { request, response })
+        .map_err(|_| SignError::Stopped)?;
+    receiver.await.map_err(|_| SignError::Stopped)
+}
+
+async fn sign<E: Clock, S: Sender<PublicKey = PublicKey>>(
+    context: &E,
+    deps: &Deps<S>,
+    request: SignRequest,
+) -> Result<Signed, SignError> {
+    let received = context.current();
+    let mut timings = Timings::default();
+    hooks::pause_point(context, "received").await;
+
+    // 1. The finalized authorization, decided by consensus if there is none yet.
+    let found = lookup(&deps.executor, request.ceremony.clone(), request.nonce).await?;
+    let ceremony = found.ceremony.ok_or(SignError::UnknownCeremony)?;
+    let Some(output) = ceremony.output.clone() else {
+        return Err(SignError::NotCompleted(ceremony.status));
+    };
+    let (authorization, kind) = match found.authorization {
+        Some(existing) if existing.payload_hash == request.payload_hash => {
+            (existing, AuthorizationKind::Existing)
+        }
+        Some(existing) => return Err(SignError::Conflict(existing)),
+        None => {
+            let submitted = context.current();
+            let receipt = select! {
+                receipt = authorize(&deps.executor, request.clone()) => { receipt? },
+                _ = context.sleep(deps.config.authorization_timeout) => {
+                    return Err(SignError::AuthorizationTimeout);
+                },
+            };
+            timings.authorization_ms = Some(millis(submitted, receipt.finalized_at));
+            timings.apply_ms = Some(millis(receipt.finalized_at, receipt.applied_at));
+            match (receipt.outcome, receipt.authorization) {
+                (Outcome::Accepted, Some(authorization)) => (authorization, AuthorizationKind::New),
+                (Outcome::AlreadyAccepted, Some(authorization)) => {
+                    (authorization, AuthorizationKind::Existing)
+                }
+                (Outcome::Rejected, Some(authorization)) => {
+                    return Err(SignError::Conflict(authorization));
+                }
+                (Outcome::UnknownCeremony, _) => return Err(SignError::UnknownCeremony),
+                _ => return Err(SignError::NotCompleted(ceremony.status)),
+            }
+        }
+    };
+    hooks::crash_point("authorized");
+    hooks::pause_point(context, "authorized").await;
+
+    // 2. Partial signatures from any `threshold` participants.
+    let collected = collect(context, deps, &ceremony, &output, &request, authorization).await?;
+
+    // 3. Group signature.
+    let threshold_at = context.current();
+    let signature = signing::recover(output.public(), collected.partials.values())
+        .map_err(|_| SignError::Invalid)?;
+    let message = signing::Message::Ethereum(request.payload_hash);
+    message
+        .verify(output.public().public(), &signature)
+        .map_err(|_| SignError::Invalid)?;
+    let done = context.current();
+
+    timings.first_partial_ms = collected
+        .first
+        .map(|first| millis(collected.started, first));
+    timings.collect_ms = millis(collected.started, threshold_at);
+    timings.recover_ms = millis(threshold_at, done);
+    timings.total_ms = millis(received, done);
+    let signers: Vec<u32> = collected.partials.keys().copied().collect();
+    info!(
+        ceremony = %request.ceremony,
+        nonce = request.nonce,
+        payload_hash = %crate::types::format_hash(&request.payload_hash),
+        height = authorization.height,
+        ?kind,
+        ?signers,
+        authorization_ms = timings.authorization_ms,
+        apply_ms = timings.apply_ms,
+        first_partial_ms = timings.first_partial_ms,
+        collect_ms = timings.collect_ms,
+        recover_ms = timings.recover_ms,
+        total_ms = timings.total_ms,
+        "signed"
+    );
+    Ok(Signed {
+        request,
+        authorization,
+        kind,
+        signature,
+        signers,
+        timings,
+    })
+}
+
+struct Collected {
+    /// Valid partial signatures, by share index.
+    partials: BTreeMap<u32, PartialSignature<Variant>>,
+    started: SystemTime,
+    first: Option<SystemTime>,
+}
+
+/// Collect `threshold` valid partial signatures of the authorized payload.
+async fn collect<E: Clock, S: Sender<PublicKey = PublicKey>>(
+    context: &E,
+    deps: &Deps<S>,
+    ceremony: &Ceremony,
+    output: &Output<Variant, PublicKey>,
+    request: &SignRequest,
+    authorization: Authorization,
+) -> Result<Collected, SignError> {
+    let participants = &ceremony.config.participants;
+    let threshold = output.public().required() as usize;
+    let message = signing::Message::Ethereum(request.payload_hash);
+    let wire_request = Request::new(
+        request.ceremony.clone(),
+        request.nonce,
+        request.payload_hash,
+    );
+    let id = wire_request.id;
+    let (token, mut responses) = deps.pending.register(id);
+    let _registration = Registration {
+        pending: &deps.pending,
+        request: id,
+        token,
+    };
+    let started = context.current();
+    let deadline = started + deps.config.collect_timeout;
+
+    let mut collected = Collected {
+        partials: BTreeMap::new(),
+        started,
+        first: None,
+    };
+    let mut refusals: BTreeMap<u32, Refusal> = BTreeMap::new();
+    let mut strikes: BTreeMap<u32, u32> = BTreeMap::new();
+
+    // Our own partial goes through the same checks as everyone else's.
+    let (response, receiver) = oneshot::channel();
+    deps.keyholder
+        .send(dkg::actor::Message::Partial {
+            ceremony: request.ceremony.clone(),
+            nonce: request.nonce,
+            payload_hash: request.payload_hash,
+            response,
+        })
+        .map_err(|_| SignError::Stopped)?;
+    let own = match receiver.await.map_err(|_| SignError::Stopped)? {
+        Ok(partial) => wire::Message::Partial {
+            request: id,
+            partial,
+        },
+        Err(reason) => wire::Message::Refused {
+            request: id,
+            reason,
+        },
+    };
+
+    let mut sender = deps.sender.clone();
+    let encoded = wire::Message::Request(wire_request).encode();
+    let mut resend_at = started;
+    let mut next: Option<(PublicKey, wire::Message)> = Some((deps.me.clone(), own));
+    loop {
+        if let Some((from, response)) = next.take() {
+            let Some(index) = participants.index(&from).map(|index| index.get()) else {
+                warn!(peer = ?from, "rejected partial signature: not a participant");
+                continue;
+            };
+            if collected.partials.contains_key(&index)
+                || strikes
+                    .get(&index)
+                    .is_some_and(|strikes| *strikes >= MAX_STRIKES)
+            {
+                debug!(
+                    index,
+                    "ignored signing response: already answered or banned"
+                );
+            } else {
+                match response {
+                    wire::Message::Partial { partial, .. } => {
+                        // The index must be the sender's own (authenticated) index, and the
+                        // signature must verify against that index's public share.
+                        let reason = if partial.index.get() != index {
+                            Some("forged participant index")
+                        } else if message.verify_partial(output.public(), &partial).is_err() {
+                            Some("invalid signature")
+                        } else {
+                            None
+                        };
+                        match reason {
+                            Some(reason) => {
+                                warn!(index, reason, "rejected partial signature");
+                                *strikes.entry(index).or_default() += 1;
+                            }
+                            None => {
+                                collected.partials.insert(index, partial);
+                                refusals.remove(&index);
+                                collected.first.get_or_insert(context.current());
+                                hooks::crash_after_partials(collected.partials.len());
+                                hooks::pause_after_partials(context, collected.partials.len())
+                                    .await;
+                            }
+                        }
+                    }
+                    wire::Message::Refused { reason, .. } => {
+                        debug!(index, %reason, "participant refused to sign");
+                        refusals.insert(index, reason);
+                    }
+                    wire::Message::Request(_) => {}
+                }
+            }
+        }
+        if collected.partials.len() >= threshold {
+            return Ok(collected);
+        }
+
+        // Give up early once too many participants refused for good or were banned. A participant
+        // counts once, however many ways it failed.
+        let lost: BTreeSet<u32> = refusals
+            .iter()
+            .filter(|(_, reason)| reason.is_final())
+            .map(|(index, _)| *index)
+            .chain(
+                strikes
+                    .iter()
+                    .filter(|(_, strikes)| **strikes >= MAX_STRIKES)
+                    .map(|(index, _)| *index),
+            )
+            .collect();
+        if participants.len().saturating_sub(lost.len()) < threshold {
+            return Err(SignError::InsufficientSigners {
+                authorization,
+                valid: collected.partials.len(),
+                refusals,
+            });
+        }
+
+        let now = context.current();
+        if now >= deadline {
+            return Err(SignError::Timeout {
+                authorization,
+                valid: collected.partials.len(),
+                refusals,
+            });
+        }
+
+        // (Re)send the request, every `retry`, to the participants that have not answered for good.
+        if now >= resend_at {
+            resend_at = now + deps.config.retry;
+            let silent: Vec<PublicKey> = participants
+                .iter()
+                .filter(|participant| **participant != deps.me)
+                .filter(|participant| {
+                    participants.index(participant).is_some_and(|index| {
+                        !collected.partials.contains_key(&index.get())
+                            && !refusals
+                                .get(&index.get())
+                                .is_some_and(|reason| reason.is_final())
+                    })
+                })
+                .cloned()
+                .collect();
+            if !silent.is_empty() {
+                sender.send(Recipients::Some(silent), encoded.clone(), true);
+            }
+        }
+
+        let wait = resend_at
+            .min(deadline)
+            .duration_since(now)
+            .unwrap_or_default();
+        select! {
+            response = responses.recv() => {
+                match response {
+                    Some(response) => next = Some(response),
+                    None => return Err(SignError::Stopped),
+                }
+            },
+            _ = context.sleep(wait) => {},
+        }
+    }
+}
+
+/// Route messages of the signing channel: requests to this node's keyholder, responses to the
+/// coordinator sessions waiting for them.
+pub async fn receive(
+    mut receiver: impl commonware_p2p::Receiver<PublicKey = PublicKey>,
+    keyholder: mpsc::UnboundedSender<dkg::actor::Message>,
+    pending: Pending,
+) {
+    use commonware_codec::DecodeExt as _;
+    while let Ok((from, bytes)) = receiver.recv().await {
+        match wire::Message::decode(bytes) {
+            Ok(wire::Message::Request(request)) => {
+                if keyholder
+                    .send(dkg::actor::Message::SignRequest { from, request })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Ok(response) => {
+                let request = match &response {
+                    wire::Message::Partial { request, .. }
+                    | wire::Message::Refused { request, .. } => *request,
+                    wire::Message::Request(_) => unreachable!(),
+                };
+                if !pending.dispatch(&request, (from.clone(), response)) {
+                    debug!(peer = ?from, "unsolicited signing response");
+                }
+            }
+            Err(err) => warn!(peer = ?from, ?err, "invalid signing message"),
+        }
+    }
+}

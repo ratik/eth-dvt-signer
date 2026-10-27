@@ -1,0 +1,361 @@
+//! Audit A1/A2: storage rollback. Node storage is restored to older bytes (a snapshot taken while
+//! the node was stopped), then the network is asked to authorize and sign a conflicting payload.
+//!
+//! A1 and A2 roll back everything but the consensus journal: the replicated state, the key share,
+//! the block archive and marshal's progress. Restoring the journal too makes the node forget its
+//! own consensus votes, so it may vote twice in one view and be blocked by its peers (L-10 in
+//! docs/audit.md): `a1_full_restore_never_signs_conflict` covers that case.
+
+use crate::{
+    KEY,
+    failures::{index_of, request, wait_applied},
+    harness::{
+        TestNetwork, ethereum_verify,
+        peer::{FakePeer, Responder},
+        root, unhex,
+    },
+};
+use eth_mpc_signer::signer::wire::{self, Refusal};
+use serde_json::Value;
+use std::time::{Duration, Instant};
+
+/// A network whose nodes wait at most `secs` for a new authorization (so a stale coordinator
+/// answers instead of hanging), with a completed ceremony.
+/// The consensus journal partition (the node's own votes), see the module documentation.
+const CONSENSUS_JOURNAL: &str = "registry-consensus";
+
+pub fn network_with_key_args(args: &[&str]) -> (TestNetwork, Value) {
+    let network = TestNetwork::start_with_args(
+        crate::harness::NODES,
+        args.iter().map(|arg| arg.to_string()).collect(),
+        |_| Vec::new(),
+    );
+    network.wait_for_ready(&network.all());
+    network.start_dkg(0, KEY);
+    let key = network.wait_for_dkg(KEY, &network.all());
+    (network, Value::String(key))
+}
+
+fn hold_env(network: &TestNetwork, node: usize) -> (std::path::PathBuf, Vec<(String, String)>) {
+    let hold = network.dir.join(format!("hold-{node}"));
+    (
+        hold.clone(),
+        vec![(
+            "ETH_MPC_SIGNER_HOLD_FILE".into(),
+            hold.display().to_string(),
+        )],
+    )
+}
+
+fn authorization(network: &TestNetwork, node: usize, nonce: u64) -> Option<(Vec<u8>, u64)> {
+    let (status, body) = network.get(node, &format!("/authorizations/{KEY}/{nonce}"));
+    (status == 200).then(|| {
+        (
+            unhex(&body["payload_hash"]),
+            body["height"].as_u64().unwrap(),
+        )
+    })
+}
+
+/// A1: node 3 is rolled back to storage from before `(KEY, 100)` was authorized for A (all but the
+/// consensus journal). It must not authorize or sign B, before or after catching up, and the
+/// network must keep A.
+#[test]
+fn a1_single_node_rollback() {
+    let (network, key) = network_with_key_args(&["--authorization-timeout", "5"]);
+    network.stop_node(3);
+    network.snapshot(3, "before-a");
+    network.restart_node(3);
+    network.wait_for_ready(&[3]);
+
+    let (status, signed_a) = network.sign(0, KEY, 100, root(0xaa));
+    assert_eq!(status, 200, "{signed_a}");
+    wait_applied(&network, &network.all(), 100);
+    let authorized = authorization(&network, 0, 100).unwrap();
+
+    // Roll node 3 back to the old bytes and keep it from applying blocks: it is stale but serves.
+    network.stop_node(3);
+    network.restore_keeping(3, "before-a", &[CONSENSUS_JOURNAL]);
+    let (hold, env) = hold_env(&network, 3);
+    std::fs::write(&hold, b"").unwrap();
+    network.restart_node_with(3, env);
+    network.wait_until("node 3 to serve HTTP", || network.height(3).is_some());
+    assert_eq!(
+        authorization(&network, 3, 100),
+        None,
+        "stale read: node 3 is behind"
+    );
+
+    // As a signer, the stale node refuses: node 2 is frozen, so node 0 needs node 3.
+    let index_3 = index_of(&network, 3);
+    network.freeze(2);
+    let (status, body) = network.sign(0, KEY, 100, root(0xaa));
+    network.thaw(2);
+    assert_eq!(status, 504, "{body}");
+    assert_eq!(
+        body["refusals"][index_3.to_string()],
+        "not_authorized",
+        "{body}"
+    );
+
+    // As a coordinator, the stale node cannot get B authorized: consensus orders its command after
+    // A and rejects it (it only learns that once it catches up, so it answers with a timeout).
+    let (status, body) = network.sign(3, KEY, 100, root(0xbb));
+    assert_ne!(status, 200, "{body}");
+    assert!(body.get("signature").is_none(), "{body}");
+
+    // A peer (node 2's identity) asks the stale node directly for B and for A.
+    network.stop_node(2);
+    let silent: Responder = Box::new(|_, _, _| Vec::new());
+    let peer = FakePeer::start(&network, 2, &[], silent);
+    let ask_b = request(100, root(0xbb));
+    let ask_a = request(100, root(0xaa));
+    for asked in [&ask_b, &ask_a] {
+        assert_eq!(
+            crate::failures::ask(&network, &peer, 3, asked),
+            wire::Message::Refused {
+                request: asked.id,
+                reason: Refusal::NotAuthorized
+            }
+        );
+    }
+
+    // Let node 3 catch up: it replays the finalized history and ends with A, as the others.
+    std::fs::remove_file(&hold).unwrap();
+    network.wait_until("node 3 to re-apply the authorization", || {
+        authorization(&network, 3, 100).is_some()
+    });
+    assert_eq!(authorization(&network, 3, 100), Some(authorized.clone()));
+    for node in [0, 1, 3] {
+        assert_eq!(authorization(&network, node, 100), Some(authorized.clone()));
+    }
+
+    // The parked request for B is answered with a conflict, never a partial; A is signed.
+    let start = Instant::now();
+    let mut b_answer = None;
+    while start.elapsed() < Duration::from_secs(10) && b_answer.is_none() {
+        if let Some((3, message)) = peer.recv(Duration::from_millis(100)) {
+            match &message {
+                wire::Message::Partial { request, .. } if *request == ask_b.id => {
+                    panic!("node 3 signed the conflicting payload")
+                }
+                wire::Message::Refused { request, .. } if *request == ask_b.id => {
+                    b_answer = Some(message)
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        crate::failures::ask(&network, &peer, 3, &ask_b),
+        wire::Message::Refused {
+            request: ask_b.id,
+            reason: Refusal::Conflict
+        }
+    );
+    assert!(matches!(
+        crate::failures::ask(&network, &peer, 3, &ask_a),
+        wire::Message::Partial { .. }
+    ));
+
+    // Through HTTP, B is rejected everywhere and A still signs, identically, including through
+    // node 3 (which now needs nodes 0 and 1).
+    for node in [0, 1, 3] {
+        let (status, body) = network.sign(node, KEY, 100, root(0xbb));
+        assert_eq!(status, 409, "node {node}: {body}");
+    }
+    let (status, again) = network.sign(3, KEY, 100, root(0xaa));
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(again["signature"], signed_a["signature"]);
+    assert!(ethereum_verify(&key, &root(0xaa), &again["signature"]));
+    assert_eq!(network.blocked_for_equivocation(3), Vec::<usize>::new());
+}
+
+/// A1 with the whole data directory restored, consensus journal included (L-10 in docs/audit.md).
+/// Node 3 no longer knows which consensus votes it cast and, depending on timing, votes against one
+/// of them; the peers that see it block it (for an hour). Either way it must never sign B, and the
+/// intact nodes keep signing A.
+#[test]
+fn a1_full_restore_never_signs_conflict() {
+    let (network, key) = network_with_key_args(&["--authorization-timeout", "5"]);
+    network.stop_node(3);
+    network.snapshot(3, "before-a");
+    network.restart_node(3);
+    network.wait_for_ready(&[3]);
+    let (status, signed_a) = network.sign(0, KEY, 100, root(0xaa));
+    assert_eq!(status, 200, "{signed_a}");
+    wait_applied(&network, &network.all(), 100);
+    let authorized = authorization(&network, 0, 100).unwrap();
+
+    network.stop_node(3);
+    network.restore(3, "before-a");
+    let (hold, env) = hold_env(&network, 3);
+    std::fs::write(&hold, b"").unwrap();
+    network.restart_node_with(3, env);
+    network.wait_until("node 3 to serve HTTP", || network.height(3).is_some());
+    assert_eq!(
+        authorization(&network, 3, 100),
+        None,
+        "stale read: node 3 is behind"
+    );
+
+    // Stale, and possibly cut off: B through node 3 is not signed; the intact nodes sign A.
+    let (status, body) = network.sign(3, KEY, 100, root(0xbb));
+    assert_ne!(status, 200, "{body}");
+    assert!(body.get("signature").is_none(), "{body}");
+    let (status, again) = network.sign(0, KEY, 100, root(0xaa));
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(again["signature"], signed_a["signature"]);
+
+    // Released, node 3 converges to A unless peers blocked it for equivocating.
+    std::fs::remove_file(&hold).unwrap();
+    network.wait_until("node 3 to re-apply the authorization or be blocked", || {
+        authorization(&network, 3, 100).is_some() || !network.blocked_for_equivocation(3).is_empty()
+    });
+    if let Some(applied) = authorization(&network, 3, 100) {
+        assert_eq!(applied, authorized);
+    }
+    for node in network.all() {
+        let (status, body) = network.sign(node, KEY, 100, root(0xbb));
+        assert_ne!(status, 200, "node {node} signed B: {body}");
+        assert!(body.get("signature").is_none(), "{body}");
+        if node != 3 {
+            assert_eq!(status, 409, "node {node}: {body}");
+        }
+    }
+    let blocked = network.blocked_for_equivocation(3);
+    println!("a1 full restore: node 3 blocked for equivocation by {blocked:?}");
+    if blocked.is_empty() {
+        let (status, again) = network.sign(3, KEY, 100, root(0xaa));
+        assert_eq!(status, 200, "{again}");
+        assert_eq!(again["signature"], signed_a["signature"]);
+    }
+    let (status, again) = network.sign(1, KEY, 100, root(0xaa));
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(again["signature"], signed_a["signature"]);
+    assert!(ethereum_verify(&key, &root(0xaa), &again["signature"]));
+    for node in network.all() {
+        assert_eq!(network.count(node, "panicked"), 0, "node {node} panicked");
+    }
+}
+
+/// A2: two nodes (2 and 3) are rolled back together (all but the consensus journal), beyond
+/// `f = 1`. The two intact nodes keep the finalized history; the rolled-back ones must converge to
+/// it, not to a conflicting one.
+#[test]
+fn a2_two_node_rollback() {
+    let (network, key) = network_with_key_args(&["--authorization-timeout", "10"]);
+    for node in [2, 3] {
+        network.stop_node(node);
+        network.snapshot(node, &format!("before-a-{node}"));
+        network.restart_node(node);
+    }
+    network.wait_for_ready(&network.all());
+    let (status, signed_a) = network.sign(0, KEY, 100, root(0xaa));
+    assert_eq!(status, 200, "{signed_a}");
+    wait_applied(&network, &network.all(), 100);
+    let authorized = authorization(&network, 0, 100).unwrap();
+
+    for node in [2, 3] {
+        network.stop_node(node);
+        network.restore_keeping(node, &format!("before-a-{node}"), &[CONSENSUS_JOURNAL]);
+    }
+    for node in [2, 3] {
+        network.restart_node(node);
+    }
+    for node in [2, 3] {
+        network.wait_until(&format!("node {node} to serve HTTP"), || {
+            network.height(node).is_some()
+        });
+    }
+
+    // Right away (the restored nodes are still behind), through every node, B is never signed.
+    let results = std::thread::scope(|scope| {
+        let network = &network;
+        let handles: Vec<_> = [2, 3, 0]
+            .into_iter()
+            .map(|node| scope.spawn(move || (node, network.sign(node, KEY, 100, root(0xbb)))))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    for (node, (status, body)) in results {
+        assert_ne!(status, 200, "node {node} signed B: {body}");
+        assert!(body.get("signature").is_none());
+    }
+
+    // The rolled-back nodes converge to the finalized history: A, at the same height.
+    for node in [2, 3] {
+        network.wait_until(
+            &format!("node {node} to re-apply the authorization"),
+            || authorization(&network, node, 100).is_some(),
+        );
+    }
+    for node in network.all() {
+        assert_eq!(
+            authorization(&network, node, 100),
+            Some(authorized.clone()),
+            "node {node}"
+        );
+        let (status, body) = network.sign(node, KEY, 100, root(0xbb));
+        assert_eq!(status, 409, "node {node}: {body}");
+    }
+    let (status, again) = network.sign(2, KEY, 100, root(0xaa));
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(again["signature"], signed_a["signature"]);
+
+    // Consensus is still live and every node agrees on the state.
+    let (status, new) = network.sign(3, KEY, 101, root(0xcc));
+    assert_eq!(status, 200, "{new}");
+    assert!(ethereum_verify(&key, &root(0xcc), &new["signature"]));
+    wait_applied(&network, &network.all(), 101);
+    let counts: Vec<_> = network
+        .all()
+        .into_iter()
+        .map(|node| network.status(node)["authorizations"].clone())
+        .collect();
+    assert!(
+        counts.windows(2).all(|pair| pair[0] == pair[1]),
+        "{counts:?}"
+    );
+    for node in network.all() {
+        assert_eq!(network.count(node, "panicked"), 0, "node {node} panicked");
+        assert_eq!(network.blocked_for_equivocation(node), Vec::<usize>::new());
+    }
+}
+
+/// Fault-model boundary: every node rolled back (a quorum). Nothing on any node remembers that
+/// nonce 100 was authorized for A, so B gets authorized and signed: two valid signatures for one
+/// `(ceremony, nonce)`. Not detectable without state outside the nodes (see docs/audit.md); kept as
+/// an explicit, failing reproducer.
+#[test]
+#[ignore = "known limitation (docs/audit.md): rolling back a quorum of nodes is undetected"]
+fn a2_whole_network_rollback() {
+    let (network, _) = network_with_key_args(&[]);
+    for node in network.all() {
+        network.stop_node(node);
+        network.snapshot(node, &format!("before-a-{node}"));
+    }
+    for node in network.all() {
+        network.restart_node(node);
+    }
+    network.wait_for_ready(&network.all());
+    let (status, body) = network.sign(0, KEY, 100, root(0xaa));
+    assert_eq!(status, 200, "{body}");
+
+    for node in network.all() {
+        network.stop_node(node);
+        network.restore(node, &format!("before-a-{node}"));
+    }
+    for node in network.all() {
+        network.restart_node(node);
+    }
+    network.wait_for_ready(&network.all());
+    let (status, body) = network.sign(1, KEY, 100, root(0xbb));
+    assert_ne!(
+        status, 200,
+        "conflicting signature for nonce 100 after a whole-network rollback: {body}"
+    );
+}

@@ -1,4 +1,4 @@
-//! Run one node of a local eth-mpc-signer network (Distributed Nonce Registry and BLS DKG).
+//! Run one node of a local eth-mpc-signer network (BLS DKG and threshold signing).
 //!
 //! Node `i` listens for peers on `127.0.0.1:<p2p-port + i>` and for clients on
 //! `127.0.0.1:<http-port + i>`. Keys are derived from the node index, which is only suitable for
@@ -26,6 +26,7 @@ use commonware_utils::{
 use eth_mpc_signer::{
     engine::{self, Channels},
     rpc,
+    signer::coordinator,
 };
 use std::{
     io::IsTerminal as _,
@@ -33,12 +34,13 @@ use std::{
     num::{NonZeroU64, NonZeroUsize},
     os::unix::fs::PermissionsExt as _,
     path::PathBuf,
+    time::Duration,
 };
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(about = "Run a node of eth-mpc-signer (Distributed Nonce Registry and BLS DKG)")]
+#[command(about = "Run a node of eth-mpc-signer (BLS DKG and threshold signing)")]
 struct Args {
     /// Index of this node; also the seed of its (development) key.
     #[arg(long)]
@@ -61,13 +63,22 @@ struct Args {
     data_dir: PathBuf,
 
     /// Recent finalized blocks to keep; older blocks and certificates are pruned every
-    /// 4096 blocks. The registry state itself is never pruned.
+    /// 4096 blocks. The replicated state itself is never pruned.
     #[arg(long, default_value_t = NonZeroU64::new(100_000).unwrap())]
     retain_blocks: NonZeroU64,
+
+    /// Seconds a coordinator waits for partial signatures before giving up on a request.
+    #[arg(long, default_value_t = 10)]
+    signing_timeout: u64,
+
+    /// Seconds a coordinator waits for a new authorization to be finalized.
+    #[arg(long, default_value_t = 30)]
+    authorization_timeout: u64,
 }
 
 fn main() {
     let args = Args::parse();
+    eth_mpc_signer::hooks::exit_on_stdin_eof();
     assert!(args.id < args.participants, "id must be below participants");
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
@@ -123,6 +134,7 @@ fn main() {
             blocks: network.register(engine::BLOCKS_CHANNEL, quota),
             mempool: network.register(engine::MEMPOOL_CHANNEL, quota),
             dkg: network.register(engine::DKG_CHANNEL, quota),
+            signing: network.register(engine::SIGNING_CHANNEL, quota),
         };
         let network_handle = network.start();
 
@@ -138,6 +150,11 @@ fn main() {
                     section: engine::ARCHIVE_SECTION,
                     blocks: args.retain_blocks,
                 },
+                signing: coordinator::Config {
+                    collect_timeout: Duration::from_secs(args.signing_timeout),
+                    authorization_timeout: Duration::from_secs(args.authorization_timeout),
+                    ..Default::default()
+                },
             },
             channels,
         )
@@ -146,15 +163,16 @@ fn main() {
         let listener = ::tokio::net::TcpListener::bind(http)
             .await
             .expect("failed to bind HTTP listener");
-        let router = rpc::router(node.client, node.dkg);
+        let router = rpc::router(node.client, node.dkg, node.signer);
         let rpc_handle = context.child("rpc").spawn(move |_| async move {
             if let Err(err) = axum::serve(listener, router).await {
                 error!(?err, "HTTP server failed");
             }
         });
 
-        if let Err(err) = Handle::select([network_handle, node.handle, rpc_handle]).await {
-            error!(?err, "node stopped");
-        }
+        // A node never stops on its own: whatever ended, it is a failure.
+        let result = Handle::select([network_handle, node.handle, rpc_handle]).await;
+        error!(?result, "node stopped");
+        std::process::exit(1);
     });
 }

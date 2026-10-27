@@ -1,6 +1,6 @@
 //! Wires one node together: consensus (simplex), ordered finalization (marshal), block
-//! dissemination (buffered broadcast), backfill (resolver), the application, the executor and the
-//! DKG actor.
+//! dissemination (buffered broadcast), backfill (resolver), the application, the executor, the DKG
+//! actor (which holds the key shares) and the signing coordinator.
 //!
 //! The engine is generic over the runtime and the p2p network so the same code runs on the real
 //! `tokio` runtime with authenticated p2p and in deterministic simulation (see `tests/`).
@@ -9,6 +9,7 @@ use crate::{
     application::{Application, MAX_IDLE, Mempool, Scheme},
     dkg::{self, secrets::Secrets},
     executor::{self, Client, Executor},
+    signer::coordinator::{self, Coordinator, Pending},
     storage::Store,
     types::Block,
 };
@@ -49,12 +50,21 @@ pub const BLOCKS_CHANNEL: u64 = 4;
 pub const MEMPOOL_CHANNEL: u64 = 5;
 /// Private DKG messages between dealers and players.
 pub const DKG_CHANNEL: u64 = 6;
+/// Partial-signature requests and responses.
+pub const SIGNING_CHANNEL: u64 = 7;
 
 /// Largest p2p message (a full block is ~40KB).
 pub const MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
 
 const MAILBOX_SIZE: NonZeroUsize = NZUsize!(1024);
 const IO_BUFFER_SIZE: NonZeroUsize = NZUsize!(1024 * 1024);
+
+/// How long validators wait for a view's proposal before voting to skip the view (an offline
+/// leader costs this much per turn).
+pub const LEADER_TIMEOUT: Duration = Duration::from_secs(2);
+
+// An idle leader must propose (an empty block) before the others give up on it.
+const _: () = assert!(MAX_IDLE.as_millis() + 500 <= LEADER_TIMEOUT.as_millis());
 
 /// A single epoch that never ends: the validator set is static.
 const EPOCH_LENGTH: NonZeroU64 = NZU64!(u64::MAX);
@@ -89,11 +99,13 @@ pub struct Config<B, P> {
     pub partition_prefix: String,
     /// How much finalized history to keep.
     pub retention: Retention,
+    /// Signing coordinator timeouts and limits.
+    pub signing: coordinator::Config,
 }
 
 /// Registered p2p channels, one `(sender, receiver)` pair per purpose.
 ///
-/// The DKG channel may use other types (tests wrap it to inject messages).
+/// The DKG and signing channels may use other types (tests wrap them to inject messages).
 pub struct Channels<S, R, DS = S, DR = R> {
     pub votes: (S, R),
     pub certificates: (S, R),
@@ -102,11 +114,13 @@ pub struct Channels<S, R, DS = S, DR = R> {
     pub blocks: (S, R),
     pub mempool: (S, R),
     pub dkg: (DS, DR),
+    pub signing: (DS, DR),
 }
 
 pub struct Node {
     pub client: Client,
     pub dkg: dkg::actor::Client,
+    pub signer: coordinator::Client,
     /// Resolves when any actor of the node stops. Dropping it stops the node.
     pub handle: Handle<()>,
 }
@@ -210,14 +224,11 @@ where
     .await;
 
     // State machine.
-    let store = Store::init(
-        context.child("store"),
-        format!("{prefix}-registry"),
-        committee.clone(),
-    )
-    .await
-    .expect("failed to open registry store");
+    let store = Store::init(context.child("store"), &prefix, committee.clone())
+        .await
+        .expect("failed to open replicated state");
     let ceremonies = store.ceremonies().iter().cloned().collect();
+    let authorizations = store.authorizations();
     let mempool = Mempool::default();
     let executed = Arc::new(AtomicU64::new(0));
     let (mempool_sender, mempool_receiver) = channels.mempool;
@@ -244,6 +255,7 @@ where
         .await
         .expect("failed to open secret store");
     let (dkg_p2p_sender, dkg_p2p_receiver) = channels.dkg;
+    let (signing_sender, signing_receiver) = channels.signing;
     let dkg_client = dkg::actor::Client::new(
         public_key.clone(),
         committee,
@@ -255,14 +267,33 @@ where
         signer,
         secrets,
         dkg_p2p_sender,
+        signing_sender.clone(),
         executor_mailbox.clone(),
         dkg_mailbox,
         ceremonies,
+        authorizations,
     )
     .start();
-    let dkg_receiver_handle = context
-        .child("dkg_receiver")
-        .spawn(move |_| dkg::actor::receive(dkg_p2p_receiver, dkg_sender));
+    let dkg_receiver_handle = context.child("dkg_receiver").spawn({
+        let dkg_sender = dkg_sender.clone();
+        move |_| dkg::actor::receive(dkg_p2p_receiver, dkg_sender)
+    });
+
+    // Signing: the coordinator, and the router of the signing channel.
+    let pending = Pending::default();
+    let (coordinator, signer_client) = Coordinator::new(
+        context.child("coordinator"),
+        public_key.clone(),
+        config.signing,
+        executor_mailbox.clone(),
+        dkg_sender.clone(),
+        signing_sender,
+        pending.clone(),
+    );
+    let coordinator_handle = coordinator.start();
+    let signing_receiver_handle = context
+        .child("signing_receiver")
+        .spawn(move |_| coordinator::receive(signing_receiver, dkg_sender, pending));
 
     // Marshal adapter: verifies blocks inline and feeds finalized ones to the application.
     let application = Inline::new(
@@ -289,9 +320,9 @@ where
             floor: simplex::Floor::Genesis(genesis.digest()),
             replay_buffer: IO_BUFFER_SIZE,
             write_buffer: IO_BUFFER_SIZE,
-            // A leader may wait up to `MAX_IDLE` for transactions before proposing.
-            leader_timeout: MAX_IDLE + Duration::from_secs(1),
-            certification_timeout: MAX_IDLE + Duration::from_secs(2),
+            // A leader may wait up to `MAX_IDLE` (< `LEADER_TIMEOUT`) for transactions.
+            leader_timeout: LEADER_TIMEOUT,
+            certification_timeout: LEADER_TIMEOUT + Duration::from_secs(1),
             timeout_retry: Duration::from_secs(10),
             fetch_timeout: Duration::from_secs(1),
             view_retention: ViewDelta::new(10),
@@ -315,11 +346,14 @@ where
         gossip_handle,
         dkg_handle,
         dkg_receiver_handle,
+        coordinator_handle,
+        signing_receiver_handle,
         consensus_handle,
     ]));
     Node {
         client,
         dkg: dkg_client,
+        signer: signer_client,
         handle,
     }
 }

@@ -38,8 +38,9 @@ pub type Scheme = commonware_consensus::simplex::scheme::ed25519::Scheme;
 /// How long a leader waits for transactions before proposing an empty block.
 ///
 /// Requests are gossiped to every node, so the leader proposes as soon as one arrives; this only
-/// bounds how often empty blocks are produced while idle. Must stay below the leader timeout.
-pub const MAX_IDLE: Duration = Duration::from_secs(4);
+/// bounds how often empty blocks are produced while idle. It must stay below
+/// `engine::LEADER_TIMEOUT`, leaving time to build and broadcast the proposal.
+pub const MAX_IDLE: Duration = Duration::from_millis(1500);
 const IDLE_POLL: Duration = Duration::from_millis(10);
 
 /// Transactions waiting to be included in a block, in arrival order.

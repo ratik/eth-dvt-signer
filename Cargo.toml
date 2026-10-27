@@ -3,8 +3,13 @@ name = "eth-mpc-signer"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95.0"
-description = "Ethereum MPC signer built on commonware: a 4-node BFT nonce registry with BLS12-381 DKG"
+description = "Ethereum MPC signer built on commonware: BLS12-381 DKG and consensus-authorized threshold signing"
 publish = false
+
+[features]
+# Fault injection for the real-process end-to-end tests (see `src/hooks.rs`). Never enable it in
+# a deployment.
+test-hooks = []
 
 [dependencies]
 commonware-actor = "2026.9.0"
@@ -40,3 +45,9 @@ tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 # Reference BLS implementation of Ethereum consensus clients (already used by commonware).
 blst = { version = "0.3.17", default-features = false, features = ["no-threads"] }
 commonware-p2p = { version = "2026.9.0", features = ["mocks"] }
+
+# Real processes, real p2p and HTTP: slow, run with `cargo test --features test-hooks --test e2e`.
+[[test]]
+name = "e2e"
+path = "tests/e2e/main.rs"
+required-features = ["test-hooks"]
