@@ -1176,6 +1176,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "blst",
  "bytes",
  "clap",
  "commonware-actor",
@@ -1184,6 +1185,7 @@ dependencies = [
  "commonware-consensus",
  "commonware-cryptography",
  "commonware-macros",
+ "commonware-math",
  "commonware-p2p",
  "commonware-parallel",
  "commonware-resolver",

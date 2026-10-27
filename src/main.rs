@@ -1,4 +1,4 @@
-//! Run one node of a local eth-mpc-signer network (Distributed Nonce Registry).
+//! Run one node of a local eth-mpc-signer network (Distributed Nonce Registry and BLS DKG).
 //!
 //! Node `i` listens for peers on `127.0.0.1:<p2p-port + i>` and for clients on
 //! `127.0.0.1:<http-port + i>`. Keys are derived from the node index, which is only suitable for
@@ -31,13 +31,14 @@ use std::{
     io::IsTerminal as _,
     net::{Ipv4Addr, SocketAddr},
     num::{NonZeroU64, NonZeroUsize},
+    os::unix::fs::PermissionsExt as _,
     path::PathBuf,
 };
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(about = "Run a node of eth-mpc-signer (Distributed Nonce Registry)")]
+#[command(about = "Run a node of eth-mpc-signer (Distributed Nonce Registry and BLS DKG)")]
 struct Args {
     /// Index of this node; also the seed of its (development) key.
     #[arg(long)]
@@ -94,6 +95,10 @@ fn main() {
         args.http_port + u16::try_from(args.id).expect("id too large"),
     ));
     let storage = args.data_dir.join(format!("node-{}", args.id));
+    // The node directory holds private key shares (not encrypted): owner access only.
+    std::fs::create_dir_all(&storage).expect("failed to create data directory");
+    std::fs::set_permissions(&storage, std::fs::Permissions::from_mode(0o700))
+        .expect("failed to restrict data directory permissions");
 
     let runtime = tokio::Runner::new(tokio::Config::new().with_storage_directory(&storage));
     runtime.start(|context| async move {
@@ -117,6 +122,7 @@ fn main() {
             backfill: network.register(engine::BACKFILL_CHANNEL, quota),
             blocks: network.register(engine::BLOCKS_CHANNEL, quota),
             mempool: network.register(engine::MEMPOOL_CHANNEL, quota),
+            dkg: network.register(engine::DKG_CHANNEL, quota),
         };
         let network_handle = network.start();
 
@@ -140,7 +146,7 @@ fn main() {
         let listener = ::tokio::net::TcpListener::bind(http)
             .await
             .expect("failed to bind HTTP listener");
-        let router = rpc::router(node.client);
+        let router = rpc::router(node.client, node.dkg);
         let rpc_handle = context.child("rpc").spawn(move |_| async move {
             if let Err(err) = axum::serve(listener, router).await {
                 error!(?err, "HTTP server failed");

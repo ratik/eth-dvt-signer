@@ -1,139 +1,14 @@
 //! Four nodes in a deterministic simulation: consensus, p2p and storage are real, the network and
 //! clock are simulated.
 
-use commonware_cryptography::{
-    Signer as _,
-    ed25519::{PrivateKey, PublicKey},
-};
-use commonware_p2p::simulated::{self, Link, Network, Oracle};
-use commonware_runtime::{
-    Clock as _, Handle, Quota, Runner as _, Storage as _, Supervisor as _, deterministic,
-};
-use commonware_utils::{NZU64, NZUsize, TryCollect as _, ordered::Set, probability};
-use eth_mpc_signer::{
-    engine::{self, Channels, Retention},
-    executor::Client,
-    types::{Outcome, SignRequest},
-};
+mod common;
+
+use common::{NODES, RETENTION, request, start_network, wait_for_height};
+use commonware_runtime::{Clock as _, Runner as _, Storage as _, deterministic};
+use commonware_utils::NZU64;
+use eth_mpc_signer::{engine::Retention, types::Outcome};
 use futures::future::join_all;
-use std::{num::NonZeroU32, time::Duration};
-
-const NODES: u64 = 4;
-
-const RETENTION: Retention = Retention {
-    section: engine::ARCHIVE_SECTION,
-    blocks: NZU64!(100_000),
-};
-
-const LINK: Link = Link {
-    latency: Duration::from_millis(50),
-    jitter: Duration::from_millis(10),
-    success_rate: probability!(1.0),
-};
-
-fn request(nonce: u64, byte: u8) -> SignRequest {
-    SignRequest {
-        nonce,
-        payload_hash: [byte; 32],
-    }
-}
-
-struct Cluster {
-    clients: Vec<Client>,
-    /// Dropping a node's handle stops the node.
-    _handles: Vec<Handle<()>>,
-}
-
-/// Start every node over a fully connected simulated network.
-async fn start_network(context: &deterministic::Context, retention: Retention) -> Cluster {
-    let signers: Vec<PrivateKey> = (0..NODES).map(PrivateKey::from_seed).collect();
-    let keys: Vec<PublicKey> = signers.iter().map(|signer| signer.public_key()).collect();
-    let participants: Set<PublicKey> = keys.iter().cloned().try_collect().unwrap();
-
-    let (network, oracle): (_, Oracle<PublicKey, _>) = Network::new_with_peers(
-        context.child("network"),
-        simulated::Config {
-            max_size: engine::MAX_MESSAGE_SIZE,
-            disconnect_on_block: true,
-            tracked_peer_sets: NZUsize!(1),
-            max_peers_per_set: NZUsize!(NODES as usize),
-        },
-        keys.clone(),
-    )
-    .await;
-    network.start();
-    for from in &keys {
-        for to in &keys {
-            if from != to {
-                oracle
-                    .add_link(from.clone(), to.clone(), LINK)
-                    .await
-                    .unwrap();
-            }
-        }
-    }
-
-    let quota = Quota::per_second(NonZeroU32::MAX);
-    let mut clients = Vec::new();
-    let mut handles = Vec::new();
-    for (index, signer) in signers.into_iter().enumerate() {
-        let control = oracle.control(signer.public_key());
-        let channels = Channels {
-            votes: control
-                .register(engine::VOTES_CHANNEL, quota)
-                .await
-                .unwrap(),
-            certificates: control
-                .register(engine::CERTIFICATES_CHANNEL, quota)
-                .await
-                .unwrap(),
-            resolver: control
-                .register(engine::RESOLVER_CHANNEL, quota)
-                .await
-                .unwrap(),
-            backfill: control
-                .register(engine::BACKFILL_CHANNEL, quota)
-                .await
-                .unwrap(),
-            blocks: control
-                .register(engine::BLOCKS_CHANNEL, quota)
-                .await
-                .unwrap(),
-            mempool: control
-                .register(engine::MEMPOOL_CHANNEL, quota)
-                .await
-                .unwrap(),
-        };
-        let node = engine::start(
-            context.child("node").with_attribute("index", index),
-            engine::Config {
-                signer,
-                participants: participants.clone(),
-                blocker: control,
-                peer_provider: oracle.manager(),
-                partition_prefix: format!("node-{index}"),
-                retention,
-            },
-            channels,
-        )
-        .await;
-        clients.push(node.client);
-        handles.push(node.handle);
-    }
-    Cluster {
-        clients,
-        _handles: handles,
-    }
-}
-
-/// Wait until every node applied at least `height` blocks.
-async fn wait_for_height(context: &deterministic::Context, clients: &[Client], height: u64) {
-    for client in clients {
-        while client.status().await.unwrap().height < height {
-            context.sleep(Duration::from_millis(100)).await;
-        }
-    }
-}
+use std::time::Duration;
 
 #[test]
 fn registry_rules_across_nodes() {

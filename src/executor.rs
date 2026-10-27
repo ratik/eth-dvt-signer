@@ -2,15 +2,21 @@
 
 use crate::{
     application::{Mempool, Scheme},
+    dkg::{
+        self, CeremonyConfig, CeremonyId, DkgStatus,
+        ceremony::{Ceremony, SignedLog, StartOutcome},
+        format_key,
+    },
     engine::Retention,
-    storage::Store,
-    types::{Block, Outcome, PayloadHash, SignRequest, Transaction, format_hash},
+    storage::{Effect, Store},
+    types::{Block, Command, Outcome, PayloadHash, SignRequest, Transaction, format_hash},
 };
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_consensus::{
     marshal::{core::Mailbox as Marshal, standard::Standard},
     types::Height,
 };
+use commonware_cryptography::Digestible as _;
 use commonware_p2p::{Receiver, Recipients, Sender};
 use commonware_runtime::{ContextCell, Handle, Spawner, spawn_cell};
 use commonware_storage::Context;
@@ -19,7 +25,7 @@ use commonware_utils::{
     acknowledgement::Exact,
     channel::{mpsc, oneshot},
 };
-use rand_core::Rng;
+use rand_core::CryptoRng;
 use std::{
     collections::HashMap,
     sync::{
@@ -34,6 +40,14 @@ use tracing::{debug, info, warn};
 pub struct Receipt {
     pub outcome: Outcome,
     /// Height of the block that finalized the request.
+    pub height: u64,
+}
+
+/// Final answer for a submitted ceremony start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartReceipt {
+    pub outcome: StartOutcome,
+    /// Height of the block that finalized the command.
     pub height: u64,
 }
 
@@ -52,9 +66,22 @@ pub enum Message {
         request: SignRequest,
         response: oneshot::Sender<Receipt>,
     },
+    StartCeremony {
+        config: CeremonyConfig,
+        response: oneshot::Sender<StartReceipt>,
+    },
+    /// A dealer log of this node (sent by the DKG actor, no answer).
+    SubmitLog {
+        round: u64,
+        log: Box<SignedLog>,
+    },
     Get {
         nonce: u64,
         response: oneshot::Sender<Option<PayloadHash>>,
+    },
+    Ceremony {
+        id: CeremonyId,
+        response: oneshot::Sender<Option<Ceremony>>,
     },
     Status {
         response: oneshot::Sender<Status>,
@@ -104,7 +131,13 @@ impl Client {
     }
 }
 
-pub struct Executor<E: Rng + Spawner + Context, S: Sender> {
+/// A client waiting for its transaction.
+enum Waiter {
+    Sign(oneshot::Sender<Receipt>),
+    Start(oneshot::Sender<StartReceipt>),
+}
+
+pub struct Executor<E: CryptoRng + Spawner + Context, S: Sender> {
     context: ContextCell<E>,
     store: Store<E>,
     mempool: Mempool,
@@ -113,13 +146,16 @@ pub struct Executor<E: Rng + Spawner + Context, S: Sender> {
     gossip: S,
     mailbox: mpsc::UnboundedReceiver<Message>,
     /// Clients waiting for their transaction, by transaction id.
-    waiters: HashMap<u64, oneshot::Sender<Receipt>>,
+    waiters: HashMap<u64, Waiter>,
     /// Prunes finalized history outside the retention window.
     marshal: Marshal<Scheme, Standard<Block>>,
     retention: Retention,
+    /// This node's DKG actor, told about every finalized block and ceremony change.
+    dkg: mpsc::UnboundedSender<dkg::actor::Message>,
 }
 
-impl<E: Rng + Spawner + Context, S: Sender> Executor<E, S> {
+impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         context: E,
         store: Store<E>,
@@ -128,6 +164,7 @@ impl<E: Rng + Spawner + Context, S: Sender> Executor<E, S> {
         gossip: S,
         marshal: Marshal<Scheme, Standard<Block>>,
         retention: Retention,
+        dkg: mpsc::UnboundedSender<dkg::actor::Message>,
     ) -> (Self, mpsc::UnboundedSender<Message>, Client) {
         executed.store(store.height(), Ordering::Release);
         let (sender, mailbox) = mpsc::unbounded_channel();
@@ -141,6 +178,7 @@ impl<E: Rng + Spawner + Context, S: Sender> Executor<E, S> {
             waiters: HashMap::new(),
             marshal,
             retention,
+            dkg,
         };
         let client = Client {
             sender: sender.clone(),
@@ -156,23 +194,29 @@ impl<E: Rng + Spawner + Context, S: Sender> Executor<E, S> {
         while let Some(message) = self.mailbox.recv().await {
             match message {
                 Message::Submit { request, response } => {
-                    let transaction = Transaction {
-                        id: self.context.next_u64(),
-                        request,
-                    };
+                    let id = self.submit(Command::Sign(request));
                     info!(
-                        id = transaction.id,
+                        id,
                         nonce = request.nonce,
                         payload_hash = %format_hash(&request.payload_hash),
                         "received request"
                     );
-                    self.waiters.insert(transaction.id, response);
-                    self.mempool.insert(transaction);
-                    self.gossip
-                        .send(Recipients::All, transaction.encode(), false);
+                    self.waiters.insert(id, Waiter::Sign(response));
+                }
+                Message::StartCeremony { config, response } => {
+                    let ceremony = config.id.clone();
+                    let id = self.submit(Command::StartCeremony(config));
+                    info!(id, %ceremony, "received ceremony start");
+                    self.waiters.insert(id, Waiter::Start(response));
+                }
+                Message::SubmitLog { round, log } => {
+                    self.submit(Command::DealerLog { round, log });
                 }
                 Message::Get { nonce, response } => {
                     let _ = response.send(self.store.state().requests.get(&nonce).copied());
+                }
+                Message::Ceremony { id, response } => {
+                    let _ = response.send(self.store.ceremonies().get(&id).cloned());
                 }
                 Message::Status { response } => {
                     let _ = response.send(Status {
@@ -189,6 +233,19 @@ impl<E: Rng + Spawner + Context, S: Sender> Executor<E, S> {
         }
     }
 
+    /// Add a command to the mempool and gossip it. Returns the transaction id.
+    fn submit(&mut self, command: Command) -> u64 {
+        let transaction = Transaction {
+            id: self.context.next_u64(),
+            command,
+        };
+        let id = transaction.id;
+        self.gossip
+            .send(Recipients::All, transaction.encode(), false);
+        self.mempool.insert(transaction);
+        id
+    }
+
     async fn execute(&mut self, block: &Block) {
         let height = block.height.get();
         if height <= self.store.height() {
@@ -197,23 +254,24 @@ impl<E: Rng + Spawner + Context, S: Sender> Executor<E, S> {
             return;
         }
 
-        let requests: Vec<SignRequest> = block
-            .transactions
-            .iter()
-            .map(|transaction| transaction.request)
-            .collect();
-        let outcomes = self
+        let applied = self
             .store
-            .apply_block(height, &requests)
+            .apply_block(
+                height,
+                &block.digest(),
+                &block.transactions,
+                &mut *self.context,
+            )
             .await
             .expect("failed to persist state");
         self.executed.store(height, Ordering::Release);
         self.mempool.remove_all(&block.transactions);
 
         if !block.transactions.is_empty() {
-            let accepted = outcomes
+            let accepted = applied
+                .effects
                 .iter()
-                .filter(|outcome| **outcome == Outcome::Accepted)
+                .filter(|effect| **effect == Effect::Sign(Outcome::Accepted))
                 .count();
             info!(
                 height,
@@ -224,19 +282,57 @@ impl<E: Rng + Spawner + Context, S: Sender> Executor<E, S> {
             );
         }
 
-        for (transaction, outcome) in block.transactions.iter().zip(outcomes) {
-            info!(
-                height,
-                id = transaction.id,
-                nonce = transaction.request.nonce,
-                payload_hash = %format_hash(&transaction.request.payload_hash),
-                ?outcome,
-                "applied transaction"
-            );
-            if let Some(waiter) = self.waiters.remove(&transaction.id) {
-                let _ = waiter.send(Receipt { outcome, height });
+        for (transaction, effect) in block.transactions.iter().zip(applied.effects) {
+            let waiter = self.waiters.remove(&transaction.id);
+            match (&transaction.command, effect) {
+                (Command::Sign(request), Effect::Sign(outcome)) => {
+                    info!(
+                        height,
+                        id = transaction.id,
+                        nonce = request.nonce,
+                        payload_hash = %format_hash(&request.payload_hash),
+                        ?outcome,
+                        "applied transaction"
+                    );
+                    if let Some(Waiter::Sign(waiter)) = waiter {
+                        let _ = waiter.send(Receipt { outcome, height });
+                    }
+                }
+                (Command::StartCeremony(config), Effect::Start(outcome)) => {
+                    info!(height, id = transaction.id, ceremony = %config.id, ?outcome, "applied ceremony start");
+                    if let Some(Waiter::Start(waiter)) = waiter {
+                        let _ = waiter.send(StartReceipt { outcome, height });
+                    }
+                }
+                (Command::DealerLog { round, .. }, Effect::Log(outcome)) => match outcome {
+                    Ok(dealer) => info!(height, round, ?dealer, "recorded dealer log"),
+                    Err(reason) => debug!(height, round, %reason, "ignored dealer log"),
+                },
+                _ => unreachable!("one effect per command"),
             }
         }
+
+        for ceremony in applied.changed {
+            match (ceremony.status, ceremony.public_key()) {
+                (DkgStatus::Completed, Some(key)) => info!(
+                    height,
+                    ceremony = %ceremony.config.id,
+                    round = ceremony.round,
+                    public_key = %format_key(key),
+                    "dkg ceremony completed"
+                ),
+                (DkgStatus::Failed, _) => warn!(
+                    height,
+                    ceremony = %ceremony.config.id,
+                    round = ceremony.round,
+                    logs = ceremony.logs.len(),
+                    "dkg ceremony failed: not enough dealer logs before the deadline"
+                ),
+                _ => {}
+            }
+            let _ = self.dkg.send(dkg::actor::Message::Ceremony(ceremony));
+        }
+        let _ = self.dkg.send(dkg::actor::Message::Tick);
 
         // The archives only drop whole sections, so prune once per section rather than per block.
         let retained = self.retention.blocks.get();

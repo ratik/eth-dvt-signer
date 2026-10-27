@@ -1,0 +1,626 @@
+//! This node's side of every ceremony: its dealer, its player, and the shares it holds.
+//!
+//! The actor learns about ceremonies from the executor (finalized state only), exchanges dealings
+//! and acknowledgements with the other participants over the DKG p2p channel, and submits its
+//! dealer log through consensus. A share is used only after its ceremony is finalized as completed
+//! and the share is durably stored and verified against the agreed public polynomial.
+
+use super::{
+    CeremonyConfig, CeremonyId, DkgStatus, Faults, Variant,
+    ceremony::{Ceremony, SignedLog},
+    format_key,
+    secrets::{KeyShare, Secrets},
+    signing, wire,
+};
+use crate::executor::{self, StartReceipt, Stopped};
+use commonware_codec::{DecodeExt as _, Encode as _};
+use commonware_cryptography::{
+    Signer as _,
+    bls12381::{
+        dkg::feldman_desmedt::{
+            Dealer, DealerPrivMsg, DealerPubMsg, FinalizeError, Player, PlayerAck,
+        },
+        primitives::{group::Share, variant::PartialSignature},
+    },
+    ed25519::{self, PrivateKey, PublicKey},
+    transcript::{Summary, Transcript, Version},
+};
+use commonware_math::algebra::Random as _;
+use commonware_p2p::{Receiver, Recipients, Sender};
+use commonware_parallel::Sequential;
+use commonware_runtime::{ContextCell, Handle, Spawner, spawn_cell};
+use commonware_storage::Context;
+use commonware_utils::{
+    channel::{mpsc, oneshot},
+    ordered::Set,
+};
+use rand_core::CryptoRng;
+use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
+use tracing::{debug, error, info, warn};
+
+/// Label of the dealer's randomness stream (derived from its persisted seed).
+const DEALER_NOISE: &[u8] = b"dealer";
+
+/// A submitted dealer log missing from finalized state after this many blocks is submitted again.
+const RESUBMIT_BLOCKS: u64 = 8;
+
+pub enum Message {
+    /// A ceremony changed in finalized state (started, gained a log, completed or failed).
+    Ceremony(Ceremony),
+    /// A block was finalized: retransmit what has not been acknowledged yet.
+    Tick,
+    /// A message from a peer on the DKG channel (the sender is authenticated by p2p).
+    Peer {
+        from: PublicKey,
+        message: wire::Message,
+    },
+    Share {
+        id: CeremonyId,
+        response: oneshot::Sender<ShareStatus>,
+    },
+    Sign {
+        id: CeremonyId,
+        message: signing::Message,
+        response: oneshot::Sender<Result<PartialSignature<Variant>, SignError>>,
+    },
+}
+
+/// State of this node's share of a ceremony.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareStatus {
+    /// The ceremony is unknown or not completed.
+    Pending,
+    /// Durably stored, verified against the public polynomial and usable.
+    Stored,
+    /// The ceremony completed but this node has no usable share (lost or inconsistent).
+    Unavailable,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SignError {
+    #[error("unknown ceremony")]
+    UnknownCeremony,
+    #[error("no usable share for this ceremony")]
+    NoShare,
+    #[error("node stopped")]
+    Stopped,
+}
+
+/// Interface to this node's DKG (ceremony lifecycle and threshold partial signatures).
+#[derive(Clone)]
+pub struct Client {
+    me: PublicKey,
+    committee: Set<PublicKey>,
+    executor: mpsc::UnboundedSender<executor::Message>,
+    actor: mpsc::UnboundedSender<Message>,
+}
+
+impl Client {
+    pub const fn new(
+        me: PublicKey,
+        committee: Set<PublicKey>,
+        executor: mpsc::UnboundedSender<executor::Message>,
+        actor: mpsc::UnboundedSender<Message>,
+    ) -> Self {
+        Self {
+            me,
+            committee,
+            executor,
+            actor,
+        }
+    }
+
+    /// This node's identity.
+    pub const fn me(&self) -> &PublicKey {
+        &self.me
+    }
+
+    /// Participants of every ceremony.
+    pub const fn committee(&self) -> &Set<PublicKey> {
+        &self.committee
+    }
+
+    /// The configuration supported today for `id`: the whole committee, threshold `n - f`.
+    pub fn config(&self, id: CeremonyId) -> CeremonyConfig {
+        CeremonyConfig::new(id, self.committee.clone())
+    }
+
+    /// Submit `config` to consensus and wait until it is finalized.
+    pub async fn start(&self, config: CeremonyConfig) -> Result<StartReceipt, Stopped> {
+        let (response, receiver) = oneshot::channel();
+        self.executor
+            .send(executor::Message::StartCeremony { config, response })
+            .map_err(|_| Stopped)?;
+        receiver.await.map_err(|_| Stopped)
+    }
+
+    /// Finalized (public) state of a ceremony.
+    pub async fn ceremony(&self, id: CeremonyId) -> Result<Option<Ceremony>, Stopped> {
+        let (response, receiver) = oneshot::channel();
+        self.executor
+            .send(executor::Message::Ceremony { id, response })
+            .map_err(|_| Stopped)?;
+        receiver.await.map_err(|_| Stopped)
+    }
+
+    /// State of this node's share of a ceremony.
+    pub async fn share(&self, id: CeremonyId) -> Result<ShareStatus, Stopped> {
+        let (response, receiver) = oneshot::channel();
+        self.actor
+            .send(Message::Share { id, response })
+            .map_err(|_| Stopped)?;
+        receiver.await.map_err(|_| Stopped)
+    }
+
+    /// Partial signature of `message` with this node's share (internal interface: the share never
+    /// leaves the node, only the partial signature does). There is no slashing protection: callers
+    /// must not request conflicting Ethereum signatures.
+    pub async fn partial_sign(
+        &self,
+        id: CeremonyId,
+        message: signing::Message,
+    ) -> Result<PartialSignature<Variant>, SignError> {
+        let (response, receiver) = oneshot::channel();
+        self.actor
+            .send(Message::Sign {
+                id,
+                message,
+                response,
+            })
+            .map_err(|_| SignError::Stopped)?;
+        receiver.await.map_err(|_| SignError::Stopped)?
+    }
+
+    /// Submit a dealer log to consensus. The actor submits its own; this is for logs of other
+    /// dealers, which consensus validates like any other.
+    pub fn submit_log(&self, round: u64, log: SignedLog) -> Result<(), Stopped> {
+        self.executor
+            .send(executor::Message::SubmitLog {
+                round,
+                log: Box::new(log),
+            })
+            .map_err(|_| Stopped)
+    }
+}
+
+/// Our dealer, until every player acknowledged its dealing.
+struct Dealing {
+    dealer: Dealer<Variant, PrivateKey>,
+    commitment: DealerPubMsg<Variant>,
+    /// Private dealings not acknowledged yet, by player. Dropped once acknowledged.
+    pending: BTreeMap<PublicKey, DealerPrivMsg>,
+}
+
+/// This node's participation in one ceremony in progress.
+struct Session {
+    dealing: Option<Dealing>,
+    /// Our submitted log, until it appears in finalized state.
+    log: Option<Box<SignedLog>>,
+    blocks: u64,
+    /// `None` if the player could not be restored (this node then gets no share).
+    player: Option<Player<Variant, PrivateKey>>,
+    /// Our acknowledgement of each dealer, sent again when the dealer retransmits.
+    acks: BTreeMap<PublicKey, PlayerAck<PublicKey>>,
+}
+
+pub struct Actor<E: CryptoRng + Spawner + Context, S: Sender<PublicKey = PublicKey>> {
+    context: ContextCell<E>,
+    signer: PrivateKey,
+    me: PublicKey,
+    secrets: Secrets<E>,
+    /// DKG p2p channel.
+    sender: S,
+    /// Submits dealer logs to consensus.
+    executor: mpsc::UnboundedSender<executor::Message>,
+    mailbox: mpsc::UnboundedReceiver<Message>,
+    /// Finalized state of the ceremonies to resume on start.
+    initial: Vec<Ceremony>,
+    ids: BTreeMap<CeremonyId, u64>,
+    sessions: BTreeMap<u64, Session>,
+    /// Usable shares: finalized, durably stored and verified.
+    shares: BTreeMap<u64, Share>,
+    /// Completed ceremonies without a usable share on this node.
+    unavailable: BTreeSet<u64>,
+}
+
+impl<E: CryptoRng + Spawner + Context, S: Sender<PublicKey = PublicKey>> Actor<E, S> {
+    pub fn new(
+        context: E,
+        signer: PrivateKey,
+        secrets: Secrets<E>,
+        sender: S,
+        executor: mpsc::UnboundedSender<executor::Message>,
+        mailbox: mpsc::UnboundedReceiver<Message>,
+        initial: Vec<Ceremony>,
+    ) -> Self {
+        Self {
+            context: ContextCell::new(context),
+            me: signer.public_key(),
+            signer,
+            secrets,
+            sender,
+            executor,
+            mailbox,
+            initial,
+            ids: BTreeMap::new(),
+            sessions: BTreeMap::new(),
+            shares: BTreeMap::new(),
+            unavailable: BTreeSet::new(),
+        }
+    }
+
+    pub fn start(mut self) -> Handle<()> {
+        spawn_cell!(self.context, self.run())
+    }
+
+    async fn run(mut self) {
+        for ceremony in std::mem::take(&mut self.initial) {
+            self.update(ceremony).await;
+        }
+        while let Some(message) = self.mailbox.recv().await {
+            match message {
+                Message::Ceremony(ceremony) => self.update(ceremony).await,
+                Message::Tick => self.tick(),
+                Message::Peer { from, message } => match message {
+                    wire::Message::Dealing {
+                        round,
+                        commitment,
+                        share,
+                    } => self.on_dealing(from, round, commitment, share).await,
+                    wire::Message::Ack { round, ack } => self.on_ack(from, round, ack),
+                },
+                Message::Share { id, response } => {
+                    let _ = response.send(self.share_status(&id));
+                }
+                Message::Sign {
+                    id,
+                    message,
+                    response,
+                } => {
+                    let _ = response.send(self.sign(&id, &message));
+                }
+            }
+        }
+    }
+
+    async fn update(&mut self, ceremony: Ceremony) {
+        let round = ceremony.round;
+        self.ids.insert(ceremony.config.id.clone(), round);
+        if ceremony.config.participants.position(&self.me).is_none() {
+            return;
+        }
+        match ceremony.status {
+            DkgStatus::InProgress => {
+                if !self.sessions.contains_key(&round) {
+                    self.open(&ceremony).await;
+                }
+                if ceremony.logs.contains_key(&self.me)
+                    && let Some(session) = self.sessions.get_mut(&round)
+                {
+                    session.log = None;
+                }
+            }
+            DkgStatus::Completed => self.complete(&ceremony).await,
+            DkgStatus::Failed => {
+                if self.sessions.remove(&round).is_some() {
+                    warn!(ceremony = %ceremony.config.id, round, "dkg ceremony failed");
+                }
+                self.secrets
+                    .forget(round)
+                    .await
+                    .expect("failed to update secret store");
+            }
+            DkgStatus::NotStarted => {}
+        }
+    }
+
+    /// Join a ceremony in progress as dealer and player (again, after a restart).
+    async fn open(&mut self, ceremony: &Ceremony) {
+        let round = ceremony.round;
+        let info = ceremony.info();
+        info!(ceremony = %ceremony.config.id, round, "joining dkg ceremony");
+
+        // The player replays the dealings it acknowledged before a restart.
+        let (player, acks) = match Player::resume::<Faults>(
+            info.clone(),
+            self.signer.clone(),
+            &ceremony.logs,
+            self.secrets.dealings(round),
+        ) {
+            Ok((player, acks)) => (Some(player), acks),
+            Err(err) => {
+                error!(round, %err, "cannot restore dkg player: no share for this node");
+                (None, BTreeMap::new())
+            }
+        };
+
+        // The dealer's randomness comes from a fresh random seed persisted before anything is
+        // sent, so a restart replays the same dealing instead of equivocating. A dealer whose log
+        // is already finalized has nothing left to do.
+        let dealing = if ceremony.logs.contains_key(&self.me) {
+            None
+        } else {
+            let seed = match self.secrets.seed(round) {
+                Some(seed) => seed,
+                None => {
+                    let seed = Summary::random(&mut *self.context);
+                    self.secrets
+                        .put_seed(round, seed)
+                        .await
+                        .expect("failed to persist dealer seed");
+                    seed
+                }
+            };
+            let rng = Transcript::resume(seed, Version::V1).noise(DEALER_NOISE);
+            let (dealer, commitment, dealings) =
+                Dealer::start::<Faults>(rng, info, self.signer.clone(), None)
+                    .expect("a participant can deal");
+            Some(Dealing {
+                dealer,
+                commitment,
+                pending: dealings.into_iter().collect(),
+            })
+        };
+
+        let own = dealing.as_ref().map(|dealing| {
+            (
+                dealing.commitment.clone(),
+                dealing.pending[&self.me].clone(),
+            )
+        });
+        self.sessions.insert(
+            round,
+            Session {
+                dealing,
+                log: None,
+                blocks: 0,
+                player,
+                acks,
+            },
+        );
+
+        // Deal to ourselves locally, then to everyone else over p2p.
+        if let Some((commitment, share)) = own {
+            self.on_dealing(self.me.clone(), round, commitment, share)
+                .await;
+        }
+        self.send_dealings(round);
+    }
+
+    fn send_dealings(&mut self, round: u64) {
+        let Some(Session {
+            dealing: Some(dealing),
+            ..
+        }) = self.sessions.get(&round)
+        else {
+            return;
+        };
+        for (player, share) in &dealing.pending {
+            if *player == self.me {
+                continue;
+            }
+            let message = wire::Message::Dealing {
+                round,
+                commitment: dealing.commitment.clone(),
+                share: share.clone(),
+            };
+            self.sender
+                .send(Recipients::One(player.clone()), message.encode(), false);
+        }
+    }
+
+    async fn on_dealing(
+        &mut self,
+        dealer: PublicKey,
+        round: u64,
+        commitment: DealerPubMsg<Variant>,
+        share: DealerPrivMsg,
+    ) {
+        let Some(session) = self.sessions.get_mut(&round) else {
+            debug!(
+                round,
+                ?dealer,
+                "dealing for a ceremony not in progress here"
+            );
+            return;
+        };
+        let Some(player) = session.player.as_mut() else {
+            return;
+        };
+        let ack = match player.dealer_message::<Faults>(
+            dealer.clone(),
+            commitment.clone(),
+            share.clone(),
+        ) {
+            Ok(Some(ack)) => {
+                // Persist before acknowledging: the ack promises that we hold this dealing.
+                self.secrets
+                    .put_dealing(round, (dealer.clone(), commitment, share))
+                    .await
+                    .expect("failed to persist dealing");
+                session.acks.insert(dealer.clone(), ack.clone());
+                ack
+            }
+            // A retransmission (or a conflicting dealing: the first one stays).
+            Ok(None) => match session.acks.get(&dealer) {
+                Some(ack) => ack.clone(),
+                None => return,
+            },
+            Err(err) => {
+                warn!(round, ?dealer, %err, "rejected dealing");
+                return;
+            }
+        };
+        if dealer == self.me {
+            self.on_ack(dealer, round, ack);
+        } else {
+            let message = wire::Message::Ack { round, ack };
+            self.sender
+                .send(Recipients::One(dealer), message.encode(), false);
+        }
+    }
+
+    fn on_ack(&mut self, player: PublicKey, round: u64, ack: PlayerAck<PublicKey>) {
+        let Some(session) = self.sessions.get_mut(&round) else {
+            return;
+        };
+        let Some(dealing) = session.dealing.as_mut() else {
+            return;
+        };
+        if !dealing.pending.contains_key(&player) {
+            return;
+        }
+        if let Err(err) = dealing.dealer.receive_player_ack(player.clone(), ack) {
+            warn!(round, ?player, %err, "rejected ack");
+            return;
+        }
+        dealing.pending.remove(&player);
+        if !dealing.pending.is_empty() {
+            return;
+        }
+
+        // Every player holds our dealing: publish the log (commitment and acks, nothing private).
+        let dealing = session.dealing.take().expect("dealing is present");
+        let log = Box::new(dealing.dealer.finalize::<Faults>());
+        info!(
+            round,
+            "every player acknowledged our dealing, submitting dealer log"
+        );
+        let _ = self.executor.send(executor::Message::SubmitLog {
+            round,
+            log: log.clone(),
+        });
+        session.log = Some(log);
+        session.blocks = 0;
+    }
+
+    fn tick(&mut self) {
+        let rounds: Vec<u64> = self.sessions.keys().copied().collect();
+        for round in rounds {
+            self.send_dealings(round);
+            let session = self.sessions.get_mut(&round).expect("session exists");
+            if let Some(log) = &session.log {
+                session.blocks += 1;
+                if session.blocks.is_multiple_of(RESUBMIT_BLOCKS) {
+                    let _ = self.executor.send(executor::Message::SubmitLog {
+                        round,
+                        log: log.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// The ceremony is finalized as completed: load or derive this node's share.
+    async fn complete(&mut self, ceremony: &Ceremony) {
+        let round = ceremony.round;
+        let session = self.sessions.remove(&round);
+        if self.shares.contains_key(&round) || self.unavailable.contains(&round) {
+            return;
+        }
+        let id = &ceremony.config.id;
+        let public_key = format_key(ceremony.public_key().expect("ceremony is completed"));
+
+        // Already derived (before a restart): load and check it.
+        if let Some(stored) = self.secrets.share(round) {
+            match stored.verify(&self.me, ceremony) {
+                Ok(()) => {
+                    info!(ceremony = %id, round, %public_key, index = stored.share.index.get(), "loaded key share");
+                    self.shares.insert(round, stored.share.clone());
+                }
+                Err(err) => {
+                    error!(ceremony = %id, round, %err, "stored key share is unusable");
+                    self.unavailable.insert(round);
+                }
+            }
+            return;
+        }
+
+        // Derive it from the live player or, after a restart, from the persisted dealings.
+        let player = match session.and_then(|session| session.player) {
+            Some(player) => Ok(player),
+            None => Player::resume::<Faults>(
+                ceremony.info(),
+                self.signer.clone(),
+                &ceremony.logs,
+                self.secrets.dealings(round),
+            )
+            .map(|(player, _)| player),
+        };
+        let derived = player.map_err(FinalizeError::from).and_then(|player| {
+            player.finalize::<Faults, ed25519::Batch>(
+                &mut *self.context,
+                ceremony.logs(),
+                &Sequential,
+            )
+        });
+        let key_share = match derived {
+            Ok((_, share)) => KeyShare::new(ceremony, share),
+            Err(err) => {
+                error!(ceremony = %id, round, %err, "cannot derive key share");
+                self.give_up(round).await;
+                return;
+            }
+        };
+        if let Err(err) = key_share.verify(&self.me, ceremony) {
+            error!(ceremony = %id, round, %err, "derived key share does not match the agreed key");
+            self.give_up(round).await;
+            return;
+        }
+
+        // Durable before use.
+        let index = key_share.share.index.get();
+        let share = key_share.share.clone();
+        self.secrets
+            .put_share(key_share)
+            .await
+            .expect("failed to persist key share");
+        info!(ceremony = %id, round, %public_key, index, "dkg ceremony completed, key share stored");
+        self.shares.insert(round, share);
+    }
+
+    async fn give_up(&mut self, round: u64) {
+        self.unavailable.insert(round);
+        self.secrets
+            .forget(round)
+            .await
+            .expect("failed to update secret store");
+    }
+
+    fn share_status(&self, id: &CeremonyId) -> ShareStatus {
+        match self.ids.get(id) {
+            Some(round) if self.shares.contains_key(round) => ShareStatus::Stored,
+            Some(round) if self.unavailable.contains(round) => ShareStatus::Unavailable,
+            _ => ShareStatus::Pending,
+        }
+    }
+
+    fn sign(
+        &self,
+        id: &CeremonyId,
+        message: &signing::Message,
+    ) -> Result<PartialSignature<Variant>, SignError> {
+        let round = self.ids.get(id).ok_or(SignError::UnknownCeremony)?;
+        let share = self.shares.get(round).ok_or(SignError::NoShare)?;
+        Ok(message.partial_sign(share))
+    }
+}
+
+/// Forward DKG messages from peers to the actor.
+pub async fn receive(
+    mut receiver: impl Receiver<PublicKey = PublicKey>,
+    actor: mpsc::UnboundedSender<Message>,
+) {
+    while let Ok((from, bytes)) = receiver.recv().await {
+        match wire::Message::decode(bytes) {
+            Ok(message) => {
+                if actor.send(Message::Peer { from, message }).is_err() {
+                    return;
+                }
+            }
+            Err(err) => warn!(peer = ?from, ?err, "invalid dkg message"),
+        }
+    }
+}

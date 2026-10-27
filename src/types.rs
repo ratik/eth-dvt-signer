@@ -1,5 +1,6 @@
 //! Wire types shared by every node: the command, its outcome and the block that orders commands.
 
+use crate::dkg::{CeremonyConfig, MAX_PARTICIPANTS, ceremony::SignedLog};
 use bytes::{Buf, BufMut};
 use commonware_codec::{Encode, EncodeSize, Error, FixedSize, Read, ReadExt, Write, varint::UInt};
 use commonware_consensus::{Heightable, types::Height};
@@ -16,6 +17,9 @@ pub fn format_hash(hash: &PayloadHash) -> String {
 
 /// Maximum number of transactions a single block may carry (enforced when decoding).
 pub const MAX_TRANSACTIONS_PER_BLOCK: usize = 1024;
+
+/// Maximum encoded size of the transactions of a proposed block (well below the p2p limit).
+pub const MAX_BLOCK_BYTES: usize = 512 * 1024;
 
 /// The only command of the registry: reserve `nonce` for `payload_hash`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -46,20 +50,88 @@ impl FixedSize for SignRequest {
     const SIZE: usize = u64::SIZE + PayloadHash::SIZE;
 }
 
-/// A [SignRequest] submitted by a client.
+/// A command ordered by consensus.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Command {
+    /// Reserve a nonce (the registry).
+    Sign(SignRequest),
+    /// Start a DKG ceremony.
+    StartCeremony(CeremonyConfig),
+    /// A dealer's public log for the ceremony `round`: its commitment and every player's
+    /// acknowledgement. Never contains private dealings (see `dkg::ceremony`).
+    DealerLog { round: u64, log: Box<SignedLog> },
+}
+
+// `SignedLog` only implements `PartialEq`, but its equality is a full equivalence.
+impl Eq for Command {}
+
+impl Write for Command {
+    fn write(&self, buf: &mut impl BufMut) {
+        match self {
+            Self::Sign(request) => {
+                0u8.write(buf);
+                request.write(buf);
+            }
+            Self::StartCeremony(config) => {
+                1u8.write(buf);
+                config.write(buf);
+            }
+            Self::DealerLog { round, log } => {
+                2u8.write(buf);
+                UInt(*round).write(buf);
+                log.write(buf);
+            }
+        }
+    }
+}
+
+impl Read for Command {
+    type Cfg = ();
+
+    fn read_cfg(buf: &mut impl Buf, _: &()) -> Result<Self, Error> {
+        match u8::read(buf)? {
+            0 => Ok(Self::Sign(SignRequest::read(buf)?)),
+            1 => Ok(Self::StartCeremony(CeremonyConfig::read(buf)?)),
+            2 => Ok(Self::DealerLog {
+                round: UInt::read(buf)?.into(),
+                log: Box::new(SignedLog::read_cfg(buf, &MAX_PARTICIPANTS)?),
+            }),
+            tag => Err(Error::InvalidEnum(tag)),
+        }
+    }
+}
+
+impl EncodeSize for Command {
+    fn encode_size(&self) -> usize {
+        1 + match self {
+            Self::Sign(request) => request.encode_size(),
+            Self::StartCeremony(config) => config.encode_size(),
+            Self::DealerLog { round, log } => UInt(*round).encode_size() + log.encode_size(),
+        }
+    }
+}
+
+/// A [Command] submitted to one node.
 ///
-/// `id` tells apart two submissions of the same request, so every client is answered with the
+/// `id` tells apart two submissions of the same command, so every client is answered with the
 /// outcome of its own submission (the second one is `AlreadyAccepted`, not `Accepted` again).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Transaction {
     pub id: u64,
-    pub request: SignRequest,
+    pub command: Command,
+}
+
+impl Transaction {
+    /// Identifies the transaction in mempools.
+    pub fn digest(&self) -> Digest {
+        Sha256::hash(&[&self.encode()])
+    }
 }
 
 impl Write for Transaction {
     fn write(&self, buf: &mut impl BufMut) {
         self.id.write(buf);
-        self.request.write(buf);
+        self.command.write(buf);
     }
 }
 
@@ -69,13 +141,15 @@ impl Read for Transaction {
     fn read_cfg(buf: &mut impl Buf, _: &()) -> Result<Self, Error> {
         Ok(Self {
             id: u64::read(buf)?,
-            request: SignRequest::read(buf)?,
+            command: Command::read(buf)?,
         })
     }
 }
 
-impl FixedSize for Transaction {
-    const SIZE: usize = u64::SIZE + SignRequest::SIZE;
+impl EncodeSize for Transaction {
+    fn encode_size(&self) -> usize {
+        self.id.encode_size() + self.command.encode_size()
+    }
 }
 
 /// Result of applying a [SignRequest] to the state machine.
@@ -204,10 +278,10 @@ mod tests {
     fn block_roundtrip() {
         let transaction = Transaction {
             id: 1,
-            request: SignRequest {
+            command: Command::Sign(SignRequest {
                 nonce: 7,
                 payload_hash: [9; 32],
-            },
+            }),
         };
         let block = Block::new(
             Block::genesis().digest(),

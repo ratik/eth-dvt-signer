@@ -1,11 +1,13 @@
 //! Wires one node together: consensus (simplex), ordered finalization (marshal), block
-//! dissemination (buffered broadcast), backfill (resolver), the application and the executor.
+//! dissemination (buffered broadcast), backfill (resolver), the application, the executor and the
+//! DKG actor.
 //!
 //! The engine is generic over the runtime and the p2p network so the same code runs on the real
 //! `tokio` runtime with authenticated p2p and in deterministic simulation (see `tests/`).
 
 use crate::{
     application::{Application, MAX_IDLE, Mempool, Scheme},
+    dkg::{self, secrets::Secrets},
     executor::{self, Client, Executor},
     storage::Store,
     types::Block,
@@ -27,7 +29,7 @@ use commonware_runtime::{
     BufferPooler, Clock, Handle, Metrics, Spawner, Storage, buffer::paged::CacheRef,
 };
 use commonware_storage::{archive::prunable, translator::TwoCap};
-use commonware_utils::{NZU16, NZU64, NZUsize, ordered::Set};
+use commonware_utils::{NZU16, NZU64, NZUsize, channel::mpsc, ordered::Set};
 use rand_core::CryptoRng;
 use std::{
     num::{NonZeroU64, NonZeroUsize},
@@ -45,6 +47,8 @@ pub const RESOLVER_CHANNEL: u64 = 2;
 pub const BACKFILL_CHANNEL: u64 = 3;
 pub const BLOCKS_CHANNEL: u64 = 4;
 pub const MEMPOOL_CHANNEL: u64 = 5;
+/// Private DKG messages between dealers and players.
+pub const DKG_CHANNEL: u64 = 6;
 
 /// Largest p2p message (a full block is ~40KB).
 pub const MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
@@ -88,34 +92,42 @@ pub struct Config<B, P> {
 }
 
 /// Registered p2p channels, one `(sender, receiver)` pair per purpose.
-pub struct Channels<S, R> {
+///
+/// The DKG channel may use other types (tests wrap it to inject messages).
+pub struct Channels<S, R, DS = S, DR = R> {
     pub votes: (S, R),
     pub certificates: (S, R),
     pub resolver: (S, R),
     pub backfill: (S, R),
     pub blocks: (S, R),
     pub mempool: (S, R),
+    pub dkg: (DS, DR),
 }
 
 pub struct Node {
     pub client: Client,
+    pub dkg: dkg::actor::Client,
     /// Resolves when any actor of the node stops. Dropping it stops the node.
     pub handle: Handle<()>,
 }
 
-pub async fn start<E, S, R, B, P>(
+pub async fn start<E, S, R, DS, DR, B, P>(
     context: E,
     config: Config<B, P>,
-    channels: Channels<S, R>,
+    channels: Channels<S, R, DS, DR>,
 ) -> Node
 where
     E: BufferPooler + Clock + CryptoRng + Spawner + Storage + Metrics,
     S: Sender<PublicKey = PublicKey>,
     R: Receiver<PublicKey = PublicKey>,
+    DS: Sender<PublicKey = PublicKey>,
+    DR: Receiver<PublicKey = PublicKey>,
     B: Blocker<PublicKey = PublicKey>,
     P: Provider<PublicKey = PublicKey>,
 {
     let public_key = config.signer.public_key();
+    let signer = config.signer.clone();
+    let committee = config.participants.clone();
     let prefix = config.partition_prefix;
     let retention = config.retention;
     let page_cache = CacheRef::from_pooler(&context, NZU16!(16_384), NZUsize!(10_000));
@@ -142,7 +154,7 @@ where
     let (broadcast, buffer) = buffered::Engine::new(
         context.child("broadcast"),
         buffered::Config {
-            public_key,
+            public_key: public_key.clone(),
             mailbox_size: MAILBOX_SIZE,
             deque_size: 16,
             priority: false,
@@ -198,12 +210,18 @@ where
     .await;
 
     // State machine.
-    let store = Store::init(context.child("store"), format!("{prefix}-registry"))
-        .await
-        .expect("failed to open registry store");
+    let store = Store::init(
+        context.child("store"),
+        format!("{prefix}-registry"),
+        committee.clone(),
+    )
+    .await
+    .expect("failed to open registry store");
+    let ceremonies = store.ceremonies().iter().cloned().collect();
     let mempool = Mempool::default();
     let executed = Arc::new(AtomicU64::new(0));
     let (mempool_sender, mempool_receiver) = channels.mempool;
+    let (dkg_sender, dkg_mailbox) = mpsc::unbounded_channel();
     let (executor, executor_mailbox, client) = Executor::new(
         context.child("executor"),
         store,
@@ -212,12 +230,39 @@ where
         mempool_sender,
         marshal.clone(),
         retention,
+        dkg_sender.clone(),
     );
     let executor_handle = executor.start();
     let gossip_handle = context.child("gossip").spawn({
         let mempool = mempool.clone();
         move |_| executor::receive_gossip(mempool_receiver, mempool)
     });
+
+    // DKG: this node's dealer and player, and its secret store. A secret store that cannot be
+    // read is a fatal error: the node must not run with lost or inconsistent shares.
+    let secrets = Secrets::init(context.child("secrets"), format!("{prefix}-secrets"))
+        .await
+        .expect("failed to open secret store");
+    let (dkg_p2p_sender, dkg_p2p_receiver) = channels.dkg;
+    let dkg_client = dkg::actor::Client::new(
+        public_key.clone(),
+        committee,
+        executor_mailbox.clone(),
+        dkg_sender.clone(),
+    );
+    let dkg_handle = dkg::actor::Actor::new(
+        context.child("dkg"),
+        signer,
+        secrets,
+        dkg_p2p_sender,
+        executor_mailbox.clone(),
+        dkg_mailbox,
+        ceremonies,
+    )
+    .start();
+    let dkg_receiver_handle = context
+        .child("dkg_receiver")
+        .spawn(move |_| dkg::actor::receive(dkg_p2p_receiver, dkg_sender));
 
     // Marshal adapter: verifies blocks inline and feeds finalized ones to the application.
     let application = Inline::new(
@@ -268,9 +313,15 @@ where
         marshal_handle,
         executor_handle,
         gossip_handle,
+        dkg_handle,
+        dkg_receiver_handle,
         consensus_handle,
     ]));
-    Node { client, handle }
+    Node {
+        client,
+        dkg: dkg_client,
+        handle,
+    }
 }
 
 fn archive_config<C>(

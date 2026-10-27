@@ -9,9 +9,10 @@
 
 use crate::{
     executor::Message,
-    types::{Block, MAX_TRANSACTIONS_PER_BLOCK, Transaction},
+    types::{Block, MAX_BLOCK_BYTES, MAX_TRANSACTIONS_PER_BLOCK, Transaction},
 };
 use commonware_actor::Feedback;
+use commonware_codec::EncodeSize as _;
 use commonware_consensus::{
     Heightable as _, Reporter,
     marshal::{Update, ancestry::Ancestry},
@@ -47,18 +48,19 @@ pub struct Mempool(Arc<Mutex<Pending>>);
 
 #[derive(Default)]
 struct Pending {
-    queue: VecDeque<Transaction>,
-    known: HashSet<Transaction>,
+    queue: VecDeque<(Digest, Transaction)>,
+    known: HashSet<Digest>,
 }
 
 impl Mempool {
     /// Returns true if the transaction was not already pending.
     pub fn insert(&self, transaction: Transaction) -> bool {
+        let digest = transaction.digest();
         let mut pending = self.0.lock().unwrap();
-        if !pending.known.insert(transaction) {
+        if !pending.known.insert(digest) {
             return false;
         }
-        pending.queue.push_back(transaction);
+        pending.queue.push_back((digest, transaction));
         true
     }
 
@@ -66,11 +68,11 @@ impl Mempool {
         let mut pending = self.0.lock().unwrap();
         let mut removed = false;
         for transaction in transactions {
-            removed |= pending.known.remove(transaction);
+            removed |= pending.known.remove(&transaction.digest());
         }
         if removed {
             let Pending { queue, known } = &mut *pending;
-            queue.retain(|transaction| known.contains(transaction));
+            queue.retain(|(digest, _)| known.contains(digest));
         }
     }
 
@@ -82,15 +84,20 @@ impl Mempool {
         self.len() == 0
     }
 
-    /// Oldest pending transactions not contained in `exclude`.
-    fn select(&self, exclude: &HashSet<Transaction>) -> Vec<Transaction> {
+    /// Oldest pending transactions not contained in `exclude`, within the block size limits.
+    fn select(&self, exclude: &HashSet<Digest>) -> Vec<Transaction> {
         let pending = self.0.lock().unwrap();
+        let mut bytes = 0;
         pending
             .queue
             .iter()
-            .filter(|transaction| !exclude.contains(transaction))
+            .filter(|(digest, _)| !exclude.contains(digest))
             .take(MAX_TRANSACTIONS_PER_BLOCK)
-            .copied()
+            .take_while(|(_, transaction)| {
+                bytes += transaction.encode_size();
+                bytes <= MAX_BLOCK_BYTES
+            })
+            .map(|(_, transaction)| transaction.clone())
             .collect()
     }
 }
@@ -145,7 +152,7 @@ where
         let mut in_flight = HashSet::new();
         let mut ancestor = Some(parent.clone());
         while let Some(block) = ancestor.filter(|block| block.height().get() > executed) {
-            in_flight.extend(block.transactions.iter().copied());
+            in_flight.extend(block.transactions.iter().map(Transaction::digest));
             ancestor = ancestry.next().await;
         }
 
