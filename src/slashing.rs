@@ -13,8 +13,9 @@
 //!   `target_2 < target_1`, in either order). The whole history is kept and checked, not only the
 //!   latest attestation;
 //! - for the other duties, which are not slashable, the signing roots authorized per (kind, period):
-//!   retries are idempotent, and at most [MAX_ROOTS_PER_PERIOD] distinct roots per period are
-//!   authorized.
+//!   retries are idempotent, and at most `MAX_ROOTS_PER_PERIOD` distinct roots per period are
+//!   authorized. A validator signs one deposit message, ever (`MAX_DEPOSIT_MESSAGES`): the
+//!   withdrawal credentials of its first deposit cannot be replaced through the signer.
 //!
 //! History is keyed by the validator public key, never by ceremony: a ceremony is only how the key
 //! signs today (a future resharing would move the key to another ceremony and keep its history).
@@ -40,7 +41,7 @@
 //! reference.
 
 use crate::eth::{
-    duty::{DutyKind, DutyRequest, MAX_ROOTS_PER_PERIOD, Protection as Rule, ValidatorKey},
+    duty::{Duty, DutyKind, DutyRequest, Protection as Rule, ValidatorKey},
     types::{Root, hex_bytes},
 };
 use serde::Serialize;
@@ -131,6 +132,9 @@ pub enum Refusal {
     },
     #[error("the validator signs for another chain (genesis validators root)")]
     OtherChain,
+    /// A deposit message for another public key than the validator's.
+    #[error("the deposit message is for another public key")]
+    DepositForAnotherKey,
     #[error("another block was signed for slot {slot}")]
     DoubleProposal { slot: u64 },
     #[error("another attestation was signed for target epoch {target}")]
@@ -429,8 +433,20 @@ impl Protection {
                 target_epoch,
             },
         )?;
-        if activation.chain.genesis_validators_root != request.fork.genesis_validators_root {
-            return Err(Refusal::OtherChain);
+        match &request.duty {
+            // A deposit's domain has no genesis validators root: it is not bound to the chain,
+            // only to the key, which signs one deposit message, ever.
+            Duty::Deposit(message) => {
+                if message.pubkey != request.validator {
+                    return Err(Refusal::DepositForAnotherKey);
+                }
+            }
+            _ => {
+                if activation.chain.genesis_validators_root != request.fork.genesis_validators_root
+                {
+                    return Err(Refusal::OtherChain);
+                }
+            }
         }
         match request.duty.protection() {
             Rule::Proposal { slot } => match self.proposals.get(&(id, slot)) {
@@ -474,11 +490,11 @@ impl Protection {
                 let roots = self.bounded(id, kind, period);
                 if roots.iter().any(|signed| signed.signing_root == *root) {
                     Ok(None)
-                } else if roots.len() >= MAX_ROOTS_PER_PERIOD {
+                } else if roots.len() >= kind.max_roots() {
                     Err(Refusal::TooManyRoots {
                         kind,
                         period,
-                        max: MAX_ROOTS_PER_PERIOD,
+                        max: kind.max_roots(),
                     })
                 } else {
                     Ok(Some(id))
@@ -634,8 +650,8 @@ impl Protection {
 mod tests {
     use super::*;
     use crate::eth::{
-        duty::{Duty, Fork, ForkInfo},
-        types::{AttestationData, BeaconBlockHeader, Checkpoint},
+        duty::{Duty, Fork, ForkInfo, MAX_ROOTS_PER_PERIOD},
+        types::{AttestationData, BeaconBlockHeader, Checkpoint, DepositMessage},
     };
 
     const KEY: ValidatorKey = [7; 48];
@@ -996,6 +1012,57 @@ mod tests {
             decide(&mut p, &request(Duty::AggregationSlot { slot: 3 })),
             Decision::Accepted
         );
+    }
+
+    /// A deposit request as the Web3Signer adapter builds it: the genesis fork version as both
+    /// versions, no genesis validators root.
+    fn deposit(pubkey: ValidatorKey, credentials: u8) -> DutyRequest {
+        DutyRequest {
+            validator: KEY,
+            fork: ForkInfo {
+                fork: Fork {
+                    previous_version: [0, 0, 0, 1],
+                    current_version: [0, 0, 0, 1],
+                    epoch: 0,
+                },
+                genesis_validators_root: [0; 32],
+            },
+            duty: Duty::Deposit(DepositMessage {
+                pubkey,
+                withdrawal_credentials: [credentials; 32],
+                amount: 32_000_000_000,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_validator_signs_one_deposit_message_of_its_own_key() {
+        let mut inactive = Protection::default();
+        inactive.designate(0);
+        inactive.register(0, KEY);
+        assert_eq!(
+            decide(&mut inactive, &deposit(KEY, 1)),
+            Decision::Refused(Refusal::NotActivated)
+        );
+
+        let mut p = protection();
+        // Not bound to the chain (its domain has no genesis validators root), but to the key.
+        assert_eq!(
+            decide(&mut p, &deposit([8; 48], 1)),
+            Decision::Refused(Refusal::DepositForAnotherKey)
+        );
+        assert_eq!(decide(&mut p, &deposit(KEY, 1)), Decision::Accepted);
+        assert_eq!(decide(&mut p, &deposit(KEY, 1)), Decision::AlreadyAccepted);
+        // Other withdrawal credentials: refused for good, the first deposit's stand.
+        assert_eq!(
+            decide(&mut p, &deposit(KEY, 2)),
+            Decision::Refused(Refusal::TooManyRoots {
+                kind: DutyKind::Deposit,
+                period: 0,
+                max: 1
+            })
+        );
+        assert_eq!(p.validator(0).unwrap().records, 1);
     }
 
     #[test]

@@ -119,7 +119,6 @@ fn unsupported_requests_are_refused() {
     for kind in [
         "BLOCK",
         "VALIDATOR_REGISTRATION",
-        "DEPOSIT",
         "SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF_V9",
         "EXECUTION_PAYLOAD_ENVELOPE",
         "PAYLOAD_ATTESTATION_MESSAGE",
@@ -316,4 +315,32 @@ fn lighthouse_produced_requests_reproduce_lighthouse_roots() {
         parse(&lighthouse("block_v2_altair_full_block.json")),
         Err(ParseError::Unsupported(_))
     ));
+}
+
+#[test]
+fn deposits_reproduce_the_web3signer_example_root() {
+    // Web3Signer's DEPOSIT example (openapi-specs/eth2/signing/paths/sign.yaml).
+    let value = json!({
+        "type": "DEPOSIT",
+        "signingRoot": "0x3a49cdd70862ee95fed10e7494a8caa16af1be2f53612fc74dad27260bb2d711",
+        "deposit": {
+            "pubkey": "0x8f82597c919c056571a05dfe83e6a7d32acf9ad8931be04d11384e95468cd68b40129864ae12745f774654bbac09b057",
+            "withdrawal_credentials": "0x39722cbbf8b91a4b9045c5e6175f1001eac32f7fcd5eccda5c6e62fc4e638508",
+            "amount": "32",
+            "genesis_fork_version": "0x00000001"
+        }
+    });
+    let request = parse(&value).unwrap();
+    assert_eq!(request.duty.kind(), DutyKind::Deposit);
+    assert_eq!(
+        format_root(&request.duty.signing_root(&request.fork)),
+        value["signingRoot"].as_str().unwrap()
+    );
+    // Fork-agnostic: no `fork_info`.
+    let mut with_fork = value.clone();
+    with_fork["fork_info"] = fixture("attestation.json")["fork_info"].clone();
+    assert!(matches!(parse(&with_fork), Err(ParseError::Invalid(_))));
+    let mut short_version = value;
+    short_version["deposit"]["genesis_fork_version"] = json!("0x0001");
+    assert!(matches!(parse(&short_version), Err(ParseError::Invalid(_))));
 }

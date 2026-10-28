@@ -124,6 +124,7 @@ DOMAINS = {
     "SYNC_COMMITTEE_MESSAGE": 7,
     "SYNC_COMMITTEE_SELECTION_PROOF": 8,
     "SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF": 9,
+    "DEPOSIT": 3,
 }
 
 
@@ -180,11 +181,24 @@ def object_root_and_epoch(request, p):
             uint64(c["aggregator_index"]), contribution, signature(c["selection_proof"])
         )
         return root, int(k["slot"]) // SLOTS_PER_EPOCH
+    if kind == "DEPOSIT":
+        d = request["deposit"]
+        root = container(
+            merkleize(pack(hexbytes(d["pubkey"], 48))),
+            bytes32(d["withdrawal_credentials"]),
+            uint64(d["amount"]),
+        )
+        return root, 0
     raise ValueError(f"unsupported type {kind}")
 
 
 def signing_root(request, p):
     root, epoch = object_root_and_epoch(request, p)
+    if request["type"] == "DEPOSIT":
+        # compute_domain(DOMAIN_DEPOSIT): genesis fork version, zero genesis validators root.
+        version = request["deposit"]["genesis_fork_version"]
+        fork_data_root = container(hexbytes(version, 4).ljust(32, b"\0"), b"\0" * 32)
+        return container(root, bytes([DOMAINS["DEPOSIT"], 0, 0, 0]) + fork_data_root[:28])
     fork = request["fork_info"]["fork"]
     version = fork["previous_version"] if epoch < int(fork["epoch"]) else fork["current_version"]
     fork_data_root = container(

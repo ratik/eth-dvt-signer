@@ -273,9 +273,14 @@ fn a1_full_restore_never_signs_conflict() {
 /// A2: two nodes (2 and 3) are rolled back together (all but the consensus journal), beyond
 /// `f = 1`. The two intact nodes keep the finalized history; the rolled-back ones must converge to
 /// it, not to a conflicting one.
+///
+/// Liveness here is eventual only: two simultaneous failures exceed `f = 1`. If the restored
+/// nodes missed the certificate of the view the others are in, consensus waits for the next
+/// nullify retry, which carries it (`timeout_retry`, 3 s). The authorization timeout leaves room
+/// for that wait; the time to recover is printed.
 #[test]
 fn a2_two_node_rollback() {
-    let (network, key) = network_with_key_args(&["--authorization-timeout", "10"]);
+    let (network, key) = network_with_key_args(&["--authorization-timeout", "15"]);
     for node in [2, 3] {
         network.stop_node(node);
         network.snapshot(node, &format!("before-a-{node}"));
@@ -294,6 +299,7 @@ fn a2_two_node_rollback() {
     for node in [2, 3] {
         network.restart_node(node);
     }
+    let restarted = Instant::now();
     for node in [2, 3] {
         network.wait_until(&format!("node {node} to serve HTTP"), || {
             network.height(node).is_some()
@@ -340,8 +346,14 @@ fn a2_two_node_rollback() {
     // Consensus is still live and every node agrees on the state. Node 3 authorizes once it has
     // applied everything it knows of (until then it answers `NOT_READY`).
     network.wait_for_ready(&network.all());
+    let requested = Instant::now();
     let (status, new) = network.sign(3, KEY, 101, root(0xcc));
     assert_eq!(status, 200, "{new}");
+    println!(
+        "a2: new authorization signed {} ms after the rolled-back nodes restarted (request {} ms)",
+        restarted.elapsed().as_millis(),
+        requested.elapsed().as_millis()
+    );
     assert!(ethereum_verify(&key, &root(0xcc), &new["signature"]));
     wait_applied(&network, &network.all(), 101);
     let counts: Vec<_> = network

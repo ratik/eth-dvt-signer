@@ -167,6 +167,33 @@ pub struct ContributionAndProof {
     pub selection_proof: Signature,
 }
 
+/// `DepositMessage`: what a deposit's signature covers (phase 0 `beacon-chain.md`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, TreeHash)]
+#[serde(deny_unknown_fields)]
+pub struct DepositMessage {
+    #[serde(with = "hex_bytes")]
+    pub pubkey: [u8; 48],
+    #[serde(with = "hex_bytes")]
+    pub withdrawal_credentials: Root,
+    /// Gwei.
+    #[serde(with = "serde_utils::quoted_u64")]
+    pub amount: u64,
+}
+
+/// `DepositData`: what the deposit contract checks (`deposit_data_root` is its root).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, TreeHash)]
+#[serde(deny_unknown_fields)]
+pub struct DepositData {
+    #[serde(with = "hex_bytes")]
+    pub pubkey: [u8; 48],
+    #[serde(with = "hex_bytes")]
+    pub withdrawal_credentials: Root,
+    #[serde(with = "serde_utils::quoted_u64")]
+    pub amount: u64,
+    #[serde(with = "hex_bytes")]
+    pub signature: Signature,
+}
+
 /// `ForkData`: what `compute_fork_data_root` hashes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TreeHash)]
 #[serde(deny_unknown_fields)]

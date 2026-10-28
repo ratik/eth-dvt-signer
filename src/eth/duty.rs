@@ -10,8 +10,8 @@
 
 use super::types::{
     AggregateAndProofElectra, AggregateAndProofPhase0, AttestationData, BeaconBlockHeader,
-    ContributionAndProof, ForkData, Root, SigningData, SyncAggregatorSelectionData, Version,
-    VoluntaryExit, hex_bytes,
+    ContributionAndProof, DepositMessage, ForkData, Root, SigningData, SyncAggregatorSelectionData,
+    Version, VoluntaryExit, hex_bytes,
 };
 use bytes::{Buf, BufMut};
 use commonware_codec::{EncodeSize, Error as CodecError, Read, ReadExt as _, Write, varint::UInt};
@@ -25,6 +25,10 @@ pub const SLOTS_PER_EPOCH: u64 = 32;
 /// Distinct signing roots authorized for one non-slashable duty of one validator in one period
 /// (a slot or an epoch). Retries of the same root are free; this bounds everything else.
 pub const MAX_ROOTS_PER_PERIOD: usize = 8;
+
+/// Distinct deposit messages a validator key ever signs: one, so the withdrawal credentials of
+/// its first deposit cannot be replaced by another signed deposit.
+pub const MAX_DEPOSIT_MESSAGES: usize = 1;
 
 /// Largest encoded duty accepted in a consensus command (an Electra aggregate is ~17 KB).
 pub const MAX_DUTY_BYTES: usize = 32 * 1024;
@@ -165,6 +169,10 @@ pub enum Duty {
     SyncSelectionProof(SyncAggregatorSelectionData),
     ContributionAndProof(Box<ContributionAndProof>),
     VoluntaryExit(VoluntaryExit),
+    /// A deposit of the validator's own key. Its domain uses the genesis fork version and no
+    /// genesis validators root (`compute_domain(DOMAIN_DEPOSIT)`): the request's [ForkInfo] holds
+    /// that version as both versions and a zero root.
+    Deposit(DepositMessage),
 }
 
 /// Kind of duty (stable numbering: part of the replicated state's keys).
@@ -181,10 +189,11 @@ pub enum DutyKind {
     SyncSelectionProof = 6,
     ContributionAndProof = 7,
     VoluntaryExit = 8,
+    Deposit = 9,
 }
 
 impl DutyKind {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::BlockProposal,
         Self::Attestation,
         Self::RandaoReveal,
@@ -194,7 +203,16 @@ impl DutyKind {
         Self::SyncSelectionProof,
         Self::ContributionAndProof,
         Self::VoluntaryExit,
+        Self::Deposit,
     ];
+
+    /// Distinct roots authorized per period for a non-slashable kind.
+    pub const fn max_roots(self) -> usize {
+        match self {
+            Self::Deposit => MAX_DEPOSIT_MESSAGES,
+            _ => MAX_ROOTS_PER_PERIOD,
+        }
+    }
 
     pub fn from_u8(value: u8) -> Option<Self> {
         Self::ALL.into_iter().find(|kind| *kind as u8 == value)
@@ -235,6 +253,7 @@ impl Duty {
             Self::SyncSelectionProof(_) => DutyKind::SyncSelectionProof,
             Self::ContributionAndProof(_) => DutyKind::ContributionAndProof,
             Self::VoluntaryExit(_) => DutyKind::VoluntaryExit,
+            Self::Deposit(_) => DutyKind::Deposit,
         }
     }
 
@@ -249,6 +268,7 @@ impl Duty {
             Self::SyncSelectionProof(_) => domain::SYNC_COMMITTEE_SELECTION_PROOF,
             Self::ContributionAndProof(_) => domain::CONTRIBUTION_AND_PROOF,
             Self::VoluntaryExit(_) => domain::VOLUNTARY_EXIT,
+            Self::Deposit(_) => domain::DEPOSIT,
         }
     }
 
@@ -265,6 +285,21 @@ impl Duty {
             Self::SyncSelectionProof(data) => data.slot / SLOTS_PER_EPOCH,
             Self::ContributionAndProof(proof) => proof.contribution.slot / SLOTS_PER_EPOCH,
             Self::VoluntaryExit(exit) => exit.epoch,
+            // Fork-agnostic: the fork info carries the genesis fork version only.
+            Self::Deposit(_) => 0,
+        }
+    }
+
+    /// The slot the duty is for, when it has one (for logs and correlation).
+    pub fn slot(&self) -> Option<u64> {
+        match self {
+            Self::BlockProposal(header) => Some(header.slot),
+            Self::Attestation(data) => Some(data.slot),
+            Self::AggregationSlot { slot } | Self::SyncCommitteeMessage { slot, .. } => Some(*slot),
+            Self::AggregateAndProof(aggregate) => Some(aggregate.slot()),
+            Self::SyncSelectionProof(data) => Some(data.slot),
+            Self::ContributionAndProof(proof) => Some(proof.contribution.slot),
+            Self::RandaoReveal { .. } | Self::VoluntaryExit(_) | Self::Deposit(_) => None,
         }
     }
 
@@ -282,6 +317,7 @@ impl Duty {
             Self::SyncSelectionProof(data) => data.tree_hash_root().0,
             Self::ContributionAndProof(proof) => proof.tree_hash_root().0,
             Self::VoluntaryExit(exit) => exit.tree_hash_root().0,
+            Self::Deposit(message) => message.tree_hash_root().0,
         }
     }
 
@@ -312,6 +348,8 @@ impl Duty {
                 period: proof.contribution.slot,
             },
             Self::VoluntaryExit(exit) => Protection::Bounded { period: exit.epoch },
+            // One period for all of a validator's deposits: one message, ever.
+            Self::Deposit(_) => Protection::Bounded { period: 0 },
         }
     }
 
@@ -352,6 +390,7 @@ impl Duty {
             Self::SyncSelectionProof(data) => (7, data.as_ssz_bytes()),
             Self::ContributionAndProof(proof) => (8, proof.as_ssz_bytes()),
             Self::VoluntaryExit(exit) => (9, exit.as_ssz_bytes()),
+            Self::Deposit(message) => (10, message.as_ssz_bytes()),
         }
     }
 
@@ -388,6 +427,7 @@ impl Duty {
                 ContributionAndProof::from_ssz_bytes(body).map_err(invalid)?,
             )),
             9 => Self::VoluntaryExit(VoluntaryExit::from_ssz_bytes(body).map_err(invalid)?),
+            10 => Self::Deposit(DepositMessage::from_ssz_bytes(body).map_err(invalid)?),
             _ => return Err(CodecError::InvalidEnum(tag)),
         })
     }

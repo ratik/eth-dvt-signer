@@ -63,19 +63,15 @@ decision: an already authorized duty skips to T4, and a refused one ends there (
 The harness drives nodes only through their public interfaces (process, HTTP, p2p), so the same
 scenarios can run against nodes started elsewhere.
 
-## Future: Ethereum validator client (Kurtosis)
-
-Target topology:
+## Ethereum validator client (Kurtosis and Lighthouse)
 
 ```
-Kurtosis ethereum-package devnet: execution client + beacon node + validator client
-                                                       │ Web3Signer HTTP API
-                                              remote signer adapter
-                                                       │ SignRequest
-                                       4 eth-mpc-signer nodes (this repository)
+Kurtosis devnet (ethereum-package): geth + Lighthouse beacon node + genesis validators
+          │ beacon API
+Lighthouse validator client v8.3.2: one web3signer validator, the DKG key, no keystore
+          │ Web3Signer HTTP API
+failover proxy (development)  ──>  4 eth-mpc-signer nodes (this repository)
 ```
-
-Steps:
 
 1. Done: the Web3Signer API, `POST /api/v1/eth2/sign/{identifier}` and
    `GET /api/v1/eth2/publicKeys` ([ethereum-signing.md](ethereum-signing.md)). It differs from the
@@ -84,14 +80,13 @@ Steps:
 2. Done: slashing protection inside the replicated state machine, the specification's rules over
    the whole history ([slashing-protection.md](slashing-protection.md)). Not done: EIP-3076
    import and export, pruning, and an anchor against whole-network rollback (designed only).
-3. Validator onboarding: the DKG group key as the validator public key, a deposit (its signature is
-   a regular signature over the deposit signing root; `DEPOSIT` is not supported by the API, and
-   needs the network's genesis fork version).
-4. Devnet: a Kurtosis `ethereum-package` args file with a validator client in remote-signer mode
-   pointing at one node's adapter (or a load balancer over the four), and the generated validator
-   keys replaced by the DKG key. A new test target drives Kurtosis (`kurtosis run`), waits for the
-   chain to finalize, and checks that the validator attests and proposes with the threshold key,
-   including while one signer node is down (reusing `TestNetwork` to run the signer nodes).
+3. Done: validator onboarding. The DKG key is activated for the devnet's chain, the MPC network
+   signs its one deposit message (`DEPOSIT`, behind `--enable-deposit-signing`), and the deposit
+   goes through the deposit contract.
+4. Done: the devnet (`integration/ethereum`, [ethereum-devnet.md](ethereum-devnet.md)). A real
+   Lighthouse validator client performs duties with the MPC network as its only signer, through a
+   development failover proxy. The run also covers a keyholder offline, a coordinator failure and
+   a coordinator crash mid-request, with acceptance checked in the beacon state.
 
 ## Anvil
 

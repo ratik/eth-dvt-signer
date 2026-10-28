@@ -40,12 +40,14 @@ fn hash_tree_roots_match_the_specification_vectors() {
         + check::<AggregateAndProofPhase0>("phase0", "AggregateAndProof")
         + check::<ForkData>("phase0", "ForkData")
         + check::<SigningData>("phase0", "SigningData")
+        + check::<DepositMessage>("phase0", "DepositMessage")
+        + check::<DepositData>("phase0", "DepositData")
         + check::<SyncAggregatorSelectionData>("altair", "SyncAggregatorSelectionData")
         + check::<SyncCommitteeContribution>("altair", "SyncCommitteeContribution")
         + check::<ContributionAndProof>("altair", "ContributionAndProof")
         + check::<AttestationElectra>("electra", "Attestation")
         + check::<AggregateAndProofElectra>("electra", "AggregateAndProof");
-    assert_eq!(cases, 39);
+    assert_eq!(cases, 45);
 }
 
 mod signing_roots {

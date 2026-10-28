@@ -259,15 +259,27 @@ fn e3_in_flight_limit() {
     network.wait_for_ready(&[0]);
     let rss_before = network.rss_kib(0);
 
+    let refused = std::sync::atomic::AtomicUsize::new(0);
     let (results, rss_during) = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..300u64)
             .map(|i| {
-                let network = &network;
-                scope.spawn(move || (i, network.sign(0, KEY, 5_000 + i, root(i as u8))))
+                let (network, refused) = (&network, &refused);
+                scope.spawn(move || {
+                    let result = network.sign(0, KEY, 5_000 + i, root(i as u8));
+                    if result.0 == 503 {
+                        refused.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    (i, result)
+                })
             })
             .collect();
         network.wait_until("256 requests in flight", || {
             network.status(0)["signing_in_flight"] == 256
+        });
+        // The pause is lifted only once every excess request was refused: a request sent later
+        // would find a slot freed by a completed one (seen as 257 signed, 43 refused).
+        network.wait_until("the other 44 requests refused", || {
+            refused.load(std::sync::atomic::Ordering::SeqCst) == 44
         });
         let rss_during = network.rss_kib(0);
         std::fs::remove_file(&pause).unwrap();

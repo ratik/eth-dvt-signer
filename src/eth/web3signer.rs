@@ -8,10 +8,11 @@
 //! decides whether a duty may be signed.
 
 use super::{
-    duty::{AggregateAndProof, Duty, ForkInfo, ValidatorKey},
+    duty::{AggregateAndProof, Duty, Fork, ForkInfo, ValidatorKey},
     types::{
         AggregateAndProofElectra, AggregateAndProofPhase0, AttestationData, BeaconBlockHeader,
-        ContributionAndProof, Root, SyncAggregatorSelectionData, VoluntaryExit, hex_bytes,
+        ContributionAndProof, DepositMessage, Root, SyncAggregatorSelectionData, Version,
+        VoluntaryExit, hex_bytes,
     },
 };
 use serde::{Deserialize, de::DeserializeOwned};
@@ -76,6 +77,20 @@ struct SyncCommitteeMessage {
     beacon_block_root: Root,
     #[serde(with = "serde_utils::quoted_u64")]
     slot: u64,
+}
+
+/// `deposit` of a `DEPOSIT` request: the deposit message and the genesis fork version.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DepositRequest {
+    #[serde(with = "hex_bytes")]
+    pubkey: [u8; 48],
+    #[serde(with = "hex_bytes")]
+    withdrawal_credentials: Root,
+    #[serde(with = "serde_utils::quoted_u64")]
+    amount: u64,
+    #[serde(with = "hex_bytes")]
+    genesis_fork_version: Version,
 }
 
 #[derive(Deserialize)]
@@ -215,6 +230,33 @@ pub fn parse_request(body: &[u8]) -> Result<Request, ParseError> {
             )?))
         }
         "VOLUNTARY_EXIT" => Duty::VoluntaryExit(field::<VoluntaryExit>(&body, "voluntary_exit")?),
+        // Fork-agnostic (`compute_domain(DOMAIN_DEPOSIT)`): the genesis fork version comes with
+        // the deposit, there is no `fork_info`.
+        "DEPOSIT" => {
+            if envelope.fork_info.is_some() {
+                return Err(ParseError::Invalid(
+                    "DEPOSIT takes `deposit.genesis_fork_version`, not `fork_info`".into(),
+                ));
+            }
+            let deposit: DepositRequest = field(&body, "deposit")?;
+            let signing_root = envelope.signing_root.as_deref().map(root).transpose()?;
+            return Ok(Request {
+                fork: ForkInfo {
+                    fork: Fork {
+                        previous_version: deposit.genesis_fork_version,
+                        current_version: deposit.genesis_fork_version,
+                        epoch: 0,
+                    },
+                    genesis_validators_root: [0; 32],
+                },
+                duty: Duty::Deposit(DepositMessage {
+                    pubkey: deposit.pubkey,
+                    withdrawal_credentials: deposit.withdrawal_credentials,
+                    amount: deposit.amount,
+                }),
+                signing_root,
+            });
+        }
         "BLOCK" => {
             return Err(ParseError::Unsupported(
                 "BLOCK (deprecated): use BLOCK_V2 with a block header".into(),

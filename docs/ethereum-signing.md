@@ -113,6 +113,7 @@ the implementation Lighthouse uses (`src/eth/types.rs`, `src/eth/duty.rs`).
 | `SYNC_COMMITTEE_SELECTION_PROOF` | `SyncAggregatorSelectionData` | `SYNC_COMMITTEE_SELECTION_PROOF` | `slot / 32` | bounded |
 | `SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF` | `ContributionAndProof` | `CONTRIBUTION_AND_PROOF` | `contribution.slot / 32` | bounded |
 | `VOLUNTARY_EXIT` | `VoluntaryExit` | `VOLUNTARY_EXIT` | `epoch` | bounded |
+| `DEPOSIT` (only with `--enable-deposit-signing`) | `DepositMessage` of the validator's own key | `DEPOSIT`, with `deposit.genesis_fork_version` and a zero genesis validators root | none (fork-agnostic) | one message per key, ever |
 
 "Bounded" duties are not slashable. A retry of the same root is free, and at most 8 distinct roots
 are authorized per validator, duty type and period. The period is the slot, or the epoch for
@@ -139,7 +140,7 @@ Unsupported, refused with `400`, never signed:
 | `type` | Why |
 | ------ | --- |
 | `VALIDATOR_REGISTRATION` | Its domain uses the network's genesis fork version, which the request does not carry. The signer has no network configuration. |
-| `DEPOSIT` | Same domain issue. A deposit is also an onboarding step, outside this API. |
+| `DEPOSIT` on a node without `--enable-deposit-signing` | Off by default (validator onboarding, [ethereum-devnet.md](ethereum-devnet.md#deposit-signing)). |
 | `BLOCK` (deprecated), `BLOCK_V2` with a whole block | Phase 0 and Altair block bodies are not implemented. |
 | `AGGREGATE_AND_PROOF_V2` with another version | Unknown container. |
 | Gloas and later types (`EXECUTION_PAYLOAD_ENVELOPE`, `PAYLOAD_ATTESTATION_MESSAGE`, ...) | Not implemented. |
@@ -202,8 +203,8 @@ of this signer (README, Ethereum compatibility).
 `400`, `404`, `412` and `500` are the codes of Web3Signer's specification. `503` and `504` are this
 signer's transient failures. A client treats them as errors, and nothing was signed. The
 `refusal` reasons are `unknown_validator`, `not_activated`, `source_after_target`, `other_chain`,
-`double_proposal`, `double_vote`, `surrounds_signed`, `surrounded_by_signed` and
-`too_many_roots`.
+`deposit_for_another_key`, `double_proposal`, `double_vote`, `surrounds_signed`,
+`surrounded_by_signed` and `too_many_roots`.
 
 ## Retries and failures
 
@@ -214,6 +215,10 @@ signer's transient failures. A client treats them as errors, and nothing was sig
   conflicting duty stays refused.
 - **Timeout before finalization.** The authorization may still finalize. A retry finds it, or
   decides it again: one finalized command is the only decision.
+- **Two nodes down at once.** Nothing is authorized while two of the four nodes are away: consensus
+  needs three. After both restart, consensus can stall several seconds more: 6.3 to 9.7 s were
+  measured when they missed a certificate ([audit.md](audit.md) L-14). New duties due meanwhile
+  are not signed in time, and are missed. Restart one node at a time.
 
 ## Development API (`dev-api` feature)
 
@@ -295,7 +300,8 @@ What still needs a running Lighthouse:
 | `SYNC_COMMITTEE_SELECTION_PROOF` | Yes | Lighthouse-computed root; Web3Signer example root; `SyncAggregatorSelectionData` spec vectors | Bounded | Signed |
 | `SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF` | Yes | Lighthouse-computed root; Web3Signer example root (written for the minimal preset; the same root with mainnet sizes); `ContributionAndProof` spec vectors | Bounded | Signed |
 | `VOLUNTARY_EXIT` | Yes | Lighthouse-computed root; Web3Signer example root; `VoluntaryExit` spec vectors | Bounded | Signed |
-| `VALIDATOR_REGISTRATION`, `DEPOSIT`, Gloas types | No (400) | — | — | Refusal (E2E and unit) |
+| `DEPOSIT` (`--enable-deposit-signing`) | Yes | Web3Signer example root; `DepositMessage` and `DepositData` spec vectors; `ssz_roots.py`; accepted by the devnet's deposit contract and beacon chain | One message per key, its own key only | Yes: signed, retried, other credentials and another key refused (E2E-ETH-10); off by default (E2E-ETH-1); a real deposit on the devnet ([ethereum-devnet.md](ethereum-devnet.md)) |
+| `VALIDATOR_REGISTRATION`, Gloas types | No (400) | — | — | Refusal (E2E and unit) |
 
 What the evidence is:
 

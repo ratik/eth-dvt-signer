@@ -77,6 +77,11 @@ struct Args {
     #[arg(long, default_value_t = 30)]
     authorization_timeout: u64,
 
+    /// Accept `DEPOSIT` signing requests through the Web3Signer API (validator onboarding). A key
+    /// signs one deposit message, ever, once activated.
+    #[arg(long)]
+    enable_deposit_signing: bool,
+
     /// Start although the consensus journal (`registry-consensus`) is missing while the node has
     /// finalized history. The node may have voted in views it no longer remembers: use only as
     /// the README's recovery procedure describes.
@@ -180,7 +185,15 @@ fn main() {
         let listener = ::tokio::net::TcpListener::bind(http)
             .await
             .expect("failed to bind HTTP listener");
-        let router = rpc::router(node.client, node.dkg, node.signer, node.recovery);
+        let router = rpc::router(
+            node.client,
+            node.dkg,
+            node.signer,
+            node.recovery,
+            rpc::Options {
+                deposit_signing: args.enable_deposit_signing,
+            },
+        );
         let rpc_handle = context.child("rpc").spawn(move |_| async move {
             if let Err(err) = axum::serve(listener, router).await {
                 error!(?err, "HTTP server failed");

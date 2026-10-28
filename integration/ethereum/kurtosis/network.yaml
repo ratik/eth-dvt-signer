@@ -1,0 +1,25 @@
+# The devnet: one execution and one consensus node, Lighthouse's own validator client with the 32
+# genesis validators, mainnet preset, 4 s slots, every fork up to Fulu at genesis (Gloas never).
+# The MPC validator joins later by a deposit (docs/ethereum-devnet.md).
+participants:
+  - el_type: geth
+    el_image: ethereum/client-go:v1.17.10
+    cl_type: lighthouse
+    cl_image: sigp/lighthouse:v8.3.2
+    vc_type: lighthouse
+    vc_image: sigp/lighthouse:v8.3.2
+    # Fulu (PeerDAS): the only beacon node must custody every data column.
+    supernode: true
+    count: 1
+network_params:
+  preset: mainnet
+  seconds_per_slot: 4
+  slot_duration_ms: 4000
+  num_validator_keys_per_node: 32
+  genesis_delay: 30
+  deneb_fork_epoch: 0
+  electra_fork_epoch: 0
+  fulu_fork_epoch: 0
+  gloas_fork_epoch: 18446744073709551615
+additional_services: []
+persistent: false

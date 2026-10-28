@@ -14,6 +14,10 @@ A 4-node threshold signer built on [commonware](https://github.com/commonwarexyz
   `(ceremony_id, nonce) -> payload_hash` once, through consensus, and returns the threshold
   signature of any 32-byte payload (see [Signing](#signing)).
 
+A real Lighthouse v8.3.2 validator client has run against it on a local proof-of-stake devnet
+(Kurtosis), as a validator whose key exists only as the network's shares
+([docs/ethereum-devnet.md](docs/ethereum-devnet.md)).
+
 **Not production-ready**: no client authentication (loopback only), development node keys, no
 independent audit, and slashing history that a rollback of every node would lose
 ([Limitations](#limitations-next-steps)).
@@ -502,10 +506,26 @@ another root, another ceremony's key); concurrent identical and conflicting requ
 coordinator dying after the authorization or holding partials; one node offline and a lagging
 node; a full restart; byzantine responses on the signing channel; refused unauthorized requests.
 
-`tests/e2e` (real processes): E2E-1 to E2E-9 below, E2E-ETH-1 to E2E-ETH-9 (`eth2.rs`: every
+Ethereum devnet with a real Lighthouse validator client (Kurtosis, inside an isolated
+Docker-in-Docker environment; about an hour per run, see
+[docs/ethereum-devnet.md](docs/ethereum-devnet.md)):
+
+```bash
+IT_HOME=~/eth-mpc-it ./integration/ethereum/scripts/run.sh
+```
+
+Every check below, in the same pinned Rust image on the same host (fmt, clippy, `cargo test`, the
+E2E suite three times, the L-1 reproducer; logs in `$IT_HOME/validation/`):
+
+```bash
+IT_HOME=~/eth-mpc-it ./integration/ethereum/scripts/env.sh validate 3
+```
+
+`tests/e2e` (real processes): E2E-1 to E2E-9 below, E2E-ETH-1 to E2E-ETH-10 (`eth2.rs`: every
 duty through the Web3Signer API, activation, slashing refusals, concurrent conflicts, a full
 restart, crashes around a duty's application, failed requests, a lagging node, nodes rolled back
-before a duty and before the activation, the authorization binding over real p2p), plus the
+before a duty and before the activation, the authorization binding over real p2p, deposit
+signing), plus the
 audit scenarios of
 [docs/audit.md](docs/audit.md) (rollback, crash boundaries, concurrency, cancellation, byzantine
 traffic, limits, lifecycle, corrupted storage) and the recovery scenarios R1-R6 of
@@ -570,8 +590,9 @@ Signing an existing authorization costs one p2p round trip and four pairings.
   signs a conflicting duty (a double proposal is reproduced). It cannot be detected without state
   outside the nodes. An anchor design is proposed, not implemented
   ([docs/slashing-protection.md](docs/slashing-protection.md)).
-- Ethereum: mainnet preset only. No validator registrations, deposits, Phase 0 and Altair blocks or
-  Gloas types. The client's fork versions are trusted for the domain (the chain is the explicit
+- Ethereum: mainnet preset only. No validator registrations, Phase 0 and Altair blocks or Gloas
+  types. Deposits only on a node started with `--enable-deposit-signing`, one deposit message per
+  key. The client's fork versions are trusted for the domain (the chain is the explicit
   activation). No EIP-3076 interchange import or export. No validator client has been run against
   the API ([docs/ethereum-signing.md](docs/ethereum-signing.md#lighthouse-v832)).
 - `POST /sign` (`dev-api` builds only) is generic authorization, not slashing protection: the
@@ -589,4 +610,7 @@ Signing an existing authorization costs one p2p round trip and four pairings.
 - Not production-ready: no independent audit, development keys, slashing history inside the
   rollback domain of the nodes, no rate limits on DKG or signing traffic beyond the p2p quotas.
 - The mempool is not persisted: requests not yet in a block are lost if their node crashes.
+- Two nodes restarted together can stall consensus for seconds after they are back (6.3 to 9.7 s
+  measured when they missed a certificate), enough to miss Ethereum duties
+  ([docs/audit.md](docs/audit.md) L-14). Restart one node at a time.
 - No state sync: a node behind by more than the retention window must be restored by hand.

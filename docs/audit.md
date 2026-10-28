@@ -46,6 +46,10 @@ processes otherwise). Passing tests are evidence, not a proof.
 | T-8 | Test harness | The E2E harness runs `target/debug/eth-mpc-signer`, a path shared by every feature set. A `cargo test` with default features (no `dev-api`), run during or between E2E runs, replaces it. Cargo copies the binary to that path only when it relinks, so a later `test-hooks` build that is up to date does not restore it, and every development API call answered `404`. Observed while validating the Web3Signer work: 20 and then 47 failures (`target/audit-logs/eth-e2e-invalid-binary-*.txt`). | `target/audit-logs/eth-e2e-invalid-binary-*.txt` | The harness now fails at once with an explanation when `/sign` is not served. Validation runs never overlap cargo builds with other features; `touch src/main.rs` forces the relink |
 | T-9 | Test logic | E2E-ETH-8 asked the rolled-back node to sign a known duty as soon as it had replayed the activation. It had not replayed the later block holding that duty's record yet, so the duty was a new authorization to it, which it correctly refused while catching up (`503 local_backlog`). Failed once in the first hardening run. | `target/audit-logs/failures/hardening-e2e-run1*` | The test waits until the node has caught up; no assertion relaxed |
 | T-7 | Test logic | Timing assumptions in the first versions: F4 damaged state at an unpinned moment (a crash before the acknowledgement is a legitimate replay), A5/A6 crash hooks on participants the coordinator did not need, D1 duplicates sent after the session had completed, scripted-peer replies read from earlier requests. | full-suite runs | Pinned with hooks (hold, freeze of a third node, `ask` drains old events); no assertion was relaxed |
+| T-10 | Test environment (exposure) | The first devnet check started Kurtosis 1.22.2's engine directly on the shared test host. The engine publishes its API, which creates containers, on `0.0.0.0`, with no option to change it, and Docker's published ports bypass a host firewall. | observed on the test host; no request reached it in our logs | Stopped after about 20 s and its 4 volumes removed; nothing else on the host was touched. The integration now runs inside one Docker-in-Docker container, alone on its network, with no published port, its inner daemon on its Unix socket only (`integration/ethereum/scripts/env.sh`). `dockerd --ip=127.0.0.1` was tried first: Kurtosis then fails, it needs host port bindings |
+| T-11 | Integration harness | First integration runs, each failing in the harness, never in the signer. Fulu needs a supernode (`kurtosis run` refused). Signer containers could not write log files created by the root driver (run 1: `environment`, node 0 not ready in 180 s). The real `cast` error was hidden by Docker's pull progress (run A: `deposit`). A retried deposit transaction was refused (`transaction indexing is in progress`, then `replacement transaction underpriced`). Foundry's `--json` receipt is an envelope. Alpine has no `/etc/machine-id` | on the test host, `$IT_HOME/failed/` and `$IT_HOME/runs/` (Kurtosis and run logs; the `cast` errors were seen in interactive output only) | Supernode; files owned by the host user; images pulled first, errors keep stdout and stderr; the deposit is sent once and its receipt polled; the envelope is unwrapped; a machine id is created. No assertion was relaxed |
+| H-8 | Hardening (liveness beyond `f = 1`) | Two nodes that missed the certificate of the view the other two had entered (restarted or rolled back together) stayed in the previous view, and the other two could not reach a quorum alone. Simplex sends that certificate only with a view's nullify retries, not with its first nullify, so consensus waited for the intact nodes' next retry: `timeout_retry`, 10 s. Found on Linux: `rollback::a2_two_node_rollback` failed 3 of 10 runs and in 1 of 3 full suites (`504`, authorization timeout 10 s). Debug logs show the split (nodes 0 and 1 in view 12, nodes 2 and 3 nullifying view 11) and the release 160 ms after the retry that carried view 11's notarization. | `a2_two_node_rollback` with `E2E_RUST_LOG=...,commonware_consensus=debug` (test host, `validation/repro-a2-1402`, `validation/debug-a2-1405`) | `timeout_retry` 3 s, checked first in commonware-consensus 2026.9.0 (the retry broadcasts `get_best_certificate()` to every peer; it re-signs the same nullify; the skip timeout, 11 s, must stay above it). The test's authorization timeout is 15 s: it checks eventual recovery beyond `f = 1`; its safety assertions are unchanged. The stall itself remains (L-14) |
+| T-12 | Test logic | `concurrency::e3_in_flight_limit` lifted its pause as soon as 256 requests were in flight, before the other 44 were refused: a request sent late found a slot freed by a completed one (`(257, 43)` instead of `(256, 44)`, one of three full suites on Linux). The limit was never exceeded. | test host, `validation/20261028T135047Z/e2e-3.txt` | The pause is lifted once all 44 are refused; the assertion stays `(256, 44)` |
 
 ## 3. Remaining issues and unsupported scenarios
 
@@ -59,6 +63,8 @@ processes otherwise). Passing tests are evidence, not a proof.
 | L-6 | No client authentication or rate limiting: any HTTP client can create authorizations and slashing records (consensus and storage cost). It can also use up a validator's slot or epoch with a duty for the wrong block or fork version, which is a liveness loss for that duty. The API binds to loopback only, with no option to expose it. The raw signing API exists only in `dev-api` builds. | Availability | design, `tests/production_api.rs` |
 | L-11 | Slashing history is never pruned. It grows by ~66 bytes per authorized duty, and every block rewrites the state partition (a block with one duty: 4.1 ms on disk with no history, 10.5 ms with 50 000 records). The surround check scans the validator's attestations with a lower target (normally all of them: 341 µs with 100 000). Pruning needs EIP-3076 low watermarks (refuse at or below the pruned range). | Performance over a validator's lifetime | design; measured in §6 |
 | L-12 | The validator client's `fork_info` is trusted for the fork versions (the domain). The chain is no longer taken from the first duty (**addressed**, H-6): it is the explicit activation. A fork version that is wrong for the activated chain gives a signature that is invalid on chain but uses the slot or epoch. Only the mainnet preset is supported. | Liveness of a duty | [ethereum-signing.md](ethereum-signing.md) |
+| L-13 | **Deposit signing is first come, once per key.** On a node started with `--enable-deposit-signing`, any client of its API obtains the key's one deposit signature, with withdrawal credentials of its choice, if nobody did before. A wrong first request (amount, credentials, genesis fork version) uses that signature for good: any other deposit message for the key is refused (`too_many_roots`). The first deposit on chain sets the credentials; later deposits to the key are top-ups to them. | Onboarding of a key; the funds of later deposits if the credentials are not the operator's | E2E-ETH-10, `slashing::tests::a_validator_signs_one_deposit_message_of_its_own_key`; mitigations: the flag is off by default and the API is loopback-only. Check the deposit's credentials on chain before funding more |
+| L-14 | **Two nodes restarted together can stall signing for seconds, enough to miss Ethereum duties.** When both missed the certificate of the view the others are in (H-8), consensus waits for the intact nodes' leader timeout (2 s), then one or more nullify retries (3 s each), then a view change. Measured on Linux, 25 runs of `a2_two_node_rollback`: longest stall after the restart p50 3.0 s, p90 8.2 s, max 9.7 s; with a split (at least 9 of 25), 6.3 to 9.7 s. With 10 s retries: up to 13.3 s, and 2 of 6 runs still stalled when the test gave up. On mainnet an attestation is due 4 s into a 12 s slot: an authorization stalled past that misses it or arrives late, and a block proposal due then is lost. Two simultaneous failures exceed `f = 1`, so no bound is guaranteed. Not implemented: a faster way for lagging peers to get the certificate (answering a nullify for an older view with that view's certificate, or advancing from marshal's finalizations). | Liveness of duties | §6, `a2_two_node_rollback` (prints the recovery time). Operational rule: restart one node at a time, and wait for it to be `ready` |
 | L-7 | **Restoring a node's consensus journal from older bytes (for example a whole data-directory backup) makes it forget its own votes.** It can then vote twice in one view (observed: `nullify` after its own `finalize`). Honest peers detect this and block it at the P2P layer for `block_duration` (1 hour), on every channel, signing included. Safety holds: consensus tolerates one equivocator, and the node still signs only what it has committed. Liveness: the node cannot catch up, coordinate or contribute partials for up to an hour; the other three continue with no spare capacity. Whether it happens depends on timing: 4 of about 32 full restores during the audit, mostly under load (it needs the node to time out a view before it fetches the certificates). Operational rule: never restore `registry-consensus` from a backup. Mitigated since (H-3): consensus resumes above the last finalization marshal durably processed, so a lost or older journal cannot repeat votes at or below it; a missing journal stops the node (H-2). Not covered: votes after that finalization, and a whole-directory restore (marshal rolled back too), which stays undetectable. | Availability of the restored node; a Byzantine fault, tolerated only within `f = 1` | `rollback::a1_full_restore_never_signs_conflict` (both outcomes), logs in `target/audit-logs/` |
 | L-8 | A test process killed with SIGKILL leaves its temporary directory (and a stale port lock, reclaimed by the next run). Its nodes do exit. | Disk, tests only | `lifecycle::f1_nodes_die_with_their_test_process` |
 | L-9 | A node uses ~320 MB resident at rest (a 160 MB page cache). 256 requests in flight add ~20 MB; 256 parked requests ~0.5 MB. | Sizing | `concurrency::e3_in_flight_limit` |
@@ -74,7 +80,8 @@ processes otherwise). Passing tests are evidence, not a proof.
 | One node's storage rolled back, consensus journal kept | Preserved: it re-learns the finalized history, refuses while stale, never signs B | After catch-up | `a1_single_node_rollback` |
 | One node behind the retained history, restored from a healthy node's partitions (own key share and consensus journal kept) | Preserved | Yes: it signs with its own share and keeps up | `recovery::lagging_node_restored_from_peer_copy` |
 | One node's whole data directory rolled back (journal included) | Preserved: never signs B, the intact nodes sign A | Not guaranteed for that node: may equivocate and be blocked for 1 hour (L-7) | `a1_full_restore_never_signs_conflict` |
-| Two nodes rolled back, consensus journals kept | Preserved in the tested case (two intact nodes online keep the finalized history; the rolled-back ones converge). **Not guaranteed in general**: two stale validators exceed `f`. | Not guaranteed | `a2_two_node_rollback` |
+| Two nodes rolled back, consensus journals kept | Preserved in the tested case (two intact nodes online keep the finalized history; the rolled-back ones converge). **Not guaranteed in general**: two stale validators exceed `f`. | Not guaranteed; in the tested case, after a stall of up to 9.7 s measured (L-14) | `a2_two_node_rollback` |
+| Two nodes restarted together (storage intact) | Preserved | Eventually. Stalled while both are down; then possibly up to the intact nodes' next nullify retries (6.3 to 9.7 s measured after the restart when they missed a certificate), enough to miss duties (L-14) | `a2_two_node_rollback` recovery measurements (§6) |
 | Quorum or whole network rolled back | **Violated** (L-1) | n/a | `a2_whole_network_rollback` (failing) |
 | State partition corrupted, deleted or restored alone | Fail closed (after BUG-2) | Node down until repaired | `f4_*` |
 | Coordinator crash | Preserved: the authorization is durable, partials are recomputed | Yes, retry on any node | `c2_*`, E2E-5, `b4_cancellation` |
@@ -91,6 +98,9 @@ processes otherwise). Passing tests are evidence, not a proof.
 | Conflicting activations, concurrent, through different nodes | Preserved: consensus applies the first; the other is refused everywhere, before and after restarts | Yes | same, `slashing_history_survives_a_full_restart` |
 | Stale or rolled-back node and the chain identity | Preserved: it refuses until it has the activation; a duty it submits for another chain is refused when ordered | After catch-up | `stale_node_cannot_authorize_another_chain`, E2E-ETH-8 |
 | Byzantine coordinator using another reference (key, ceremony, purpose, nonce) | Preserved: refused by every keyholder | Yes | `byzantine_coordinators_cannot_sign_unauthorized_duties`, E2E-ETH-9 |
+| A real validator client (Lighthouse) with one keyholder offline | Preserved | Yes: no attestation or proposal missed | devnet runs B, C and D (§6) |
+| A real validator client whose coordinator is stopped, behind a failover proxy | Preserved | Yes: the proxy fails over, no duty missed | devnet runs B, C and D |
+| A real validator client whose coordinator crashes after consensus authorized its duty (`authorized` crash point) | Preserved: the retry on another node returns the signature of the same authorization, accepted once | Yes | devnet runs B, C and D |
 
 The guarantees come from different places, which must not be confused:
 
@@ -131,6 +141,8 @@ The guarantees come from different places, which must not be confused:
 | Authorization binding | `byzantine_coordinators_cannot_sign_unauthorized_duties`, E2E-ETH-9 | Pass | Every scenario of the binding audit refused by every keyholder, in simulation and over real p2p |
 | Logarithmic attestation checks equal to the full scan | `logarithmic_checks_match_the_exhaustive_reference`, `long_histories_match_the_exhaustive_reference` | Pass | 1.5 million decisions over 5 000 seeds |
 | Quorum rollback of slashing history | `e2e_eth_l1_whole_network_rollback_signs_a_double_proposal` | **Fail** (known, L-1) | Double proposal signed |
+| Real validator duties on a beacon chain | devnet runs B, C and D (`integration/ethereum/scripts/run.sh`) | Pass | A DKG key, activated by a deposit the MPC network signed. Lighthouse v8.3.2 signs only through the Web3Signer API, with no keystore. Attestations have a correct target and head in the beacon state, and blocks are canonical and finalized (§6) |
+| One deposit message per validator key | E2E-ETH-10, `slashing::tests` | Pass | Identical retry: same signature. Other credentials: `too_many_roots`. Another key's message: `deposit_for_another_key` |
 
 Not covered precisely:
 
@@ -146,7 +158,9 @@ Not covered precisely:
 ## 6. Final runs
 
 Logs of every run below, and the directories of every failure seen during the audit (node logs and
-storage, named by test and cause), are in `target/audit-logs/`.
+storage, named by test and cause), were kept in a local `target/audit-logs/`, which has since been
+deleted. From the devnet integration on, every run is on the test host, in containers, and its
+logs stay under `$IT_HOME` there (`~/eth-mpc-it`).
 
 | Check | Result |
 | ----- | ------ |
@@ -237,6 +251,40 @@ Lighthouse compatibility, checked afterwards with Lighthouse v8.3.2's own code. 
 
 A first E2E run of this work failed in E2E-ETH-8 (T-9, test logic). It was fixed, and the three runs
 above were started from scratch.
+
+### Deposit signing, the devnet integration, and validation on Linux
+
+These checks run on the Linux test host (x86_64, 12 cores, 62 GB), in containers. The repository
+checks use `env.sh validate`, in `rust:1.99.1-bookworm`. Logs are under `~/eth-mpc-it/validation/`
+on that host. The first local checks, on macOS, matched (cargo test 97 passed, E2E 56 of 56 three
+times), but their logs went with the deleted `target/`.
+
+| Check | Result |
+| ----- | ------ |
+| First validation, `timeout_retry` 10 s (`20261028T135047Z`) | fmt, clippy (all features, default) clean; `cargo test` 97 passed (lib 51, dkg 8, eth_duties 9, eth_vectors 4, eth_web3signer 9, network 5, production_api 1, signing 10). E2E 56 of 56 in run 1; 55 of 56 in run 2 (`a2_two_node_rollback`, H-8) and run 3 (`e3_in_flight_limit`, T-12). L-1 reproducer fails: a double proposal is signed |
+| `a2_two_node_rollback` alone, 10 runs, 10 s (`repro-a2-1402`) | 7 passed, 3 failed (`504`) |
+| The same with consensus debug logs, 6 runs (`debug-a2-1405`) | 4 passed, 2 failed. Longest stall after the restart: p50 3.8 s, max 13.3 s; the failed runs were still stalled when the test gave up |
+| E2E without `a2`, e3 fixed, 3 runs (`e3fix-1407`) | 55 of 55 in each |
+| `a2` alone, 25 runs, `timeout_retry` 3 s, authorization timeout 15 s (`a2-retry3-1417`, every directory kept) | 25 of 25. Longest stall after the restart p50 3.0 s, p90 8.2 s, max 9.7 s: 16 runs within 3.9 s (no split), 6 at 6.3 to 6.5 s (one retry), 3 at 8.2 to 9.7 s. New authorization signed 0.6 to 13.4 s after the restart (p50 4.1 s); its request 0.2 to 6.1 s |
+| `e3_in_flight_limit` alone, 10 runs | 10 of 10 |
+| Second validation (`20261028T142418Z`) | fmt, clippy clean; `cargo test` 97 passed; E2E 56 of 56 in each of 3 runs (173-175 s); L-1 reproducer fails as expected |
+
+The stall is measured from node 0's log: the longest gap between finalizations after the restart
+of the second rolled-back node. The analysis script and the kept directories are on the test host.
+
+Devnet runs, details in [ethereum-devnet.md](ethereum-devnet.md#results). Runs B and C used the
+10 s retry, run D the 3 s retry and the final scripts. Logs are on the test host, in
+`~/eth-mpc-it/runs/`.
+
+| Run | Result |
+| --- | ------ |
+| Early runs (failed in the harness, T-11) | Run 1: `environment`, signer logs not writable. Run A: `deposit`, the `cast` error hidden by pull progress. The deposit was then debugged by hand |
+| B (`20261028T113358Z`) | Every scenario and check passed. 86 Lighthouse requests, all signed; 10 of 10 observed epochs attested with the correct target and head; 12 of 12 observed proposals canonical. In-flight crash after a new authorization |
+| C (`20261028T124404Z`) | Every scenario and check passed. 102 requests, all signed; 10 of 10; 9 of 9 canonical. The in-flight crash hit an existing authorization (so the scenario now re-arms). The whole-period check failed: the beacon node had pruned old states (so a recorder was added) |
+| D (`20261028T143415Z`) | Every scenario and check passed. 91 requests, all signed. Whole active period, epochs 11 to 26: 16 of 16 correct target and head, 15 of 15 proposals canonical; 18 of 18 signed blocks canonical. In-flight crash after a new authorization, on the first attempt |
+
+Latency over every Lighthouse request: p50 234 / 249 / 262 ms, p95 427 / 468 / 451, max 501 / 586 /
+595 (runs B / C / D). The attestation deadline here is 1.33 s.
 
 ## 7. Reproducing
 

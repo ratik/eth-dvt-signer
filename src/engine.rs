@@ -559,7 +559,11 @@ where
             // A leader may wait up to `MAX_IDLE` (< `LEADER_TIMEOUT`) for transactions.
             leader_timeout: LEADER_TIMEOUT,
             certification_timeout: LEADER_TIMEOUT + Duration::from_secs(1),
-            timeout_retry: Duration::from_secs(10),
+            // A view's nullify retries carry the previous view's certificate (the first nullify
+            // does not). Two nodes that missed it (restarted together) cannot enter the view, and
+            // the other two cannot reach a quorum alone: the retry is what unblocks them. 10 s
+            // stalled authorizations for up to 10 s; 3 s keeps the skip timeout above it.
+            timeout_retry: Duration::from_secs(3),
             fetch_timeout: Duration::from_secs(1),
             view_retention: ViewDelta::new(10),
             skip: SkipPolicy::Enabled {

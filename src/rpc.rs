@@ -6,6 +6,7 @@
 //! - `POST /api/v1/eth2/sign/{public key}`: sign a validator duty, under slashing protection
 //!   decided by consensus. `200` with the signature, `400` bad or unsupported request, `404`
 //!   unknown key, `412` refused by slashing protection, `503`/`504` not ready or not in time.
+//!   `DEPOSIT` (validator onboarding) only with `--enable-deposit-signing`.
 //! - `GET /upcheck`: `OK` while the HTTP server runs.
 //!
 //! Development API (`dev-api` feature only, never in a deployment):
@@ -48,7 +49,7 @@ use crate::{
     },
     engine::Recovery,
     eth::{
-        duty::{DutyRequest, format_root, format_validator},
+        duty::{Duty, DutyRequest, format_root, format_validator},
         web3signer::{parse_identifier, parse_request},
     },
     executor::{Client, Status, Stopped},
@@ -251,6 +252,15 @@ struct Api {
     dkg: dkg::Client,
     signer: coordinator::Client,
     recovery: Recovery,
+    options: Options,
+}
+
+/// What this node's API accepts beyond the defaults.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Options {
+    /// Accept `DEPOSIT` signing requests (validator onboarding). Off by default: a deposit is a
+    /// one-time operation, and the state machine signs one deposit message per key, ever.
+    pub deposit_signing: bool,
 }
 
 pub fn router(
@@ -258,6 +268,7 @@ pub fn router(
     dkg: dkg::Client,
     signer: coordinator::Client,
     recovery: Recovery,
+    options: Options,
 ) -> Router {
     let router = Router::new()
         .route("/api/v1/eth2/publicKeys", get(eth2_public_keys))
@@ -279,6 +290,7 @@ pub fn router(
         dkg,
         signer,
         recovery,
+        options,
     })
 }
 
@@ -494,6 +506,12 @@ async fn eth2_sign(
         Ok(parsed) => parsed,
         Err(err) => return eth2_error(StatusCode::BAD_REQUEST, err.to_string()),
     };
+    if matches!(request.duty, Duty::Deposit(_)) && !api.options.deposit_signing {
+        return eth2_error(
+            StatusCode::BAD_REQUEST,
+            "deposit signing is disabled on this node (--enable-deposit-signing)".into(),
+        );
+    }
     let duty = DutyRequest {
         validator,
         fork: request.fork,

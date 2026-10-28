@@ -411,7 +411,28 @@ impl<E: Clock + Spawner, S: Sender<PublicKey = PublicKey>> Coordinator<E, S> {
                 let result = match job.work {
                     Work::Payload(request) => sign(&context, &deps, request).await,
                     Work::Duty(request, expected) => {
-                        sign_duty(&context, &deps, *request, expected).await
+                        let started = context.current();
+                        let (validator, duty, slot, epoch) = (
+                            format_validator(&request.validator),
+                            request.duty.kind(),
+                            request.duty.slot(),
+                            request.duty.epoch(),
+                        );
+                        let result = sign_duty(&context, &deps, *request, expected).await;
+                        // Successes are logged by `sign_duty` ("signed validator duty").
+                        if let Err(error) = &result {
+                            warn!(
+                                %validator,
+                                ?duty,
+                                slot,
+                                epoch,
+                                coordinator = %deps.me,
+                                %error,
+                                total_ms = millis(started, context.current()),
+                                "validator duty not signed"
+                            );
+                        }
+                        result
                     }
                 };
                 drop(active);
@@ -725,8 +746,11 @@ async fn sign_duty<E: Clock, S: Sender<PublicKey = PublicKey>>(
     info!(
         validator = %format_validator(&request.validator),
         duty = ?request.duty.kind(),
+        slot = request.duty.slot(),
+        epoch = request.duty.epoch(),
         signing_root = %format_root(&signing_root),
         height,
+        coordinator = %deps.me,
         ?kind,
         ?signers,
         authorization_ms = timings.authorization_ms,

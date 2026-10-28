@@ -234,6 +234,13 @@ fn e2e_eth_1_web3signer_signs_every_supported_duty() {
     // Immutable: the same activation again changes nothing, another chain is refused.
     let (status, again) = activate(&network, 3, &key, CHAIN);
     assert_eq!((status, &again), (200, &activated));
+    // Deposit signing is off unless a node is started with `--enable-deposit-signing`.
+    let (status, answer) = sign(&network, 0, &key, &deposit(&key, 1));
+    assert_eq!(status, 400, "{answer}");
+    assert!(
+        answer["error"].as_str().unwrap().contains("disabled"),
+        "{answer}"
+    );
     let (status, answer) = activate(&network, 2, &key, &hex32(0x42));
     assert_eq!(status, 409, "{answer}");
     assert_eq!(answer["refusal"]["reason"], "other_chain", "{answer}");
@@ -716,4 +723,47 @@ fn e2e_eth_9_signing_requests_are_bound_to_their_authorization() {
             );
         }
     }
+}
+
+/// A `DEPOSIT` request for `pubkey` with withdrawal credentials `credentials` (all bytes).
+fn deposit(pubkey: &str, credentials: u8) -> Value {
+    with_root(json!({
+        "type": "DEPOSIT",
+        "deposit": {
+            "pubkey": pubkey,
+            "withdrawal_credentials": hex32(credentials),
+            "amount": "32000000000",
+            "genesis_fork_version": "0x10000038",
+        },
+    }))
+}
+
+/// E2E-ETH-10: validator onboarding. With `--enable-deposit-signing`, an activated validator key
+/// signs one deposit message of its own key, verified with blst; the same message again returns
+/// the same signature; other withdrawal credentials, or another key, are refused.
+#[test]
+fn e2e_eth_10_one_deposit_message_per_validator() {
+    let network =
+        TestNetwork::start_with_args(NODES, vec!["--enable-deposit-signing".into()], |_| {
+            Vec::new()
+        });
+    network.wait_for_ready(&network.all());
+    network.start_validator_dkg(0, VALIDATOR);
+    let key = network.wait_for_dkg(VALIDATOR, &network.all());
+
+    // Not activated: nothing, not even a deposit.
+    let (status, answer) = sign(&network, 1, &key, &deposit(&key, 1));
+    assert_eq!(status, 404, "{answer}");
+    activate_everywhere(&network, 0, &key);
+
+    let signature = signed(&network, 2, &key, &deposit(&key, 1));
+    assert_eq!(signed(&network, 3, &key, &deposit(&key, 1)), signature);
+    refused(&network, 0, &key, &deposit(&key, 2), "too_many_roots");
+    refused(
+        &network,
+        1,
+        &key,
+        &deposit(&format!("0x{}", "ab".repeat(48)), 1),
+        "deposit_for_another_key",
+    );
 }
