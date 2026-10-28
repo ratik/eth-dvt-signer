@@ -21,13 +21,15 @@ use eth_mpc_signer::{
         types::{AttestationData, BeaconBlockHeader, Checkpoint, Root},
         web3signer::parse_request,
     },
-    executor::ValidatorEntry,
     signer::{
         coordinator::{AuthorizationKind, SignError, Signed},
         wire::Refusal,
     },
-    slashing::{Decision, Refusal as Slashing},
-    types::Outcome,
+    slashing::{
+        Activation, ActivationOutcome, ActivationRefusal, ChainIdentity, Decision,
+        Refusal as Slashing,
+    },
+    types::{Outcome, SignRequest},
 };
 use std::{path::Path, time::Duration};
 
@@ -136,8 +138,16 @@ fn validator_key(ceremony: &Ceremony) -> ValidatorKey {
         .unwrap()
 }
 
-/// Complete the validator ceremony `name` and return its key, once every node lists it.
-async fn validator(
+/// The chain of the fixtures.
+fn chain() -> ChainIdentity {
+    ChainIdentity {
+        genesis_validators_root: fork().genesis_validators_root,
+    }
+}
+
+/// Complete the validator ceremony `name` and return its key, once every node lists it (not
+/// activated: it signs nothing yet).
+async fn inactive_validator(
     context: &deterministic::Context,
     cluster: &Cluster,
     name: &str,
@@ -145,13 +155,67 @@ async fn validator(
     let ceremony = complete_ceremony(context, cluster, name, true).await;
     let key = validator_key(&ceremony);
     for client in &cluster.clients {
-        let entry = ValidatorEntry {
-            key,
-            ceremony: id(name),
-            round: ceremony.round,
-        };
-        assert!(client.validators().await.unwrap().contains(&entry));
+        let entry = client
+            .validators()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.key == key)
+            .expect("listed once its ceremony completed");
+        assert_eq!(
+            (entry.ceremony, entry.round, entry.activation),
+            (id(name), ceremony.round, None)
+        );
     }
+    key
+}
+
+/// Wait until every node has applied `key`'s activation; return it.
+async fn wait_activated(
+    context: &deterministic::Context,
+    cluster: &Cluster,
+    key: ValidatorKey,
+) -> Activation {
+    let mut activations = Vec::new();
+    for client in &cluster.clients {
+        loop {
+            let entry = client
+                .validators()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|entry| entry.key == key);
+            if let Some(activation) = entry.and_then(|entry| entry.activation) {
+                activations.push(activation);
+                break;
+            }
+            context.sleep(Duration::from_millis(50)).await;
+        }
+    }
+    assert!(activations.windows(2).all(|pair| pair[0] == pair[1]));
+    activations[0]
+}
+
+/// A validator key `name`, activated for the fixtures' chain on every node.
+async fn validator(
+    context: &deterministic::Context,
+    cluster: &Cluster,
+    name: &str,
+) -> ValidatorKey {
+    let key = inactive_validator(context, cluster, name).await;
+    let receipt = cluster.clients[0]
+        .activate_validator(key, chain())
+        .await
+        .unwrap();
+    assert_eq!(receipt.outcome, ActivationOutcome::Activated);
+    let activation = wait_activated(context, cluster, key).await;
+    assert_eq!(
+        activation,
+        Activation {
+            chain: chain(),
+            height: receipt.height
+        }
+    );
     key
 }
 
@@ -179,14 +243,23 @@ async fn wait_applied(
     }
 }
 
-/// No node produces a partial signature of `root` for the validator ceremony `name`.
-async fn nobody_signs(cluster: &Cluster, name: &str, root: Root) {
+/// No node produces a partial signature of `root` with the validator ceremony `name`, as a duty
+/// of `validator` or as a development request (whatever its nonce).
+async fn nobody_signs(cluster: &Cluster, name: &str, validator: ValidatorKey, root: Root) {
     for (node, dkg) in cluster.dkg.iter().enumerate() {
+        assert_eq!(
+            dkg.partial_duty(id(name), validator, root)
+                .await
+                .unwrap()
+                .err(),
+            Some(Refusal::NotAuthorized),
+            "node {node} signed an unauthorized root"
+        );
         for nonce in [0, 1] {
             assert_eq!(
-                dkg.partial(id(name), nonce, root).await.unwrap(),
-                Err(Refusal::NotAuthorized),
-                "node {node} signed an unauthorized root (nonce {nonce})"
+                dkg.partial(id(name), nonce, root).await.unwrap().err(),
+                Some(Refusal::WrongPurpose),
+                "node {node}: a development request to a validator key (nonce {nonce})"
             );
         }
     }
@@ -229,7 +302,7 @@ fn signs_every_supported_duty() {
             .unwrap();
         assert_eq!(receipt.outcome, Outcome::ValidatorKey);
         assert_eq!(receipt.authorization, None);
-        nobody_signs(&cluster, KEY, [0xaa; 32]).await;
+        nobody_signs(&cluster, KEY, key, [0xaa; 32]).await;
     });
 }
 
@@ -285,14 +358,14 @@ fn slashing_protection_refuses_conflicting_duties() {
 
         // Refused roots are signed by nobody, however asked.
         for (request, _) in &refused {
-            nobody_signs(&cluster, KEY, request.signing_root()).await;
+            nobody_signs(&cluster, KEY, key, request.signing_root()).await;
         }
-        nobody_signs(&cluster, KEY, double.signing_root()).await;
+        nobody_signs(&cluster, KEY, key, double.signing_root()).await;
         for node in 0..4 {
             wait_applied(&context, &cluster, node, &block).await;
             assert!(
                 cluster.dkg[node]
-                    .partial(id(KEY), 0, block.signing_root())
+                    .partial_duty(id(KEY), key, block.signing_root())
                     .await
                     .unwrap()
                     .is_ok()
@@ -361,11 +434,14 @@ fn concurrent_conflicting_duties_authorize_one() {
                     "node {node}"
                 );
             }
-            nobody_signs(&cluster, KEY, loser.signing_root()).await;
+            nobody_signs(&cluster, KEY, key, loser.signing_root()).await;
         }
     });
 }
 
+/// What a Byzantine coordinator can ask of the keyholders (a request from the network goes through
+/// the same check as this node's own coordinator): the authorization-binding scenarios of
+/// docs/security-review.md, against every node.
 #[test]
 fn byzantine_coordinators_cannot_sign_unauthorized_duties() {
     runner(Duration::from_secs(900)).start(|context| async move {
@@ -376,9 +452,92 @@ fn byzantine_coordinators_cannot_sign_unauthorized_duties() {
 
         let block = proposal(first, 10, 1);
         sign(&cluster, 0, &block).await.unwrap();
+        let root = block.signing_root();
+        let duty = |name: &'static str, validator: ValidatorKey, root: Root| {
+            let cluster = &cluster;
+            move |node: usize| async move {
+                cluster.dkg[node]
+                    .partial_duty(id(name), validator, root)
+                    .await
+                    .unwrap()
+                    .err()
+            }
+        };
+        let development = |name: &'static str, nonce: u64, root: Root| {
+            let cluster = &cluster;
+            move |node: usize| async move {
+                cluster.dkg[node]
+                    .partial(id(name), nonce, root)
+                    .await
+                    .unwrap()
+                    .err()
+            }
+        };
+        for node in 0..4 {
+            wait_applied(&context, &cluster, node, &block).await;
+            // The genuine reference signs.
+            assert_eq!(duty(KEY, first, root)(node).await, None);
+            // 1. Another validator's authorization: under its key, or its ceremony.
+            assert_eq!(
+                duty("validator-other", first, root)(node).await,
+                Some(Refusal::NotAuthorized)
+            );
+            assert_eq!(
+                duty("validator-other", second, root)(node).await,
+                Some(Refusal::NotAuthorized)
+            );
+            assert_eq!(
+                duty(KEY, second, root)(node).await,
+                Some(Refusal::NotAuthorized)
+            );
+            // 2. Another ceremony with another purpose (a development key).
+            assert_eq!(
+                duty("development", first, root)(node).await,
+                Some(Refusal::WrongPurpose)
+            );
+            // 5. A root that is not authorized.
+            assert_eq!(
+                duty(KEY, first, proposal(first, 10, 2).signing_root())(node).await,
+                Some(Refusal::NotAuthorized)
+            );
+            // 6, 7. A development request to the validator key: never, with any nonce, even
+            // for a root the validator may sign.
+            for nonce in [0, 1, u64::MAX] {
+                assert_eq!(
+                    development(KEY, nonce, root)(node).await,
+                    Some(Refusal::WrongPurpose)
+                );
+            }
+        }
+
+        // 6. A development authorization of the duty's root under nonce 0: it signs with the
+        //    development key only.
+        let receipt = cluster.clients[2]
+            .submit(SignRequest {
+                ceremony: id("development"),
+                nonce: 0,
+                payload_hash: root,
+            })
+            .await
+            .unwrap();
+        assert_eq!(receipt.outcome, Outcome::Accepted);
+        for node in 0..4 {
+            while development("development", 0, root)(node).await == Some(Refusal::NotAuthorized) {
+                context.sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(development("development", 0, root)(node).await, None);
+            assert_eq!(
+                duty("development", first, root)(node).await,
+                Some(Refusal::WrongPurpose)
+            );
+            assert_eq!(
+                development(KEY, 0, root)(node).await,
+                Some(Refusal::WrongPurpose)
+            );
+        }
 
         // A coordinator skipping its own checks submits the conflict straight to consensus: the
-        // state machine refuses it.
+        // state machine refuses it, and nobody signs it.
         let double = proposal(first, 10, 2);
         let receipt = cluster.clients[1]
             .submit_duty(double.clone())
@@ -389,23 +548,8 @@ fn byzantine_coordinators_cannot_sign_unauthorized_duties() {
             Decision::Refused(Slashing::DoubleProposal { slot: 10 })
         );
         assert_eq!(receipt.signing_root, double.signing_root());
-        nobody_signs(&cluster, KEY, double.signing_root()).await;
-
-        // An authorization is for one root and one validator: the other validator's ceremony
-        // does not sign it, and a development authorization of a duty's root signs nothing with
-        // a validator key.
-        nobody_signs(&cluster, "validator-other", block.signing_root()).await;
-        let development = cluster.clients[2]
-            .submit(eth_mpc_signer::types::SignRequest {
-                ceremony: id("development"),
-                nonce: 1,
-                payload_hash: double.signing_root(),
-            })
-            .await
-            .unwrap();
-        assert_eq!(development.outcome, Outcome::Accepted);
-        nobody_signs(&cluster, KEY, double.signing_root()).await;
-        nobody_signs(&cluster, "validator-other", double.signing_root()).await;
+        nobody_signs(&cluster, KEY, first, double.signing_root()).await;
+        nobody_signs(&cluster, "validator-other", second, double.signing_root()).await;
 
         // The other validator's history is its own.
         let theirs = proposal(second, 10, 2);
@@ -426,6 +570,13 @@ fn authorization_outlives_its_coordinator() {
         let block = proposal(key, 20, 1);
         let receipt = cluster.clients[0].submit_duty(block.clone()).await.unwrap();
         assert_eq!(receipt.decision, Decision::Accepted);
+        assert_eq!(receipt.authorized_at, Some(receipt.height));
+        // The same duty submitted again is decided in a later block, and keeps the original
+        // authorization.
+        let retry = cluster.clients[3].submit_duty(block.clone()).await.unwrap();
+        assert_eq!(retry.decision, Decision::AlreadyAccepted);
+        assert!(retry.height > receipt.height);
+        assert_eq!(retry.authorized_at, Some(receipt.height));
         assert!(matches!(
             sign(&cluster, 1, &proposal(key, 20, 2)).await,
             Err(SignError::Refused(Slashing::DoubleProposal { slot: 20 }))
@@ -443,10 +594,19 @@ fn isolated_node_cannot_authorize_a_conflict() {
         let cluster = start_network(&context, RETENTION).await;
         let key = validator(&context, &cluster, KEY).await;
 
-        // Node 3 misses the authorization of the block.
+        // Node 3 misses the authorization of the block: it does not sign it either (4. a keyholder
+        // that has not applied the authorization).
         cluster.disconnect(3).await;
         let block = proposal(key, 30, 1);
         sign(&cluster, 0, &block).await.unwrap();
+        assert_eq!(
+            cluster.dkg[3]
+                .partial_duty(id(KEY), key, block.signing_root())
+                .await
+                .unwrap()
+                .err(),
+            Some(Refusal::NotAuthorized)
+        );
 
         // Its stale state does not know the block, so it tries consensus, which it cannot reach.
         let double = proposal(key, 30, 2);
@@ -466,7 +626,7 @@ fn isolated_node_cannot_authorize_a_conflict() {
             sign(&cluster, 3, &double).await,
             Err(SignError::Refused(Slashing::DoubleProposal { slot: 30 }))
         ));
-        nobody_signs(&cluster, KEY, double.signing_root()).await;
+        nobody_signs(&cluster, KEY, key, double.signing_root()).await;
         let again = sign(&cluster, 3, &block).await.unwrap();
         assert_eq!(again.kind, AuthorizationKind::Existing);
     });
@@ -474,20 +634,38 @@ fn isolated_node_cannot_authorize_a_conflict() {
 
 #[test]
 fn slashing_history_survives_a_full_restart() {
-    let ((key, signature), checkpoint) =
-        runner(Duration::from_secs(600)).start_and_recover(|context| async move {
+    let ((key, signature, activation), checkpoint) = runner(Duration::from_secs(600))
+        .start_and_recover(|context| async move {
             let cluster = start_network(&context, RETENTION).await;
             let key = validator(&context, &cluster, KEY).await;
+            let activation = wait_activated(&context, &cluster, key).await;
             let signed = sign(&cluster, 0, &proposal(key, 40, 1)).await.unwrap();
             sign(&cluster, 1, &attestation(key, 2, 5, 1)).await.unwrap();
-            (key, signed.signature)
+            (key, signed.signature, activation)
         });
 
     deterministic::Runner::from(checkpoint).start(|context| async move {
         let cluster = start_network(&context, RETENTION).await;
+        // The activation is read back as it was, and still cannot change.
         for client in &cluster.clients {
-            assert_eq!(client.validators().await.unwrap()[0].key, key);
+            let entry = client.validators().await.unwrap()[0].clone();
+            assert_eq!((entry.key, entry.activation), (key, Some(activation)));
         }
+        let receipt = cluster.clients[2]
+            .activate_validator(
+                key,
+                ChainIdentity {
+                    genesis_validators_root: [0x42; 32],
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            receipt.outcome,
+            ActivationOutcome::Refused(ActivationRefusal::OtherChain {
+                genesis_validators_root: chain().genesis_validators_root
+            })
+        );
 
         // The history decides as before the restart.
         let again = sign(&cluster, 3, &proposal(key, 40, 1)).await.unwrap();
@@ -509,5 +687,147 @@ fn slashing_history_survives_a_full_restart() {
         let signed = sign(&cluster, 0, &vote).await.unwrap();
         assert_eq!(signed.kind, AuthorizationKind::New);
         assert!(ethereum_verify(&key, &vote.signing_root(), &signed));
+    });
+}
+
+/// `request` for the chain `chain`.
+fn on_chain(mut request: DutyRequest, chain: ChainIdentity) -> DutyRequest {
+    request.fork.genesis_validators_root = chain.genesis_validators_root;
+    request
+}
+
+/// Activation is explicit, decided by consensus, and immutable: nothing is signed before it, two
+/// conflicting activations sent at once through different nodes end in one decision, and only the
+/// activated chain is signed for afterwards.
+#[test]
+fn activation_is_explicit_decided_by_consensus_and_immutable() {
+    runner(Duration::from_secs(600)).start(|context| async move {
+        let cluster = start_network(&context, RETENTION).await;
+        let key = inactive_validator(&context, &cluster, KEY).await;
+
+        // Not activated: refused through any coordinator and straight from consensus, nothing
+        // recorded, nothing signed.
+        let block = proposal(key, 64, 1);
+        for via in 0..4 {
+            assert!(matches!(
+                sign(&cluster, via, &block).await,
+                Err(SignError::Refused(Slashing::NotActivated))
+            ));
+        }
+        let receipt = cluster.clients[1].submit_duty(block.clone()).await.unwrap();
+        assert_eq!(receipt.decision, Decision::Refused(Slashing::NotActivated));
+        nobody_signs(&cluster, KEY, key, block.signing_root()).await;
+
+        // Two activations for different chains at once, through different nodes.
+        let other = ChainIdentity {
+            genesis_validators_root: [0x42; 32],
+        };
+        let (a, b) = futures::join!(
+            cluster.clients[0].activate_validator(key, chain()),
+            cluster.clients[3].activate_validator(key, other)
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        let (winner, loser) = match (a.outcome, b.outcome) {
+            (
+                ActivationOutcome::Activated,
+                ActivationOutcome::Refused(ActivationRefusal::OtherChain {
+                    genesis_validators_root,
+                }),
+            ) => {
+                assert_eq!(genesis_validators_root, chain().genesis_validators_root);
+                (chain(), other)
+            }
+            (
+                ActivationOutcome::Refused(ActivationRefusal::OtherChain {
+                    genesis_validators_root,
+                }),
+                ActivationOutcome::Activated,
+            ) => {
+                assert_eq!(genesis_validators_root, other.genesis_validators_root);
+                (other, chain())
+            }
+            outcomes => panic!("expected one activation and one refusal: {outcomes:?}"),
+        };
+        let activation = wait_activated(&context, &cluster, key).await;
+        assert_eq!(activation.chain, winner);
+
+        // The activated chain signs; the other is refused, and was never recorded.
+        let signed = sign(&cluster, 2, &on_chain(block.clone(), winner))
+            .await
+            .unwrap();
+        assert!(ethereum_verify(
+            &key,
+            &on_chain(block.clone(), winner).signing_root(),
+            &signed
+        ));
+        assert!(matches!(
+            sign(&cluster, 1, &on_chain(proposal(key, 65, 1), loser)).await,
+            Err(SignError::Refused(Slashing::OtherChain))
+        ));
+
+        // Immutable: the other chain is refused, the same one changes nothing.
+        let again = cluster.clients[2]
+            .activate_validator(key, loser)
+            .await
+            .unwrap();
+        assert_eq!(
+            again.outcome,
+            ActivationOutcome::Refused(ActivationRefusal::OtherChain {
+                genesis_validators_root: winner.genesis_validators_root
+            })
+        );
+        let same = cluster.clients[1]
+            .activate_validator(key, winner)
+            .await
+            .unwrap();
+        assert_eq!(
+            same.outcome,
+            ActivationOutcome::AlreadyActivated(activation)
+        );
+        assert_eq!(wait_activated(&context, &cluster, key).await, activation);
+    });
+}
+
+/// A node that has not applied the activation refuses every duty of the key, and a duty for
+/// another chain that it submits anyway is refused when consensus orders it.
+#[test]
+fn stale_node_cannot_authorize_another_chain() {
+    runner(Duration::from_secs(900)).start(|context| async move {
+        let cluster = start_network(&context, RETENTION).await;
+        let key = inactive_validator(&context, &cluster, KEY).await;
+
+        cluster.disconnect(3).await;
+        let receipt = cluster.clients[0]
+            .activate_validator(key, chain())
+            .await
+            .unwrap();
+        assert_eq!(receipt.outcome, ActivationOutcome::Activated);
+
+        let other = on_chain(
+            proposal(key, 64, 1),
+            ChainIdentity {
+                genesis_validators_root: [0x42; 32],
+            },
+        );
+        assert!(matches!(
+            sign(&cluster, 3, &other).await,
+            Err(SignError::Refused(Slashing::NotActivated))
+        ));
+        // Submitted straight from the stale node, decided once ordered, with the activation.
+        let (receipt, ()) = futures::join!(cluster.clients[3].submit_duty(other.clone()), async {
+            context.sleep(Duration::from_secs(2)).await;
+            cluster.connect(3).await;
+        });
+        assert_eq!(
+            receipt.unwrap().decision,
+            Decision::Refused(Slashing::OtherChain)
+        );
+        wait_activated(&context, &cluster, key).await;
+        nobody_signs(&cluster, KEY, key, other.signing_root()).await;
+
+        // Caught up, it signs for the activated chain.
+        let block = proposal(key, 64, 1);
+        let signed = sign(&cluster, 3, &block).await.unwrap();
+        assert!(ethereum_verify(&key, &block.signing_root(), &signed));
     });
 }

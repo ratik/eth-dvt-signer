@@ -6,8 +6,11 @@
 //! and the share is durably stored and verified against the agreed public polynomial.
 //!
 //! It is also the only place that produces partial signatures, and only for signing
-//! authorizations that are [Committed] on this node (see [Actor::partial]): a request, local or
-//! from the network, never authorizes anything by itself.
+//! authorizations committed on this node (see [Actor::partial]): a request, local or from the
+//! network, never authorizes anything by itself. A request names the authorization it relies on
+//! ([AuthorizationRef]); a development key's ceremony checks only development authorizations
+//! ([Committed]), a validator key's only duty authorizations of that validator
+//! ([DutyAuthorization]).
 
 use super::{
     CeremonyConfig, CeremonyId, DkgStatus, Faults, Variant,
@@ -18,9 +21,10 @@ use super::{
     signing, wire,
 };
 use crate::{
-    eth::types::Root,
+    eth::{duty::ValidatorKey, types::Root},
     executor::{self, StartReceipt, Stopped},
-    signer::wire::{self as sign_wire, Refusal},
+    signer::wire::{self as sign_wire, AuthorizationRef, Refusal},
+    slashing::DutyAuthorization,
     storage::Committed,
     types::PayloadHash,
 };
@@ -72,13 +76,15 @@ pub enum Message {
     },
     /// Authorizations of a block, sent by the executor once the block is durably committed.
     Authorized(Vec<Committed>),
-    /// Validator duty signing roots a block authorized `(ceremony round, signing root)`, sent by
-    /// the executor once the block is durably committed (with their slashing records).
-    AuthorizedDuties(Vec<(u64, Root)>),
+    /// Validator duty signing roots a block authorized, sent by the executor once the block is
+    /// durably committed (they are its slashing records).
+    AuthorizedDuties(Vec<DutyAuthorization>),
+    /// Ceremony rounds a block started as validator keys, sent before anything else of it.
+    ValidatorRounds(Vec<u64>),
     /// This node's partial signature for an authorization (from its own coordinator).
     Partial {
         ceremony: CeremonyId,
-        nonce: u64,
+        authorization: AuthorizationRef,
         payload_hash: PayloadHash,
         response: oneshot::Sender<Result<PartialSignature<Variant>, Refusal>>,
     },
@@ -187,7 +193,7 @@ impl Client {
         receiver.await.map_err(|_| Stopped)
     }
 
-    /// This node's partial signature of `payload_hash` under the authorization
+    /// This node's partial signature of `payload_hash` under the development authorization
     /// `(ceremony, nonce)`. Refused unless that exact authorization is committed on this node: it
     /// is the same check a signing request from the network goes through.
     pub async fn partial(
@@ -196,11 +202,37 @@ impl Client {
         nonce: u64,
         payload_hash: PayloadHash,
     ) -> Result<Result<PartialSignature<Variant>, Refusal>, Stopped> {
+        self.partial_with(
+            ceremony,
+            AuthorizationRef::Development { nonce },
+            payload_hash,
+        )
+        .await
+    }
+
+    /// This node's partial signature of validator `validator`'s duty with `signing_root`.
+    pub async fn partial_duty(
+        &self,
+        ceremony: CeremonyId,
+        validator: ValidatorKey,
+        signing_root: Root,
+    ) -> Result<Result<PartialSignature<Variant>, Refusal>, Stopped> {
+        self.partial_with(ceremony, AuthorizationRef::Duty { validator }, signing_root)
+            .await
+    }
+
+    /// This node's partial signature of `payload_hash` under `authorization` of `ceremony`.
+    pub async fn partial_with(
+        &self,
+        ceremony: CeremonyId,
+        authorization: AuthorizationRef,
+        payload_hash: PayloadHash,
+    ) -> Result<Result<PartialSignature<Variant>, Refusal>, Stopped> {
         let (response, receiver) = oneshot::channel();
         self.actor
             .send(Message::Partial {
                 ceremony,
-                nonce,
+                authorization,
                 payload_hash,
                 response,
             })
@@ -278,9 +310,12 @@ pub struct Actor<
     participants: BTreeMap<u64, Set<PublicKey>>,
     /// Signing authorizations committed on this node, by `(round, nonce)`.
     authorizations: HashMap<(u64, u64), Committed>,
-    /// Validator duty signing roots committed on this node, with the round of the ceremony that
-    /// signs them. A validator key's ceremony has only these, a development key's only the above.
-    duty_roots: HashSet<(u64, Root)>,
+    /// Ceremony rounds started as validator keys: they sign only duty authorizations.
+    validator_rounds: HashSet<u64>,
+    /// The ceremony round that holds each validator key.
+    validators: HashMap<ValidatorKey, u64>,
+    /// Validator duty signing roots committed on this node (their slashing records), by key.
+    duty_roots: HashSet<(ValidatorKey, Root)>,
     parked: Parked,
     /// Blocks applied since start.
     blocks: u64,
@@ -303,7 +338,8 @@ impl<
         mailbox: mpsc::UnboundedReceiver<Message>,
         initial: Vec<Ceremony>,
         authorizations: Vec<Committed>,
-        duty_roots: Vec<(u64, Root)>,
+        validator_rounds: Vec<u64>,
+        duties: Vec<DutyAuthorization>,
     ) -> Self {
         Self {
             context: ContextCell::new(context),
@@ -324,7 +360,15 @@ impl<
                 .into_iter()
                 .map(|committed| ((committed.round(), committed.nonce()), committed))
                 .collect(),
-            duty_roots: duty_roots.into_iter().collect(),
+            validator_rounds: validator_rounds.into_iter().collect(),
+            validators: duties
+                .iter()
+                .map(|duty| (duty.validator, duty.round))
+                .collect(),
+            duty_roots: duties
+                .iter()
+                .map(|duty| (duty.validator, duty.signing_root))
+                .collect(),
             parked: Parked::default(),
             blocks: 0,
         }
@@ -354,17 +398,21 @@ impl<
                     let _ = response.send(self.share_status(&id));
                 }
                 Message::Authorized(committed) => self.authorized(committed),
-                Message::AuthorizedDuties(roots) => {
-                    self.duty_roots.extend(roots);
+                Message::AuthorizedDuties(duties) => {
+                    for duty in duties {
+                        self.validators.insert(duty.validator, duty.round);
+                        self.duty_roots.insert((duty.validator, duty.signing_root));
+                    }
                     self.release_parked();
                 }
+                Message::ValidatorRounds(rounds) => self.validator_rounds.extend(rounds),
                 Message::Partial {
                     ceremony,
-                    nonce,
+                    authorization,
                     payload_hash,
                     response,
                 } => {
-                    let _ = response.send(self.partial(&ceremony, nonce, &payload_hash));
+                    let _ = response.send(self.partial(&ceremony, &authorization, &payload_hash));
                 }
                 Message::SignRequest { from, request } => self.on_sign_request(from, request),
                 Message::Health { response } => {
@@ -699,12 +747,17 @@ impl<
         }
     }
 
-    /// The only way to a partial signature: `(ceremony, nonce)` must be authorized in this node's
-    /// committed state, for exactly `payload_hash`, and the node must hold a verified share.
+    /// The only way to a partial signature. The node must hold a verified share of `ceremony`,
+    /// the ceremony's purpose must be the authorization's, and that authorization must be
+    /// committed in this node's state for exactly `payload_hash`:
+    ///
+    /// - development `(ceremony, nonce)`: its committed payload;
+    /// - duty of `validator`: the ceremony holds the validator's key (its current round), and the
+    ///   root is one of the validator's slashing records.
     fn partial(
         &self,
         ceremony: &CeremonyId,
-        nonce: u64,
+        authorization: &AuthorizationRef,
         payload_hash: &PayloadHash,
     ) -> Result<PartialSignature<Variant>, Refusal> {
         let &round = self.ids.get(ceremony).ok_or(Refusal::UnknownCeremony)?;
@@ -715,20 +768,34 @@ impl<
                 Refusal::NotCompleted
             });
         };
-        // A validator duty: its exact signing root was authorized, under slashing protection, for
-        // the key this ceremony signs for.
-        if self.duty_roots.contains(&(round, *payload_hash)) {
-            return Ok(signing::Message::Ethereum(*payload_hash).partial_sign(share));
+        let validator_key = self.validator_rounds.contains(&round);
+        match authorization {
+            AuthorizationRef::Development { nonce } => {
+                if validator_key {
+                    return Err(Refusal::WrongPurpose);
+                }
+                let authorization = self
+                    .authorizations
+                    .get(&(round, *nonce))
+                    .ok_or(Refusal::NotAuthorized)?;
+                if authorization.payload_hash() != payload_hash {
+                    return Err(Refusal::Conflict);
+                }
+                // Sign what consensus authorized, as an Ethereum signing root.
+                Ok(signing::Message::Ethereum(*authorization.payload_hash()).partial_sign(share))
+            }
+            AuthorizationRef::Duty { validator } => {
+                if !validator_key {
+                    return Err(Refusal::WrongPurpose);
+                }
+                if self.validators.get(validator) != Some(&round)
+                    || !self.duty_roots.contains(&(*validator, *payload_hash))
+                {
+                    return Err(Refusal::NotAuthorized);
+                }
+                Ok(signing::Message::Ethereum(*payload_hash).partial_sign(share))
+            }
         }
-        let authorization = self
-            .authorizations
-            .get(&(round, nonce))
-            .ok_or(Refusal::NotAuthorized)?;
-        if authorization.payload_hash() != payload_hash {
-            return Err(Refusal::Conflict);
-        }
-        // Sign what consensus authorized, as an Ethereum signing root.
-        Ok(signing::Message::Ethereum(*authorization.payload_hash()).partial_sign(share))
     }
 
     /// Answer a peer's signing request: a partial signature or a refusal. A request whose
@@ -744,7 +811,11 @@ impl<
                 .is_some_and(|participants| participants.position(&from).is_some())
         });
         let result = if member {
-            self.partial(&request.ceremony, request.nonce, &request.payload_hash)
+            self.partial(
+                &request.ceremony,
+                &request.authorization,
+                &request.payload_hash,
+            )
         } else {
             Err(Refusal::NotParticipant)
         };
@@ -760,11 +831,11 @@ impl<
             Err(reason) => {
                 match reason {
                     Refusal::NotAuthorized => {
-                        debug!(peer = ?from, ceremony = %request.ceremony, nonce = request.nonce, "signing request not authorized here (yet)");
+                        debug!(peer = ?from, ceremony = %request.ceremony, authorization = ?request.authorization, "signing request not authorized here (yet)");
                         self.park(from.clone(), request.clone());
                     }
                     _ => {
-                        info!(peer = ?from, ceremony = %request.ceremony, nonce = request.nonce, %reason, "refused signing request");
+                        info!(peer = ?from, ceremony = %request.ceremony, authorization = ?request.authorization, %reason, "refused signing request");
                     }
                 }
                 sign_wire::Message::Refused {
@@ -799,10 +870,15 @@ impl<
     fn release_parked(&mut self) {
         let (ids, authorizations, duty_roots) = (&self.ids, &self.authorizations, &self.duty_roots);
         let ready = self.parked.take(|request| {
-            ids.get(&request.ceremony).is_some_and(|round| {
-                authorizations.contains_key(&(*round, request.nonce))
-                    || duty_roots.contains(&(*round, request.payload_hash))
-            })
+            ids.get(&request.ceremony)
+                .is_some_and(|round| match request.authorization {
+                    AuthorizationRef::Development { nonce } => {
+                        authorizations.contains_key(&(*round, nonce))
+                    }
+                    AuthorizationRef::Duty { validator } => {
+                        duty_roots.contains(&(validator, request.payload_hash))
+                    }
+                })
         });
         for (from, request) in ready {
             self.on_sign_request(from, request);

@@ -2,7 +2,8 @@
 
 use crate::{
     dkg::{CeremonyConfig, CeremonyId, MAX_PARTICIPANTS, ceremony::SignedLog},
-    eth::duty::DutyRequest,
+    eth::duty::{DutyRequest, ValidatorKey},
+    slashing::ChainIdentity,
 };
 use bytes::{Buf, BufMut};
 use commonware_codec::{Encode, EncodeSize, Error, Read, ReadExt, Write, varint::UInt};
@@ -78,6 +79,11 @@ pub enum Command {
     /// Authorize an Ethereum validator duty (the state machine computes its signing root and
     /// applies slashing protection).
     Duty(Box<DutyRequest>),
+    /// Activate a validator key for an Ethereum chain: once, immutably. It signs nothing before.
+    ActivateValidator {
+        validator: ValidatorKey,
+        chain: ChainIdentity,
+    },
 }
 
 // `SignedLog` only implements `PartialEq`, but its equality is a full equivalence.
@@ -107,6 +113,11 @@ impl Write for Command {
                 4u8.write(buf);
                 request.write(buf);
             }
+            Self::ActivateValidator { validator, chain } => {
+                5u8.write(buf);
+                buf.put_slice(validator);
+                buf.put_slice(&chain.genesis_validators_root);
+            }
         }
     }
 }
@@ -124,6 +135,21 @@ impl Read for Command {
             }),
             3 => Ok(Self::StartValidatorCeremony(CeremonyConfig::read(buf)?)),
             4 => Ok(Self::Duty(Box::new(DutyRequest::read(buf)?))),
+            5 => {
+                if buf.remaining() < 48 + 32 {
+                    return Err(Error::EndOfBuffer);
+                }
+                let mut validator = [0; 48];
+                buf.copy_to_slice(&mut validator);
+                let mut genesis_validators_root = [0; 32];
+                buf.copy_to_slice(&mut genesis_validators_root);
+                Ok(Self::ActivateValidator {
+                    validator,
+                    chain: ChainIdentity {
+                        genesis_validators_root,
+                    },
+                })
+            }
             tag => Err(Error::InvalidEnum(tag)),
         }
     }
@@ -137,6 +163,7 @@ impl EncodeSize for Command {
             Self::DealerLog { round, log } => UInt(*round).encode_size() + log.encode_size(),
             Self::StartValidatorCeremony(config) => config.encode_size(),
             Self::Duty(request) => request.encode_size(),
+            Self::ActivateValidator { .. } => 48 + 32,
         }
     }
 }

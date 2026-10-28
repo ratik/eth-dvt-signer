@@ -1,0 +1,1 @@
+{"type":"AGGREGATION_SLOT","fork_info":{"fork":{"previous_version":"0x05000000","current_version":"0x06000000","epoch":"411392"},"genesis_validators_root":"0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673"},"signingRoot":"0x5e66024038ee02983b9e6e3898f69cbaf6c04c6892a66c48485832627dd48cf2","aggregation_slot":{"slot":"13164867"}}

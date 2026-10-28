@@ -43,9 +43,28 @@ The same root again is `ALREADY_ACCEPTED`. It is signed without a new record, so
 Before the rules, in this order:
 
 1. The key must be a validator key of the state (`unknown_validator`).
-2. An attestation with `source > target` can never be signed (`source_after_target`, `400`).
-3. A validator's first authorized duty pins its chain, the `genesis_validators_root` of the request.
-   A duty for another chain is refused (`other_chain`).
+2. It must be activated (`not_activated`).
+3. An attestation with `source > target` can never be signed (`source_after_target`, `400`).
+4. The request's `genesis_validators_root` must be the activated chain's (`other_chain`).
+
+## Activation and chain identity
+
+A validator key signs nothing until an `ActivateValidator {validator key, chain identity}` command
+is decided by consensus (`POST /validators/activate`; [ethereum-signing.md](ethereum-signing.md)).
+The chain identity is the `genesis_validators_root`. The activation and the block height that
+decided it are stored in the validator's entry, written in that block's sync with the rest of it.
+
+- **Once.** The first activation decided is the only one. The same identity again is
+  `AlreadyActivated` and changes nothing. Another identity is refused (`other_chain`), before or
+  after any signature, and after restarts. Concurrent activations are ordered by consensus.
+- **Explicit.** No duty activates a key: a duty for an inactive key is refused and records nothing.
+- **Keyed by validator, not ceremony.** Like the history, the activation stays with the key if its
+  ceremony changes.
+- **Earlier data.** The previous version pinned the chain implicitly, with a validator's first
+  signed duty. Such a validator (stored with the previous record layout) is read as not activated.
+  Its pinned chain is kept only to refuse an activation for another chain (`recorded_chain`). It
+  signs nothing, and its recorded roots are not signed again, until an operator activates it
+  explicitly. Nothing is migrated automatically.
 
 Decisions are deterministic functions of the committed state and the command. Each node computes
 the signing root itself from the typed duty and `fork_info` (`DutyRequest::signing_root`). A root
@@ -64,22 +83,46 @@ returns the existing ceremony.
 ```
 finalized block ──> Store::apply_block
    for each Duty command: Protection::authorize ──> decision, computed root, changed records
-   ──> one Metadata sync: records + authorization + ceremonies + block height (all or nothing)
-   ──> executor hands (ceremony round, root) of authorized duties to the keyholder
+   ──> one Metadata sync: records + activations + ceremonies + block height (all or nothing)
+   ──> executor hands DutyAuthorization {validator key, ceremony round, root} to the keyholder
    ──> only then: answers to clients
-keyholder (dkg::actor::partial): signs root R with the share of ceremony round r
-   only if (r, R) is in its set of committed duty authorizations
+keyholder (dkg::actor::partial), request {ceremony, Duty {validator key}, root R}:
+   signs only if the ceremony is a validator key's, it is the round holding that key, and
+   (key, R) is among the key's committed records
 ```
 
-- A signing root becomes authorized only with its slashing record. There is no code path that
-  writes one without the other, and no signing path that does not check the keyholder's set.
-- The keyholder's set is built at startup from the committed state (`Protection::authorized_roots`)
-  and extended only after each sync. A partial request for any other root gets `not_authorized`,
-  whoever asks and however (HTTP, p2p, a Byzantine coordinator). Authorizations are scoped to the
-  ceremony of the key: a root authorized for one validator is not signed with another validator's
-  key, nor through a development authorization of the same bytes.
-- Validator keys never sign generic payloads. The `Sign` command on a validator ceremony is
-  refused by the state machine (`Outcome::ValidatorKey`), and the development API answers `403`.
+- **One object.** For a duty, the signing authorization *is* the slashing record: there is no
+  second store that could hold one without the other. The keyholder's set is derived from the
+  records (`Protection::authorized_duties`, activated validators only) at startup, and extended
+  only after each sync. A request cannot be authorized by a record whose authorization is missing,
+  or the reverse; a startup check refuses a state where records exist without an activation.
+- **Refusals record nothing.** A refused duty changes no record and reaches no keyholder.
+- **Scoped.** A partial request for any other root, another key, another ceremony or another
+  purpose is refused (`not_authorized`, `wrong_purpose`), whoever asks and however (HTTP, p2p, a
+  Byzantine coordinator). The binding audit is in [security-review.md](security-review.md).
+- **Purposes.** Validator keys never sign development payloads. The `Sign` command on a validator
+  ceremony is refused by the state machine (`Outcome::ValidatorKey`), the development API answers
+  `403`, and a keyholder refuses a development request to a validator ceremony (`wrong_purpose`).
+
+## Consistency invariants
+
+For slashable duties:
+
+- a durable signing authorization implies a durable slashing record (they are one entry);
+- a slashing conflict implies no signing authorization (a refusal writes nothing).
+
+Checked deterministically, at the storage level, with the real commit path:
+
+| Situation | Result | Test |
+| --------- | ------ | ---- |
+| A block with several duties, two of them conflicting | the first authorized, the second refused, only the first handed to the keyholder | `storage::tests::validator::duties_and_their_history_survive_restart` |
+| The same duty repeated in a later block | `ALREADY_ACCEPTED`: no new record, the original height | same |
+| Crash after finalization, before application | nothing written; the block is applied on restart | E2E-ETH-4 (`before-apply-authorization`) |
+| Crash during application (torn newest copy, not acknowledged) | the previous state; the block applied again gives identical decisions and records | `storage::tests::validator::a_torn_duty_block_is_applied_again_identically` |
+| Crash after application, before answering | written; the keyholder is seeded from disk | E2E-ETH-4 (`after-apply-authorization`) |
+| Client retry after a timeout or a hang-up | the original authorization, the conflict still refused | E2E-ETH-5, `authorization_outlives_its_coordinator` |
+| Another coordinator for the retry | the same | E2E-ETH-5, `signs_every_supported_duty` |
+| Records altered on disk | the node does not start | `storage::tests::validator::altered_history_fails_closed` (9 alterations) |
 
 ## Storage
 
@@ -89,23 +132,56 @@ next to the authorizations, written in the same commit:
 | Key prefix | Entry | Value |
 | ---------- | ----- | ----- |
 | 3 | `(round, 0)` | the ceremony `round` was started as a validator key |
-| 4 | `(validator id, 0)` | key, ceremony round, pinned chain, number of records |
+| 4 | `(validator id, 0)` | key, ceremony round, activation (genesis validators root, height), chain pinned by the previous version, number of records |
 | 5 | `(validator id, slot)` | proposal: signing root, height |
 | 6 | `(validator id, target epoch)` | attestation: source epoch, signing root, height |
 | 16 + duty type | `(validator id, period)` | up to 8 signing roots with their heights |
 
 The format version did not change. A state written before these entries existed reads as a state
-without validators. An older binary does not start on a state that has them, and does not ignore
+without validators. A validator entry in the previous layout (value tag 3) reads as not activated
+(above); entries are written in the current layout (tag 7). An older binary does not start on a state that has them, and does not ignore
 them. It either cannot decode the new value types (commonware's `Metadata::init` panics on a copy
 whose checksum is valid but whose values do not decode, before writing anything), or it reports
 the new key prefix as an unknown entry (`refusing to start`).
 
 Nothing is pruned. The history grows by one entry per new authorized duty (about 66 bytes, key
-included), and each block rewrites the state partition (`Metadata`). Measured on one machine:
-applying a block with one new duty takes 4.1 ms with no history and 10.5 ms with 50 000 records
-(3.3 MB). The decision for a new attestation scans the validator's attestations with a lower
-target: 22 µs with 10 000, 341 µs with 100 000. Pruning needs EIP-3076-style low
-watermarks: refuse anything at or below the pruned range. It is not implemented.
+included), and each block that adds an entry rewrites the state partition (`Metadata`).
+
+### Attestation checks
+
+The authorized attestations of a validator are pairwise neither double votes nor surround votes:
+each was checked against all those authorized before it. So their targets are distinct, and their
+sources never decrease as targets increase. If `t1 < t2` and `s2 < s1`, the second surrounds the
+first. For a candidate `(s, t)`:
+
+- it surrounds a recorded attestation if and only if the recorded one with the greatest target
+  below `t` has a source above `s`. That one has the greatest source of all those below `t`;
+- a recorded attestation surrounds it if and only if the one with the smallest target above `t`
+  has a source below `s`. That one has the smallest source of all those above `t`;
+- a double vote or a retry is the entry at target `t`.
+
+So the decision reads three neighbours in the ordered history, in O(log n), with exactly the
+rules of the full scan. Authorizing a candidate that passes keeps the order. The order is not an
+extra index: it is a property of the canonical history, checked at startup (a decreasing source
+fails closed). A refusal names the nearest conflicting attestation, where the full scan named the
+one with the lowest target; both are real conflicts. The full scan is kept in the tests as the
+reference. Randomized differential tests compare the two, with double votes, both surround
+directions, equal sources and targets, large epoch gaps, out-of-order requests, retries, invalid
+attestations, long histories and a history restored from storage. 1.5 million decisions over 5 000
+seeds agreed.
+
+Measured on one machine (release build):
+
+| History (attestations and proposals) | 1 000 | 10 000 | 100 000 |
+| ------------------------------------ | ----- | ------ | ------- |
+| new attestation decision, full scan (before) | 4.0 µs | 21.7 µs | 341 µs |
+| new attestation decision, ordered neighbours (now) | 2.1 µs | 2.2 µs | 2.2 µs |
+
+The 2 µs are mostly the signing root. Applying a block with one new duty on disk is unchanged by
+this, because it is dominated by the state rewrite: 4.5 ms with 1 000 records, 5.8 ms with
+10 000, 10.9 ms with 50 000 and 19.5 ms with 100 000 (6.6 MB). That is the remaining limit.
+Pruning needs EIP-3076-style low watermarks (refuse anything at or below the pruned range), and an
+append-only layout would avoid the rewrite. Neither is implemented.
 
 ## Startup checks (fail closed)
 
@@ -118,7 +194,10 @@ and refuses to start (`refusing to start`, exit status 1, storage left as is) wh
 - a validator's number of records differs from the records stored: history is missing or added;
 - a validator signs with a ceremony that was not started as a validator key;
 - a completed validator ceremony has no validator entry for its key, or a validator's key is not
-  its ceremony's group key.
+  its ceremony's group key;
+- a validator has records but no chain identity (its activation was lost);
+- an attestation's source is after its target, or a validator's attestations surround each other
+  (sources decreasing as targets increase): the history was altered.
 
 These checks are added to the recovery checks of [recovery.md](recovery.md) §2: the state must not
 be behind the finalized blocks the node acknowledged, and every share must have its ceremony. A
@@ -133,7 +212,7 @@ counts change together. That is the same class as a rollback.
 | ----- | ---------------- | ------- |
 | Crash before a duty's block is applied | Not written; the block is re-delivered by marshal and applied on restart | Nothing was signed from it here |
 | Crash after the sync, before the keyholder or client learns | Written; on restart the block is skipped and the keyholder is seeded from disk | Signs it once restarted |
-| Torn write of the newest state copy | The previous copy is used; it is behind marshal's progress, so the node refuses to start (recovery.md §2) | — |
+| Torn write of the newest state copy | The previous copy is used. If the block was not acknowledged to marshal yet, it is delivered and applied again, with identical decisions; if it was, the state is behind marshal's progress and the node refuses to start (recovery.md §2) | Nothing was signed from the lost write |
 | Coordinator crash with 2 partials | Unaffected | A retry anywhere signs the same root (`EXISTING`) |
 | Restart of every node | Read from disk, verified | Same decisions as before |
 | One node restored from an older backup (consensus journal kept) | A prefix; replayed from the finalized chain | Refuses unapplied roots; never decides from stale history alone: a duty it submits is decided by consensus |
@@ -201,8 +280,11 @@ watermarks.
 | What | Tests |
 | ---- | ----- |
 | Rules: proposals, double and surround votes in both directions, history older than the latest attestation, bounded duties, other chain, invalid and unknown | `slashing::tests` (unit) |
-| Records persist with the authorization; purposes stay separate; decisions identical after restart; restarting a validator ceremony resets nothing | `storage::tests::validator::duties_and_their_history_survive_restart` |
-| Startup refuses a lost proposal or attestation, a lost validator or validator purpose, records of an unknown validator, a replaced key, a corrupt entry | `storage::tests::validator::altered_history_fails_closed` |
-| Every duty signed and verified; refusals; root mismatch; another chain; concurrent conflicts; a Byzantine coordinator; scoping to a validator; a failed coordinator; an isolated node; a full restart | `tests/eth_duties.rs` (4 simulated nodes) |
-| The same over HTTP on real processes, plus crashes before and after applying a duty, a coordinator crash with 2 partials, a client hanging up after authorization, a lagging node, a rolled-back node | `tests/e2e/eth2.rs` (E2E-ETH-1 to 7) |
+| Activation: required, once, immutable, unknown keys; chains pinned by the previous version | `slashing::tests::a_validator_signs_only_once_activated_and_for_its_chain`, `a_chain_pinned_by_an_earlier_version_must_be_confirmed`, `storage::tests::validator::legacy_validator_records_are_not_activated` |
+| Ordered-neighbour attestation checks against the full scan | `slashing::tests::logarithmic_checks_match_the_exhaustive_reference` (`SLASHING_SEEDS=<n>`), `long_histories_match_the_exhaustive_reference` |
+| Records persist with the authorization; activation persists; purposes stay separate; decisions identical after restart; restarting a validator ceremony resets nothing | `storage::tests::validator::duties_and_their_history_survive_restart` |
+| A torn duty block is applied again identically | `storage::tests::validator::a_torn_duty_block_is_applied_again_identically` |
+| Startup refuses a lost proposal or attestation, a lost validator, validator purpose or activation, records of an unknown validator, a replaced key, a corrupt entry, surrounding attestations | `storage::tests::validator::altered_history_fails_closed` |
+| Every duty signed and verified; refusals; root mismatch; another chain; concurrent conflicts; activation (explicit, concurrent, immutable, after restart); a stale node and another chain; the authorization-binding scenarios; a failed coordinator; an isolated node; a full restart | `tests/eth_duties.rs` (4 simulated nodes) |
+| The same over HTTP on real processes, plus activation, crashes before and after applying a duty, a coordinator crash with 2 partials, a client hanging up after authorization, a lagging node, a rolled-back node (before a duty and before the activation), the binding on the wire | `tests/e2e/eth2.rs` (E2E-ETH-1 to 9) |
 | Whole-network rollback | `eth2::e2e_eth_l1_whole_network_rollback_signs_a_double_proposal` (ignored, fails) |

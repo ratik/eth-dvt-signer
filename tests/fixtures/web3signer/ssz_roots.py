@@ -3,9 +3,11 @@ code with the signer (Python standard library only), to cross-check fixtures who
 did not publish.
 
     python3 -I ssz_roots.py [--minimal] FILE.json...
+    python3 -I ssz_roots.py --write-block-fixtures DIRECTORY
 
 Prints the computed signing root and the request's `signingRoot` for each file. `--minimal` uses
 the minimal preset's list and vector limits (Web3Signer's contribution example is written for it).
+`--write-block-fixtures` writes the per-fork BLOCK_V2 requests (see `block_fixtures`).
 """
 
 import hashlib
@@ -193,7 +195,60 @@ def signing_root(request, p):
     return container(root, domain)
 
 
+# Mainnet fork versions and epochs (Lighthouse v8.3.2 `ChainSpec::mainnet`), in order.
+MAINNET_FORKS = [
+    ("PHASE0", "0x00000000", 0),
+    ("ALTAIR", "0x01000000", 74240),
+    ("BELLATRIX", "0x02000000", 144896),
+    ("CAPELLA", "0x03000000", 194048),
+    ("DENEB", "0x04000000", 269568),
+    ("ELECTRA", "0x05000000", 364032),
+    ("FULU", "0x06000000", 411392),
+]
+
+# The genesis validators root of Web3Signer's examples (the other fixtures).
+GENESIS_VALIDATORS_ROOT = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673"
+
+
+def block_fixtures(out_dir):
+    """One BLOCK_V2 request per fork from Bellatrix to Fulu, as Lighthouse v8.3.2 builds it:
+    `Web3SignerObject::beacon_block` sends `{version, block_header}` from Bellatrix on, and the
+    fork info is `ChainSpec::fork_at_epoch(block epoch)` (the fork's previous and current versions
+    and its epoch). Full and blinded blocks give the same header, hence the same request."""
+    for index, (name, version, epoch) in enumerate(MAINNET_FORKS):
+        if index < 2:
+            continue  # Phase 0 and Altair send the whole block.
+        previous = MAINNET_FORKS[index - 1][1]
+        slot = (epoch + 1) * SLOTS_PER_EPOCH + index
+        request = {
+            "type": "BLOCK_V2",
+            "fork_info": {
+                "fork": {"previous_version": previous, "current_version": version, "epoch": str(epoch)},
+                "genesis_validators_root": GENESIS_VALIDATORS_ROOT,
+            },
+            "signingRoot": None,
+            "beacon_block": {
+                "version": name,
+                "block_header": {
+                    "slot": str(slot),
+                    "proposer_index": str(1000 + index),
+                    "parent_root": "0x" + bytes([index] * 32).hex(),
+                    "state_root": "0x" + bytes([0x10 + index] * 32).hex(),
+                    "body_root": "0x" + bytes([0x20 + index] * 32).hex(),
+                },
+            },
+        }
+        request["signingRoot"] = "0x" + signing_root(request, preset(False)).hex()
+        path = f"{out_dir}/block_v2_mainnet_{name.lower()}.json"
+        with open(path, "w") as file:
+            file.write(json.dumps(request, separators=(",", ":")) + "\n")
+        print(f"wrote {path}")
+
+
 def main(args):
+    if args[:1] == ["--write-block-fixtures"]:
+        block_fixtures(args[1])
+        return
     minimal = "--minimal" in args
     p = preset(minimal)
     for path in (arg for arg in args if arg != "--minimal"):

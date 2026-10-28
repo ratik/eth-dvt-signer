@@ -227,3 +227,93 @@ fn identifiers_are_48_byte_hex_keys() {
         assert!(parse_identifier(bad).is_err(), "{bad}");
     }
 }
+
+#[test]
+fn block_headers_of_every_supported_fork_reproduce_their_roots() {
+    // Lighthouse v8.3.2 (`Web3SignerObject::beacon_block`) sends `block_header` from Bellatrix on,
+    // with `fork_at_epoch(block epoch)` as the fork. Roots from `ssz_roots.py`, which shares no
+    // code with the signer.
+    for (fork, current_version) in [
+        ("bellatrix", [2, 0, 0, 0]),
+        ("capella", [3, 0, 0, 0]),
+        ("deneb", [4, 0, 0, 0]),
+        ("electra", [5, 0, 0, 0]),
+        ("fulu", [6, 0, 0, 0]),
+    ] {
+        let value = fixture(&format!("block_v2_mainnet_{fork}.json"));
+        let request = parse(&value).unwrap_or_else(|err| panic!("{fork}: {err}"));
+        assert_eq!(request.duty.kind(), DutyKind::BlockProposal, "{fork}");
+        // The block is in its fork: the domain uses the current version.
+        assert_eq!(
+            request.fork.version_at(request.duty.epoch()),
+            current_version,
+            "{fork}"
+        );
+        let expected = value["signingRoot"].as_str().unwrap();
+        assert_eq!(
+            format_root(&request.duty.signing_root(&request.fork)),
+            expected,
+            "{fork}"
+        );
+    }
+}
+
+fn lighthouse(name: &str) -> Value {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/lighthouse")
+        .join(name);
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+/// Requests produced by Lighthouse v8.3.2's own code (`tests/fixtures/lighthouse/README.md`): the
+/// parser accepts each supported one, and the signing root it computes is the one Lighthouse
+/// computed.
+#[test]
+fn lighthouse_produced_requests_reproduce_lighthouse_roots() {
+    let cases = [
+        ("block_v2_bellatrix.json", DutyKind::BlockProposal),
+        ("block_v2_capella.json", DutyKind::BlockProposal),
+        ("block_v2_deneb.json", DutyKind::BlockProposal),
+        ("block_v2_electra.json", DutyKind::BlockProposal),
+        ("block_v2_fulu.json", DutyKind::BlockProposal),
+        ("attestation.json", DutyKind::Attestation),
+        ("randao_reveal.json", DutyKind::RandaoReveal),
+        ("aggregation_slot.json", DutyKind::AggregationSlot),
+        (
+            "aggregate_and_proof_phase0.json",
+            DutyKind::AggregateAndProof,
+        ),
+        (
+            "aggregate_and_proof_electra.json",
+            DutyKind::AggregateAndProof,
+        ),
+        (
+            "sync_committee_message.json",
+            DutyKind::SyncCommitteeMessage,
+        ),
+        (
+            "sync_committee_selection_proof.json",
+            DutyKind::SyncSelectionProof,
+        ),
+        (
+            "contribution_and_proof.json",
+            DutyKind::ContributionAndProof,
+        ),
+        ("voluntary_exit.json", DutyKind::VoluntaryExit),
+    ];
+    for (name, kind) in cases {
+        let value = lighthouse(name);
+        let request = parse(&value).unwrap_or_else(|err| panic!("{name}: {err}"));
+        assert_eq!(request.duty.kind(), kind, "{name}");
+        assert_eq!(
+            format_root(&request.duty.signing_root(&request.fork)),
+            value["signingRoot"].as_str().unwrap(),
+            "{name}: Lighthouse's root"
+        );
+    }
+    // Lighthouse sends an Altair block whole: refused, not misread.
+    assert!(matches!(
+        parse(&lighthouse("block_v2_altair_full_block.json")),
+        Err(ParseError::Unsupported(_))
+    ));
+}

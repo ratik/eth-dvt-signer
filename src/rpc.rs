@@ -30,8 +30,14 @@
 //! No endpoint ever returns or accepts private key shares or partial signatures. Request parsing
 //! (hex, JSON) stays here: the signer core only sees [SignRequest].
 //!
-//! This API is for development and tests: it has no authentication and signs any root it is
-//! given (no slashing protection). The node binds it to loopback only.
+//! Validator keys (operations, not part of the Web3Signer API):
+//!
+//! - `GET /validators`: every validator key with a completed ceremony, and its activation.
+//! - `POST /validators/activate` `{"public_key": "0x..", "genesis_validators_root": "0x.."}`:
+//!   activates the key for that chain, through consensus. A key signs nothing before, and only for
+//!   that chain after; the activation never changes (`409` for another chain).
+//!
+//! There is no authentication: the node binds this API to loopback only.
 
 use crate::{
     dkg::{
@@ -42,13 +48,13 @@ use crate::{
     },
     engine::Recovery,
     eth::{
-        duty::{DutyRequest, format_validator},
+        duty::{DutyRequest, format_root, format_validator},
         web3signer::{parse_identifier, parse_request},
     },
     executor::{Client, Status, Stopped},
     readiness::{Readiness, Reason, State as ReadinessState},
     signer::coordinator::{self, SignError},
-    slashing::Refusal as DutyRefusal,
+    slashing::{ActivationOutcome, ActivationRefusal, ChainIdentity, Refusal as DutyRefusal},
 };
 #[cfg(feature = "dev-api")]
 use crate::{
@@ -261,7 +267,9 @@ pub fn router(
         .route("/ready", get(ready))
         .route("/dkg/start", post(dkg_start))
         .route("/dkg/status/{ceremony_id}", get(dkg_status))
-        .route("/dkg/public-key/{ceremony_id}", get(dkg_public_key));
+        .route("/dkg/public-key/{ceremony_id}", get(dkg_public_key))
+        .route("/validators", get(validators))
+        .route("/validators/activate", post(activate_validator));
     #[cfg(feature = "dev-api")]
     let router = router
         .route("/sign", post(sign))
@@ -274,14 +282,174 @@ pub fn router(
     })
 }
 
+/// The keys this network signs for: activated validator keys only.
 async fn eth2_public_keys(State(api): State<Api>) -> Result<Json<Vec<String>>, ApiError> {
     let validators = api.client.validators().await.map_err(unavailable)?;
     Ok(Json(
         validators
             .iter()
+            .filter(|validator| validator.activation.is_some())
             .map(|validator| format_validator(&validator.key))
             .collect(),
     ))
+}
+
+#[derive(Serialize)]
+struct ValidatorResponse {
+    public_key: String,
+    ceremony_id: String,
+    /// `active`: signs duties for `genesis_validators_root`; `inactive`: signs nothing.
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    genesis_validators_root: Option<String>,
+    /// Height of the block that activated it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activated_at: Option<u64>,
+}
+
+impl From<&crate::executor::ValidatorEntry> for ValidatorResponse {
+    fn from(entry: &crate::executor::ValidatorEntry) -> Self {
+        Self {
+            public_key: format_validator(&entry.key),
+            ceremony_id: entry.ceremony.to_string(),
+            status: if entry.activation.is_some() {
+                "active"
+            } else {
+                "inactive"
+            },
+            genesis_validators_root: entry
+                .activation
+                .map(|activation| format_root(&activation.chain.genesis_validators_root)),
+            activated_at: entry.activation.map(|activation| activation.height),
+        }
+    }
+}
+
+async fn validators(State(api): State<Api>) -> Result<Json<Vec<ValidatorResponse>>, ApiError> {
+    let validators = api.client.validators().await.map_err(unavailable)?;
+    Ok(Json(
+        validators.iter().map(ValidatorResponse::from).collect(),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivateBody {
+    public_key: String,
+    genesis_validators_root: String,
+}
+
+#[derive(Serialize)]
+struct ActivationError {
+    error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refusal: Option<ActivationRefusal>,
+}
+
+fn activation_error(
+    status: StatusCode,
+    error: String,
+    refusal: Option<ActivationRefusal>,
+) -> Response {
+    (status, Json(ActivationError { error, refusal })).into_response()
+}
+
+/// The activation of `key` as committed on this node, as an answer.
+async fn committed_validator(
+    api: &Api,
+    key: &[u8; 48],
+) -> Result<Option<ValidatorResponse>, ApiError> {
+    let validators = api.client.validators().await.map_err(unavailable)?;
+    Ok(validators
+        .iter()
+        .find(|validator| &validator.key == key)
+        .map(ValidatorResponse::from))
+}
+
+async fn activate_validator(State(api): State<Api>, Json(body): Json<ActivateBody>) -> Response {
+    let key = match parse_identifier(&body.public_key) {
+        Ok(key) => key,
+        Err(err) => return activation_error(StatusCode::BAD_REQUEST, err.to_string(), None),
+    };
+    let Some(genesis_validators_root) = body
+        .genesis_validators_root
+        .strip_prefix("0x")
+        .and_then(|digits| hex::decode(digits).ok())
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+    else {
+        return activation_error(
+            StatusCode::BAD_REQUEST,
+            "genesis_validators_root must be 32 bytes of 0x-hex".into(),
+            None,
+        );
+    };
+    let chain = ChainIdentity {
+        genesis_validators_root,
+    };
+    // The committed state first: a repeated activation needs no consensus, and one for another
+    // chain is refused for good.
+    let committed = match api.client.validators().await {
+        Ok(validators) => validators
+            .into_iter()
+            .find(|validator| validator.key == key),
+        Err(err) => {
+            return activation_error(StatusCode::SERVICE_UNAVAILABLE, err.to_string(), None);
+        }
+    };
+    match committed
+        .as_ref()
+        .and_then(|validator| validator.activation)
+    {
+        Some(activation) if activation.chain == chain => {
+            return Json(ValidatorResponse::from(committed.as_ref().expect("found")))
+                .into_response();
+        }
+        Some(activation) => {
+            let refusal = ActivationRefusal::OtherChain {
+                genesis_validators_root: activation.chain.genesis_validators_root,
+            };
+            return activation_error(StatusCode::CONFLICT, refusal.to_string(), Some(refusal));
+        }
+        None => {}
+    }
+    let receipt =
+        tokio::time::timeout(SUBMIT_TIMEOUT, api.client.activate_validator(key, chain)).await;
+    let receipt = match receipt {
+        Ok(Ok(receipt)) => receipt,
+        Ok(Err(err)) => {
+            return activation_error(StatusCode::SERVICE_UNAVAILABLE, err.to_string(), None);
+        }
+        Err(_) => {
+            return activation_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "activation not finalized in time (it may still be)".into(),
+                None,
+            );
+        }
+    };
+    match receipt.outcome {
+        ActivationOutcome::Activated | ActivationOutcome::AlreadyActivated(_) => {
+            match committed_validator(&api, &key).await {
+                Ok(Some(validator)) => Json(validator).into_response(),
+                Ok(None) => activation_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "activated validator not found".into(),
+                    None,
+                ),
+                Err((status, error)) => activation_error(status, error, None),
+            }
+        }
+        ActivationOutcome::Refused(refusal @ ActivationRefusal::UnknownValidator) => {
+            activation_error(
+                StatusCode::NOT_FOUND,
+                "unknown validator public key (is its ceremony completed?)".into(),
+                Some(refusal),
+            )
+        }
+        ActivationOutcome::Refused(refusal) => {
+            activation_error(StatusCode::CONFLICT, refusal.to_string(), Some(refusal))
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -354,7 +522,9 @@ async fn eth2_sign(
         }
     };
     let status = match &error {
-        SignError::UnknownValidator | SignError::Refused(DutyRefusal::UnknownValidator) => {
+        // A key this network does not sign for (yet): unknown, or not activated.
+        SignError::UnknownValidator
+        | SignError::Refused(DutyRefusal::UnknownValidator | DutyRefusal::NotActivated) => {
             StatusCode::NOT_FOUND
         }
         SignError::RootMismatch(_) | SignError::Refused(DutyRefusal::SourceAfterTarget { .. }) => {

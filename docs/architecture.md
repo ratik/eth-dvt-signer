@@ -10,12 +10,15 @@ Coordinator             src/signer/coordinator  authorization (consensus if need
                                                 collection, recovery, verification. Knows nothing
                                                 about HTTP.
         │ executor messages / signing p2p channel
-Replicated state        src/executor, storage,  duties: signing root computed from the typed duty,
-                        src/slashing            slashing rules, record; development requests:
-                                                (ceremony, nonce) -> payload. Decided by consensus,
-                                                committed atomically per block.
-Keyholder               src/dkg/actor           shares; signs only committed authorizations:
-                                                (ceremony, root) for duties, Committed for the rest.
+Replicated state        src/executor, storage,  validator activations (chain identity, once);
+                        src/slashing            duties: signing root computed from the typed duty,
+                                                activation, chain and slashing rules, record;
+                                                development requests: (ceremony, nonce) -> payload.
+                                                Decided by consensus, committed atomically per block.
+Keyholder               src/dkg/actor           shares; signs only committed authorizations of the
+                                                kind a request names: (validator key, root) for a
+                                                validator key's ceremony, (ceremony, nonce) for a
+                                                development key's.
 Crypto                  src/dkg/signing         Ethereum ciphersuite over raw 32-byte roots.
 Ethereum types          src/eth                 containers, SSZ hash_tree_root, domains, roots.
 ```

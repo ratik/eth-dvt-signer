@@ -16,7 +16,7 @@
 //! is an optimization only: coordinators on different nodes may aggregate the same authorized
 //! payload independently, and consensus alone decides what is authorized.
 
-use super::wire::{self, Refusal, Request};
+use super::wire::{self, AuthorizationRef, Refusal, Request};
 use crate::{
     dkg::{self, CeremonyId, DkgStatus, Variant, ceremony::Ceremony, signing},
     eth::{
@@ -538,7 +538,19 @@ async fn sign<E: Clock, S: Sender<PublicKey = PublicKey>>(
     hooks::pause_point(context, "authorized").await;
 
     // 2. Partial signatures from any `threshold` participants.
-    let collected = collect(context, deps, &ceremony, &output, &request, authorization).await?;
+    let reference = AuthorizationRef::Development {
+        nonce: request.nonce,
+    };
+    let collected = collect(
+        context,
+        deps,
+        &ceremony,
+        &output,
+        &request,
+        reference,
+        authorization,
+    )
+    .await?;
 
     // 3. Group signature.
     let threshold_at = context.current();
@@ -655,26 +667,45 @@ async fn sign_duty<E: Clock, S: Sender<PublicKey = PublicKey>>(
                 Decision::AlreadyAccepted => AuthorizationKind::Existing,
                 Decision::Refused(refusal) => return Err(SignError::Refused(refusal)),
             };
-            (receipt.signing_root, receipt.height, kind)
+            // A retry decided in a later block keeps the original authorization.
+            let height = receipt.authorized_at.unwrap_or(receipt.height);
+            (receipt.signing_root, height, kind)
         }
     };
     hooks::crash_point("authorized");
     hooks::pause_point(context, "authorized").await;
 
-    // 2. Partial signatures of exactly that root, from the ceremony that signs for the key.
+    // 2. Partial signatures of exactly that root, from the ceremony that signs for the key: each
+    //    participant checks the duty authorization of this validator in its own state.
     let found = lookup(&deps.executor, validator.ceremony.clone(), 0).await?;
     let ceremony = found.ceremony.ok_or(SignError::UnknownValidator)?;
     let output = ceremony.output.clone().ok_or(SignError::UnknownValidator)?;
+    if output.public().public().encode().as_ref() != request.validator.as_slice() {
+        return Err(SignError::UnknownValidator);
+    }
     let authorization = Authorization {
         payload_hash: signing_root,
         height,
     };
+    // `nonce` is not used for duties: the wire request names the validator instead.
     let payload = SignRequest {
         ceremony: validator.ceremony,
         nonce: 0,
         payload_hash: signing_root,
     };
-    let collected = collect(context, deps, &ceremony, &output, &payload, authorization).await?;
+    let reference = AuthorizationRef::Duty {
+        validator: request.validator,
+    };
+    let collected = collect(
+        context,
+        deps,
+        &ceremony,
+        &output,
+        &payload,
+        reference,
+        authorization,
+    )
+    .await?;
 
     // 3. The validator's signature, checked against its public key.
     let threshold_at = context.current();
@@ -730,16 +761,13 @@ async fn collect<E: Clock, S: Sender<PublicKey = PublicKey>>(
     ceremony: &Ceremony,
     output: &Output<Variant, PublicKey>,
     request: &SignRequest,
+    reference: AuthorizationRef,
     authorization: Authorization,
 ) -> Result<Collected, SignError> {
     let participants = &ceremony.config.participants;
     let threshold = output.public().required() as usize;
     let message = signing::Message::Ethereum(request.payload_hash);
-    let wire_request = Request::new(
-        request.ceremony.clone(),
-        request.nonce,
-        request.payload_hash,
-    );
+    let wire_request = Request::with(request.ceremony.clone(), reference, request.payload_hash);
     let id = wire_request.id;
     let (token, mut responses) = deps.pending.register(id);
     let _registration = Registration {
@@ -763,7 +791,7 @@ async fn collect<E: Clock, S: Sender<PublicKey = PublicKey>>(
     deps.keyholder
         .send(dkg::actor::Message::Partial {
             ceremony: request.ceremony.clone(),
-            nonce: request.nonce,
+            authorization: reference,
             payload_hash: request.payload_hash,
             response,
         })

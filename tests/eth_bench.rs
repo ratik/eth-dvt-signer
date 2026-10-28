@@ -11,7 +11,7 @@ use eth_mpc_signer::{
         types::{AttestationData, BeaconBlockHeader, Checkpoint},
         web3signer::parse_request,
     },
-    slashing::{Decision, Protection},
+    slashing::{ActivationOutcome, ChainIdentity, Decision, Protection},
 };
 use std::{hint::black_box, path::Path, time::Instant};
 
@@ -87,6 +87,13 @@ fn history(epochs: u64) -> Protection {
     let mut protection = Protection::default();
     protection.designate(0);
     protection.register(0, KEY);
+    let chain = ChainIdentity {
+        genesis_validators_root: fork().genesis_validators_root,
+    };
+    assert_eq!(
+        protection.activate(&KEY, chain, 0).0,
+        ActivationOutcome::Activated
+    );
     for epoch in 1..=epochs {
         let (_, decision, _) = protection.authorize(&attestation(epoch - 1, epoch), epoch);
         assert_eq!(decision, Decision::Accepted);

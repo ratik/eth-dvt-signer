@@ -35,9 +35,12 @@ struct DutyRequest {
 }
 ```
 
-The state machine computes the signing root and decides the duty with the validator's slashing
-history ([docs/slashing-protection.md](docs/slashing-protection.md)): no second block for a slot, no
-double vote and no surround vote. The decision and the record are committed together.
+A validator key signs nothing until it is activated, once and immutably, for one chain (its
+genesis validators root), by an `ActivateValidator` command decided by consensus. The state machine
+computes the signing root and decides the duty with the validator's activation and slashing history
+([docs/slashing-protection.md](docs/slashing-protection.md)): only the activated chain, no second
+block for a slot, no double vote and no surround vote. The decision and the record are committed
+together.
 
 A generic authorization, for development keys (`dev-api`):
 
@@ -337,7 +340,10 @@ Validator keys and the Web3Signer API ([docs/ethereum-signing.md](docs/ethereum-
 ```bash
 curl -s localhost:8080/dkg/start -H 'content-type: application/json' \
   -d '{"ceremony_id": "validator-eth", "validator": true}'
-curl -s localhost:8081/api/v1/eth2/publicKeys          # ["0xa1b2.."] once completed
+curl -s localhost:8081/validators                      # [{"public_key":"0xa1b2..","status":"inactive",..}]
+curl -s localhost:8081/validators/activate -H 'content-type: application/json' \
+  -d '{"public_key": "0xa1b2..", "genesis_validators_root": "0x0470.."}'   # once, through consensus
+curl -s localhost:8081/api/v1/eth2/publicKeys          # ["0xa1b2.."] once activated
 curl -s localhost:8082/api/v1/eth2/sign/0xa1b2.. -H 'content-type: application/json' \
   -H 'accept: application/json' -d @tests/fixtures/web3signer/attestation.json
 # {"signature":"0x8f3e..(96 bytes)"}
@@ -348,7 +354,7 @@ curl -s localhost:8082/api/v1/eth2/sign/0xa1b2.. -H 'content-type: application/j
 | ------------------------------ | ---- |
 | signed | 200 (`{"signature"}`, or `text/plain` without `Accept: application/json`) |
 | malformed or unsupported request, `signingRoot` different from the computed root | 400 |
-| unknown validator key | 404 |
+| unknown validator key, or a key that is not activated | 404 |
 | refused by slashing protection | 412 (with `refusal.reason`) |
 | not ready, too few signers, busy | 503 |
 | authorization or signing timeout | 504 |
@@ -477,25 +483,29 @@ duplicate submissions, a restart of every node from disk, pruning of old history
 Ethereum signing ([docs/ethereum-signing.md](docs/ethereum-signing.md#compatibility-evidence)):
 - `tests/eth_vectors.rs`: `hash_tree_root` of 39 consensus-spec-tests `ssz_static` cases (vendored
   in `tests/vectors`), and signing roots that Web3Signer publishes for its examples;
-- `tests/eth_web3signer.rs`: request parsing on Lighthouse-shaped fixtures
-  (`tests/fixtures/web3signer`, roots cross-checked by `ssz_roots.py`, an independent Python
-  implementation), unsupported and malformed requests;
+- `tests/eth_web3signer.rs`: request parsing on the Web3Signer examples and on requests produced
+  by Lighthouse v8.3.2's own code (`tests/fixtures/lighthouse`, with its generator), each root
+  compared with Lighthouse's and with `ssz_roots.py` (an independent Python implementation);
+  unsupported and malformed requests;
 - `tests/eth_duties.rs`: duties over the simulated network, each signature verified with blst
   against the validator key. It covers every supported duty, every slashing refusal, concurrent
-  conflicting duties through different nodes, a Byzantine coordinator, a failed coordinator, an
-  isolated node and a full restart;
+  conflicting duties through different nodes, activation (explicit, concurrent, immutable, after
+  a restart, with a stale node), the authorization-binding scenarios of a Byzantine coordinator, a
+  failed coordinator, an isolated node and a full restart. `SIM_SEED=<n>` runs another schedule;
 - `tests/production_api.rs`: a default build serves the Web3Signer API and no raw signing route;
-- unit tests: `slashing::tests` (the rules), `storage::tests::validator` (persistence, purposes,
-  startup refusal of altered history).
+- unit tests: `slashing::tests` (the rules, activation, and the logarithmic attestation checks
+  against the full scan, `SLASHING_SEEDS=<n>`), `storage::tests::validator` (persistence,
+  activation, purposes, earlier data, a torn duty block, startup refusal of altered history).
 
 `tests/signing.rs`: signing through the coordinator, verified with blst (combinations of signers,
 another root, another ceremony's key); concurrent identical and conflicting requests; a
 coordinator dying after the authorization or holding partials; one node offline and a lagging
 node; a full restart; byzantine responses on the signing channel; refused unauthorized requests.
 
-`tests/e2e` (real processes): E2E-1 to E2E-9 below, E2E-ETH-1 to E2E-ETH-7 (`eth2.rs`: every
-duty through the Web3Signer API, slashing refusals, concurrent conflicts, a full restart, crashes
-around a duty's application, failed requests, a lagging node and a rolled-back node), plus the
+`tests/e2e` (real processes): E2E-1 to E2E-9 below, E2E-ETH-1 to E2E-ETH-9 (`eth2.rs`: every
+duty through the Web3Signer API, activation, slashing refusals, concurrent conflicts, a full
+restart, crashes around a duty's application, failed requests, a lagging node, nodes rolled back
+before a duty and before the activation, the authorization binding over real p2p), plus the
 audit scenarios of
 [docs/audit.md](docs/audit.md) (rollback, crash boundaries, concurrency, cancellation, byzantine
 traffic, limits, lifecycle, corrupted storage) and the recovery scenarios R1-R6 of
@@ -531,19 +541,19 @@ Web3Signer API, same run (`eth2_latency`, 100 requests each):
 
 | ms | p50 | p95 | p99 | min | max | mean |
 | --- | --- | --- | --- | --- | --- | --- |
-| new attestation (consensus, slashing decision, signing), client round trip | 349 | 572 | 633 | 249 | 668 | 380 |
-| &nbsp;&nbsp;of which consensus (`authorization_ms`) | 302 | 525 | 590 | 199 | 632 | 336 |
-| &nbsp;&nbsp;of which partials (`collect_ms`) | 11 | 38 | 45 | 4 | 146 | 15 |
-| same attestation again (signing only) | 6.7 | 14.0 | 30.8 | 6.4 | 70.6 | 8.3 |
-| new block proposal, client round trip | 373 | 570 | 623 | 146 | 630 | 391 |
+| new attestation (consensus, slashing decision, signing), client round trip | 352 | 580 | 603 | 250 | 631 | 390 |
+| &nbsp;&nbsp;of which consensus (`authorization_ms`) | 315 | 531 | 553 | 213 | 561 | 347 |
+| &nbsp;&nbsp;of which partials (`collect_ms`) | 10 | 29 | 39 | 4 | 139 | 14 |
+| same attestation again (signing only) | 6.8 | 10.9 | 16.1 | 6.4 | 30.0 | 7.4 |
+| new block proposal, client round trip | 351 | 564 | 590 | 225 | 636 | 369 |
 
-The same run's development API, for comparison: new authorization p50 384 ms (p99 586), already
-authorized p50 6.7 ms, one node offline p99 2247 ms. A duty costs what a generic authorization
+The same run's development API, for comparison: new authorization p50 368 ms (p99 617), already
+authorized p50 6.7 ms, one node offline p99 2146 ms. A duty costs what a generic authorization
 costs: consensus dominates. Computing a signing root takes 0.5-6 µs (4-17 µs with JSON parsing).
-The slashing decision for a new attestation is linear in the validator's recorded attestations:
-2 µs with none, 22 µs with 10 000, 341 µs with 100 000. Proposals stay at 1.5 µs. Applying a block
-with one new duty on disk takes 4.1 ms with no history and 10.5 ms with 50 000 records (3.3 MB of
-state): the cost of never pruning (L-11).
+The slashing decision for a new attestation takes about 2 µs whatever the history (2.2 µs with
+100 000 attestations; it was linear before). Applying a block with one new duty on disk takes
+4.1 ms with no history and 19.5 ms with 100 000 records (6.6 MB of state): the cost of rewriting
+the state partition and never pruning (L-11).
 
 Authorization is one or two consensus views; each view is dominated by disk syncs (consensus
 journal, marshal archives, the state commit), not by the network. With a node offline, the requests
@@ -561,9 +571,9 @@ Signing an existing authorization costs one p2p round trip and four pairings.
   outside the nodes. An anchor design is proposed, not implemented
   ([docs/slashing-protection.md](docs/slashing-protection.md)).
 - Ethereum: mainnet preset only. No validator registrations, deposits, Phase 0 and Altair blocks or
-  Gloas types. A validator's chain is pinned by its first duty, not by configuration. No EIP-3076
-  interchange import or export. No validator client has been run against the API
-  ([docs/ethereum-signing.md](docs/ethereum-signing.md#compatibility-evidence)).
+  Gloas types. The client's fork versions are trusted for the domain (the chain is the explicit
+  activation). No EIP-3076 interchange import or export. No validator client has been run against
+  the API ([docs/ethereum-signing.md](docs/ethereum-signing.md#lighthouse-v832)).
 - `POST /sign` (`dev-api` builds only) is generic authorization, not slashing protection: the
   nonce is caller-chosen, and the caller computes the signing root.
 - Authorizations and slashing history are kept forever, and every new one rewrites the state

@@ -39,9 +39,46 @@ fault-model table are in [audit.md](audit.md).
 | Slashing record and authorization out of step | Not possible: both are written in the one atomic commit of their block. The keyholder learns of a duty only after that commit; at startup it is seeded from the committed state. | Implemented, tested (crash points, E2E-ETH-4) |
 | Validator key through the development API, or a development key through the Web3Signer API | No. The purpose is fixed by consensus when the ceremony starts. A `Sign` command on a validator ceremony is refused by the state machine (`ValidatorKey`). A development key is not a validator (`404`). The development API is not compiled into default builds. | Implemented, tested (`storage::tests::validator`, E2E-ETH-1, `tests/production_api.rs`) |
 | Cross-validator and cross-purpose replay | A duty authorization is scoped to the key's ceremony round: another validator's ceremony, or a development authorization of the same bytes, does not sign it. | Implemented, tested (`tests/eth_duties.rs`) |
-| Chain confusion | A validator's first authorized duty pins its genesis validators root. Duties for another chain are refused. The domain also separates chains. | Implemented, tested |
+| Chain confusion | A validator key signs nothing until an explicit activation for one chain (genesis validators root), decided by consensus, stored with the key, immutable. Duties for another chain are refused, and the domain also separates chains. A wrong first duty can no longer pin the wrong chain. Data of the previous version (chain pinned by the first duty) is read as not activated, and must be activated explicitly for the same chain. | Implemented, tested (`slashing::tests`, `tests/eth_duties.rs`, E2E-ETH-1, E2E-ETH-8) |
 | Slashing history lost or altered on disk | Startup refuses missing or extra records (per-validator counts), unknown validators, keys that do not match their ceremony, and corrupt entries. A consistent rewrite of the history of 2 or more nodes, or a rollback of every node, is not detected: a double proposal is reproduced (`e2e_eth_l1_*`, ignored). | Partial: see [slashing-protection.md](slashing-protection.md) |
 | Signing-domain separation | Ethereum signatures use the POP ciphersuite DST over the raw root. The internal domain uses another DST, and nothing exposed signs in it. DKG transcripts are signed with the ed25519 node keys. | Implemented, tested (unit, blst) |
+
+## Signing authorization binding
+
+The signing transport is shared by validator duties and development requests, so whether a
+partial signature can only be produced for the authorization it claims was audited end to end. The
+partial and group signatures cover the 32-byte signing root alone, as Ethereum requires, so
+nothing else can be bound cryptographically into them. The binding is structural: who signs, with
+which share, and under which committed authorization.
+
+| Property | How it is bound |
+| -------- | --------------- |
+| Validator public key | Wire request `AuthorizationRef::Duty {validator}` (in the request id). The keyholder requires `(key, root)` among the key's records. The coordinator checks the ceremony's group key is the key. |
+| Active ceremony id and round | The keyholder resolves the ceremony id to its round and requires it to be the round holding the key, and the ceremony to be a validator key's. |
+| Ethereum chain identity | The state machine refuses roots for another chain than the activated one. The domain of the root contains the genesis validators root. |
+| Duty type | The domain of the root (domain type) and the object; slashing rules per type. |
+| Signing root | Computed by every node from the typed duty; compared, never taken from the client. |
+| Durable authorization | The slashing record itself (one entry), committed with its block; the keyholder's set is derived from the records. |
+
+Adversarial coordinator scenarios (a request from the network goes through the same check as the
+node's own coordinator; tests: `tests/eth_duties.rs::byzantine_coordinators_cannot_sign_unauthorized_duties`,
+`isolated_node_cannot_authorize_a_conflict`, E2E-ETH-9 over real p2p):
+
+| Scenario | Before (protocol 1) | Now (protocol 2) |
+| -------- | ------------------- | ---------------- |
+| 1. Reuse another validator's authorization | Rejected by an explicit check: duty roots were scoped to the ceremony round | Rejected by explicit checks: the validator key in the request must be held by that round, and the root must be among that key's records (`not_authorized`) |
+| 2. Reuse another ceremony's authorization | Rejected (round scope) | Rejected: round and key checks; a development ceremony refuses any duty request (`wrong_purpose`) |
+| 3. Reuse one from a previous ceremony round of the validator | Impossible by construction (no resharing; a new ceremony has a new key), but an old round's in-memory roots were not invalidated if a key's round changed | Rejected by an explicit check: the key's current round only; still unreachable (no resharing) |
+| 4. Ask a keyholder that has not applied the authorization | Rejected (`not_authorized`, request parked until applied) | Same |
+| 5. Ask for an unauthorized root | Rejected | Rejected |
+| 6. Use `nonce = 0` to mix development and duty authorizations | **Possible, harmless:** the duty check ignored the nonce, so a "development" request with any nonce for an authorized duty root got a partial; purpose separation rested on the state machine never creating development authorizations for validator rounds | Rejected by an explicit check: the request names its kind; a development request to a validator ceremony is `wrong_purpose`, whatever the nonce and root |
+| 7. Use a development ceremony to sign with a validator key | Impossible by construction (each ceremony has its own key and shares); `Sign` on a validator ceremony refused by the state machine | Same, plus `wrong_purpose` at the keyholder |
+| 8. Reuse a root after the validator's active ceremony changed | Unreachable (no resharing); after a restart only the current round was rebuilt, before it the old round kept its roots | Rejected by an explicit check (current round only); unreachable |
+
+None of the "before" cases could produce a signature that was not already authorized for that
+validator key. The change makes every binding an explicit check at the keyholder instead of a
+consequence of invariants elsewhere. The protocol version is bound into every request id: nodes
+of different versions do not sign for each other.
 
 ## Not provided
 

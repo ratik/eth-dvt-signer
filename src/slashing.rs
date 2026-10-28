@@ -18,15 +18,47 @@
 //!
 //! History is keyed by the validator public key, never by ceremony: a ceremony is only how the key
 //! signs today (a future resharing would move the key to another ceremony and keep its history).
-//! The first authorized duty pins the chain (genesis validators root); duties for another chain are
-//! refused.
+//!
+//! A validator key signs nothing until it is activated: an `ActivateValidator` command, decided by
+//! consensus, sets the chain it signs for ([ChainIdentity], the genesis validators root). The
+//! activation is immutable; duties for another chain are refused.
+//!
+//! # Attestation checks in logarithmic time
+//!
+//! The authorized attestations of a validator are pairwise neither double votes nor surround
+//! votes: each was checked against every one authorized before it. So their targets are distinct,
+//! and their sources never decrease as targets increase. For `t1 < t2`, `s2 < s1` would make the
+//! second surround the first. A candidate `(s, t)` then:
+//!
+//! - surrounds a recorded attestation iff the one with the greatest target below `t` has a source
+//!   above `s` (it has the greatest source among those);
+//! - is surrounded by one iff the one with the smallest target above `t` has a source below `s` (it
+//!   has the smallest source among those).
+//!
+//! Authorizing a candidate that passes both keeps the order. [Protection::verify] checks it on the
+//! stored history at startup, and the exhaustive scan it replaces is kept in the tests as a
+//! reference.
 
 use crate::eth::{
     duty::{DutyKind, DutyRequest, MAX_ROOTS_PER_PERIOD, Protection as Rule, ValidatorKey},
-    types::Root,
+    types::{Root, hex_bytes},
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+/// The Ethereum chain a validator key signs for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+pub struct ChainIdentity {
+    #[serde(with = "hex_bytes")]
+    pub genesis_validators_root: Root,
+}
+
+/// A validator's activation: the chain it signs for, and the block that set it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Activation {
+    pub chain: ChainIdentity,
+    pub height: u64,
+}
 
 /// A validator key and how it signs.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,10 +66,22 @@ pub struct Validator {
     pub key: ValidatorKey,
     /// Round of the ceremony whose shares sign for this key.
     pub round: u64,
-    /// Genesis validators root of the chain it signs for, pinned by its first authorized duty.
-    pub chain: Option<Root>,
+    /// Set once, by consensus: the key signs nothing before, and only for this chain after.
+    pub activation: Option<Activation>,
+    /// The chain an earlier version pinned implicitly, with the first signed duty. It activates
+    /// nothing: it only refuses an activation for another chain.
+    pub legacy_chain: Option<Root>,
     /// Number of slashing and duty records of this validator (checked at startup).
     pub records: u64,
+}
+
+/// A signing root that a validator key may sign: authorized, under slashing protection, for
+/// `validator`, whose key the ceremony `round` holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DutyAuthorization {
+    pub validator: ValidatorKey,
+    pub round: u64,
+    pub signing_root: Root,
 }
 
 /// An authorized signing root and the block that authorized it.
@@ -58,7 +102,7 @@ pub struct Attested {
 /// What a decision changed, for the store to persist.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Record {
-    /// The validator `id` (its chain or record count).
+    /// The validator `id` (its activation or record count).
     Validator(u64),
     /// Proposal of validator `id` at `slot`.
     Proposal { id: u64, slot: u64 },
@@ -78,6 +122,8 @@ pub enum Record {
 pub enum Refusal {
     #[error("unknown validator public key")]
     UnknownValidator,
+    #[error("the validator is not activated (no chain identity)")]
+    NotActivated,
     #[error("attestation source epoch {source_epoch} is after target epoch {target_epoch}")]
     SourceAfterTarget {
         source_epoch: u64,
@@ -122,6 +168,35 @@ impl Refusal {
                 | Self::SurroundedBySigned { .. }
         )
     }
+}
+
+/// Why an activation is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, thiserror::Error)]
+#[serde(rename_all = "snake_case", tag = "reason")]
+pub enum ActivationRefusal {
+    #[error("unknown validator public key")]
+    UnknownValidator,
+    /// Activated for another chain: an activation never changes.
+    #[error("the validator is already activated for another chain")]
+    OtherChain {
+        #[serde(with = "hex_bytes")]
+        genesis_validators_root: Root,
+    },
+    /// An earlier version recorded signatures of the key for another chain.
+    #[error("an earlier version recorded signatures of this validator for another chain")]
+    RecordedChain {
+        #[serde(with = "hex_bytes")]
+        genesis_validators_root: Root,
+    },
+}
+
+/// Result of [Protection::activate].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivationOutcome {
+    Activated,
+    /// Already activated for this chain: the activation, unchanged.
+    AlreadyActivated(Activation),
+    Refused(ActivationRefusal),
 }
 
 /// Result of [Protection::authorize].
@@ -182,12 +257,48 @@ impl Protection {
             Validator {
                 key,
                 round,
-                chain: None,
+                activation: None,
+                legacy_chain: None,
                 records: 0,
             },
         );
         self.by_key.insert(key, id);
         id
+    }
+
+    /// Activate `key` for `chain` in the block at `height`, or confirm the activation it has.
+    pub fn activate(
+        &mut self,
+        key: &ValidatorKey,
+        chain: ChainIdentity,
+        height: u64,
+    ) -> (ActivationOutcome, Vec<Record>) {
+        let Some(&id) = self.by_key.get(key) else {
+            return (
+                ActivationOutcome::Refused(ActivationRefusal::UnknownValidator),
+                Vec::new(),
+            );
+        };
+        let validator = self.validators.get_mut(&id).expect("indexed validator");
+        let refused = |refusal| (ActivationOutcome::Refused(refusal), Vec::new());
+        match (validator.activation, validator.legacy_chain) {
+            (Some(activation), _) if activation.chain == chain => {
+                (ActivationOutcome::AlreadyActivated(activation), Vec::new())
+            }
+            (Some(activation), _) => refused(ActivationRefusal::OtherChain {
+                genesis_validators_root: activation.chain.genesis_validators_root,
+            }),
+            (None, Some(recorded)) if recorded != chain.genesis_validators_root => {
+                refused(ActivationRefusal::RecordedChain {
+                    genesis_validators_root: recorded,
+                })
+            }
+            (None, _) => {
+                validator.activation = Some(Activation { chain, height });
+                validator.legacy_chain = None;
+                (ActivationOutcome::Activated, vec![Record::Validator(id)])
+            }
+        }
     }
 
     pub fn validators(&self) -> impl Iterator<Item = (u64, &Validator)> {
@@ -295,7 +406,6 @@ impl Protection {
             }
         };
         let validator = self.validators.get_mut(&id).expect("decided validator");
-        validator.chain = Some(request.fork.genesis_validators_root);
         validator.records += 1;
         (
             root,
@@ -309,6 +419,7 @@ impl Protection {
         let (id, validator) = self
             .validator_of(&request.validator)
             .ok_or(Refusal::UnknownValidator)?;
+        let activation = validator.activation.ok_or(Refusal::NotActivated)?;
         request.duty.validate().map_err(
             |crate::eth::duty::Invalid::SourceAfterTarget {
                  source_epoch,
@@ -318,10 +429,7 @@ impl Protection {
                 target_epoch,
             },
         )?;
-        if validator
-            .chain
-            .is_some_and(|chain| chain != request.fork.genesis_validators_root)
-        {
+        if activation.chain.genesis_validators_root != request.fork.genesis_validators_root {
             return Err(Refusal::OtherChain);
         }
         match request.duty.protection() {
@@ -336,11 +444,12 @@ impl Protection {
                     Some(_) => return Err(Refusal::DoubleVote { target }),
                     None => {}
                 }
+                // Sources never decrease with targets (module docs): the closest attestation on
+                // each side has the extreme source of that side.
                 // The new attestation surrounds a signed one: earlier target, later source.
-                if let Some((&(_, signed_target), signed)) = self
-                    .attestations
-                    .range((id, 0)..(id, target))
-                    .find(|(_, signed)| signed.source > source)
+                if let Some((&(_, signed_target), signed)) =
+                    self.attestations.range((id, 0)..(id, target)).next_back()
+                    && signed.source > source
                 {
                     return Err(Refusal::SurroundsSigned {
                         source_epoch: signed.source,
@@ -348,11 +457,10 @@ impl Protection {
                     });
                 }
                 // A signed attestation surrounds the new one: later target, earlier source.
-                if let Some((&(_, signed_target), signed)) = self
-                    .attestations
-                    .range((id, target.saturating_add(1))..=(id, u64::MAX))
-                    .filter(|((_, signed_target), _)| *signed_target > target)
-                    .find(|(_, signed)| signed.source < source)
+                if let Some(after) = target.checked_add(1)
+                    && let Some((&(_, signed_target), signed)) =
+                        self.attestations.range((id, after)..=(id, u64::MAX)).next()
+                    && signed.source < source
                 {
                     return Err(Refusal::SurroundedBySigned {
                         source_epoch: signed.source,
@@ -379,21 +487,47 @@ impl Protection {
         }
     }
 
-    /// Every authorized signing root, with the round of the ceremony that signs it: what this
-    /// node's keyholder may sign for validator keys.
-    pub fn authorized_roots(&self) -> Vec<(u64, Root)> {
-        let round = |id: &u64| self.validators[id].round;
-        self.proposals
+    /// The duty authorization of `root` for validator `id`, as the keyholder knows it.
+    pub fn duty_authorization(&self, id: u64, signing_root: Root) -> DutyAuthorization {
+        let validator = &self.validators[&id];
+        DutyAuthorization {
+            validator: validator.key,
+            round: validator.round,
+            signing_root,
+        }
+    }
+
+    /// Every authorized signing root of every activated validator: what this node's keyholder
+    /// may sign for validator keys. They are the slashing records themselves; there is no other
+    /// copy. Records of a validator that is not activated (written by an earlier version) are
+    /// signed again only once it is.
+    pub fn authorized_duties(&self) -> Vec<DutyAuthorization> {
+        self.validators
             .iter()
-            .map(|((id, _), signed)| (round(id), signed.signing_root))
+            .filter(|(_, validator)| validator.activation.is_some())
+            .flat_map(|(id, _)| self.duties_of(*id))
+            .collect()
+    }
+
+    /// The authorized signing roots of validator `id`.
+    pub fn duties_of(&self, id: u64) -> Vec<DutyAuthorization> {
+        let roots = self
+            .proposals
+            .range((id, 0)..=(id, u64::MAX))
+            .map(|(_, signed)| signed.signing_root)
             .chain(
                 self.attestations
-                    .iter()
-                    .map(|((id, _), signed)| (round(id), signed.signing_root)),
+                    .range((id, 0)..=(id, u64::MAX))
+                    .map(|(_, attested)| attested.signing_root),
             )
-            .chain(self.bounded.iter().flat_map(|((id, _, _), roots)| {
-                roots.iter().map(|signed| (round(id), signed.signing_root))
-            }))
+            .chain(
+                self.bounded
+                    .iter()
+                    .filter(|((validator, _, _), _)| *validator == id)
+                    .flat_map(|(_, roots)| roots.iter().map(|signed| signed.signing_root)),
+            );
+        roots
+            .map(|root| self.duty_authorization(id, root))
             .collect()
     }
 
@@ -461,6 +595,36 @@ impl Protection {
                     validator.round
                 ));
             }
+            // Records exist only for an activated key (or one an earlier version pinned).
+            if validator.records > 0
+                && validator.activation.is_none()
+                && validator.legacy_chain.is_none()
+            {
+                return Err(format!(
+                    "validator {id} has {} records but no chain identity: its activation is lost",
+                    validator.records
+                ));
+            }
+        }
+        // The order the logarithmic attestation checks rely on (module docs).
+        let mut previous: Option<(u64, u64, u64)> = None;
+        for (&(id, target), attested) in &self.attestations {
+            if attested.source > target {
+                return Err(format!(
+                    "validator {id} has an attestation with source {} after its target {target}",
+                    attested.source
+                ));
+            }
+            if let Some((previous_id, previous_target, previous_source)) = previous
+                && previous_id == id
+                && previous_source > attested.source
+            {
+                return Err(format!(
+                    "attestations of validator {id} with targets {previous_target} and {target} \
+                     surround each other: slashing history is altered"
+                ));
+            }
+            previous = Some((id, target, attested.source));
         }
         Ok(())
     }
@@ -475,6 +639,9 @@ mod tests {
     };
 
     const KEY: ValidatorKey = [7; 48];
+    const CHAIN: ChainIdentity = ChainIdentity {
+        genesis_validators_root: [9; 32],
+    };
 
     fn fork() -> ForkInfo {
         ForkInfo {
@@ -487,10 +654,15 @@ mod tests {
         }
     }
 
+    /// One validator, activated for [CHAIN].
     fn protection() -> Protection {
         let mut protection = Protection::default();
         protection.designate(0);
         protection.register(0, KEY);
+        assert_eq!(
+            protection.activate(&KEY, CHAIN, 1).0,
+            ActivationOutcome::Activated
+        );
         protection
     }
 
@@ -515,7 +687,7 @@ mod tests {
     /// An attestation with `source` and `target`; `vote` changes the data (and the root).
     fn attestation(source: u64, target: u64, vote: u8) -> DutyRequest {
         request(Duty::Attestation(AttestationData {
-            slot: target * 32,
+            slot: target.saturating_mul(32),
             index: 0,
             beacon_block_root: [vote; 32],
             source: Checkpoint {
@@ -580,7 +752,9 @@ mod tests {
             decide(&mut p, &attestation(2, 3, 2)),
             Decision::Refused(Refusal::DoubleVote { target: 3 })
         );
-        assert!(p.authorized_roots().iter().all(|(round, _)| *round == 7));
+        assert!(p.authorized_duties().iter().all(|duty| duty.round == 7));
+        // The activation is the key's, not the ceremony's.
+        assert_eq!(p.validator(0).unwrap().activation.unwrap().chain, CHAIN);
     }
 
     #[test]
@@ -662,12 +836,13 @@ mod tests {
                 target_epoch: 20
             })
         );
-        // Surrounds attestations in the middle of the history, not the latest.
+        // Surrounds attestations in the middle of the history, not the latest: the nearest one
+        // below its target is reported.
         assert_eq!(
             decide(&mut p, &attestation(40, 50, 1)),
             Decision::Refused(Refusal::SurroundsSigned {
-                source_epoch: 42,
-                target_epoch: 43
+                source_epoch: 48,
+                target_epoch: 49
             })
         );
         // Fits between: no conflict with any.
@@ -690,15 +865,105 @@ mod tests {
             decide(&mut p, &unknown),
             Decision::Refused(Refusal::UnknownValidator)
         );
-        // Nothing refused pinned the chain: the first authorized duty does.
-        assert_eq!(p.validator(0).unwrap().chain, None);
-        assert_eq!(decide(&mut p, &block(1, 1)), Decision::Accepted);
         let mut other_chain = block(2, 1);
         other_chain.fork.genesis_validators_root = [1; 32];
         assert_eq!(
             decide(&mut p, &other_chain),
             Decision::Refused(Refusal::OtherChain)
         );
+        assert_eq!(decide(&mut p, &block(1, 1)), Decision::Accepted);
+    }
+
+    #[test]
+    fn a_validator_signs_only_once_activated_and_for_its_chain() {
+        let mut p = Protection::default();
+        p.designate(0);
+        p.register(0, KEY);
+        // Registered by its ceremony, not activated: nothing is signed, nothing recorded.
+        assert_eq!(
+            decide(&mut p, &block(1, 1)),
+            Decision::Refused(Refusal::NotActivated)
+        );
+        assert_eq!(p.validator(0).unwrap().records, 0);
+        assert_eq!(
+            p.activate(&[8; 48], CHAIN, 2).0,
+            ActivationOutcome::Refused(ActivationRefusal::UnknownValidator)
+        );
+
+        let (outcome, records) = p.activate(&KEY, CHAIN, 2);
+        assert_eq!(outcome, ActivationOutcome::Activated);
+        assert_eq!(records, vec![Record::Validator(0)]);
+        let activation = Activation {
+            chain: CHAIN,
+            height: 2,
+        };
+        assert_eq!(p.validator(0).unwrap().activation, Some(activation));
+        // Repeating it changes nothing; another chain is refused, now and after signing.
+        assert_eq!(
+            p.activate(&KEY, CHAIN, 3),
+            (ActivationOutcome::AlreadyActivated(activation), Vec::new())
+        );
+        let other = ChainIdentity {
+            genesis_validators_root: [1; 32],
+        };
+        let refused = ActivationOutcome::Refused(ActivationRefusal::OtherChain {
+            genesis_validators_root: CHAIN.genesis_validators_root,
+        });
+        assert_eq!(p.activate(&KEY, other, 3).0, refused);
+        assert_eq!(decide(&mut p, &block(1, 1)), Decision::Accepted);
+        assert_eq!(p.activate(&KEY, other, 4).0, refused);
+        assert_eq!(p.validator(0).unwrap().activation, Some(activation));
+    }
+
+    #[test]
+    fn a_chain_pinned_by_an_earlier_version_must_be_confirmed() {
+        // State written before activations existed: the first signed duty pinned the chain.
+        let mut p = Protection::default();
+        p.designate(0);
+        p.restore_validator(
+            0,
+            Validator {
+                key: KEY,
+                round: 0,
+                activation: None,
+                legacy_chain: Some(CHAIN.genesis_validators_root),
+                records: 1,
+            },
+        );
+        p.restore_proposal(
+            0,
+            1,
+            Signed {
+                signing_root: block(1, 1).signing_root(),
+                height: 5,
+            },
+        );
+        assert_eq!(p.verify(), Ok(()));
+        // It is not activated by it: nothing is signed until an explicit activation, which must
+        // be for the same chain. Its recorded roots are not even signed again before.
+        assert!(p.authorized_duties().is_empty());
+        assert_eq!(
+            decide(&mut p, &block(2, 1)),
+            Decision::Refused(Refusal::NotActivated)
+        );
+        let other = ChainIdentity {
+            genesis_validators_root: [1; 32],
+        };
+        assert_eq!(
+            p.activate(&KEY, other, 6).0,
+            ActivationOutcome::Refused(ActivationRefusal::RecordedChain {
+                genesis_validators_root: CHAIN.genesis_validators_root
+            })
+        );
+        assert_eq!(p.activate(&KEY, CHAIN, 6).0, ActivationOutcome::Activated);
+        assert_eq!(p.validator(0).unwrap().legacy_chain, None);
+        assert_eq!(p.authorized_duties(), p.duties_of(0));
+        assert_eq!(p.duties_of(0).len(), 1);
+        assert_eq!(
+            decide(&mut p, &block(1, 2)),
+            Decision::Refused(Refusal::DoubleProposal { slot: 1 })
+        );
+        assert_eq!(decide(&mut p, &block(2, 1)), Decision::Accepted);
     }
 
     #[test]
@@ -775,7 +1040,7 @@ mod tests {
         );
         assert!(foreign.verify().unwrap_err().contains("unknown validator"));
 
-        let mut undesignated = p;
+        let mut undesignated = p.clone();
         undesignated.validator_rounds.clear();
         assert!(
             undesignated
@@ -783,5 +1048,235 @@ mod tests {
                 .unwrap_err()
                 .contains("not started as a validator")
         );
+
+        let mut deactivated = p.clone();
+        deactivated.validators.get_mut(&0).unwrap().activation = None;
+        assert!(
+            deactivated
+                .verify()
+                .unwrap_err()
+                .contains("activation is lost")
+        );
+
+        // A history that is not surround-free would defeat the logarithmic checks.
+        let mut surrounding = p;
+        surrounding.restore_attestation(
+            0,
+            9,
+            Attested {
+                source: 0,
+                signing_root: [0; 32],
+                height: 1,
+            },
+        );
+        surrounding.validators.get_mut(&0).unwrap().records += 1;
+        assert!(
+            surrounding
+                .verify()
+                .unwrap_err()
+                .contains("surround each other")
+        );
+    }
+
+    /// The exhaustive decision over the whole attestation history, as first implemented: the
+    /// reference for the logarithmic one.
+    fn reference(
+        history: &BTreeMap<u64, (u64, Root)>,
+        source: u64,
+        target: u64,
+        root: Root,
+    ) -> Decision {
+        if source > target {
+            return Decision::Refused(Refusal::SourceAfterTarget {
+                source_epoch: source,
+                target_epoch: target,
+            });
+        }
+        match history.get(&target) {
+            Some((_, signed)) if *signed == root => return Decision::AlreadyAccepted,
+            Some(_) => return Decision::Refused(Refusal::DoubleVote { target }),
+            None => {}
+        }
+        for (&signed_target, &(signed_source, _)) in history {
+            if source < signed_source && signed_target < target {
+                return Decision::Refused(Refusal::SurroundsSigned {
+                    source_epoch: signed_source,
+                    target_epoch: signed_target,
+                });
+            }
+            if signed_source < source && target < signed_target {
+                return Decision::Refused(Refusal::SurroundedBySigned {
+                    source_epoch: signed_source,
+                    target_epoch: signed_target,
+                });
+            }
+        }
+        Decision::Accepted
+    }
+
+    /// Whether `actual` is the reference decision, a refusal of the same kind citing a recorded
+    /// attestation that really conflicts (the witness may differ: any one is a proof).
+    fn agrees(
+        actual: Decision,
+        expected: Decision,
+        history: &BTreeMap<u64, (u64, Root)>,
+        (source, target): (u64, u64),
+    ) -> bool {
+        let conflicts = |source_epoch: u64, target_epoch: u64, surrounds: bool| {
+            history.get(&target_epoch).map(|(s, _)| *s) == Some(source_epoch)
+                && if surrounds {
+                    source < source_epoch && target_epoch < target
+                } else {
+                    source_epoch < source && target < target_epoch
+                }
+        };
+        match (actual, expected) {
+            (
+                Decision::Refused(Refusal::SurroundsSigned {
+                    source_epoch,
+                    target_epoch,
+                }),
+                Decision::Refused(Refusal::SurroundsSigned { .. }),
+            ) => conflicts(source_epoch, target_epoch, true),
+            (
+                Decision::Refused(Refusal::SurroundedBySigned {
+                    source_epoch,
+                    target_epoch,
+                }),
+                Decision::Refused(Refusal::SurroundedBySigned { .. }),
+            ) => conflicts(source_epoch, target_epoch, false),
+            _ => actual == expected,
+        }
+    }
+
+    /// Random histories built by authorizing random candidates, each decision compared with the
+    /// exhaustive reference. Small epoch ranges make equal sources and targets, double votes and
+    /// surrounds frequent; large ones make gaps; candidates come in any order, retries included.
+    #[test]
+    fn logarithmic_checks_match_the_exhaustive_reference() {
+        use rand::{RngExt as _, SeedableRng as _, rngs::StdRng};
+
+        let seeds: u64 = std::env::var("SLASHING_SEEDS")
+            .ok()
+            .and_then(|seeds| seeds.parse().ok())
+            .unwrap_or(200);
+        let mut kinds = BTreeMap::<&str, u64>::new();
+        for seed in 0..seeds {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let span: u64 = [8, 64, 1 << 20, u64::MAX][(seed % 4) as usize];
+            let mut p = protection();
+            let mut history = BTreeMap::new();
+            let mut previous = Vec::new();
+            for step in 0..300 {
+                let (source, target, vote) = if !previous.is_empty() && rng.random_ratio(1, 6) {
+                    // A retry, or the same epochs with other data.
+                    let (source, target, vote) = previous[rng.random_range(0..previous.len())];
+                    (
+                        source,
+                        target,
+                        if rng.random_bool(0.5) { vote } else { vote ^ 1 },
+                    )
+                } else {
+                    let a = rng.random_range(0..span.min(u64::MAX - 1));
+                    let b = rng.random_range(0..span.min(u64::MAX - 1));
+                    let (source, target) = if rng.random_ratio(1, 20) {
+                        (a.max(b), a.min(b)) // sometimes invalid
+                    } else {
+                        (a.min(b), a.max(b))
+                    };
+                    (source, target, rng.random_range(0..2u8))
+                };
+                let request = attestation(source, target, vote);
+                let root = request.signing_root();
+                let expected = reference(&history, source, target, root);
+                let actual = decide(&mut p, &request);
+                assert!(
+                    agrees(actual, expected, &history, (source, target)),
+                    "seed {seed} step {step}: ({source}, {target}) decided {actual:?}, reference \
+                     {expected:?}"
+                );
+                *kinds
+                    .entry(match expected {
+                        Decision::Accepted => "accepted",
+                        Decision::AlreadyAccepted => "retry",
+                        Decision::Refused(Refusal::DoubleVote { .. }) => "double vote",
+                        Decision::Refused(Refusal::SurroundsSigned { .. }) => "surrounds",
+                        Decision::Refused(Refusal::SurroundedBySigned { .. }) => "surrounded",
+                        Decision::Refused(_) => "invalid",
+                    })
+                    .or_default() += 1;
+                if expected == Decision::Accepted {
+                    history.insert(target, (source, root));
+                    previous.push((source, target, vote));
+                }
+            }
+            assert_eq!(p.verify(), Ok(()), "seed {seed}");
+            // The same history restored as from storage decides the same.
+            let mut restored = Protection::default();
+            restored.designate(0);
+            restored.restore_validator(0, p.validator(0).unwrap().clone());
+            for (&target, &(source, root)) in &history {
+                restored.restore_attestation(
+                    0,
+                    target,
+                    Attested {
+                        source,
+                        signing_root: root,
+                        height: 1,
+                    },
+                );
+            }
+            assert_eq!(restored.verify(), Ok(()));
+            for _ in 0..50 {
+                let a = rng.random_range(0..span.min(u64::MAX - 1));
+                let b = rng.random_range(0..span.min(u64::MAX - 1));
+                let request = attestation(a.min(b), a.max(b), rng.random_range(0..2u8));
+                let expected = reference(&history, a.min(b), a.max(b), request.signing_root());
+                let actual = restored.check(&request).1;
+                assert!(agrees(actual, expected, &history, (a.min(b), a.max(b))));
+            }
+        }
+        println!("decisions compared with the reference: {kinds:?}");
+        for kind in [
+            "accepted",
+            "retry",
+            "double vote",
+            "surrounds",
+            "surrounded",
+            "invalid",
+        ] {
+            assert!(
+                kinds.get(kind).is_some_and(|count| *count > 0),
+                "no {kind} case"
+            );
+        }
+    }
+
+    /// A long history (consecutive epochs, then old and wide candidates): the logarithmic checks
+    /// agree with the reference at its extremes.
+    #[test]
+    fn long_histories_match_the_exhaustive_reference() {
+        let mut p = protection();
+        let mut history = BTreeMap::new();
+        for epoch in 1..=20_000u64 {
+            let request = attestation(epoch - 1, epoch, 1);
+            history.insert(epoch, (epoch - 1, request.signing_root()));
+            assert_eq!(decide(&mut p, &request), Decision::Accepted);
+        }
+        for (source, target) in [
+            (0, 20_001),
+            (19_999, 20_001),
+            (5, 7),
+            (100, 101),
+            (0, u64::MAX),
+        ] {
+            let request = attestation(source, target, 2);
+            let expected = reference(&history, source, target, request.signing_root());
+            let actual = p.check(&request).1;
+            assert!(
+                agrees(actual, expected, &history, (source, target)),
+                "({source}, {target}): {actual:?} / {expected:?}"
+            );
+        }
     }
 }

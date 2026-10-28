@@ -1,7 +1,18 @@
-Web3Signer signing requests shaped exactly as Lighthouse v8.3.2 serializes its `SigningRequest`
-(`validator_client/signing_method/src/web3signer.rs`): `type`, `fork_info`, `signingRoot`, and the
-duty object under its snake_case name, integers quoted, bytes as `0x`-hex. Built from those type
-definitions, not captured from a running client.
+Web3Signer signing requests shaped as Lighthouse v8.3.2 serializes its `SigningRequest`
+(`validator_client/signing_method/src/web3signer.rs`, tag object `6b6898e6`): `type`,
+`fork_info`, `signingRoot`, and the flattened `Web3SignerObject` under its snake_case name,
+integers quoted, bytes as `0x`-hex. Written by following that serialization path in the source,
+not captured from a running client or produced by Lighthouse's code
+(docs/ethereum-signing.md, "Lighthouse v8.3.2").
+
+Requests produced by Lighthouse's own code are in `../lighthouse`. These hand-written ones have
+exactly the same fields and top-level order as Lighthouse's output for the same duty.
+
+`block_v2_mainnet_<fork>.json`: one `BLOCK_V2` request per fork from Bellatrix to Fulu, with the
+fork Lighthouse sends (`ChainSpec::fork_at_epoch` with mainnet fork versions and epochs) and the
+genesis validators root of Web3Signer's examples. They are written by
+`ssz_roots.py --write-block-fixtures`, which also computes their roots. A blinded block gives the
+same request: Lighthouse sends the header for both.
 
 The duty data and the `signingRoot` of every file except `aggregate_and_proof_electra.json` come
 from the examples of the Web3Signer API specification (Consensys/web3signer

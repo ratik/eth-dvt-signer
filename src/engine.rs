@@ -438,7 +438,8 @@ where
     // State machine.
     let ceremonies = store.ceremonies().iter().cloned().collect();
     let authorizations = store.authorizations();
-    let duty_roots = store.protection().authorized_roots();
+    let validator_rounds = store.protection().validator_rounds().collect();
+    let duties = store.protection().authorized_duties();
     let mempool = Mempool::default();
     let executed = Arc::new(AtomicU64::new(0));
     let tip = Arc::new(AtomicU64::new(0));
@@ -480,7 +481,8 @@ where
         dkg_mailbox,
         ceremonies,
         authorizations,
-        duty_roots,
+        validator_rounds,
+        duties,
     )
     .start();
     let dkg_receiver_handle = context.child("dkg_receiver").spawn({

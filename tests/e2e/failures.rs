@@ -176,8 +176,11 @@ fn byzantine_responses_never_count() {
             index: Participant::new(victim),
             value: genuine.value,
         };
-        let other_ceremony =
-            Request::id_of(&id("validator-002"), request.nonce, &request.payload_hash);
+        let other_ceremony = Request::id_for(
+            &id("validator-002"),
+            &request.authorization,
+            &request.payload_hash,
+        );
         let other_request = Request::id_of(&request.ceremony, 999, &request.payload_hash);
         let partial = |request, partial| {
             wire::Message::Partial { request, partial }

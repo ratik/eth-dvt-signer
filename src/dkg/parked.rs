@@ -99,7 +99,7 @@ impl Parked {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dkg::CeremonyId;
+    use crate::{dkg::CeremonyId, signer::wire::AuthorizationRef};
     use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 
     fn peer(seed: u64) -> PublicKey {
@@ -108,6 +108,13 @@ mod tests {
 
     fn request(nonce: u64) -> Request {
         Request::new(CeremonyId::new("validator-001").unwrap(), nonce, [0xaa; 32])
+    }
+
+    fn nonce(request: &Request) -> u64 {
+        match request.authorization {
+            AuthorizationRef::Development { nonce } => nonce,
+            AuthorizationRef::Duty { .. } => unreachable!("development requests only"),
+        }
     }
 
     #[test]
@@ -126,7 +133,7 @@ mod tests {
         let nonces_of = |all: &[(PublicKey, Request)], from: &PublicKey| -> Vec<u64> {
             all.iter()
                 .filter(|(peer, _)| peer == from)
-                .map(|(_, request)| request.nonce)
+                .map(|(_, request)| nonce(request))
                 .collect()
         };
         let all = parked.take(|_| true);
@@ -179,11 +186,11 @@ mod tests {
         for nonce in 0..4 {
             parked.park(peer(1), request(nonce), 0);
         }
-        let ready = parked.take(|request| request.nonce % 2 == 0);
+        let ready = parked.take(|request| nonce(request).is_multiple_of(2));
         assert_eq!(
             ready
                 .iter()
-                .map(|(_, request)| request.nonce)
+                .map(|(_, request)| nonce(request))
                 .collect::<Vec<_>>(),
             [0, 2]
         );

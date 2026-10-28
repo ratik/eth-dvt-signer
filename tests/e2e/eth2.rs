@@ -2,13 +2,31 @@
 //! as Lighthouse sends them (`tests/fixtures/web3signer`), slashing protection, restarts, crashes
 //! and a lagging node.
 
-use crate::harness::{NODES, TestNetwork, ethereum_verify, http, root};
-use eth_mpc_signer::eth::{duty::format_root, types::Root, web3signer::parse_request};
+use crate::{
+    failures::ask,
+    harness::{
+        NODES, TestNetwork, ethereum_verify, http,
+        peer::{FakePeer, Responder},
+        root, unhex,
+    },
+    rollback::CONSENSUS_JOURNAL,
+};
+use eth_mpc_signer::{
+    eth::{
+        duty::format_root,
+        types::Root,
+        web3signer::{parse_identifier, parse_request},
+    },
+    signer::wire::{self, Refusal, Request},
+};
 use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
 
 /// The validator key's ceremony.
 const VALIDATOR: &str = "validator-eth";
+
+/// The chain of the fixtures (their `genesis_validators_root`).
+const CHAIN: &str = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
 
 /// Every supported duty.
 const FIXTURES: [&str; 10] = [
@@ -23,6 +41,31 @@ const FIXTURES: [&str; 10] = [
     "contribution_and_proof.json",
     "voluntary_exit.json",
 ];
+
+/// Requests produced by Lighthouse v8.3.2's own code, one per supported duty and fork.
+const LIGHTHOUSE: [&str; 14] = [
+    "block_v2_bellatrix.json",
+    "block_v2_capella.json",
+    "block_v2_deneb.json",
+    "block_v2_electra.json",
+    "block_v2_fulu.json",
+    "attestation.json",
+    "randao_reveal.json",
+    "aggregation_slot.json",
+    "aggregate_and_proof_phase0.json",
+    "aggregate_and_proof_electra.json",
+    "sync_committee_message.json",
+    "sync_committee_selection_proof.json",
+    "contribution_and_proof.json",
+    "voluntary_exit.json",
+];
+
+fn lighthouse(name: &str) -> Value {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/lighthouse")
+        .join(name);
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
 
 fn fixture(name: &str) -> Value {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -68,12 +111,47 @@ pub(crate) fn attestation(source: u64, target: u64, vote: u8) -> Value {
     with_root(request)
 }
 
-/// A network with a completed validator ceremony; returns it and the validator public key.
+/// `POST /validators/activate` on node `via`.
+fn activate(network: &TestNetwork, via: usize, key: &str, chain: &str) -> (u16, Value) {
+    let body = json!({ "public_key": key, "genesis_validators_root": chain });
+    network.post(via, "/validators/activate", &body)
+}
+
+/// The activation of `key` as node `node` has it (`GET /validators`), if any.
+fn activation(network: &TestNetwork, node: usize, key: &str) -> Option<Value> {
+    let (status, validators) = network.get(node, "/validators");
+    assert_eq!(status, 200, "{validators}");
+    validators
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|validator| validator["public_key"] == key && validator["status"] == "active")
+        .cloned()
+}
+
+/// Activate `key` for [CHAIN] through node `via` and wait until every node has applied it.
+fn activate_everywhere(network: &TestNetwork, via: usize, key: &str) -> Value {
+    let (status, activated) = activate(network, via, key, CHAIN);
+    assert_eq!(status, 200, "{activated}");
+    assert_eq!(activated["status"], "active", "{activated}");
+    assert_eq!(activated["genesis_validators_root"], CHAIN, "{activated}");
+    for node in network.all() {
+        network.wait_until(&format!("activation on node {node}"), || {
+            activation(network, node, key).is_some()
+        });
+        assert_eq!(activation(network, node, key).as_ref(), Some(&activated));
+    }
+    activated
+}
+
+/// A network with a completed validator ceremony, its key activated for [CHAIN]; returns it and
+/// the validator public key.
 pub(crate) fn validator_network() -> (TestNetwork, String) {
     let network = TestNetwork::start(NODES);
     network.wait_for_ready(&network.all());
     network.start_validator_dkg(0, VALIDATOR);
     let key = network.wait_for_dkg(VALIDATOR, &network.all());
+    activate_everywhere(&network, 0, &key);
     (network, key)
 }
 
@@ -125,10 +203,44 @@ fn e2e_eth_1_web3signer_signs_every_supported_duty() {
     // A development key is not a validator key.
     network.start_dkg(1, "development");
     network.wait_for_dkg("development", &network.all());
+
+    // Not activated: listed as inactive, not offered, not signed.
+    let (status, validators) = network.get(2, "/validators");
+    assert_eq!(status, 200, "{validators}");
+    assert_eq!(
+        validators,
+        json!([{ "public_key": key, "ceremony_id": VALIDATOR, "status": "inactive" }])
+    );
+    let (status, keys) = network.get(2, "/api/v1/eth2/publicKeys");
+    assert_eq!((status, keys), (200, json!([])));
+    let (status, answer) = sign(&network, 3, &key, &fixture("attestation.json"));
+    assert_eq!(status, 404, "{answer}");
+    assert!(
+        answer["error"].as_str().unwrap().contains("not activated"),
+        "{answer}"
+    );
+
+    // Activation: bad input, an unknown key, then the key for the fixtures' chain.
+    let (status, answer) = activate(&network, 0, &key, "0x1234");
+    assert_eq!(status, 400, "{answer}");
+    let (status, answer) = activate(&network, 0, &format!("0x{}", "ab".repeat(48)), CHAIN);
+    assert_eq!(status, 404, "{answer}");
+    let activated = activate_everywhere(&network, 1, &key);
+    assert!(activated["activated_at"].as_u64().is_some(), "{activated}");
     for node in network.all() {
         let (status, keys) = network.get(node, "/api/v1/eth2/publicKeys");
         assert_eq!((status, keys), (200, json!([key])), "node {node}");
     }
+    // Immutable: the same activation again changes nothing, another chain is refused.
+    let (status, again) = activate(&network, 3, &key, CHAIN);
+    assert_eq!((status, &again), (200, &activated));
+    let (status, answer) = activate(&network, 2, &key, &hex32(0x42));
+    assert_eq!(status, 409, "{answer}");
+    assert_eq!(answer["refusal"]["reason"], "other_chain", "{answer}");
+    assert_eq!(
+        answer["refusal"]["genesis_validators_root"], CHAIN,
+        "{answer}"
+    );
 
     let mut signatures = Vec::new();
     for (index, name) in FIXTURES.iter().enumerate() {
@@ -142,6 +254,27 @@ fn e2e_eth_1_web3signer_signs_every_supported_duty() {
         );
         signatures.push(signature);
     }
+
+    // Requests produced by Lighthouse v8.3.2's own code (`tests/fixtures/lighthouse`): signed,
+    // and the signature verifies for the root Lighthouse computed. Its Altair request (a whole
+    // block) is refused.
+    for (index, name) in LIGHTHOUSE.iter().enumerate() {
+        let body = lighthouse(name);
+        let root: Root = unhex(&body["signingRoot"]).try_into().unwrap();
+        let (status, answer) = sign(&network, index % NODES, &key, &body);
+        assert_eq!(status, 200, "{name}: {answer}");
+        assert!(
+            ethereum_verify(&json!(key), &root, &answer["signature"]),
+            "{name}: {answer}"
+        );
+    }
+    let (status, answer) = sign(
+        &network,
+        0,
+        &key,
+        &lighthouse("block_v2_altair_full_block.json"),
+    );
+    assert_eq!(status, 400, "{answer}");
 
     // Repeated through another node: the same signature. Without `Accept: application/json`, the
     // signature as text.
@@ -483,4 +616,104 @@ fn e2e_eth_l1_whole_network_rollback_signs_a_double_proposal() {
         status, 200,
         "double proposal signed after a whole-network rollback: {answer}"
     );
+}
+
+/// E2E-ETH-8: node 3 is rolled back to storage from before the validator's activation (all but its
+/// consensus journal). It replays the activation; until then it signs nothing for the key, and
+/// never for another chain; the activation cannot be changed through it.
+#[test]
+fn e2e_eth_8_recovery_cannot_reset_the_chain_identity() {
+    let network = TestNetwork::start(NODES);
+    network.wait_for_ready(&network.all());
+    network.start_validator_dkg(0, VALIDATOR);
+    let key = network.wait_for_dkg(VALIDATOR, &network.all());
+    network.stop_node(3);
+    network.snapshot(3, "before-activation");
+    network.restart_node(3);
+    network.wait_for_ready(&[3]);
+
+    let activated = activate_everywhere(&network, 0, &key);
+    let signature = signed(&network, 0, &key, &block(80, 1));
+
+    network.stop_node(3);
+    network.restore_keeping(3, "before-activation", &[CONSENSUS_JOURNAL]);
+    network.restart_node(3);
+    let mut other_chain = fixture("block_v2_electra.json");
+    other_chain["fork_info"]["genesis_validators_root"] = json!(hex32(0x42));
+    other_chain["beacon_block"]["block_header"]["slot"] = json!("81");
+    let other_chain = with_root(other_chain);
+    network.wait_until("node 3 to replay the activation", || {
+        let (status, answer) = sign(&network, 3, &key, &other_chain);
+        assert_ne!(
+            status, 200,
+            "a rolled-back node signed for another chain: {answer}"
+        );
+        activation(&network, 3, &key).is_some()
+    });
+    assert_eq!(activation(&network, 3, &key), Some(activated));
+    refused(&network, 3, &key, &other_chain, "other_chain");
+    let (status, answer) = activate(&network, 3, &key, &hex32(0x42));
+    assert_eq!(status, 409, "{answer}");
+    // The activation does not mean it has replayed everything after it: while it still has a
+    // backlog, a duty it does not know yet would be a new authorization, which it refuses (503).
+    wait_caught_up(&network, 3, 0);
+    assert_eq!(signed(&network, 3, &key, &block(80, 1)), signature);
+}
+
+/// E2E-ETH-9: authorization binding on the wire. A scripted peer with node 3's identity (real p2p
+/// credentials) asks the other nodes for partial signatures under every kind of reference.
+#[test]
+fn e2e_eth_9_signing_requests_are_bound_to_their_authorization() {
+    let (network, key) = validator_network();
+    network.start_dkg(0, "development");
+    network.wait_for_dkg("development", &network.all());
+    let proposal = block(90, 1);
+    signed(&network, 0, &key, &proposal);
+    let signing_root = signing_root(&proposal);
+    let validator = parse_identifier(&key).unwrap();
+    for node in 0..3 {
+        network.wait_until(&format!("the proposal applied on node {node}"), || {
+            applied(&network, node, &proposal, "Accepted")
+        });
+    }
+
+    network.stop_node(3);
+    let silent: Responder = Box::new(|_, _, _| Vec::new());
+    let peer = FakePeer::start(&network, 3, &[], silent);
+    let id = |name: &str| eth_mpc_signer::dkg::CeremonyId::new(name).unwrap();
+    let refused = |answer: wire::Message| match answer {
+        wire::Message::Refused { reason, .. } => Some(reason),
+        _ => None,
+    };
+    for node in 0..3 {
+        // The genuine reference: a partial signature.
+        let genuine = Request::duty(id(VALIDATOR), validator, signing_root);
+        assert!(matches!(
+            ask(&network, &peer, node, &genuine),
+            wire::Message::Partial { .. }
+        ));
+        // The same root as a development request, nonce 0 or another: another purpose.
+        for nonce in [0, 7] {
+            let development = Request::new(id(VALIDATOR), nonce, signing_root);
+            assert_eq!(
+                refused(ask(&network, &peer, node, &development)),
+                Some(Refusal::WrongPurpose)
+            );
+        }
+        // A development key's ceremony asked for the validator's duty: another purpose.
+        let development_key = Request::duty(id("development"), validator, signing_root);
+        assert_eq!(
+            refused(ask(&network, &peer, node, &development_key)),
+            Some(Refusal::WrongPurpose)
+        );
+        // Under another key, or for another root: not authorized.
+        let other_key = Request::duty(id(VALIDATOR), [0xab; 48], signing_root);
+        let other_root = Request::duty(id(VALIDATOR), validator, root(0xee));
+        for request in [other_key, other_root] {
+            assert_eq!(
+                refused(ask(&network, &peer, node, &request)),
+                Some(Refusal::NotAuthorized)
+            );
+        }
+    }
 }

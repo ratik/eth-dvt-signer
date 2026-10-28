@@ -1,0 +1,22 @@
+[package]
+name = "lh-fixtures"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Lighthouse v8.3.2's own types and remote-signer code, to produce Web3Signer request fixtures.
+[dependencies]
+signing_method = { git = "https://github.com/sigp/lighthouse", tag = "v8.3.2" }
+types = { git = "https://github.com/sigp/lighthouse", tag = "v8.3.2" }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[workspace]
+
+# Copied from Lighthouse v8.3.2's root Cargo.toml (patches do not apply to dependents).
+[patch.crates-io]
+ssz_types = { git = "https://github.com/sigp/ssz_types", rev = "8955d22edc7633f26fe3b5ac933facb5121d717a" }
+milhouse = { git = "https://github.com/sigp/milhouse", rev = "d67aabd2a7c405b3c16f4aaff159b137dc5b5e38" }
+ethereum_ssz = { git = "https://github.com/sigp/ethereum_ssz", rev = "974f78f421fbf70cba4e8f84e0fa28c23ad54f34" }
+ethereum_ssz_derive = { git = "https://github.com/sigp/ethereum_ssz", rev = "974f78f421fbf70cba4e8f84e0fa28c23ad54f34" }
+tree_hash = { git = "https://github.com/sigp/tree_hash", rev = "e5ea1875edddf12438506c3751cbb313f9c52d08" }
+tree_hash_derive = { git = "https://github.com/sigp/tree_hash", rev = "e5ea1875edddf12438506c3751cbb313f9c52d08" }

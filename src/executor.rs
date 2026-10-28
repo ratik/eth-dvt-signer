@@ -14,7 +14,7 @@ use crate::{
     },
     hooks,
     readiness::Progress,
-    slashing::{Decision, Validator},
+    slashing::{Activation, ActivationOutcome, ChainIdentity, Decision, Validator},
     state::Authorization,
     storage::{Effect, Store},
     types::{Block, Command, Outcome, SignRequest, Transaction, format_hash},
@@ -71,16 +71,21 @@ pub struct DutyReceipt {
     pub signing_root: Root,
     /// Height of the block that decided the duty.
     pub height: u64,
+    /// Height of the block that authorized this signing root, if it is authorized: this block for
+    /// a new authorization, the original one for a retry (`AlreadyAccepted`).
+    pub authorized_at: Option<u64>,
     pub finalized_at: SystemTime,
     pub applied_at: SystemTime,
 }
 
-/// A validator key: its public key, and the ceremony that signs for it.
+/// A validator key: its public key, the ceremony that signs for it, and its activation (none:
+/// it signs nothing yet).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidatorEntry {
     pub key: ValidatorKey,
     pub ceremony: CeremonyId,
     pub round: u64,
+    pub activation: Option<Activation>,
 }
 
 /// What the committed state says about a duty right now (nothing is recorded).
@@ -100,6 +105,14 @@ pub struct DutyCheck {
 pub struct Lookup {
     pub ceremony: Option<Ceremony>,
     pub authorization: Option<Authorization>,
+}
+
+/// Final answer for a submitted validator activation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActivationReceipt {
+    pub outcome: ActivationOutcome,
+    /// Height of the block that decided it.
+    pub height: u64,
 }
 
 /// Final answer for a submitted ceremony start.
@@ -176,6 +189,12 @@ pub enum Message {
         config: CeremonyConfig,
         response: oneshot::Sender<StartReceipt>,
     },
+    /// Activate a validator key for an Ethereum chain (through consensus).
+    ActivateValidator {
+        validator: ValidatorKey,
+        chain: ChainIdentity,
+        response: oneshot::Sender<ActivationReceipt>,
+    },
 }
 
 /// The node has shut down.
@@ -247,7 +266,24 @@ impl Client {
         receiver.await.map_err(|_| Stopped)
     }
 
-    /// Every validator key with a completed ceremony.
+    /// Activate validator `validator` for `chain` and wait until consensus decided it.
+    pub async fn activate_validator(
+        &self,
+        validator: ValidatorKey,
+        chain: ChainIdentity,
+    ) -> Result<ActivationReceipt, Stopped> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(Message::ActivateValidator {
+                validator,
+                chain,
+                response,
+            })
+            .map_err(|_| Stopped)?;
+        receiver.await.map_err(|_| Stopped)
+    }
+
+    /// Every validator key with a completed ceremony, activated or not.
     pub async fn validators(&self) -> Result<Vec<ValidatorEntry>, Stopped> {
         let (response, receiver) = oneshot::channel();
         self.sender
@@ -270,6 +306,7 @@ enum Waiter {
     Sign(oneshot::Sender<Receipt>),
     Start(oneshot::Sender<StartReceipt>),
     Duty(oneshot::Sender<DutyReceipt>),
+    Activate(oneshot::Sender<ActivationReceipt>),
 }
 
 pub struct Executor<E: CryptoRng + Spawner + Context, S: Sender> {
@@ -377,6 +414,20 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                     info!(id, %ceremony, "received validator ceremony start");
                     self.waiters.insert(id, Waiter::Start(response));
                 }
+                Message::ActivateValidator {
+                    validator,
+                    chain,
+                    response,
+                } => {
+                    let id = self.submit(Command::ActivateValidator { validator, chain });
+                    info!(
+                        id,
+                        validator = %format_validator(&validator),
+                        genesis_validators_root = %format_root(&chain.genesis_validators_root),
+                        "submitted validator activation"
+                    );
+                    self.waiters.insert(id, Waiter::Activate(response));
+                }
                 Message::SubmitDuty { request, response } => {
                     let validator = format_validator(&request.validator);
                     let kind = request.duty.kind();
@@ -468,6 +519,7 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
             key: validator.key,
             ceremony: ceremony.config.id.clone(),
             round: validator.round,
+            activation: validator.activation,
         })
     }
 
@@ -531,7 +583,13 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
         self.mempool.remove_all(&block.transactions);
 
         // The DKG actor (which holds the shares) learns about committed changes before any client
-        // is answered, so a coordinator that just got its receipt finds them there.
+        // is answered, so a coordinator that just got its receipt finds them there. The purpose of
+        // a ceremony comes first.
+        if !applied.designated.is_empty() {
+            let _ = self
+                .dkg
+                .send(dkg::actor::Message::ValidatorRounds(applied.designated));
+        }
         for ceremony in applied.changed {
             match (ceremony.status, ceremony.public_key()) {
                 (DkgStatus::Completed, Some(key)) => info!(
@@ -631,9 +689,23 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                             decision,
                             signing_root,
                             height,
+                            authorized_at: self.store.protection().authorized_at(request),
                             finalized_at,
                             applied_at,
                         });
+                    }
+                }
+                (Command::ActivateValidator { validator, chain }, Effect::Activate(outcome)) => {
+                    info!(
+                        height,
+                        id = transaction.id,
+                        validator = %format_validator(validator),
+                        genesis_validators_root = %format_root(&chain.genesis_validators_root),
+                        ?outcome,
+                        "applied validator activation"
+                    );
+                    if let Some(Waiter::Activate(waiter)) = waiter {
+                        let _ = waiter.send(ActivationReceipt { outcome, height });
                     }
                 }
                 (Command::DealerLog { round, .. }, Effect::Log(outcome)) => match outcome {
