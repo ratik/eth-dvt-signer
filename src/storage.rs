@@ -8,17 +8,27 @@
 //!
 //! Storage format 2 lives in the `<prefix>-state` partition. Format 1 (`<prefix>-registry`, before
 //! signing authorizations were scoped to a ceremony) is not migrated: a node that finds it refuses
-//! to start instead of silently ignoring it.
+//! to start instead of silently ignoring it. Validator keys and their slashing protection
+//! (`slashing`) are records of their own in the same partition, committed in the same `sync` as
+//! the rest of their block: an authorized validator signature and its slashing record become
+//! durable together or not at all. A state without such records (written before they existed)
+//! reads as one without validator keys; an older binary refuses a state that has them.
 
 use crate::{
     dkg::{
-        CeremonyId,
+        CeremonyId, DkgStatus,
         ceremony::{Ceremonies, Ceremony, Ignored, StartOutcome},
     },
+    eth::{
+        duty::{DutyKind, ValidatorKey},
+        types::Root,
+    },
+    slashing::{Attested, Decision, Protection, Record, Signed, Validator},
     state::{self, Authorization, State},
     types::{Command, Outcome, PayloadHash, Transaction},
 };
 use bytes::{Buf, BufMut};
+use commonware_codec::{Encode as _, varint::UInt};
 use commonware_codec::{EncodeSize, Error as CodecError, FixedSize, Read, ReadExt, Write};
 use commonware_cryptography::{ed25519::PublicKey, sha256::Digest};
 use commonware_storage::{
@@ -57,6 +67,16 @@ const AUTHORIZATION_PREFIX: u8 = 0;
 const META_PREFIX: u8 = 1;
 /// `(round, 0)`: DKG ceremonies.
 const CEREMONY_PREFIX: u8 = 2;
+/// `(round, 0)`: ceremonies started as validator keys.
+const VALIDATOR_ROUND_PREFIX: u8 = 3;
+/// `(validator, 0)`: validator keys.
+const VALIDATOR_PREFIX: u8 = 4;
+/// `(validator, slot)`: signed block proposals.
+const PROPOSAL_PREFIX: u8 = 5;
+/// `(validator, target epoch)`: signed attestations.
+const ATTESTATION_PREFIX: u8 = 6;
+/// `16 + duty kind`, `(validator, period)`: authorized roots of non-slashable duties.
+const BOUNDED_PREFIX: u8 = 16;
 
 /// Height of the last applied block.
 fn applied_height() -> Key {
@@ -74,6 +94,31 @@ enum Value {
     Authorization(Authorization),
     Number(u64),
     Ceremony(Box<Ceremony>),
+    Validator(Validator),
+    Signed(Signed),
+    Attested(Attested),
+    Roots(Vec<Signed>),
+}
+
+fn write_signed(signed: &Signed, buf: &mut impl BufMut) {
+    buf.put_slice(&signed.signing_root);
+    signed.height.write(buf);
+}
+
+fn read_root(buf: &mut impl Buf) -> Result<Root, CodecError> {
+    if buf.remaining() < 32 {
+        return Err(CodecError::EndOfBuffer);
+    }
+    let mut root = [0; 32];
+    buf.copy_to_slice(&mut root);
+    Ok(root)
+}
+
+fn read_signed(buf: &mut impl Buf) -> Result<Signed, CodecError> {
+    Ok(Signed {
+        signing_root: read_root(buf)?,
+        height: u64::read(buf)?,
+    })
 }
 
 impl Write for Value {
@@ -92,6 +137,36 @@ impl Write for Value {
                 2u8.write(buf);
                 ceremony.write(buf);
             }
+            Self::Validator(validator) => {
+                3u8.write(buf);
+                buf.put_slice(&validator.key);
+                validator.round.write(buf);
+                match &validator.chain {
+                    Some(chain) => {
+                        1u8.write(buf);
+                        buf.put_slice(chain);
+                    }
+                    None => 0u8.write(buf),
+                }
+                validator.records.write(buf);
+            }
+            Self::Signed(signed) => {
+                4u8.write(buf);
+                write_signed(signed, buf);
+            }
+            Self::Attested(attested) => {
+                5u8.write(buf);
+                attested.source.write(buf);
+                buf.put_slice(&attested.signing_root);
+                attested.height.write(buf);
+            }
+            Self::Roots(roots) => {
+                6u8.write(buf);
+                UInt(roots.len() as u32).write(buf);
+                for signed in roots {
+                    write_signed(signed, buf);
+                }
+            }
         }
     }
 }
@@ -107,6 +182,41 @@ impl Read for Value {
             })),
             1 => Ok(Self::Number(u64::read(buf)?)),
             2 => Ok(Self::Ceremony(Box::new(Ceremony::read(buf)?))),
+            3 => {
+                if buf.remaining() < 48 {
+                    return Err(CodecError::EndOfBuffer);
+                }
+                let mut key: ValidatorKey = [0; 48];
+                buf.copy_to_slice(&mut key);
+                let round = u64::read(buf)?;
+                let chain = match u8::read(buf)? {
+                    0 => None,
+                    1 => Some(read_root(buf)?),
+                    tag => return Err(CodecError::InvalidEnum(tag)),
+                };
+                Ok(Self::Validator(Validator {
+                    key,
+                    round,
+                    chain,
+                    records: u64::read(buf)?,
+                }))
+            }
+            4 => Ok(Self::Signed(read_signed(buf)?)),
+            5 => Ok(Self::Attested(Attested {
+                source: u64::read(buf)?,
+                signing_root: read_root(buf)?,
+                height: u64::read(buf)?,
+            })),
+            6 => {
+                let count = u32::from(UInt::<u32>::read(buf)?) as usize;
+                if count > crate::eth::duty::MAX_ROOTS_PER_PERIOD {
+                    return Err(CodecError::Invalid("Value", "too many roots"));
+                }
+                (0..count)
+                    .map(|_| read_signed(buf))
+                    .collect::<Result<_, _>>()
+                    .map(Self::Roots)
+            }
             tag => Err(CodecError::InvalidEnum(tag)),
         }
     }
@@ -118,6 +228,14 @@ impl EncodeSize for Value {
             Self::Authorization(_) => PayloadHash::SIZE + u64::SIZE,
             Self::Number(_) => u64::SIZE,
             Self::Ceremony(ceremony) => ceremony.encode_size(),
+            Self::Validator(validator) => {
+                48 + u64::SIZE + 1 + validator.chain.map_or(0, |_| 32) + u64::SIZE
+            }
+            Self::Signed(_) => 32 + u64::SIZE,
+            Self::Attested(_) => u64::SIZE + 32 + u64::SIZE,
+            Self::Roots(roots) => {
+                UInt(roots.len() as u32).encode_size() + roots.len() * (32 + u64::SIZE)
+            }
         }
     }
 }
@@ -135,6 +253,8 @@ pub enum Error {
     Format(Option<u64>),
     #[error("corrupt replicated state entry {0}")]
     Corrupt(String),
+    #[error("inconsistent slashing protection: {0}")]
+    Slashing(String),
 }
 
 /// A signing authorization that is part of this node's durably committed state.
@@ -175,6 +295,8 @@ pub enum Effect {
     Start(StartOutcome),
     /// The dealer whose log was recorded, or why it was not.
     Log(Result<PublicKey, Ignored>),
+    /// The decision on a validator duty, and the signing root the state machine computed.
+    Duty(Decision, Root),
 }
 
 /// Result of applying a block, once it is durably committed.
@@ -185,6 +307,9 @@ pub struct Applied {
     pub changed: Vec<Ceremony>,
     /// Authorizations the block created.
     pub authorized: Vec<Committed>,
+    /// Validator duty signing roots the block authorized (new or repeated), with the round of the
+    /// ceremony that signs them.
+    pub duties: Vec<(u64, Root)>,
 }
 
 /// In-memory replicated state mirrored to disk.
@@ -197,7 +322,49 @@ pub struct Store<E: Context> {
     metadata: Option<Metadata<E, Key, Value>>,
     state: State,
     ceremonies: Ceremonies,
+    protection: Protection,
     height: u64,
+}
+
+/// The compressed group key of a completed ceremony.
+fn group_key(ceremony: &Ceremony) -> Option<ValidatorKey> {
+    let key = ceremony.public_key()?.encode();
+    key.as_ref().try_into().ok()
+}
+
+/// Persist what `record` designates, as `protection` now holds it.
+fn persist<E: Context>(
+    metadata: &mut Metadata<E, Key, Value>,
+    protection: &Protection,
+    record: Record,
+) {
+    let _ = match record {
+        Record::Validator(id) => metadata.put(
+            key(VALIDATOR_PREFIX, id, 0),
+            Value::Validator(
+                protection
+                    .validator(id)
+                    .expect("recorded validator")
+                    .clone(),
+            ),
+        ),
+        Record::Proposal { id, slot } => metadata.put(
+            key(PROPOSAL_PREFIX, id, slot),
+            Value::Signed(*protection.proposal(id, slot).expect("recorded proposal")),
+        ),
+        Record::Attestation { id, target } => metadata.put(
+            key(ATTESTATION_PREFIX, id, target),
+            Value::Attested(
+                *protection
+                    .attestation(id, target)
+                    .expect("recorded attestation"),
+            ),
+        ),
+        Record::Bounded { id, kind, period } => metadata.put(
+            key(BOUNDED_PREFIX + kind as u8, id, period),
+            Value::Roots(protection.bounded(id, kind, period).to_vec()),
+        ),
+    };
 }
 
 impl<E: Context> Store<E> {
@@ -228,6 +395,7 @@ impl<E: Context> Store<E> {
 
         let mut state = State::default();
         let mut ceremonies = Ceremonies::new(committee);
+        let mut protection = Protection::default();
         let mut height = 0;
         for stored in metadata.keys() {
             match (parse(stored), metadata.get(stored)) {
@@ -242,16 +410,83 @@ impl<E: Context> Store<E> {
                 ((CEREMONY_PREFIX, _, 0), Some(Value::Ceremony(ceremony))) => {
                     ceremonies.restore(ceremony.as_ref().clone());
                 }
+                ((VALIDATOR_ROUND_PREFIX, round, 0), Some(Value::Number(1))) => {
+                    protection.designate(round);
+                }
+                ((VALIDATOR_PREFIX, id, 0), Some(Value::Validator(validator))) => {
+                    protection.restore_validator(id, validator.clone());
+                }
+                ((PROPOSAL_PREFIX, id, slot), Some(Value::Signed(signed))) => {
+                    protection.restore_proposal(id, slot, *signed);
+                }
+                ((ATTESTATION_PREFIX, id, target), Some(Value::Attested(attested))) => {
+                    protection.restore_attestation(id, target, *attested);
+                }
+                ((prefix, id, period), Some(Value::Roots(roots)))
+                    if prefix >= BOUNDED_PREFIX
+                        && DutyKind::from_u8(prefix - BOUNDED_PREFIX).is_some() =>
+                {
+                    let kind = DutyKind::from_u8(prefix - BOUNDED_PREFIX).expect("checked");
+                    protection.restore_bounded(id, kind, period, roots.clone());
+                }
                 (parsed, _) => return Err(Error::Corrupt(format!("{parsed:?}"))),
             }
         }
+        Self::verify(&ceremonies, &protection).map_err(Error::Slashing)?;
 
         Ok(Self {
             metadata: Some(metadata),
             state,
             ceremonies,
+            protection,
             height,
         })
+    }
+
+    /// Validator keys and their history must agree with each other and with the ceremonies: a
+    /// node must not sign for a key whose history is incomplete, or with a ceremony that is not
+    /// that key's.
+    fn verify(ceremonies: &Ceremonies, protection: &Protection) -> Result<(), String> {
+        protection.verify()?;
+        let by_round: std::collections::HashMap<u64, &Ceremony> = ceremonies
+            .iter()
+            .map(|ceremony| (ceremony.round, ceremony))
+            .collect();
+        for round in protection.validator_rounds() {
+            let ceremony = by_round.get(&round).ok_or(format!(
+                "validator ceremony round {round} is not in the state"
+            ))?;
+            if ceremony.status != DkgStatus::Completed {
+                continue;
+            }
+            let key = group_key(ceremony).ok_or(format!("ceremony round {round} has no key"))?;
+            match protection.validator_of(&key) {
+                Some((_, validator)) if validator.round == round => {}
+                _ => {
+                    return Err(format!(
+                        "completed validator ceremony round {round} has no validator record for \
+                         its key"
+                    ));
+                }
+            }
+        }
+        for (id, validator) in protection.validators() {
+            let key = by_round
+                .get(&validator.round)
+                .and_then(|ceremony| group_key(ceremony));
+            if key != Some(validator.key) {
+                return Err(format!(
+                    "validator {id} does not match the key of ceremony round {}",
+                    validator.round
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validator keys and their slashing protection.
+    pub const fn protection(&self) -> &Protection {
+        &self.protection
     }
 
     pub const fn ceremonies(&self) -> &Ceremonies {
@@ -309,11 +544,18 @@ impl<E: Context> Store<E> {
         let mut metadata = self.metadata.take().expect("metadata is present");
 
         let mut authorized = Vec::new();
+        let mut duties = Vec::new();
         let effects = transactions
             .iter()
             .map(|transaction| match &transaction.command {
                 Command::Sign(request) => {
                     let ceremony = self.ceremonies.get(&request.ceremony);
+                    // A validator key signs nothing but validator duties.
+                    if ceremony
+                        .is_some_and(|ceremony| self.protection.is_validator_round(ceremony.round))
+                    {
+                        return Effect::Sign(Outcome::ValidatorKey, None);
+                    }
                     let outcome = state::apply(&mut self.state, ceremony, request, height);
                     let round = ceremony.map(|ceremony| ceremony.round);
                     let authorization = round.and_then(|round| {
@@ -338,7 +580,45 @@ impl<E: Context> Store<E> {
                     Effect::Sign(outcome, authorization)
                 }
                 Command::StartCeremony(config) => {
-                    Effect::Start(self.ceremonies.start(config.clone(), height, digest))
+                    match self.ceremonies.start(config.clone(), height, digest) {
+                        // The id belongs to a validator key: not the same configuration.
+                        StartOutcome::Exists(round)
+                            if self.protection.is_validator_round(round) =>
+                        {
+                            Effect::Start(StartOutcome::Conflict(round))
+                        }
+                        outcome => Effect::Start(outcome),
+                    }
+                }
+                Command::StartValidatorCeremony(config) => {
+                    match self.ceremonies.start(config.clone(), height, digest) {
+                        StartOutcome::Started(round) => {
+                            self.protection.designate(round);
+                            metadata.put(key(VALIDATOR_ROUND_PREFIX, round, 0), Value::Number(1));
+                            Effect::Start(StartOutcome::Started(round))
+                        }
+                        // The id belongs to a development key: not the same configuration.
+                        StartOutcome::Exists(round)
+                            if !self.protection.is_validator_round(round) =>
+                        {
+                            Effect::Start(StartOutcome::Conflict(round))
+                        }
+                        outcome => Effect::Start(outcome),
+                    }
+                }
+                Command::Duty(request) => {
+                    let (root, decision, records) = self.protection.authorize(request, height);
+                    for record in records {
+                        persist(&mut metadata, &self.protection, record);
+                    }
+                    if decision.is_authorized() {
+                        let (_, validator) = self
+                            .protection
+                            .validator_of(&request.validator)
+                            .expect("authorized for a known validator");
+                        duties.push((validator.round, root));
+                    }
+                    Effect::Duty(decision, root)
                 }
                 Command::DealerLog { round, log } => {
                     Effect::Log(self.ceremonies.record(*round, log.as_ref().clone()))
@@ -352,6 +632,14 @@ impl<E: Context> Store<E> {
                 key(CEREMONY_PREFIX, ceremony.round, 0),
                 Value::Ceremony(Box::new(ceremony.clone())),
             );
+            // A completed validator ceremony: its key now signs validator duties.
+            if ceremony.status == DkgStatus::Completed
+                && self.protection.is_validator_round(ceremony.round)
+                && let Some(key) = group_key(ceremony)
+            {
+                let id = self.protection.register(ceremony.round, key);
+                persist(&mut metadata, &self.protection, Record::Validator(id));
+            }
         }
         metadata.put(applied_height(), Value::Number(height));
 
@@ -361,6 +649,7 @@ impl<E: Context> Store<E> {
             effects,
             changed,
             authorized,
+            duties,
         })
     }
 }
@@ -501,5 +790,421 @@ mod tests {
                 Err(Error::Legacy(partition)) if partition == "node-registry"
             ));
         });
+    }
+    mod validator {
+        use super::*;
+        use crate::{
+            eth::{
+                duty::{Duty, DutyRequest, Fork, ForkInfo},
+                types::{AttestationData, BeaconBlockHeader, Checkpoint},
+            },
+            slashing::Refusal,
+        };
+        use commonware_cryptography::ed25519::PrivateKey;
+
+        fn fork(genesis: u8) -> ForkInfo {
+            ForkInfo {
+                fork: Fork {
+                    previous_version: [0, 0, 0, 1],
+                    current_version: [0, 0, 0, 2],
+                    epoch: 0,
+                },
+                genesis_validators_root: [genesis; 32],
+            }
+        }
+
+        fn duty(key: ValidatorKey, duty: Duty) -> DutyRequest {
+            DutyRequest {
+                validator: key,
+                fork: fork(9),
+                duty,
+            }
+        }
+
+        fn propose(key: ValidatorKey, slot: u64, body: u8) -> DutyRequest {
+            duty(
+                key,
+                Duty::BlockProposal(BeaconBlockHeader {
+                    slot,
+                    proposer_index: 5,
+                    parent_root: [1; 32],
+                    state_root: [2; 32],
+                    body_root: [body; 32],
+                }),
+            )
+        }
+
+        fn attestation(key: ValidatorKey, source: u64, target: u64) -> DutyRequest {
+            duty(
+                key,
+                Duty::Attestation(AttestationData {
+                    slot: target * 32,
+                    index: 0,
+                    beacon_block_root: [4; 32],
+                    source: Checkpoint {
+                        epoch: source,
+                        root: [3; 32],
+                    },
+                    target: Checkpoint {
+                        epoch: target,
+                        root: [4; 32],
+                    },
+                }),
+            )
+        }
+
+        fn submit(request: &DutyRequest) -> Transaction {
+            tx(Command::Duty(Box::new(request.clone())))
+        }
+
+        fn id(id: &str) -> CeremonyId {
+            CeremonyId::new(id).unwrap()
+        }
+
+        /// Start the validator ceremony `v` (round 0) at height 1 and complete it at height 2.
+        /// Returns its key.
+        async fn complete_validator<E: Context + CryptoRng>(
+            context: &mut E,
+            store: &mut Store<E>,
+            signers: &[PrivateKey],
+        ) -> ValidatorKey {
+            let block = Sha256::hash(&[b"block"]);
+            let config = CeremonyConfig::new(id("v"), committee(signers));
+            let applied = store
+                .apply_block(
+                    1,
+                    &block,
+                    &[tx(Command::StartValidatorCeremony(config))],
+                    context,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                applied.effects,
+                vec![Effect::Start(StartOutcome::Started(0))]
+            );
+            let (_, logs) = deal(context, &applied.changed[0], signers, &[]);
+            let logs: Vec<_> = logs
+                .into_iter()
+                .map(|log| {
+                    tx(Command::DealerLog {
+                        round: 0,
+                        log: Box::new(log),
+                    })
+                })
+                .collect();
+            let applied = store.apply_block(2, &block, &logs, context).await.unwrap();
+            assert_eq!(applied.changed[0].status, DkgStatus::Completed);
+            group_key(&applied.changed[0]).unwrap()
+        }
+
+        #[test]
+        fn duties_and_their_history_survive_restart() {
+            deterministic::Runner::default().start(|mut context| async move {
+                let signers = signers();
+                let committee = committee(&signers);
+                let mut store = Store::init(context.child("first"), "node", committee.clone())
+                    .await
+                    .unwrap();
+                let block = Sha256::hash(&[b"block"]);
+
+                // A duty for a key that is not (yet) a validator.
+                let unknown = propose([0xaa; 48], 1, 1);
+                let applied = store
+                    .apply_block(1, &block, &[submit(&unknown)], &mut context)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    applied.effects,
+                    vec![Effect::Duty(
+                        Decision::Refused(Refusal::UnknownValidator),
+                        unknown.signing_root()
+                    )]
+                );
+                assert!(applied.duties.is_empty());
+                drop(store);
+
+                let mut store = Store::init(context.child("second"), "other", committee.clone())
+                    .await
+                    .unwrap();
+                let key = complete_validator(&mut context, &mut store, &signers).await;
+                // Registered when its ceremony completed: round 0, no history, no chain.
+                let (validator_id, validator) = store.protection().validator_of(&key).unwrap();
+                assert_eq!(
+                    (
+                        validator_id,
+                        validator.round,
+                        validator.chain,
+                        validator.records
+                    ),
+                    (0, 0, None, 0)
+                );
+
+                let proposal = propose(key, 10, 1);
+                let conflicting = propose(key, 10, 2);
+                let vote = attestation(key, 1, 2);
+                let mut other_chain = attestation(key, 2, 3);
+                other_chain.fork = fork(8);
+                let applied = store
+                    .apply_block(
+                        3,
+                        &block,
+                        &[
+                            // Purposes are separate: the validator key does not sign generic
+                            // payloads, and neither id can be restarted with the other purpose.
+                            tx(Command::Sign(SignRequest {
+                                ceremony: id("v"),
+                                nonce: 1,
+                                payload_hash: proposal.signing_root(),
+                            })),
+                            tx(Command::StartCeremony(CeremonyConfig::new(
+                                id("v"),
+                                committee.clone(),
+                            ))),
+                            submit(&proposal),
+                            submit(&conflicting),
+                            submit(&vote),
+                            submit(&proposal),
+                            submit(&other_chain),
+                        ],
+                        &mut context,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    applied.effects,
+                    vec![
+                        Effect::Sign(Outcome::ValidatorKey, None),
+                        Effect::Start(StartOutcome::Conflict(0)),
+                        Effect::Duty(Decision::Accepted, proposal.signing_root()),
+                        Effect::Duty(
+                            Decision::Refused(Refusal::DoubleProposal { slot: 10 }),
+                            conflicting.signing_root()
+                        ),
+                        Effect::Duty(Decision::Accepted, vote.signing_root()),
+                        Effect::Duty(Decision::AlreadyAccepted, proposal.signing_root()),
+                        Effect::Duty(
+                            Decision::Refused(Refusal::OtherChain),
+                            other_chain.signing_root()
+                        ),
+                    ]
+                );
+                assert!(applied.authorized.is_empty(), "no generic authorization");
+                assert_eq!(
+                    applied.duties,
+                    vec![
+                        (0, proposal.signing_root()),
+                        (0, vote.signing_root()),
+                        (0, proposal.signing_root())
+                    ]
+                );
+                let protection = store.protection().clone();
+                drop(store);
+
+                // After a restart the same history decides the same way.
+                let mut store = Store::init(context.child("third"), "other", committee.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(store.protection(), &protection);
+                assert_eq!(
+                    store.protection().validator(0).unwrap().chain,
+                    Some([9; 32])
+                );
+                assert_eq!(store.protection().authorized_at(&proposal), Some(3));
+                let surrounding = attestation(key, 0, 3);
+                let applied = store
+                    .apply_block(
+                        4,
+                        &block,
+                        &[
+                            submit(&conflicting),
+                            submit(&proposal),
+                            submit(&surrounding),
+                            tx(Command::StartValidatorCeremony(CeremonyConfig::new(
+                                id("v"),
+                                committee.clone(),
+                            ))),
+                        ],
+                        &mut context,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    applied.effects,
+                    vec![
+                        Effect::Duty(
+                            Decision::Refused(Refusal::DoubleProposal { slot: 10 }),
+                            conflicting.signing_root()
+                        ),
+                        Effect::Duty(Decision::AlreadyAccepted, proposal.signing_root()),
+                        Effect::Duty(
+                            Decision::Refused(Refusal::SurroundsSigned {
+                                source_epoch: 1,
+                                target_epoch: 2
+                            }),
+                            surrounding.signing_root()
+                        ),
+                        // Restarting the validator ceremony neither resets nor replaces it.
+                        Effect::Start(StartOutcome::Exists(0)),
+                    ]
+                );
+                assert_eq!(store.protection().validator(0).unwrap().records, 2);
+            });
+        }
+
+        /// Cost of applying a block with one new attestation while the state holds N slashing
+        /// records, on disk (tokio runtime): every block rewrites the whole state partition.
+        #[test]
+        #[ignore = "benchmark: cargo test --release --lib apply_cost -- --ignored --nocapture"]
+        fn apply_cost_with_history() {
+            let dir = std::env::temp_dir()
+                .join(format!("eth-mpc-signer-apply-bench-{}", std::process::id()));
+            let runner = commonware_runtime::tokio::Runner::new(
+                commonware_runtime::tokio::Config::new().with_storage_directory(&dir),
+            );
+            let partition = dir.join("bench-state");
+            runner.start(|mut context| async move {
+                let signers = signers();
+                let mut store = Store::init(context.child("store"), "bench", committee(&signers))
+                    .await
+                    .unwrap();
+                let key = complete_validator(&mut context, &mut store, &signers).await;
+                let block = Sha256::hash(&[b"block"]);
+                let (mut height, mut epoch) = (3, 0u64);
+                println!("\napplying a block with one new attestation, on disk");
+                println!(
+                    "  {:>8} {:>12} {:>12}",
+                    "records", "ms/block", "state bytes"
+                );
+                for records in [0u64, 1_000, 10_000, 50_000] {
+                    while epoch < records {
+                        let batch: Vec<_> = (epoch + 1..=(epoch + 1_000).min(records))
+                            .map(|target| submit(&attestation(key, target - 1, target)))
+                            .collect();
+                        epoch += batch.len() as u64;
+                        store
+                            .apply_block(height, &block, &batch, &mut context)
+                            .await
+                            .unwrap();
+                        height += 1;
+                    }
+                    let blocks = 20;
+                    let start = std::time::Instant::now();
+                    for _ in 0..blocks {
+                        epoch += 1;
+                        let duty = submit(&attestation(key, epoch - 1, epoch));
+                        store
+                            .apply_block(height, &block, &[duty], &mut context)
+                            .await
+                            .unwrap();
+                        height += 1;
+                    }
+                    let ms = start.elapsed().as_secs_f64() * 1000.0 / f64::from(blocks);
+                    let bytes: u64 = std::fs::read_dir(&partition)
+                        .map(|entries| {
+                            entries
+                                .filter_map(|entry| entry.ok()?.metadata().ok())
+                                .map(|metadata| metadata.len())
+                                .max()
+                                .unwrap_or(0)
+                        })
+                        .unwrap_or(0);
+                    println!("  {:>8} {ms:>12.2} {bytes:>12}", epoch);
+                }
+            });
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// What tampering with the stored history of a validator does to the next start.
+        #[test]
+        fn altered_history_fails_closed() {
+            type Tamper = fn(&mut Metadata<deterministic::Context, Key, Value>, ValidatorKey);
+            let cases: [(&str, Tamper); 7] = [
+                ("proposal removed", |metadata, _| {
+                    metadata.remove(&key(PROPOSAL_PREFIX, 0, 10));
+                }),
+                ("attestation removed", |metadata, _| {
+                    metadata.remove(&key(ATTESTATION_PREFIX, 0, 2));
+                }),
+                ("validator removed", |metadata, _| {
+                    metadata.remove(&key(VALIDATOR_PREFIX, 0, 0));
+                }),
+                ("validator purpose removed", |metadata, _| {
+                    metadata.remove(&key(VALIDATOR_ROUND_PREFIX, 0, 0));
+                }),
+                ("records of an unknown validator", |metadata, _| {
+                    let _ = metadata.put(
+                        key(PROPOSAL_PREFIX, 1, 10),
+                        Value::Signed(Signed {
+                            signing_root: [0; 32],
+                            height: 3,
+                        }),
+                    );
+                }),
+                ("validator key replaced", |metadata, key| {
+                    let Some(Value::Validator(validator)) =
+                        metadata.get(&super::key(VALIDATOR_PREFIX, 0, 0)).cloned()
+                    else {
+                        panic!("validator record")
+                    };
+                    let mut other = key;
+                    other[47] ^= 1;
+                    let _ = metadata.put(
+                        super::key(VALIDATOR_PREFIX, 0, 0),
+                        Value::Validator(Validator {
+                            key: other,
+                            ..validator
+                        }),
+                    );
+                }),
+                ("a record of the wrong type", |metadata, _| {
+                    let _ = metadata.put(key(ATTESTATION_PREFIX, 0, 2), Value::Number(1));
+                }),
+            ];
+            deterministic::Runner::default().start(|mut context| async move {
+                let signers = signers();
+                let committee = committee(&signers);
+                let block = Sha256::hash(&[b"block"]);
+                for (case, tamper) in cases {
+                    let prefix = case.replace(' ', "-");
+                    let mut store = Store::init(context.child("store"), &prefix, committee.clone())
+                        .await
+                        .unwrap();
+                    let key = complete_validator(&mut context, &mut store, &signers).await;
+                    store
+                        .apply_block(
+                            3,
+                            &block,
+                            &[
+                                submit(&propose(key, 10, 1)),
+                                submit(&attestation(key, 1, 2)),
+                            ],
+                            &mut context,
+                        )
+                        .await
+                        .unwrap();
+                    drop(store);
+
+                    let mut metadata = Metadata::<_, Key, Value>::init(
+                        context.child("tamper"),
+                        Config {
+                            partition: format!("{prefix}-state"),
+                            codec_config: (),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    tamper(&mut metadata, key);
+                    metadata.sync().await.unwrap();
+
+                    match Store::init(context.child("restart"), &prefix, committee.clone()).await {
+                        Err(Error::Slashing(reason)) => println!("{case}: {reason}"),
+                        Err(Error::Corrupt(entry)) => println!("{case}: corrupt {entry}"),
+                        Err(other) => panic!("{case}: unexpected error {other}"),
+                        Ok(_) => panic!("{case}: a store with altered history started"),
+                    }
+                }
+            });
+        }
     }
 }

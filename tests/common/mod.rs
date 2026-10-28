@@ -262,8 +262,18 @@ pub async fn complete_dkg(
     cluster: &Cluster,
     name: &str,
 ) -> Ceremony {
+    complete_ceremony(context, cluster, name, false).await
+}
+
+/// Like [complete_dkg], for a development key or (`validator`) an Ethereum validator key.
+pub async fn complete_ceremony(
+    context: &deterministic::Context,
+    cluster: &Cluster,
+    name: &str,
+    validator: bool,
+) -> Ceremony {
     let dkg = &cluster.dkg[0];
-    dkg.start(dkg.config(id(name))).await.unwrap();
+    dkg.start(dkg.config(id(name)), validator).await.unwrap();
     let mut completed = None;
     for dkg in &cluster.dkg {
         loop {

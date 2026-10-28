@@ -19,9 +19,14 @@
 use super::wire::{self, Refusal, Request};
 use crate::{
     dkg::{self, CeremonyId, DkgStatus, Variant, ceremony::Ceremony, signing},
-    executor::{self, Lookup, Receipt},
+    eth::{
+        duty::{DutyRequest, ValidatorKey, format_root, format_validator},
+        types::Root,
+    },
+    executor::{self, DutyCheck, DutyReceipt, Lookup, Receipt},
     hooks,
     readiness::{Readiness, Reason},
+    slashing::{Decision, Refusal as DutyRefusal},
     state::Authorization,
     types::{Outcome, SignRequest},
 };
@@ -152,10 +157,48 @@ pub enum SignError {
     Stopped,
     #[error("recovered signature does not verify")]
     Invalid,
+    #[error("unknown validator public key")]
+    UnknownValidator,
+    /// The ceremony's key is a validator key: it signs validator duties only.
+    #[error("the ceremony's key is an Ethereum validator key: sign through the Web3Signer API")]
+    ValidatorKey,
+    /// The client's signing root is not the one of the duty it sent.
+    #[error("the supplied signing root does not match the duty (computed {})", format_root(.0))]
+    RootMismatch(Root),
+    /// Slashing protection (or another rule of the replicated state) refuses the duty.
+    #[error("refused by slashing protection: {0}")]
+    Refused(DutyRefusal),
+}
+
+/// What to sign.
+#[derive(Clone)]
+enum Work {
+    /// An arbitrary payload under a `(ceremony, nonce)` authorization (development keys).
+    Payload(SignRequest),
+    /// A validator duty, and the signing root the client expects, if it sent one.
+    Duty(Box<DutyRequest>, Option<Root>),
+}
+
+/// Identical requests in flight share one task.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Identity {
+    Payload(SignRequest),
+    Duty(ValidatorKey, Root, Option<Root>),
+}
+
+impl Work {
+    fn identity(&self) -> Identity {
+        match self {
+            Self::Payload(request) => Identity::Payload(request.clone()),
+            Self::Duty(request, expected) => {
+                Identity::Duty(request.validator, request.signing_root(), *expected)
+            }
+        }
+    }
 }
 
 struct Job {
-    request: SignRequest,
+    work: Work,
     response: oneshot::Sender<Result<Signed, SignError>>,
 }
 
@@ -186,9 +229,24 @@ impl Client {
 
     /// Authorize (if needed) and sign `request.payload_hash` with the ceremony's group key.
     pub async fn sign(&self, request: SignRequest) -> Result<Signed, SignError> {
+        self.submit(Work::Payload(request)).await
+    }
+
+    /// Authorize (if needed, under slashing protection) and sign a validator duty with the key of
+    /// `request.validator`. `expected` is the client's signing root: refused unless it is the
+    /// duty's.
+    pub async fn sign_duty(
+        &self,
+        request: DutyRequest,
+        expected: Option<Root>,
+    ) -> Result<Signed, SignError> {
+        self.submit(Work::Duty(Box::new(request), expected)).await
+    }
+
+    async fn submit(&self, work: Work) -> Result<Signed, SignError> {
         let (response, receiver) = oneshot::channel();
         self.sender
-            .send(Job { request, response })
+            .send(Job { work, response })
             .map_err(|_| SignError::Stopped)?;
         receiver.await.map_err(|_| SignError::Stopped)?
     }
@@ -277,7 +335,7 @@ struct Deps<S> {
 }
 
 /// Clients waiting for each request in flight.
-type Waiters = Arc<Mutex<HashMap<SignRequest, Vec<oneshot::Sender<Result<Signed, SignError>>>>>>;
+type Waiters = Arc<Mutex<HashMap<Identity, Vec<oneshot::Sender<Result<Signed, SignError>>>>>>;
 
 pub struct Coordinator<E: Clock + Spawner, S: Sender<PublicKey = PublicKey>> {
     context: ContextCell<E>,
@@ -327,10 +385,11 @@ impl<E: Clock + Spawner, S: Sender<PublicKey = PublicKey>> Coordinator<E, S> {
 
     async fn run(mut self) {
         while let Some(job) = self.mailbox.recv().await {
+            let identity = job.work.identity();
             let mut waiters = self.waiters.lock().unwrap();
             // The same request is already in flight: share its result (no second authorization,
             // no second collection).
-            if let Some(waiting) = waiters.get_mut(&job.request) {
+            if let Some(waiting) = waiters.get_mut(&identity) {
                 if waiting.len() < MAX_WAITERS {
                     waiting.push(job.response);
                 } else {
@@ -342,19 +401,24 @@ impl<E: Clock + Spawner, S: Sender<PublicKey = PublicKey>> Coordinator<E, S> {
                 let _ = job.response.send(Err(SignError::Busy));
                 continue;
             }
-            waiters.insert(job.request.clone(), vec![job.response]);
+            waiters.insert(identity.clone(), vec![job.response]);
             drop(waiters);
             self.active.fetch_add(1, Ordering::AcqRel);
             let deps = self.deps.clone();
             let active = InFlight(self.active.clone());
             let waiters = self.waiters.clone();
             self.context.child("sign").spawn(move |context| async move {
-                let result = sign(&context, &deps, job.request.clone()).await;
+                let result = match job.work {
+                    Work::Payload(request) => sign(&context, &deps, request).await,
+                    Work::Duty(request, expected) => {
+                        sign_duty(&context, &deps, *request, expected).await
+                    }
+                };
                 drop(active);
                 let waiting = waiters
                     .lock()
                     .unwrap()
-                    .remove(&job.request)
+                    .remove(&identity)
                     .unwrap_or_default();
                 for waiter in waiting {
                     let _ = waiter.send(result.clone());
@@ -465,6 +529,7 @@ async fn sign<E: Clock, S: Sender<PublicKey = PublicKey>>(
                     return Err(SignError::Conflict(authorization));
                 }
                 (Outcome::UnknownCeremony, _) => return Err(SignError::UnknownCeremony),
+                (Outcome::ValidatorKey, _) => return Err(SignError::ValidatorKey),
                 _ => return Err(SignError::NotCompleted(ceremony.status)),
             }
         }
@@ -509,6 +574,140 @@ async fn sign<E: Clock, S: Sender<PublicKey = PublicKey>>(
     );
     Ok(Signed {
         request,
+        authorization,
+        kind,
+        signature,
+        signers,
+        timings,
+    })
+}
+
+async fn check_duty(
+    executor: &mpsc::UnboundedSender<executor::Message>,
+    request: DutyRequest,
+) -> Result<DutyCheck, SignError> {
+    let (response, receiver) = oneshot::channel();
+    executor
+        .send(executor::Message::CheckDuty {
+            request: Box::new(request),
+            response,
+        })
+        .map_err(|_| SignError::Stopped)?;
+    receiver.await.map_err(|_| SignError::Stopped)
+}
+
+async fn submit_duty(
+    executor: &mpsc::UnboundedSender<executor::Message>,
+    request: DutyRequest,
+) -> Result<DutyReceipt, SignError> {
+    let (response, receiver) = oneshot::channel();
+    executor
+        .send(executor::Message::SubmitDuty {
+            request: Box::new(request),
+            response,
+        })
+        .map_err(|_| SignError::Stopped)?;
+    receiver.await.map_err(|_| SignError::Stopped)
+}
+
+/// Sign a validator duty: its signing root is authorized by the replicated state machine (which
+/// computes it and applies slashing protection), then signed like any authorized payload.
+async fn sign_duty<E: Clock, S: Sender<PublicKey = PublicKey>>(
+    context: &E,
+    deps: &Deps<S>,
+    request: DutyRequest,
+    expected: Option<Root>,
+) -> Result<Signed, SignError> {
+    let received = context.current();
+    let mut timings = Timings::default();
+    hooks::pause_point(context, "received").await;
+
+    // 1. The committed decision, or consensus' decision if there is none yet. A refusal seen here
+    //    is final: slashing history only grows.
+    let check = check_duty(&deps.executor, request.clone()).await?;
+    let validator = check.validator.ok_or(SignError::UnknownValidator)?;
+    if expected.is_some_and(|expected| expected != check.signing_root) {
+        return Err(SignError::RootMismatch(check.signing_root));
+    }
+    let (signing_root, height, kind) = match (check.decision, check.height) {
+        (Decision::AlreadyAccepted, Some(height)) => {
+            (check.signing_root, height, AuthorizationKind::Existing)
+        }
+        (Decision::Refused(refusal), _) => return Err(SignError::Refused(refusal)),
+        _ => {
+            let blockers = submission_readiness(context, &deps.executor)
+                .await?
+                .submission_blockers();
+            if !blockers.is_empty() {
+                return Err(SignError::NotReady(blockers));
+            }
+            let submitted = context.current();
+            let receipt = select! {
+                receipt = submit_duty(&deps.executor, request.clone()) => { receipt? },
+                _ = context.sleep(deps.config.authorization_timeout) => {
+                    return Err(SignError::AuthorizationTimeout);
+                },
+            };
+            timings.authorization_ms = Some(millis(submitted, receipt.finalized_at));
+            timings.apply_ms = Some(millis(receipt.finalized_at, receipt.applied_at));
+            let kind = match receipt.decision {
+                Decision::Accepted => AuthorizationKind::New,
+                Decision::AlreadyAccepted => AuthorizationKind::Existing,
+                Decision::Refused(refusal) => return Err(SignError::Refused(refusal)),
+            };
+            (receipt.signing_root, receipt.height, kind)
+        }
+    };
+    hooks::crash_point("authorized");
+    hooks::pause_point(context, "authorized").await;
+
+    // 2. Partial signatures of exactly that root, from the ceremony that signs for the key.
+    let found = lookup(&deps.executor, validator.ceremony.clone(), 0).await?;
+    let ceremony = found.ceremony.ok_or(SignError::UnknownValidator)?;
+    let output = ceremony.output.clone().ok_or(SignError::UnknownValidator)?;
+    let authorization = Authorization {
+        payload_hash: signing_root,
+        height,
+    };
+    let payload = SignRequest {
+        ceremony: validator.ceremony,
+        nonce: 0,
+        payload_hash: signing_root,
+    };
+    let collected = collect(context, deps, &ceremony, &output, &payload, authorization).await?;
+
+    // 3. The validator's signature, checked against its public key.
+    let threshold_at = context.current();
+    let signature = signing::recover(output.public(), collected.partials.values())
+        .map_err(|_| SignError::Invalid)?;
+    signing::Message::Ethereum(signing_root)
+        .verify(output.public().public(), &signature)
+        .map_err(|_| SignError::Invalid)?;
+    let done = context.current();
+    timings.first_partial_ms = collected
+        .first
+        .map(|first| millis(collected.started, first));
+    timings.collect_ms = millis(collected.started, threshold_at);
+    timings.recover_ms = millis(threshold_at, done);
+    timings.total_ms = millis(received, done);
+    let signers: Vec<u32> = collected.partials.keys().copied().collect();
+    info!(
+        validator = %format_validator(&request.validator),
+        duty = ?request.duty.kind(),
+        signing_root = %format_root(&signing_root),
+        height,
+        ?kind,
+        ?signers,
+        authorization_ms = timings.authorization_ms,
+        apply_ms = timings.apply_ms,
+        first_partial_ms = timings.first_partial_ms,
+        collect_ms = timings.collect_ms,
+        recover_ms = timings.recover_ms,
+        total_ms = timings.total_ms,
+        "signed validator duty"
+    );
+    Ok(Signed {
+        request: payload,
         authorization,
         kind,
         signature,

@@ -10,6 +10,8 @@ enforces it. Passing tests are evidence, not proof (tests are listed in the last
 | --------- | ------ | --- |
 | Local storage opened | Yes | `Store::init`, `Secrets::init` and marshal's archives open, or the node exits |
 | State consistent with marshal's progress | Yes, at startup | marshal returns its durable processed height (`Floor`) from `init`; compared before any actor starts |
+| Slashing history internally consistent and matching the ceremonies | Yes, at startup | `Store::verify`: per-validator record counts, known validators, keys equal to their ceremony's group key ([slashing-protection.md](slashing-protection.md)) |
+| Slashing history complete with respect to the network | **No** | a history consistently older (a rollback) looks like a node that missed blocks; it replays them, and a rollback of every node is undetected (§7) |
 | Key shares consistent with the state | Yes, at startup | every stored share must belong to a completed ceremony of the state; loaded shares are verified against the ceremony's public polynomial |
 | All locally known finalized blocks applied | Yes | marshal reports its finalized tip (`Update::Tip`); compared with the executor's height |
 | Caught up with the network | **No** | a node only knows what its peers told it. Nothing claims this |
@@ -20,18 +22,29 @@ enforces it. Passing tests are evidence, not proof (tests are listed in the last
 
 `engine::start` opens the durable stores first and checks them against each other before any
 actor runs (`engine::check_recovery`). On failure the node logs `refusing to start` with the
-reason and exits with status 1. Nothing is reset or deleted and no key share is regenerated: the
-replicated state, the key shares, the consensus journal and marshal's progress are left byte for
-byte as they were, and no file is removed (asserted by `lifecycle::assert_fails_closed`). Reading
-marshal's progress requires opening the block archives, which, as on any start, rewrite their own
-metadata and repair torn tails of their journals.
+reason and exits with status 1. Nothing is reset or deleted, no file is removed and no key share is
+regenerated.
+
+Evidence: opening a commonware metadata store truncates a copy that fails its integrity check
+(it recovers from the other copy), and that happens before the checks can run. So, before
+opening anything, the node reads every copy of the state, the secret store, marshal's progress and
+the archives' metadata, and saves each copy that fails the same check (an 8-byte version, the
+entries, a big-endian CRC32 of both) to the `registry-diagnostics` partition, synced
+(`engine::preserve_damaged_copies`). A saved copy is named by its content: written once, never
+rewritten (a partial one, from a crash while saving, is written again), never read by the node.
+The working stores are then left to commonware's normal recovery; nothing writes old bytes back
+into them. A start interrupted after saving leaves the working copy untouched; repeated starts
+never duplicate the evidence (`lifecycle::r5_damaged_copy_is_saved_before_opening`). Opening the
+stores otherwise changes them as any start does: archive metadata rewritten, torn journal tails
+repaired.
 
 | Check | Refuses when | Why |
 | ----- | ------------ | --- |
 | Replicated state opens | both copies corrupted, unknown format, legacy format 1 | the state cannot be trusted or read |
 | State not behind marshal | state height < marshal's processed height | marshal resumes after the last block it saw acknowledged, and the executor acknowledges only after the state commit: the state can be ahead by one block (crash before the acknowledgement, replayed and skipped), never behind. Behind means applied blocks were lost; running would skip them silently (BUG-2) |
 | Share has its ceremony | a stored share's round has no completed ceremony in the state | a share is stored only after its ceremony's completion is durably applied; otherwise the state (and its authorization history) was lost or rolled back while the share stayed |
-| Consensus journal present | the journal partition is empty while the node has finalized history (state or marshal height > 0) | the node may have voted in views it no longer remembers; voting again could equivocate. Overridable by the operator only (`--allow-missing-consensus-journal`, see §5) |
+| Slashing history consistent | a record of an unknown validator, a validator whose record count differs from its stored records, a validator ceremony without its validator (or the reverse), a key that is not its ceremony's, an entry of an unknown kind | the history of a validator key must be complete before it signs again: a lost proposal or attestation would let a conflicting one through ([slashing-protection.md](slashing-protection.md#startup-checks-fail-closed)) |
+| Consensus journal present | the journal partition is empty while the node has finalized history (state or marshal height > 0) | the node may have voted in views it no longer remembers; voting again could equivocate. Overridable by the operator only (`--allow-missing-consensus-journal`, see §6) |
 
 The executor keeps the run-time check of BUG-2: a finalized block delivered at a height other than
 the next one stops the node.
@@ -45,13 +58,63 @@ which the floor requires, and genesis, used before, is the lowest possible floor
 behaves as before, and a node whose journal was lost or replaced by an older one cannot repeat a
 vote at or below its last processed finalization.
 
+What the floor guarantees, and why:
+
+- It is a durable finalization: marshal's processed height is synced only after the executor
+  acknowledged the block, which it does after the state commit; the finalization certificate of a
+  processed block is stored (and synced) before the block is delivered. A crash after the state
+  commit and before the acknowledgement leaves the floor one block below the state
+  (`crash::a4_*` asserts it), never above it.
+- It is valid for this committee: simplex verifies the certificate against the configured scheme
+  (participants and namespace) when the engine is built, and refuses to start otherwise.
+- It comes after the startup checks: consensus is the last component started.
+- The voter enters `floor_view + 1` and never moves to a lower view; journal entries at or below
+  the floor are skipped. It cannot vote at or below the floor
+  (`rollback::journal_only_rollback_resumes_above_floor` shows a node with an old journal resuming
+  at `floor_view + 1`, not at the old journal's view).
+
 What the floor does not cover: votes cast after that finalization (the views in flight when the
-node stopped), and anything at all when marshal's progress was rolled back together with the
-journal (a whole-directory restore). Those are §5's unsupported cases.
+node stopped: a journal older than those votes forgets them, and the node may vote again
+differently, an equivocation peers may detect), and anything at all when marshal's progress was
+rolled back together with the journal (a whole-directory restore: the floor is rolled back too,
+`rollback::a1_full_restore_*` asserts it). Those are §6's unsupported cases. The floor detects no
+rollback; it only bounds what a node with a lost or older journal can repeat.
 
 `/status` reports the floor (`readiness.consensus.floor_height`, `floor_view`).
 
-## 4. Readiness
+## 4. Readiness is not a safety mechanism
+
+Readiness only decides whether this node accepts new work. No signature depends on it:
+
+1. **A partial signature needs a durably applied authorization.** `dkg::actor::partial` signs only
+   a `storage::Committed` value for exactly the requested payload; only the store creates those,
+   from state read from disk or just synced. A node behind the network has fewer authorizations,
+   never different ones: it refuses (`not_authorized`, the request is parked), it never signs a
+   payload it has not applied.
+2. **Authorizations are decided by consensus, first finalized wins.** `state::apply` is
+   deterministic: the first finalized command for a `(ceremony, nonce)` creates the authorization;
+   a later command with another payload is `Rejected` and changes nothing, on every node, because
+   every node applies the same finalized sequence.
+3. **A coordinator signs only what the state machine returned.** It collects partials only after
+   finding the authorization applied locally, or after its own command was applied with outcome
+   `Accepted` (or `AlreadyAccepted`, same payload); `Rejected` ends the request with `409`.
+4. **A group signature needs three partials**, from three distinct keyholders that each checked
+   (1); a byzantine keyholder contributes at most one.
+
+So a stale node may *submit* a conflicting command (its local read finds nothing), but the command
+can only be finalized after the authorization it conflicts with, and is rejected there. The node
+learns the outcome when it applies that block: its client gets `409 REJECTED`, or
+`AUTHORIZATION_TIMEOUT` if it does not catch up in time (retrying then gets `409`). Local absence
+of an authorization is never treated as proof that a nonce is unused.
+
+The readiness tolerance (two blocks) is a liveness choice only. With a tolerance of zero, a node
+would refuse new authorizations at random right after every block; with any tolerance, (1)-(4)
+hold. `lag::*` exercises one, two and three blocks of lag with a byzantine signer in place of
+node 1 and conflicting requests racing through a current and a lagging node: B is submitted and
+rejected at one and two blocks, refused before submission at three, and no partial or group
+signature for the losing payload ever exists.
+
+## 5. Readiness
 
 `readiness::Readiness::evaluate` is a pure function of what the node observes:
 
@@ -104,7 +167,7 @@ What readiness does not claim:
   nothing older is missing; missing blocks are backfilled by marshal and appear as
   `local_backlog` once their finalization is known.
 
-## 5. Recovery scenarios
+## 6. Recovery scenarios
 
 ### Supported
 
@@ -123,7 +186,7 @@ What readiness does not claim:
 | Restoring an old consensus journal | the node forgets votes cast after the backup; votes above its floor can be repeated differently (an equivocation, a Byzantine fault) | not detectable when the rest of the directory is consistent with it; peers that see an equivocation block the node at the P2P layer for an hour (audit L-7) |
 | Replacing a node's directory with another node's | another node's key share (partials rejected) and votes (equivocation for that identity) | not detected by this node |
 | Restoring several nodes from stale snapshots | two or more nodes without their votes exceed `f = 1` | safety no longer guaranteed by consensus |
-| Whole-network rollback | §6 | conflicting signatures (L-1) |
+| Whole-network rollback | §7 | conflicting signatures (L-1) |
 
 ### Scenario summary
 
@@ -136,7 +199,7 @@ What readiness does not claim:
 | Corrupted storage | The node does not run when the damage is detected (§2); a torn copy not yet acknowledged is replayed | Does not run | Exit status 1, storage left as is |
 | Whole-network rollback | **No** (L-1) | **No** | Undetectable, unsupported |
 
-## 6. Whole-network rollback (L-1)
+## 7. Whole-network rollback (L-1)
 
 If every node is restored to storage from before `(ceremony, nonce)` was authorized for payload A,
 the network authorizes and signs a conflicting payload B for the same nonce:
@@ -160,14 +223,16 @@ What would detect it, all outside this task:
   external append-only log or anchor (another chain, a transparency log) consulted before signing;
 - or peers that are not rolled back: more nodes than the faulty threshold kept independent.
 
-Why Ethereum slashing protection must be separate: an Ethereum validator is slashed for two
-conflicting signatures, whatever this system believes. The record of what was signed (per
-validator: highest source and target epochs, block slots) must survive any recovery of the signer
-nodes, so it cannot live only in their rollbackable storage. A validator integration needs its own
-slashing-protection store with its own durability and anti-rollback guarantees (for example the
-EIP-3076 interchange format kept outside the signer, checked before every request).
+The same holds for Ethereum slashing protection, which is now part of the replicated state
+([slashing-protection.md](slashing-protection.md)). It protects against every fault above
+except this one. An Ethereum validator is slashed for two conflicting signatures, whatever this
+system believes, and a rollback of every node forgets what was signed:
+`eth2::e2e_eth_l1_whole_network_rollback_signs_a_double_proposal` reproduces a double proposal
+(ignored, failing). Protection against it needs slashing history outside the nodes' rollback
+domain. An anchor is designed in [slashing-protection.md](slashing-protection.md#proposal-an-independent-durable-anchor),
+not implemented. No local counter was added in its place.
 
-## 7. Other limits addressed here
+## 8. Other limits addressed here
 
 - **L-3 (coalescing per node).** Identical requests on one node share one task: an optimization.
   Coordinators on different nodes may each aggregate the same authorized payload; that is
@@ -180,10 +245,11 @@ EIP-3076 interchange format kept outside the signer, checked before every reques
   longer sent retransmissions for it, and its later answers are ignored; the request state is
   released when the request ends (`signer::coordinator::collect`).
 - **HTTP exposure.** The API binds to `127.0.0.1` only, with no option to change it. It has no
-  authentication and signs any root it is given: it is for development and tests, never for a
-  network. A validator API needs authentication and slashing protection first.
+  authentication. The Web3Signer API signs only duties that pass slashing protection. The
+  development API, which signs any root it is given, exists only in `dev-api` builds. Neither is
+  for a network.
 
-## 8. Tests
+## 9. Tests
 
 | Scenario | Tests |
 | -------- | ----- |
@@ -195,4 +261,9 @@ EIP-3076 interchange format kept outside the signer, checked before every reques
 | R5 corrupted or inconsistent storage | `lifecycle::f4_*`, `lifecycle::r5_missing_consensus_journal_fails_closed`, `lifecycle::r5_share_without_state_fails_closed` |
 | R6 recovery with an offline peer | `readiness::r6_recovery_with_one_offline_peer` |
 | L-4, L-5 | `adversarial::e4_e5_parked_overflow_and_expiry`, `adversarial::d4_strike_limit` |
-| L-1 | `rollback::a2_whole_network_rollback` (ignored, fails) |
+| Readiness tolerance vs. conflicting authorizations | `lag::one_block_behind_*`, `lag::two_blocks_behind_*`, `lag::three_blocks_behind_*`, `lag::concurrent_conflicting_requests_while_lagging` |
+| Durable floor | `rollback::journal_only_rollback_resumes_above_floor`, `crash::a3_*`, `crash::a4_*`, `rollback::a1_full_restore_*` |
+| Evidence of damaged copies | `lifecycle::r5_damaged_copy_is_saved_before_opening`, `lifecycle::assert_fails_closed` (every R5/F4 refusal) |
+| Slashing history: persistence, fail-closed startup on altered history | `storage::tests::validator::*` (unit) |
+| Slashing history across crashes, restarts, a lagging node and a single-node rollback | `eth2::e2e_eth_3_*`, `eth2::e2e_eth_4_*`, `eth2::e2e_eth_5_*`, `eth2::e2e_eth_6_*`, `eth2::e2e_eth_7_*`, `tests/eth_duties.rs` |
+| L-1 | `rollback::a2_whole_network_rollback`, `eth2::e2e_eth_l1_whole_network_rollback_signs_a_double_proposal` (ignored, fail) |

@@ -6,7 +6,8 @@ NODES=${NODES:-4}
 DATA_DIR=${DATA_DIR:-data}
 
 cd "$(dirname "$0")/.."
-cargo build --release
+# FEATURES=dev-api enables the development signing API (`POST /sign`).
+cargo build --release ${FEATURES:+--features "$FEATURES"}
 mkdir -p "$DATA_DIR"
 
 pids=()

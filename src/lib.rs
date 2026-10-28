@@ -4,11 +4,13 @@
 pub mod application;
 pub mod dkg;
 pub mod engine;
+pub mod eth;
 pub mod executor;
 pub mod hooks;
 pub mod readiness;
 pub mod rpc;
 pub mod signer;
+pub mod slashing;
 pub mod state;
 pub mod storage;
 pub mod types;

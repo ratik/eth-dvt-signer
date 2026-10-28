@@ -7,7 +7,12 @@
 //! - `ETH_MPC_SIGNER_PAUSE_AT=<point>` and `ETH_MPC_SIGNER_PAUSE_FILE=<path>`: at `<point>`, wait
 //!   while `<path>` exists (async points only).
 //! - `ETH_MPC_SIGNER_HOLD_FILE=<path>`: while `<path>` exists, the executor does not apply finalized
-//!   blocks (the node keeps voting and answering queries, but falls behind).
+//!   blocks (the node keeps voting and answering queries, but falls behind). With
+//!   `ETH_MPC_SIGNER_HOLD_FROM=transactions`, it keeps applying empty blocks and holds from the first
+//!   block that carries a transaction (so a test knows exactly which blocks are held).
+//! - `ETH_MPC_SIGNER_NO_EMPTY_BLOCKS_FILE=<path>`: while `<path>` exists, a leader proposes only
+//!   blocks carrying new transactions (views without one time out), so a test decides exactly
+//!   which blocks are finalized.
 //! - `ETH_MPC_SIGNER_EXIT_ON_STDIN_EOF=1`: the process exits when its stdin closes, so nodes never
 //!   outlive the test process that spawned them.
 //!
@@ -20,6 +25,7 @@
 //!   before applying it.
 //! - `after-apply-authorization`: that block is durably applied, before the DKG actor (signer)
 //!   learns about it.
+//! - `after-diagnostics`: at startup, damaged metadata copies are saved, no store is opened yet.
 //! - `before-partial-send`: a participant computed a partial for a peer, before sending it.
 //! - `after-partial-send`: right after sending it.
 
@@ -84,6 +90,17 @@ mod enabled {
         holding
     }
 
+    /// Whether leaders must not propose empty blocks right now.
+    pub fn empty_blocks_paused() -> bool {
+        std::env::var("ETH_MPC_SIGNER_NO_EMPTY_BLOCKS_FILE")
+            .is_ok_and(|path| Path::new(&path).exists())
+    }
+
+    /// Whether the executor must hold a newly finalized block (later ones are held in order).
+    pub fn hold(has_transactions: bool) -> bool {
+        holding() && (has_transactions || !at("ETH_MPC_SIGNER_HOLD_FROM", "transactions"))
+    }
+
     pub fn exit_on_stdin_eof() {
         if std::env::var("ETH_MPC_SIGNER_EXIT_ON_STDIN_EOF").is_ok() {
             std::thread::spawn(|| {
@@ -106,6 +123,14 @@ mod enabled {
     pub async fn pause_point(_: &impl commonware_runtime::Clock, _: &str) {}
 
     pub const fn holding() -> bool {
+        false
+    }
+
+    pub const fn hold(_: bool) -> bool {
+        false
+    }
+
+    pub const fn empty_blocks_paused() -> bool {
         false
     }
 

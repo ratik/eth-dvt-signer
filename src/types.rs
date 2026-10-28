@@ -1,6 +1,9 @@
 //! Wire types shared by every node: the command, its outcome and the block that orders commands.
 
-use crate::dkg::{CeremonyConfig, CeremonyId, MAX_PARTICIPANTS, ceremony::SignedLog};
+use crate::{
+    dkg::{CeremonyConfig, CeremonyId, MAX_PARTICIPANTS, ceremony::SignedLog},
+    eth::duty::DutyRequest,
+};
 use bytes::{Buf, BufMut};
 use commonware_codec::{Encode, EncodeSize, Error, Read, ReadExt, Write, varint::UInt};
 use commonware_consensus::{Heightable, types::Height};
@@ -61,13 +64,20 @@ impl EncodeSize for SignRequest {
 /// A command ordered by consensus.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
-    /// Authorize a signature.
+    /// Authorize a signature of an arbitrary payload (development keys only: refused for a
+    /// validator key).
     Sign(SignRequest),
-    /// Start a DKG ceremony.
+    /// Start a DKG ceremony for a development key.
     StartCeremony(CeremonyConfig),
     /// A dealer's public log for the ceremony `round`: its commitment and every player's
     /// acknowledgement. Never contains private dealings (see `dkg::ceremony`).
     DealerLog { round: u64, log: Box<SignedLog> },
+    /// Start a DKG ceremony whose key is an Ethereum validator key: it signs only Ethereum duties,
+    /// under slashing protection (`slashing`).
+    StartValidatorCeremony(CeremonyConfig),
+    /// Authorize an Ethereum validator duty (the state machine computes its signing root and
+    /// applies slashing protection).
+    Duty(Box<DutyRequest>),
 }
 
 // `SignedLog` only implements `PartialEq`, but its equality is a full equivalence.
@@ -89,6 +99,14 @@ impl Write for Command {
                 UInt(*round).write(buf);
                 log.write(buf);
             }
+            Self::StartValidatorCeremony(config) => {
+                3u8.write(buf);
+                config.write(buf);
+            }
+            Self::Duty(request) => {
+                4u8.write(buf);
+                request.write(buf);
+            }
         }
     }
 }
@@ -104,6 +122,8 @@ impl Read for Command {
                 round: UInt::read(buf)?.into(),
                 log: Box::new(SignedLog::read_cfg(buf, &MAX_PARTICIPANTS)?),
             }),
+            3 => Ok(Self::StartValidatorCeremony(CeremonyConfig::read(buf)?)),
+            4 => Ok(Self::Duty(Box::new(DutyRequest::read(buf)?))),
             tag => Err(Error::InvalidEnum(tag)),
         }
     }
@@ -115,6 +135,8 @@ impl EncodeSize for Command {
             Self::Sign(request) => request.encode_size(),
             Self::StartCeremony(config) => config.encode_size(),
             Self::DealerLog { round, log } => UInt(*round).encode_size() + log.encode_size(),
+            Self::StartValidatorCeremony(config) => config.encode_size(),
+            Self::Duty(request) => request.encode_size(),
         }
     }
 }
@@ -174,6 +196,8 @@ pub enum Outcome {
     UnknownCeremony,
     /// The ceremony is in progress or failed: there is no group key to sign with.
     CeremonyNotCompleted,
+    /// The ceremony's key is an Ethereum validator key: it signs only validator duties.
+    ValidatorKey,
 }
 
 /// A batch of transactions ordered by consensus.

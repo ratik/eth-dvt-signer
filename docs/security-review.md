@@ -1,7 +1,7 @@
 # Security review: signing path
 
-Scope: consensus-backed authorization, the signing protocol, the coordinator and the keyholder,
-as implemented in this repository. The adversarial test campaign, its findings (and fixes) and the
+Scope: consensus-backed authorization, Ethereum validator duties and their slashing protection,
+the signing protocol, the coordinator and the keyholder, as implemented in this repository. The adversarial test campaign, its findings (and fixes) and the
 fault-model table are in [audit.md](audit.md).
 
 ## Assumptions
@@ -12,7 +12,11 @@ fault-model table are in [audit.md](audit.md).
 - p2p (commonware `lookup`): authenticated and encrypted; only the 4 configured keys can connect.
 - Storage: `Metadata` commits are atomic and durable once `sync` returns; a node's data directory
   is not readable by others (mode `0700`, no encryption at rest).
-- Clients are not authenticated: anyone reaching the HTTP port can authorize and sign.
+- Clients are not authenticated: anyone reaching the HTTP port can have duties authorized and
+  signed, within slashing protection (and, in `dev-api` builds, any payload under a development
+  key).
+- The validator client's `fork_info` is taken as sent: a wrong fork version or chain gives a
+  signature that is invalid on the real chain but still uses the slot or epoch.
 
 ## Findings
 
@@ -26,14 +30,24 @@ fault-model table are in [audit.md](audit.md).
 | Cross-ceremony replay | The request id binds the ceremony, and partials verify against that ceremony's public polynomial, so another ceremony's partials fail. | Implemented, tested |
 | Cross-request replay | Responses are routed by request id (version, ceremony, nonce, payload), so a response for another request never reaches this one. A partial binds only the payload (the Ethereum root). Two authorized nonces with the same root give the same signature, which is harmless. | By design, documented |
 | Stale nodes | A lagging node refuses everything it has not applied. Signing an applied finalized authorization while still catching up is safe, because finalized authorizations never change. It reports why it is not ready and refuses to submit new authorizations (`NOT_READY`); readiness never claims the node has the network's latest block ([recovery.md](recovery.md)). | Implemented, tested (E2E-9, `tests/signing.rs`) |
-| State partition behind the finalized history (torn newest copy, deleted or restored alone) | The node refuses to start when its state is behind marshal's processed height, and at run time the executor refuses a block that is not the next height (exit status 1 either way), instead of silently skipping blocks and diverging. A key share without its ceremony in the state, or a missing consensus journal, also stops it at startup. The damaged storage is left as found. | Fixed in the audit (BUG-2, H-2, H-4), tested (`f4_*`, `r5_*`) |
+| State partition behind the finalized history (torn newest copy, deleted or restored alone) | The node refuses to start when its state is behind marshal's processed height, and at run time the executor refuses a block that is not the next height (exit status 1 either way), instead of silently skipping blocks and diverging. A key share without its ceremony in the state, or a missing consensus journal, also stops it at startup. Copies failing their integrity check are saved to `registry-diagnostics` before the stores are opened. | Fixed in the audit (BUG-2, H-2, H-4), tested (`f4_*`, `r5_*`) |
 | Byzantine participant vs. liveness | With 3 honest online signers, one Byzantine participant cannot stop signing. Its invalid responses cost it 3 strikes per request, it counts once however it fails (BUG-1, fixed), and it cannot spoof or ban others. With only 3 online including the Byzantine one, signing may fail; safety holds. | Implemented, tested (E2E-8, `tests/signing.rs`) |
-| Resource exhaustion | Bounded: 256 requests in flight per coordinator (`503`), 64 buffered responses per request, 3 strikes per participant, 256 parked requests, at most 64 per peer (dropped after 16 blocks), no retransmission to a participant banned for the request, 1 MB p2p messages and per-peer quotas, HTTP timeout. Not bounded: HTTP clients can create authorizations without limit (consensus and storage cost; no auth or rate limit). The keyholder mailbox is limited only by the p2p quota. Authorizations are kept forever. | Partly mitigated, documented |
+| Resource exhaustion | Bounded: duties of at most 32 KiB in a command, 8 distinct roots per validator, non-slashable duty type and period; 256 requests in flight per coordinator (`503`), 64 buffered responses per request, 3 strikes per participant, 256 parked requests, at most 64 per peer (dropped after 16 blocks), no retransmission to a participant banned for the request, 1 MB p2p messages and per-peer quotas, HTTP timeout. Not bounded: HTTP clients can create authorizations and slashing records without limit (consensus and storage cost; no auth or rate limit), and slashing history is never pruned. The keyholder mailbox is limited only by the p2p quota. Authorizations are kept forever. | Partly mitigated, documented |
+| Validator key signing an arbitrary root | No. The client sends a typed duty. Every node computes its signing root from the finalized command (`DutyRequest::signing_root`), never from a client's or coordinator's root, and the keyholder signs a root only if `(ceremony round, root)` is a committed duty authorization of that key. A client `signingRoot` that differs is refused before anything is decided. | Implemented, tested (`tests/eth_duties.rs`, E2E-ETH-1) |
+| Byzantine coordinator pairing harmless duty fields with a conflicting root | Not possible: there is no root field in the command. The root is a function of the duty and `fork_info`, recomputed by every node. | By construction |
+| Conflicting slashable duties (double proposal, double or surround vote), concurrently through different nodes | Consensus orders the commands. The state machine authorizes the first and refuses the second (`412`) on every node, over the validator's whole history. A command submitted directly by a node skipping its coordinator checks is decided the same way. | Implemented, tested (`slashing::tests`, `tests/eth_duties.rs`, E2E-ETH-2) |
+| Slashing record and authorization out of step | Not possible: both are written in the one atomic commit of their block. The keyholder learns of a duty only after that commit; at startup it is seeded from the committed state. | Implemented, tested (crash points, E2E-ETH-4) |
+| Validator key through the development API, or a development key through the Web3Signer API | No. The purpose is fixed by consensus when the ceremony starts. A `Sign` command on a validator ceremony is refused by the state machine (`ValidatorKey`). A development key is not a validator (`404`). The development API is not compiled into default builds. | Implemented, tested (`storage::tests::validator`, E2E-ETH-1, `tests/production_api.rs`) |
+| Cross-validator and cross-purpose replay | A duty authorization is scoped to the key's ceremony round: another validator's ceremony, or a development authorization of the same bytes, does not sign it. | Implemented, tested (`tests/eth_duties.rs`) |
+| Chain confusion | A validator's first authorized duty pins its genesis validators root. Duties for another chain are refused. The domain also separates chains. | Implemented, tested |
+| Slashing history lost or altered on disk | Startup refuses missing or extra records (per-validator counts), unknown validators, keys that do not match their ceremony, and corrupt entries. A consistent rewrite of the history of 2 or more nodes, or a rollback of every node, is not detected: a double proposal is reproduced (`e2e_eth_l1_*`, ignored). | Partial: see [slashing-protection.md](slashing-protection.md) |
 | Signing-domain separation | Ethereum signatures use the POP ciphersuite DST over the raw root. The internal domain uses another DST, and nothing exposed signs in it. DKG transcripts are signed with the ed25519 node keys. | Implemented, tested (unit, blst) |
 
 ## Not provided
 
-- Ethereum slashing protection (nonces are caller-chosen; see `docs/architecture.md`).
+- Slashing protection that survives a rollback of every node (an anchor is proposed in
+  [slashing-protection.md](slashing-protection.md), not implemented), EIP-3076 import and export.
+- Slashing protection for the development API (`dev-api` builds; nonces are caller-chosen).
 - Client authentication, authorization policy, rate limiting.
 - Encryption of shares at rest, HSM or TEE isolation.
 - Protection against more than `f` Byzantine or rolled-back nodes.

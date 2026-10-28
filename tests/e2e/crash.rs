@@ -98,7 +98,21 @@ fn a3_crash_before_applying_authorization() {
     assert!(network.count(1, "test hook: crashing at before-apply-authorization") > 0);
 
     network.restart_node_with(1, Vec::new());
+    // It crashed holding the block, unapplied: the state and the durable floor are below it.
+    let height = signed["height"].as_u64().unwrap();
+    let (at_start, floor) = recovery_point(&network, 1);
+    assert_eq!(at_start, height - 1);
+    assert!(floor <= at_start, "floor {floor}, state {at_start}");
     check_recovered_signer(&network, 1, 2, &signed);
+}
+
+/// The state height at startup and the finalized height consensus resumed above.
+fn recovery_point(network: &TestNetwork, node: usize) -> (u64, u64) {
+    let readiness = network.readiness(node);
+    (
+        readiness["state_height_at_start"].as_u64().unwrap(),
+        readiness["consensus"]["floor_height"].as_u64().unwrap(),
+    )
 }
 
 /// A4: node 1 crashes right after the authorization is durable, before its signer learns about
@@ -118,6 +132,12 @@ fn a4_crash_after_applying_before_signer_learns() {
     assert!(network.count(1, "test hook: crashing at after-apply-authorization") > 0);
 
     network.restart_node_with(1, Vec::new());
+    // Applied but not acknowledged: the state has the block, the floor (acknowledged progress
+    // only) does not; marshal delivers it again and it is skipped.
+    let height = signed["height"].as_u64().unwrap();
+    let (at_start, floor) = recovery_point(&network, 1);
+    assert_eq!(at_start, height);
+    assert!(floor < height, "floor {floor} from unacknowledged progress");
     check_recovered_signer(&network, 1, 2, &signed);
 }
 

@@ -3,22 +3,27 @@
 ## Layers
 
 ```
-HTTP adapter            src/rpc.rs              JSON/hex parsing, status codes. Ethereum-specific
-                                                request formats (Web3Signer) would be another adapter.
-        │ SignRequest {ceremony, nonce, payload_hash: [u8; 32]}
+HTTP adapters           src/rpc.rs              Web3Signer API (src/eth/web3signer parses typed
+                                                duties); the development API (`dev-api` only).
+        │ DutyRequest {validator, fork, duty} / SignRequest {ceremony, nonce, payload_hash}
 Coordinator             src/signer/coordinator  authorization (consensus if needed), partial
                                                 collection, recovery, verification. Knows nothing
                                                 about HTTP.
         │ executor messages / signing p2p channel
-Replicated state        src/executor, storage   (ceremony, nonce) -> payload, decided by consensus,
+Replicated state        src/executor, storage,  duties: signing root computed from the typed duty,
+                        src/slashing            slashing rules, record; development requests:
+                                                (ceremony, nonce) -> payload. Decided by consensus,
                                                 committed atomically per block.
-Keyholder               src/dkg/actor           shares; signs only Committed authorizations.
+Keyholder               src/dkg/actor           shares; signs only committed authorizations:
+                                                (ceremony, root) for duties, Committed for the rest.
 Crypto                  src/dkg/signing         Ethereum ciphersuite over raw 32-byte roots.
+Ethereum types          src/eth                 containers, SSZ hash_tree_root, domains, roots.
 ```
 
-The core never sees HTTP types, and the HTTP layer never sees shares or partial signatures. The
-signer works on opaque 32-byte signing roots: what they commit to (attestation, block, deposit) is
-the caller's business.
+The core never sees HTTP types, and the HTTP layer never sees shares or partial signatures. For
+validator keys, the state machine computes what is signed from the typed duty, so the signing
+root and the slashing decision cannot disagree. The client's `signingRoot` is only compared with
+it. The development API signs opaque 32-byte roots.
 
 ## Signing lifecycle
 
@@ -35,7 +40,10 @@ the caller's business.
 | T7 response | HTTP | | |
 
 The response carries the durations between these points (`timings_ms`), and the coordinator logs
-them (`signed`).
+them (`signed`). A validator duty has the same steps: T1 submits a `Duty` command, and T3 applies
+the slashing decision, its record and the authorization in the one sync. T3' hands
+`(ceremony round, signing root)` to the keyholder. Before T1, the coordinator reads the committed
+decision: an already authorized duty skips to T4, and a refused one ends there (`412`).
 
 ## Real-process E2E harness (`tests/e2e`)
 
@@ -46,7 +54,8 @@ them (`signed`).
   and speaks the signing protocol with a scripted responder (and, optionally, that node's real
   share). It is the injection point for protocol-level adversarial tests.
 - Test hooks (`--features test-hooks`, `src/hooks.rs`): crash after authorization or after N
-  partials, hold block execution, exit when stdin closes. Off in normal builds.
+  partials, hold block execution, exit when stdin closes. Off in normal builds. `test-hooks`
+  enables `dev-api`, so the E2E binary also serves the development signing API.
 
 The harness drives nodes only through their public interfaces (process, HTTP, p2p), so the same
 scenarios can run against nodes started elsewhere.
@@ -63,17 +72,18 @@ Kurtosis ethereum-package devnet: execution client + beacon node + validator cli
                                        4 eth-mpc-signer nodes (this repository)
 ```
 
-Steps, none done yet:
+Steps:
 
-1. Remote signer adapter (new HTTP adapter next to `src/rpc.rs`): Web3Signer
-   `POST /api/v1/eth2/sign/{identifier}` and `GET /api/v1/eth2/publicKeys`. It maps the identifier
-   to a ceremony, takes the request's `signingRoot` as `payload_hash`, and derives `nonce` from the
-   request in a way that keeps one nonce per signable duty.
-2. Slashing protection in front of the coordinator (EIP-3076 rules: no double proposal, no double or
-   surround vote). It must be replicated, like authorizations, so that all coordinators agree; the
-   nonce mechanism alone does not provide it.
+1. Done: the Web3Signer API, `POST /api/v1/eth2/sign/{identifier}` and
+   `GET /api/v1/eth2/publicKeys` ([ethereum-signing.md](ethereum-signing.md)). It differs from the
+   first plan: the request's `signingRoot` is not trusted, and there is no nonce. The duty is sent
+   typed, and the state machine computes its root.
+2. Done: slashing protection inside the replicated state machine, the specification's rules over
+   the whole history ([slashing-protection.md](slashing-protection.md)). Not done: EIP-3076
+   import and export, pruning, and an anchor against whole-network rollback (designed only).
 3. Validator onboarding: the DKG group key as the validator public key, a deposit (its signature is
-   a regular signature over the deposit signing root, so it already goes through `/sign`).
+   a regular signature over the deposit signing root; `DEPOSIT` is not supported by the API, and
+   needs the network's genesis fork version).
 4. Devnet: a Kurtosis `ethereum-package` args file with a validator client in remote-signer mode
    pointing at one node's adapter (or a load balancer over the four), and the generated validator
    keys replaced by the DKG key. A new test target drives Kurtosis (`kurtosis run`), waits for the

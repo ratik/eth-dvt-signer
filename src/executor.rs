@@ -8,8 +8,13 @@ use crate::{
         format_key,
     },
     engine::Retention,
+    eth::{
+        duty::{DutyRequest, ValidatorKey, format_root, format_validator},
+        types::Root,
+    },
     hooks,
     readiness::Progress,
+    slashing::{Decision, Validator},
     state::Authorization,
     storage::{Effect, Store},
     types::{Block, Command, Outcome, SignRequest, Transaction, format_hash},
@@ -56,6 +61,38 @@ pub struct Receipt {
     pub finalized_at: SystemTime,
     /// When the block was durably applied.
     pub applied_at: SystemTime,
+}
+
+/// Final answer for a submitted validator duty, sent once its block is durably applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DutyReceipt {
+    pub decision: Decision,
+    /// The signing root the state machine computed for the duty.
+    pub signing_root: Root,
+    /// Height of the block that decided the duty.
+    pub height: u64,
+    pub finalized_at: SystemTime,
+    pub applied_at: SystemTime,
+}
+
+/// A validator key: its public key, and the ceremony that signs for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatorEntry {
+    pub key: ValidatorKey,
+    pub ceremony: CeremonyId,
+    pub round: u64,
+}
+
+/// What the committed state says about a duty right now (nothing is recorded).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DutyCheck {
+    /// The validator, if the key is one.
+    pub validator: Option<ValidatorEntry>,
+    pub signing_root: Root,
+    /// `Accepted` means: not authorized yet, consensus may authorize it.
+    pub decision: Decision,
+    /// The block that authorized it, when it already is.
+    pub height: Option<u64>,
 }
 
 /// A ceremony and the authorization of one of its nonces, as committed.
@@ -115,6 +152,30 @@ pub enum Message {
         block: Arc<Block>,
         ack: Exact,
     },
+    /// Submit a validator duty for authorization.
+    SubmitDuty {
+        request: Box<DutyRequest>,
+        response: oneshot::Sender<DutyReceipt>,
+    },
+    /// Check a validator duty against the committed state, recording nothing.
+    CheckDuty {
+        request: Box<DutyRequest>,
+        response: oneshot::Sender<DutyCheck>,
+    },
+    /// Every validator key with a completed ceremony.
+    Validators {
+        response: oneshot::Sender<Vec<ValidatorEntry>>,
+    },
+    /// Whether ceremony `round` was started as a validator key.
+    ValidatorRound {
+        round: u64,
+        response: oneshot::Sender<bool>,
+    },
+    /// Start a ceremony for a validator key.
+    StartValidatorCeremony {
+        config: CeremonyConfig,
+        response: oneshot::Sender<StartReceipt>,
+    },
 }
 
 /// The node has shut down.
@@ -152,6 +213,49 @@ impl Client {
         receiver.await.map_err(|_| Stopped)
     }
 
+    /// Submit a validator duty and wait until consensus decided it (finalized and durably
+    /// applied). The replicated state machine decides; this only authorizes, like [Client::submit].
+    pub async fn submit_duty(&self, request: DutyRequest) -> Result<DutyReceipt, Stopped> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(Message::SubmitDuty {
+                request: Box::new(request),
+                response,
+            })
+            .map_err(|_| Stopped)?;
+        receiver.await.map_err(|_| Stopped)
+    }
+
+    /// What the committed state says about `request` now (nothing is recorded).
+    pub async fn check_duty(&self, request: DutyRequest) -> Result<DutyCheck, Stopped> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(Message::CheckDuty {
+                request: Box::new(request),
+                response,
+            })
+            .map_err(|_| Stopped)?;
+        receiver.await.map_err(|_| Stopped)
+    }
+
+    /// Whether ceremony `round` was started as a validator key.
+    pub async fn is_validator_round(&self, round: u64) -> Result<bool, Stopped> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(Message::ValidatorRound { round, response })
+            .map_err(|_| Stopped)?;
+        receiver.await.map_err(|_| Stopped)
+    }
+
+    /// Every validator key with a completed ceremony.
+    pub async fn validators(&self) -> Result<Vec<ValidatorEntry>, Stopped> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(Message::Validators { response })
+            .map_err(|_| Stopped)?;
+        receiver.await.map_err(|_| Stopped)
+    }
+
     pub async fn status(&self) -> Result<Status, Stopped> {
         let (response, receiver) = oneshot::channel();
         self.sender
@@ -165,6 +269,7 @@ impl Client {
 enum Waiter {
     Sign(oneshot::Sender<Receipt>),
     Start(oneshot::Sender<StartReceipt>),
+    Duty(oneshot::Sender<DutyReceipt>),
 }
 
 pub struct Executor<E: CryptoRng + Spawner + Context, S: Sender> {
@@ -266,6 +371,45 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                     info!(id, %ceremony, "received ceremony start");
                     self.waiters.insert(id, Waiter::Start(response));
                 }
+                Message::StartValidatorCeremony { config, response } => {
+                    let ceremony = config.id.clone();
+                    let id = self.submit(Command::StartValidatorCeremony(config));
+                    info!(id, %ceremony, "received validator ceremony start");
+                    self.waiters.insert(id, Waiter::Start(response));
+                }
+                Message::SubmitDuty { request, response } => {
+                    let validator = format_validator(&request.validator);
+                    let kind = request.duty.kind();
+                    let signing_root = format_root(&request.signing_root());
+                    let id = self.submit(Command::Duty(request));
+                    info!(id, %validator, ?kind, %signing_root, "submitted validator duty");
+                    self.waiters.insert(id, Waiter::Duty(response));
+                }
+                Message::CheckDuty { request, response } => {
+                    let protection = self.store.protection();
+                    let (signing_root, decision) = protection.check(&request);
+                    let validator = protection
+                        .validator_of(&request.validator)
+                        .and_then(|(_, validator)| self.validator_entry(validator));
+                    let _ = response.send(DutyCheck {
+                        validator,
+                        signing_root,
+                        decision,
+                        height: protection.authorized_at(&request),
+                    });
+                }
+                Message::ValidatorRound { round, response } => {
+                    let _ = response.send(self.store.protection().is_validator_round(round));
+                }
+                Message::Validators { response } => {
+                    let validators = self
+                        .store
+                        .protection()
+                        .validators()
+                        .filter_map(|(_, validator)| self.validator_entry(validator))
+                        .collect();
+                    let _ = response.send(validators);
+                }
                 Message::SubmitLog { round, log } => {
                     self.submit(Command::DealerLog { round, log });
                 }
@@ -297,7 +441,13 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                     });
                 }
                 Message::Finalized { block, ack } => {
-                    if hooks::holding() || !held.is_empty() {
+                    if !held.is_empty() || hooks::hold(!block.transactions.is_empty()) {
+                        if held.is_empty() {
+                            warn!(
+                                height = block.height.get(),
+                                "test hook: holding finalized block"
+                            );
+                        }
                         held.push_back((block, ack));
                         continue;
                     }
@@ -306,6 +456,19 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                 }
             }
         }
+    }
+
+    fn validator_entry(&self, validator: &Validator) -> Option<ValidatorEntry> {
+        let ceremony = self
+            .store
+            .ceremonies()
+            .iter()
+            .find(|ceremony| ceremony.round == validator.round)?;
+        Some(ValidatorEntry {
+            key: validator.key,
+            ceremony: ceremony.config.id.clone(),
+            round: validator.round,
+        })
     }
 
     /// Add a command to the mempool and gossip it. Returns the transaction id.
@@ -344,7 +507,7 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
         let authorizes = block
             .transactions
             .iter()
-            .any(|transaction| matches!(transaction.command, Command::Sign(_)));
+            .any(|transaction| matches!(transaction.command, Command::Sign(_) | Command::Duty(_)));
         if authorizes {
             hooks::crash_point("before-apply-authorization");
         }
@@ -394,13 +557,23 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                 .dkg
                 .send(dkg::actor::Message::Authorized(applied.authorized));
         }
+        if !applied.duties.is_empty() {
+            let _ = self
+                .dkg
+                .send(dkg::actor::Message::AuthorizedDuties(applied.duties));
+        }
         let _ = self.dkg.send(dkg::actor::Message::Tick);
 
         if !block.transactions.is_empty() {
             let accepted = applied
                 .effects
                 .iter()
-                .filter(|effect| matches!(effect, Effect::Sign(Outcome::Accepted, _)))
+                .filter(|effect| {
+                    matches!(
+                        effect,
+                        Effect::Sign(Outcome::Accepted, _) | Effect::Duty(Decision::Accepted, _)
+                    )
+                })
                 .count();
             info!(
                 height,
@@ -434,10 +607,33 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                         });
                     }
                 }
-                (Command::StartCeremony(config), Effect::Start(outcome)) => {
+                (
+                    Command::StartCeremony(config) | Command::StartValidatorCeremony(config),
+                    Effect::Start(outcome),
+                ) => {
                     info!(height, id = transaction.id, ceremony = %config.id, ?outcome, "applied ceremony start");
                     if let Some(Waiter::Start(waiter)) = waiter {
                         let _ = waiter.send(StartReceipt { outcome, height });
+                    }
+                }
+                (Command::Duty(request), Effect::Duty(decision, signing_root)) => {
+                    info!(
+                        height,
+                        id = transaction.id,
+                        validator = %format_validator(&request.validator),
+                        kind = ?request.duty.kind(),
+                        signing_root = %format_root(&signing_root),
+                        ?decision,
+                        "applied validator duty"
+                    );
+                    if let Some(Waiter::Duty(waiter)) = waiter {
+                        let _ = waiter.send(DutyReceipt {
+                            decision,
+                            signing_root,
+                            height,
+                            finalized_at,
+                            applied_at,
+                        });
                     }
                 }
                 (Command::DealerLog { round, .. }, Effect::Log(outcome)) => match outcome {

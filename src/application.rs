@@ -9,6 +9,7 @@
 
 use crate::{
     executor::Message,
+    hooks,
     types::{Block, MAX_BLOCK_BYTES, MAX_TRANSACTIONS_PER_BLOCK, Transaction},
 };
 use commonware_actor::Feedback;
@@ -159,6 +160,9 @@ where
         while let Some(block) = ancestor.filter(|block| block.height().get() > executed) {
             in_flight.extend(block.transactions.iter().map(Transaction::digest));
             ancestor = ancestry.next().await;
+        }
+        while hooks::empty_blocks_paused() && self.mempool.select(&in_flight).is_empty() {
+            context.sleep(IDLE_POLL).await;
         }
 
         Some(Block::new(

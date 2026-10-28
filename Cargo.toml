@@ -9,7 +9,10 @@ publish = false
 [features]
 # Fault injection for the real-process end-to-end tests (see `src/hooks.rs`). Never enable it in
 # a deployment.
-test-hooks = []
+test-hooks = ["dev-api"]
+# The raw signing API (`POST /sign`, `GET /authorizations`) for development and tests: signs any
+# payload with a development key. Never enable it in a deployment.
+dev-api = []
 
 [dependencies]
 commonware-actor = "2026.9.0"
@@ -40,11 +43,18 @@ thiserror = "2"
 tokio = { version = "1.52.3", features = ["net", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
+tree_hash = "0.12"
+tree_hash_derive = "0.12"
+ethereum_ssz = "0.10"
+ethereum_ssz_derive = "0.10"
+ethereum_serde_utils = "0.8.1"
+typenum = "1"
 
 [dev-dependencies]
 # Reference BLS implementation of Ethereum consensus clients (already used by commonware).
 blst = { version = "0.3.17", default-features = false, features = ["no-threads"] }
 commonware-p2p = { version = "2026.9.0", features = ["mocks"] }
+serde_yaml = "0.9"
 
 # Real processes, real p2p and HTTP: slow, run with `cargo test --features test-hooks --test e2e`.
 [[test]]

@@ -21,7 +21,7 @@ use commonware_consensus::{
     types::{Epoch, FixedEpocher, ViewDelta},
 };
 use commonware_cryptography::{
-    Digestible as _, Sha256, Signer as _,
+    Crc32, Digestible as _, Hasher as _, Sha256, Signer as _,
     certificate::{ConstantProvider, Verifier as _},
     ed25519::{PrivateKey, PublicKey},
 };
@@ -144,10 +144,10 @@ pub struct Recovery {
     pub journal_missing: bool,
 }
 
-/// Why a node refuses to start. The storage is kept for investigation: nothing is reset or
-/// deleted, no key share is regenerated, and the state, secret store and consensus journal are not
-/// written (the block archives, opened to read marshal's progress, rewrite their own metadata and
-/// repair torn tails as on any start).
+/// Why a node refuses to start. Nothing is reset or deleted and no key share is regenerated.
+/// Opening the stores recovers them as commonware does on any start (a copy failing its checksum
+/// is truncated, archive metadata rewritten, torn tails repaired); every damaged metadata copy is
+/// saved beforehand to the diagnostics partition (`preserve_damaged_copies`).
 #[derive(Debug, thiserror::Error)]
 pub enum StartError {
     #[error("failed to open replicated state: {0}")]
@@ -226,46 +226,67 @@ fn check_recovery<E: commonware_storage::Context>(
     Ok(false)
 }
 
-/// Raw bytes of the metadata stores opened before the startup checks. Opening such a store
-/// truncates a copy that fails its checksum (commonware repairs it from the other copy); if the
-/// node then refuses to start, the bytes are put back so the damaged copy stays available for
-/// investigation.
-struct Originals(Vec<(String, Vec<u8>, Vec<u8>)>);
-
-impl Originals {
-    async fn capture<E: Storage>(context: &E, partitions: &[String]) -> Self {
-        let mut blobs = Vec::new();
-        for partition in partitions {
-            let Ok(names) = context.scan(partition).await else {
+/// Save, before a metadata store is opened, every copy of it that fails its integrity check.
+/// Opening the store truncates such a copy (commonware's recovery, from the other copy): saving
+/// it first, durably, to the `diagnostics` partition keeps the evidence whatever happens next
+/// (a startup refusal, a crash). The working store is never written here. A saved copy is named
+/// by its content, so it is written once and never rewritten, however often the node restarts.
+async fn preserve_damaged_copies<E: Storage>(
+    context: &E,
+    diagnostics: &str,
+    partitions: &[String],
+) {
+    for partition in partitions {
+        let Ok(names) = context.scan(partition).await else {
+            continue;
+        };
+        for name in names {
+            let bytes = read_blob(context, partition, &name).await;
+            if bytes.is_empty() || intact(&bytes) {
                 continue;
-            };
-            for name in names {
-                let bytes = read_blob(context, partition, &name).await;
-                blobs.push((partition.clone(), name, bytes));
             }
-        }
-        Self(blobs)
-    }
-
-    async fn restore<E: Storage>(self, context: &E) {
-        for (partition, name, original) in self.0 {
-            if read_blob(context, &partition, &name).await == original {
+            let saved = format!(
+                "{partition}-{}-{}",
+                ::hex::encode(&name),
+                ::hex::encode(&Sha256::hash(&[bytes.as_slice()]).as_ref()[..8])
+            );
+            let exists = matches!(
+                context.scan(diagnostics).await,
+                Ok(names) if names.iter().any(|existing| existing.as_slice() == saved.as_bytes())
+            );
+            // A partial copy (a crash while saving) is written again.
+            if exists && read_blob(context, diagnostics, saved.as_bytes()).await == bytes {
                 continue;
             }
             let (blob, _) = context
-                .open(&partition, &name)
+                .open(diagnostics, saved.as_bytes())
                 .await
-                .expect("failed to reopen blob");
-            blob.resize(original.len() as u64)
+                .expect("failed to create diagnostic copy");
+            blob.resize(bytes.len() as u64)
                 .await
-                .expect("failed to restore blob");
-            blob.write_at(0, original, WriteOptions::DONT_CACHE)
+                .expect("failed to save diagnostic copy");
+            blob.write_at(0, bytes, WriteOptions::DONT_CACHE)
                 .await
-                .expect("failed to restore blob");
-            blob.sync().await.expect("failed to restore blob");
-            warn!(partition, "put back storage that failed the startup checks");
+                .expect("failed to save diagnostic copy");
+            blob.sync().await.expect("failed to save diagnostic copy");
+            warn!(
+                partition,
+                blob = %String::from_utf8_lossy(&name),
+                saved = %format!("{diagnostics}/{saved}"),
+                "a copy fails its integrity check: saved before opening the store"
+            );
         }
     }
+}
+
+/// Whether a metadata copy passes the check `commonware_storage::metadata` applies when opening
+/// it: an 8-byte version, the entries, then a big-endian CRC32 of both.
+fn intact(bytes: &[u8]) -> bool {
+    let Some(split) = bytes.len().checked_sub(4).filter(|split| *split >= 8) else {
+        return false;
+    };
+    let (data, checksum) = bytes.split_at(split);
+    Crc32::checksum(data) == u32::from_be_bytes(checksum.try_into().expect("4 bytes"))
 }
 
 async fn read_blob<E: Storage>(context: &E, partition: &str, name: &[u8]) -> Vec<u8> {
@@ -311,18 +332,21 @@ where
     let scheme = Scheme::signer(NAMESPACE, config.participants, config.signer)
         .expect("signer must be a participant");
 
-    // Durable state first, checked against itself before anything runs.
-    let state_partition = format!("{prefix}-state");
-    let secrets_partition = format!("{prefix}-secrets");
-    let originals = Originals::capture(
+    // Durable state first, checked against itself before anything runs. Damaged copies of the
+    // metadata stores opened before the checks are saved first (opening truncates them).
+    preserve_damaged_copies(
         &context,
+        &format!("{prefix}-diagnostics"),
         &[
+            format!("{prefix}-state"),
+            format!("{prefix}-secrets"),
             format!("{prefix}-marshal-application-metadata"),
-            state_partition.clone(),
-            secrets_partition.clone(),
+            format!("{prefix}-finalizations-metadata"),
+            format!("{prefix}-blocks-metadata"),
         ],
     )
     .await;
+    crate::hooks::crash_point("after-diagnostics");
     let finalizations = prunable::Archive::init(
         context.child("finalizations"),
         archive_config(
@@ -365,33 +389,20 @@ where
         },
     )
     .await;
+    let store = Store::init(context.child("store"), &prefix, committee.clone()).await?;
+    // A secret store that cannot be read is fatal: the node must not run with lost or
+    // inconsistent shares.
+    let secrets = Secrets::init(context.child("secrets"), format!("{prefix}-secrets")).await?;
     let journal = format!("{prefix}-consensus");
-    let checked = async {
-        let store = Store::init(context.child("store"), &prefix, committee.clone()).await?;
-        // A secret store that cannot be read is fatal: the node must not run with lost or
-        // inconsistent shares.
-        let secrets = Secrets::init(context.child("secrets"), secrets_partition).await?;
-        let journal_present =
-            matches!(context.scan(&journal).await, Ok(blobs) if !blobs.is_empty());
-        let journal_missing = check_recovery(
-            &store,
-            &secrets,
-            marshal_floor.height().map_or(0, |height| height.get()),
-            &journal,
-            journal_present,
-            config.allow_missing_consensus_journal,
-        )?;
-        Ok::<_, StartError>((store, secrets, journal_missing))
-    }
-    .await;
-    let (store, secrets, journal_missing) = match checked {
-        Ok(checked) => checked,
-        Err(err) => {
-            drop((marshal_actor, marshal));
-            originals.restore(&context).await;
-            return Err(err);
-        }
-    };
+    let journal_present = matches!(context.scan(&journal).await, Ok(blobs) if !blobs.is_empty());
+    let journal_missing = check_recovery(
+        &store,
+        &secrets,
+        marshal_floor.height().map_or(0, |height| height.get()),
+        &journal,
+        journal_present,
+        config.allow_missing_consensus_journal,
+    )?;
     let state_height = store.height();
 
     // Backfill of missing finalized blocks.
@@ -427,6 +438,7 @@ where
     // State machine.
     let ceremonies = store.ceremonies().iter().cloned().collect();
     let authorizations = store.authorizations();
+    let duty_roots = store.protection().authorized_roots();
     let mempool = Mempool::default();
     let executed = Arc::new(AtomicU64::new(0));
     let tip = Arc::new(AtomicU64::new(0));
@@ -468,6 +480,7 @@ where
         dkg_mailbox,
         ceremonies,
         authorizations,
+        duty_roots,
     )
     .start();
     let dkg_receiver_handle = context.child("dkg_receiver").spawn({

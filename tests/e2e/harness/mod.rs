@@ -378,6 +378,17 @@ impl TestNetwork {
         copy_dir(&self.dir.join("snapshots").join(name), &data);
     }
 
+    /// Replace only partition `partition` of stopped node `id` with its copy in snapshot `name`.
+    pub fn restore_partition(&self, id: usize, name: &str, partition: &str) {
+        assert!(self.pid(id).is_none(), "stop node {id} before restoring it");
+        let target = self.data_dir(id).join(partition);
+        let _ = fs::remove_dir_all(&target);
+        copy_dir(
+            &self.dir.join("snapshots").join(name).join(partition),
+            &target,
+        );
+    }
+
     /// Like [TestNetwork::restore], but the partitions in `keep` keep their current bytes.
     pub fn restore_keeping(&self, id: usize, name: &str, keep: &[&str]) {
         let data = self.data_dir(id);
@@ -482,6 +493,17 @@ impl TestNetwork {
             body.as_deref(),
             HTTP_TIMEOUT,
         )?;
+        // The router's own 404 (no route) has an empty body; the API's 404s are JSON.
+        if status == 404
+            && text.is_empty()
+            && (path == "/sign" || path.starts_with("/authorizations/"))
+        {
+            panic!(
+                "{path} is not served: {BINARY} was built without the `dev-api` feature. Another \
+                 cargo build with other features replaced it; rebuild it with \
+                 `touch src/main.rs && cargo build --features test-hooks`"
+            );
+        }
         let value = serde_json::from_str(&text).unwrap_or(Value::String(text));
         Ok((status, value))
     }
@@ -515,7 +537,6 @@ impl TestNetwork {
         }
     }
 
-    /// Every given node serves HTTP and has finalized blocks (so p2p and consensus work).
     /// Wait until every given node reports itself ready (`GET /ready` is `200`): it applied a
     /// block since it started, knows of no finalized block it has not applied, and sees consensus
     /// progress.
@@ -562,6 +583,44 @@ impl TestNetwork {
         }
         assert!(keys.windows(2).all(|pair| pair[0] == pair[1]), "{keys:?}");
         keys.pop().unwrap()
+    }
+
+    /// Start the ceremony `name` as an Ethereum validator key.
+    pub fn start_validator_dkg(&self, via: usize, name: &str) -> Value {
+        let body = json!({ "ceremony_id": name, "validator": true });
+        let (status, body) = self.post(via, "/dkg/start", &body);
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["validator"], true, "{body}");
+        body
+    }
+
+    /// `POST /api/v1/eth2/sign/{key}` on node `via`, as Lighthouse sends it (`Accept:
+    /// application/json`): status and JSON body.
+    pub fn eth2_sign(&self, via: usize, key: &str, body: &Value) -> (u16, Value) {
+        let path = format!("/api/v1/eth2/sign/{key}");
+        let (status, _, text) = self
+            .eth2_call(via, &path, &[("Accept", "application/json")], body)
+            .unwrap_or_else(|err| self.fail(&format!("POST {path} on node {via}: {err}")));
+        let value = serde_json::from_str(&text).unwrap_or(Value::String(text));
+        (status, value)
+    }
+
+    /// `POST path` on node `via` with extra headers: status, `Content-Type` and raw body.
+    pub fn eth2_call(
+        &self,
+        via: usize,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+    ) -> std::io::Result<(u16, String, String)> {
+        http::request_typed(
+            self.http_addr(via),
+            "POST",
+            path,
+            headers,
+            Some(&body.to_string()),
+            HTTP_TIMEOUT,
+        )
     }
 
     /// `POST /sign` on node `via`.

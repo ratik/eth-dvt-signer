@@ -14,14 +14,44 @@ pub fn request(
     body: Option<&str>,
     timeout: Duration,
 ) -> io::Result<(u16, String)> {
+    request_with(addr, method, path, &[], body, timeout)
+}
+
+/// Like [request], with extra request headers. Returns the status code, the `Content-Type` and
+/// the body.
+pub fn request_with(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&str>,
+    timeout: Duration,
+) -> io::Result<(u16, String)> {
+    request_typed(addr, method, path, headers, body, timeout)
+        .map(|(status, _, body)| (status, body))
+}
+
+/// Like [request_with], also returning the response's `Content-Type` (empty if none).
+pub fn request_typed(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&str>,
+    timeout: Duration,
+) -> io::Result<(u16, String, String)> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     let body = body.unwrap_or("");
+    let extra: String = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
     write!(
         stream,
         "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
-         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+         Content-Type: application/json\r\n{extra}Content-Length: {}\r\n\r\n{body}",
         body.len()
     )?;
     let mut raw = Vec::new();
@@ -33,7 +63,7 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_string())
 }
 
-fn parse(raw: &[u8]) -> io::Result<(u16, String)> {
+fn parse(raw: &[u8]) -> io::Result<(u16, String, String)> {
     let text = String::from_utf8_lossy(raw);
     let (head, body) = text
         .split_once("\r\n\r\n")
@@ -44,16 +74,21 @@ fn parse(raw: &[u8]) -> io::Result<(u16, String)> {
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse().ok())
         .ok_or_else(|| invalid("bad status line"))?;
-    let chunked = lines.any(|line| {
-        line.to_ascii_lowercase()
-            .starts_with("transfer-encoding: chunked")
-    });
+    let headers: Vec<String> = lines.map(str::to_ascii_lowercase).collect();
+    let chunked = headers
+        .iter()
+        .any(|line| line.starts_with("transfer-encoding: chunked"));
+    let content_type = headers
+        .iter()
+        .find_map(|line| line.strip_prefix("content-type:"))
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default();
     let body = if chunked {
         dechunk(body)?
     } else {
         body.to_string()
     };
-    Ok((status, body))
+    Ok((status, content_type, body))
 }
 
 fn dechunk(mut body: &str) -> io::Result<String> {

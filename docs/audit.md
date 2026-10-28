@@ -12,6 +12,8 @@ processes otherwise). Passing tests are evidence, not a proof.
 | Authorization visible (in memory) | executor, inside `Store::apply_block` (holds `&mut` until `sync`) | `src/storage.rs` |
 | Authorization durable | `Metadata::sync` returns | `src/storage.rs` |
 | Signer learns an authorization | `Committed` values, sent after the sync, before any client answer; or read from disk at start | `src/executor.rs`, `src/dkg/actor.rs` |
+| Duty decided, signing root computed | `Protection::authorize` inside `Store::apply_block`, from the typed duty of the finalized command; record and authorization in the block's one sync | `src/slashing.rs`, `src/storage.rs` |
+| Signer learns a duty authorization | `(ceremony round, root)` sent after the sync, before any client answer (`AuthorizedDuties`); or `Protection::authorized_roots` read from disk at start | `src/executor.rs`, `src/engine.rs`, `src/dkg/actor.rs` |
 | Partial signature generated | `dkg::actor::partial` only: local coordinator, peer request, or parked request released by `Authorized` | `src/dkg/actor.rs` |
 | Signature returned | coordinator `sign`, after recovery and verification | `src/signer/coordinator.rs` |
 | State restored from disk | `Store::init` (state), `Secrets::init` (shares), marshal (re-delivery from its processed height), simplex journal | |
@@ -30,28 +32,32 @@ processes otherwise). Passing tests are evidence, not a proof.
 | H-1 | Hardening | The in-flight counter was decremented by the task body; a task ending abnormally would leak one slot of the 256. No reachable path found. | none | Drop guard |
 | H-2 | Hardening (recovery) | BUG-2's check ran only when the next finalized block arrived: a node whose state was behind marshal served and signed (a stale prefix, never a conflict) until then. Nothing else related the durable stores to each other at startup. | `lifecycle::f4_*`, `lifecycle::r5_*` | Startup checks before any actor runs: state not behind marshal's processed height, every key share has its completed ceremony, consensus journal present when there is history (operator override). See [recovery.md](recovery.md) |
 | H-3 | Hardening (consensus) | Consensus always started from the genesis floor, so a node whose journal was lost or older could repeat votes in views already finalized. | `readiness::r1_*` (floor reported), `lifecycle::r5_missing_consensus_journal_fails_closed` | Simplex starts from `Floor::Finalized` at marshal's durable processed finalization: never votes again at or below it |
-| H-4 | Hardening (evidence) | A node refusing to start erased the evidence: commonware's metadata store truncates a copy that fails its checksum as soon as it is opened. | `lifecycle::f4_corrupted_state_fails_closed` (the damaged copy is compared before and after) | Raw bytes of the state, secret store and marshal progress are kept until the checks pass and put back if the node refuses to start |
+| H-4 | Hardening (evidence) | A node refusing to start erased the evidence: commonware's metadata store truncates a copy that fails its checksum as soon as it is opened. A first fix kept the bytes in memory and wrote them back if the start was refused; review found it not crash-safe (the evidence existed only in memory between the truncation and the write-back) and it wrote known-bad bytes into live storage. | `lifecycle::r5_damaged_copy_is_saved_before_opening`, `lifecycle::f4_corrupted_state_fails_closed` | Before opening any store, every copy failing the integrity check is saved, synced, to `registry-diagnostics` (named by content, written once); working stores follow commonware's normal recovery |
 | T-1 | Test harness | Port blocks were probed then released: two test processes could get the same ports. | `lifecycle::f2_port_blocks_never_overlap` | Lock files per block, shared by all test processes |
 | T-2 | Test harness | The scripted peer registered only the signing channel. commonware-p2p drops a connection on a message for an unregistered channel, so the real nodes' consensus traffic kept disconnecting it and one-shot messages were lost. | `adversarial::e4_e5_parked_overflow_and_expiry` | It registers and drains every channel |
 | T-3 | Test harness | Restarted nodes were queried before their HTTP server was up. | crash and rollback tests | Restart waits for HTTP |
 | T-4 | Test harness | Reserved ports reached 59 400, inside the ephemeral ranges (macOS 49152+, Linux 32768+): an outgoing connection could take a reserved port, and a node failed with `AddrInUse`. | full-suite run 2 (`b1`) | Port blocks between 10 240 and 32 000 |
 | T-5 | Test harness | The whole suite started every network at once (~130 node processes): 5 s signing deadlines were missed for load reasons alone. | full-suite runs 1-3 (`a6`, `a2_two_node`) | At most 4 networks at once per test process (`E2E_MAX_NETWORKS`) |
 | T-6 | Test logic | Rollback tests restored the whole data directory, consensus journal included, and expected the restored node to rejoin. In 3 of about 14 runs the node was blocked by its peers for equivocating (L-7), and the test failed on liveness (A1 stall, A1 `SIGNING_TIMEOUT` with 1 partial, A2 `SIGNING_TIMEOUT` with 2). A retry first added to A2 for this was based on a wrong hypothesis (links still coming up) and was removed. | `target/audit-logs/` (rerun 1, rerun 3, `a1-x-2-1`): `nullify after finalize peer=<restored node>` on the blocking nodes | A1 and A2 roll back all but the consensus journal and assert that nobody was blocked; `a1_full_restore_never_signs_conflict` covers the full restore with assertions valid in both outcomes |
+| T-8 | Test harness | The E2E harness runs `target/debug/eth-mpc-signer`, a path shared by every feature set. A `cargo test` with default features (no `dev-api`), run during or between E2E runs, replaces it. Cargo copies the binary to that path only when it relinks, so a later `test-hooks` build that is up to date does not restore it, and every development API call answered `404`. Observed while validating the Web3Signer work: 20 and then 47 failures (`target/audit-logs/eth-e2e-invalid-binary-*.txt`). | `target/audit-logs/eth-e2e-invalid-binary-*.txt` | The harness now fails at once with an explanation when `/sign` is not served. Validation runs never overlap cargo builds with other features; `touch src/main.rs` forces the relink |
 | T-7 | Test logic | Timing assumptions in the first versions: F4 damaged state at an unpinned moment (a crash before the acknowledgement is a legitimate replay), A5/A6 crash hooks on participants the coordinator did not need, D1 duplicates sent after the session had completed, scripted-peer replies read from earlier requests. | full-suite runs | Pinned with hooks (hold, freeze of a third node, `ask` drains old events); no assertion was relaxed |
 
 ## 3. Remaining issues and unsupported scenarios
 
 | ID | Issue | Impact | Evidence |
 | -- | ----- | ------ | -------- |
-| L-1 | **Rollback of a quorum (here: every node) to older storage is undetected.** Nothing remembers the authorization, so a conflicting payload is authorized and signed: two valid signatures for one `(ceremony, nonce)`. Needs state outside the nodes (monotonic counters, external anchoring) to detect; a counter in the same, rollbackable storage does not help. Why, and what Ethereum slashing protection needs: [recovery.md](recovery.md), §6. | Safety, unsupported scenario | `rollback::a2_whole_network_rollback`: **fails**, kept `#[ignore]` |
+| L-1 | **Rollback of a quorum (here: every node) to older storage is undetected.** Nothing remembers the authorization, so a conflicting payload is authorized and signed: two valid signatures for one `(ceremony, nonce)`. The same holds for Ethereum slashing history: a double proposal is signed. Detecting it needs state outside the nodes (a monotonic counter or an external anchor). A counter in the same, rollbackable storage does not help. See [recovery.md](recovery.md) §7, and the anchor design (not implemented) in [slashing-protection.md](slashing-protection.md). | Safety, unsupported scenario | `rollback::a2_whole_network_rollback` and `eth2::e2e_eth_l1_whole_network_rollback_signs_a_double_proposal`: both **fail**, kept `#[ignore]` |
 | L-2 | **Addressed.** A lagging or rolled-back node reports why it is not ready (`/status`, `/ready`: `no_block_since_start`, `local_backlog`, `no_recent_finalization`, `share_unavailable`) and refuses new authorizations (`503 NOT_READY`) instead of timing out. Reads (`/authorizations`) are still its local view: readiness says how current it is, never that it has the network's latest block. | Availability only | `rollback::a1_*`, `failures::lagging_signer_refuses_until_applied`, `readiness::*` |
 | L-3 | Identical requests coalesce per node only: the same request sent at once to all four nodes runs one task on each (at most four commands, four collections). Documented as an optimization: consensus alone decides what is authorized; several coordinators may aggregate the same payload. | Load, bounded by the node count | `concurrency::b1_identical_requests` (at most one command per node) |
 | L-4 | **Fixed.** The parked queue was shared: one peer could evict other peers' parked requests. Now at most 64 per peer and 256 in total; a flooding peer evicts only its own. A disconnect does not release parked requests (expiry after 16 blocks does). | Latency only | `dkg::parked::tests`, `adversarial::e4_e5_parked_overflow_and_expiry` |
 | L-5 | **Fixed.** A participant banned for a request still received its retransmissions. Now it is not asked again for that request (exactly one request in D4, where there were about ten). | Wasted messages | `adversarial::d4_strike_limit` |
-| L-6 | No client authentication or rate limiting: any HTTP client can create authorizations (consensus and storage cost). The API binds to loopback only, with no option to expose it; it is documented as a development and test API. | Availability | design |
+| L-6 | No client authentication or rate limiting: any HTTP client can create authorizations and slashing records (consensus and storage cost). It can also use up a validator's slot or epoch with a duty for the wrong block or fork version, which is a liveness loss for that duty. The API binds to loopback only, with no option to expose it. The raw signing API exists only in `dev-api` builds. | Availability | design, `tests/production_api.rs` |
+| L-11 | Slashing history is never pruned. It grows by ~66 bytes per authorized duty, and every block rewrites the state partition (a block with one duty: 4.1 ms on disk with no history, 10.5 ms with 50 000 records). The surround check scans the validator's attestations with a lower target (normally all of them: 341 µs with 100 000). Pruning needs EIP-3076 low watermarks (refuse at or below the pruned range). | Performance over a validator's lifetime | design; measured in §6 |
+| L-12 | The validator client's `fork_info` is trusted for the domain. A validator's chain (genesis validators root) is pinned by its first authorized duty, not by configuration. Only the mainnet preset is supported. | A first duty for the wrong chain blocks the validator on the right one (refused as `other_chain`) | `slashing::tests`, [ethereum-signing.md](ethereum-signing.md) |
 | L-7 | **Restoring a node's consensus journal from older bytes (for example a whole data-directory backup) makes it forget its own votes.** It can then vote twice in one view (observed: `nullify` after its own `finalize`). Honest peers detect this and block it at the P2P layer for `block_duration` (1 hour), on every channel, signing included. Safety holds: consensus tolerates one equivocator, and the node still signs only what it has committed. Liveness: the node cannot catch up, coordinate or contribute partials for up to an hour; the other three continue with no spare capacity. Whether it happens depends on timing: 4 of about 32 full restores during the audit, mostly under load (it needs the node to time out a view before it fetches the certificates). Operational rule: never restore `registry-consensus` from a backup. Mitigated since (H-3): consensus resumes above the last finalization marshal durably processed, so a lost or older journal cannot repeat votes at or below it; a missing journal stops the node (H-2). Not covered: votes after that finalization, and a whole-directory restore (marshal rolled back too), which stays undetectable. | Availability of the restored node; a Byzantine fault, tolerated only within `f = 1` | `rollback::a1_full_restore_never_signs_conflict` (both outcomes), logs in `target/audit-logs/` |
 | L-8 | A test process killed with SIGKILL leaves its temporary directory (and a stale port lock, reclaimed by the next run). Its nodes do exit. | Disk, tests only | `lifecycle::f1_nodes_die_with_their_test_process` |
 | L-9 | A node uses ~320 MB resident at rest (a 160 MB page cache). 256 requests in flight add ~20 MB; 256 parked requests ~0.5 MB. | Sizing | `concurrency::e3_in_flight_limit` |
+| L-10 | A leader that has not applied the last finalized block yet still holds that block's transactions in its mempool, so it skips the idle wait and proposes an empty block at once (the in-flight check keeps the transactions out of it). After busy blocks this adds empty blocks, and a lagging leader produces them back to back. Found while building the lag tests. | Efficiency only: more empty blocks, faster use of the block-counted retention window | `lag::*` (why the tests pause empty blocks instead of timing a freeze) |
 
 ## 4. Fault model
 
@@ -71,6 +77,11 @@ processes otherwise). Passing tests are evidence, not a proof.
 | Consensus unavailable | Preserved: no new authorizations; the submitted command is not cancelled | Existing authorizations still sign with 3 signers | `e1_*` |
 | Stale participant | Preserved: refuses until the authorization is durably applied | After catch-up | `a1_*`, E2E-9, `a3_*`, `a4_*` |
 | Malicious HTTP client | Authorization consistency preserved (decided by the state machine) | Not guaranteed: 256 requests in flight per node, then `503` | `b1`-`b4`, `e3_*` |
+| Conflicting validator duties, concurrent, through different nodes | Preserved: one authorized, the other refused (`412`) on every node | Yes | E2E-ETH-2, `tests/eth_duties.rs` |
+| Coordinator submitting a conflicting duty directly, or asking for partials of an unauthorized root | Preserved: refused by the state machine; partials refused (`not_authorized`) | Yes | `byzantine_coordinators_cannot_sign_unauthorized_duties` |
+| Crash around a duty's application, coordinator crash with 2 partials, client hang-up after authorization | Preserved: record and authorization together; retries sign the same root, the conflict stays refused | Yes | E2E-ETH-4, E2E-ETH-5 |
+| Lagging or rolled-back node asked for a conflicting duty | Preserved: it refuses, or submits it to consensus, which refuses it | After catch-up | E2E-ETH-6, E2E-ETH-7, `isolated_node_cannot_authorize_a_conflict` |
+| Slashing history altered on disk (record lost or added, key replaced) | Fail closed at startup | Node down until repaired | `storage::tests::validator::altered_history_fails_closed` |
 
 The guarantees come from different places, which must not be confused:
 
@@ -82,8 +93,11 @@ The guarantees come from different places, which must not be confused:
 - **Rollback resistance**: only what honest peers' finalized history provides. A rolled-back
   minority re-syncs (and stays connected if its consensus journal was kept, L-7); a rolled-back
   quorum is undetected (L-1).
-- **Slashing protection**: none. Nonces are caller-chosen; two nonces may authorize conflicting
-  Ethereum messages.
+- **Slashing protection**: the replicated state machine decides each validator duty by the
+  specification's rules over the validator's whole history. The decision is committed with the
+  authorization and checked by every keyholder. Its durability is that of the replicated state:
+  it survives crashes, restarts and a minority rollback, and not a quorum rollback (L-1). The
+  development API (`dev-api` builds only) has none: its nonces are caller-chosen.
 
 ## 5. Coverage matrix
 
@@ -100,6 +114,11 @@ The guarantees come from different places, which must not be confused:
 | Bounded resource usage | `e3_*`, `e4_e5_*`, `b1`-`b4` | Pass (after BUG-4) | 256 distinct requests in flight + 44 `503`; identical ones share a task; parked capped at 256 and expired; counters back to 0; RSS |
 | Signing with one offline node | E2E-4, `c3_e6_*`, `a5_c1_*`, `e2_*` | Pass | `200` with 3 signers; bounded `504` with 2 |
 | Process lifecycle | `f1_*`, `f2_*`, repeated suite runs | Pass | No orphans after SIGKILL of the runner; no overlapping ports |
+| No conflicting slashable duties | `slashing::tests`, `tests/eth_duties.rs`, E2E-ETH-2 to 7 | Pass | Exactly one of two concurrent conflicting duties signed; `412` on every node afterwards; no partial for a refused root |
+| Duty record durable with its authorization | `storage::tests::validator`, E2E-ETH-3, E2E-ETH-4 | Pass | Same decisions after restart; crash before or after the sync never loses the record of a signed duty |
+| Slashing history fails closed | `altered_history_fails_closed` | Pass | 7 alterations, each refused at startup |
+| Validator keys sign only duties | `storage::tests::validator`, E2E-ETH-1, `tests/production_api.rs` | Pass | `ValidatorKey` outcome, `403`, no `/sign` in default builds |
+| Quorum rollback of slashing history | `e2e_eth_l1_whole_network_rollback_signs_a_double_proposal` | **Fail** (known, L-1) | Double proposal signed |
 
 Not covered precisely:
 
@@ -144,12 +163,53 @@ deliver as a backlog and refused authorizations at random right after each block
 of two blocks, unit-tested); tests that asked a node still catching up to authorize now wait for it
 to be ready.
 
+### Readiness and recovery review
+
+| Check | Result |
+| ----- | ------ |
+| `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings` | clean |
+| `cargo test` (unit, simulations) | 55 passed, 0 failed |
+| `lag::*`, 5 runs (`review-lag-*.txt`) | 4 of 4 passed each run. Concurrent rounds (15): A authorized and B rejected by consensus 6, B authorized and A rejected by consensus 4, B applied first and A rejected from node 0's state 3, B refused before submission (three blocks behind) 2. Never a partial or group signature for the losing payload |
+| Recovery set (rollback, readiness, R5/F4, crash, lagging, recovery), 3 runs (`review-recovery-*.txt`) | 23 of 23 passed each run |
+| `cargo test --features test-hooks --test e2e`, 4 runs (`review-e2e-*.txt`) | 46 of 46 in runs 1, 3 and 4. Run 2: 45 of 46, `adversarial::d1_d3_*` failed at setup: node 0 could not bind its HTTP port (`AddrInUse` on 21924, free afterwards, outside the ephemeral range; cause not identified; kept in `failures/review-dev/e2e-run2-d1_d3-http-addr-in-use`) |
+
+Test bugs met while writing these tests (no assertion relaxed; directories in
+`failures/review-dev/`): a hold-log check raced marshal's tip report; freezing a node to stop
+consensus at a block boundary was racy (L-10), replaced by pausing empty blocks; the concurrent test
+re-armed the hold before node 3 had applied the previous round, and waited for submissions that
+correctly never happened (B refused when beyond the tolerance, A answered from state when B was
+already applied).
+
+### Ethereum signing and slashing protection
+
+| Check | Result |
+| ----- | ------ |
+| `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` (unit, simulations, vectors, parsing, default-build API; `eth-cargo-test.txt`) | 85 passed, 0 failed (lib 44, dkg 8, eth_duties 7, eth_vectors 4, eth_web3signer 6, network 5, production_api 1, signing 10) |
+| `tests/eth_duties.rs` with `SIM_SEED` 1 to 20 (`eth-duties-seeds.txt`) | 20 of 20 (140 test runs) |
+| `cargo test --features test-hooks --test e2e`, 3 runs (`eth-e2e-{1,2,3}.txt`) | 53 passed, 0 failed, 6 ignored (2 benchmarks, 2 helper processes, 2 L-1 reproducers) in each run; 183-200 s; no node process or temporary directory left |
+| `eth2::` E2E, 5 more rounds (`eth-slashing-e2e-*.txt`) | 35 of 35. The lagging node answered `412` (it submitted the conflict, consensus refused it) in 4 rounds and `503` (not ready) in 1 |
+| `eth2::e2e_eth_l1_whole_network_rollback_signs_a_double_proposal` (ignored, L-1) | **Fails**: a double proposal is signed (`eth-l1-whole-network-rollback/`) |
+| Latency, release (`eth-bench-latency.txt`) | Web3Signer new attestation p50 349 ms, p99 633; new proposal p50 373, p99 623; repeated duty p50 6.7 ms. The development API in the same run: new p50 384, p99 586; existing p50 6.7; one node offline p99 2247. Earlier baseline: 337 / 639 / 6.6 / 2252. No regression beyond run-to-run variation |
+| Micro-benchmarks, release (`eth-bench-micro.txt`, `eth-bench-apply.txt`) | Signing root 0.5-6 µs; parse and root 4-17 µs. Slashing decision for a new attestation 2 µs (no history) to 341 µs (100 000 attestations). Apply with one duty 4.1 ms (no history) to 10.5 ms (50 000 records, 3.3 MB) |
+
+Two first E2E runs are invalid and kept as `eth-e2e-invalid-binary-*.txt` (T-8). A default-feature
+build, run during them, replaced the test binary, and every development-API call returned `404`.
+They were stopped and repeated with no concurrent builds.
+
 ## 7. Reproducing
 
 ```bash
 cargo test                                                   # unit + simulations
 cargo test --features test-hooks --test e2e                  # real processes
 cargo test --features test-hooks --test e2e rollback::a2_whole -- --ignored   # L-1, fails
+cargo test --features test-hooks --test e2e eth2::e2e_eth_l1 -- --ignored     # L-1 for duties, fails
+cargo test --features test-hooks --test e2e eth2::                            # Web3Signer E2E
+SIM_SEED=7 cargo test --test eth_duties                                       # another schedule
+cargo test --release --test eth_bench -- --ignored --nocapture                # roots, slashing checks
+cargo test --release --lib apply_cost -- --ignored --nocapture                # apply cost vs history
+python3 -I tests/fixtures/web3signer/ssz_roots.py tests/fixtures/web3signer/*.json   # independent roots
+cargo test --features test-hooks --test e2e lag:: -- --nocapture      # E2E_SEED=<seed> to replay
 cargo test --release --features test-hooks --test e2e latency -- --ignored --nocapture
 E2E_KEEP=1 cargo test --features test-hooks --test e2e <name>               # keep logs
 ```

@@ -2,8 +2,9 @@
 //!
 //! Node `i` listens for peers on `127.0.0.1:<p2p-port + i>` and for clients on
 //! `127.0.0.1:<http-port + i>`. Keys are derived from the node index, which is only suitable for
-//! local development. The HTTP API (raw signing included) is bound to loopback on purpose: it has
-//! no authentication and no slashing protection, and must not be exposed to a network.
+//! local development. The HTTP API is bound to loopback on purpose: it has no authentication and
+//! must not be exposed to a network. Validator duties go through slashing protection; the raw
+//! signing API, which has none, exists only in builds with the `dev-api` feature.
 //!
 //! ```sh
 //! cargo run --release -- --id 0

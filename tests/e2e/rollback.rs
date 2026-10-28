@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 /// A network whose nodes wait at most `secs` for a new authorization (so a stale coordinator
 /// answers instead of hanging), with a completed ceremony.
 /// The consensus journal partition (the node's own votes), see the module documentation.
-const CONSENSUS_JOURNAL: &str = "registry-consensus";
+pub const CONSENSUS_JOURNAL: &str = "registry-consensus";
 
 pub fn network_with_key_args(args: &[&str]) -> (TestNetwork, Value) {
     let network = TestNetwork::start_with_args(
@@ -219,6 +219,9 @@ fn a1_full_restore_never_signs_conflict() {
         None,
         "stale read: node 3 is behind"
     );
+    // The durable floor was rolled back with everything else: it does not know of A.
+    let floor = network.readiness(3)["consensus"]["floor_height"].as_u64();
+    assert!(floor.is_none_or(|floor| floor < authorized.1), "{floor:?}");
 
     // Stale, and possibly cut off: B through node 3 is not signed; the intact nodes sign A.
     assert_not_ready(&network, 3, "no_block_since_start");
@@ -388,4 +391,80 @@ fn a2_whole_network_rollback() {
         status, 200,
         "conflicting signature for nonce 100 after a whole-network rollback: {body}"
     );
+}
+
+/// Views node `node`'s consensus resumed at, one per start (`consensus initialized`).
+fn resumed_views(network: &TestNetwork, node: usize) -> Vec<u64> {
+    network
+        .log(node)
+        .lines()
+        .filter(|line| line.contains("consensus initialized"))
+        .map(|line| {
+            let view = line.split("observed_view=").nth(1).unwrap();
+            view.split_whitespace().next().unwrap().parse().unwrap()
+        })
+        .collect()
+}
+
+/// Journal-only rollback: node 3 gets back a consensus journal from before it voted in many views,
+/// while its state and marshal progress stay current. It resumes right above its durable
+/// finalized floor, never at the old journal's view: it cannot vote again at or below the floor.
+/// It is stopped at a quiet point (just after applying a block, while the next leader still waits
+/// for transactions), so it cast no vote above the floor either, and nothing it forgot can be
+/// repeated: its peers do not block it.
+#[test]
+fn journal_only_rollback_resumes_above_floor() {
+    let (network, key) = network_with_key_args(&[]);
+    network.stop_node(3);
+    network.snapshot(3, "old-journal");
+    network.restart_node(3);
+    network.wait_for_ready(&[3]);
+    let old_view = *resumed_views(&network, 3).last().unwrap();
+
+    let (status, signed) = network.sign(0, KEY, 100, root(0xaa));
+    assert_eq!(status, 200, "{signed}");
+    wait_applied(&network, &network.all(), 100);
+    let height = network.height(3).unwrap();
+    network.wait_until("node 3 to vote in more views", || {
+        network
+            .height(3)
+            .is_some_and(|applied| applied >= height + 5)
+    });
+
+    // Quiet point: node 3 just applied a block; 300 ms lets marshal persist the acknowledgement,
+    // well before the next leader proposes (an idle leader waits 1.5 s).
+    let applied = network.height(3).unwrap();
+    network.wait_until("node 3 to apply a new block", || {
+        network.height(3).is_some_and(|now| now > applied)
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    network.stop_node(3);
+    network.restore_partition(3, "old-journal", CONSENSUS_JOURNAL);
+    network.restart_node(3);
+    network.wait_for_ready(&[3]);
+
+    let readiness = network.readiness(3);
+    let floor_view = readiness["consensus"]["floor_view"].as_u64().unwrap();
+    let resumed = *resumed_views(&network, 3).last().unwrap();
+    assert!(
+        floor_view > old_view,
+        "the old journal is below the floor: {readiness}"
+    );
+    assert_eq!(
+        resumed,
+        floor_view + 1,
+        "resumed above the floor, not at view {old_view}"
+    );
+    assert_eq!(network.blocked_for_equivocation(3), Vec::<usize>::new());
+
+    network.freeze(1);
+    let (status, again) = network.sign(0, KEY, 100, root(0xaa));
+    network.thaw(1);
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(again["signature"], signed["signature"]);
+    let (status, body) = network.sign(3, KEY, 100, root(0xbb));
+    assert_eq!(status, 409, "{body}");
+    let (status, new) = network.sign(3, KEY, 101, root(0xcc));
+    assert_eq!(status, 200, "{new}");
+    assert!(ethereum_verify(&key, &root(0xcc), &new["signature"]));
 }

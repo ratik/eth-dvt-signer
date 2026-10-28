@@ -18,6 +18,7 @@ use super::{
     signing, wire,
 };
 use crate::{
+    eth::types::Root,
     executor::{self, StartReceipt, Stopped},
     signer::wire::{self as sign_wire, Refusal},
     storage::Committed,
@@ -46,7 +47,7 @@ use commonware_utils::{
 };
 use rand_core::CryptoRng;
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use tracing::{debug, error, info, warn};
 
 /// Label of the dealer's randomness stream (derived from its persisted seed).
@@ -71,6 +72,9 @@ pub enum Message {
     },
     /// Authorizations of a block, sent by the executor once the block is durably committed.
     Authorized(Vec<Committed>),
+    /// Validator duty signing roots a block authorized `(ceremony round, signing root)`, sent by
+    /// the executor once the block is durably committed (with their slashing records).
+    AuthorizedDuties(Vec<(u64, Root)>),
     /// This node's partial signature for an authorization (from its own coordinator).
     Partial {
         ceremony: CeremonyId,
@@ -147,12 +151,21 @@ impl Client {
         CeremonyConfig::new(id, self.committee.clone())
     }
 
-    /// Submit `config` to consensus and wait until it is finalized.
-    pub async fn start(&self, config: CeremonyConfig) -> Result<StartReceipt, Stopped> {
+    /// Submit `config` to consensus and wait until it is finalized. A validator key
+    /// (`validator`) signs only Ethereum duties, under slashing protection; a development key
+    /// signs authorized payloads (the development API).
+    pub async fn start(
+        &self,
+        config: CeremonyConfig,
+        validator: bool,
+    ) -> Result<StartReceipt, Stopped> {
         let (response, receiver) = oneshot::channel();
-        self.executor
-            .send(executor::Message::StartCeremony { config, response })
-            .map_err(|_| Stopped)?;
+        let message = if validator {
+            executor::Message::StartValidatorCeremony { config, response }
+        } else {
+            executor::Message::StartCeremony { config, response }
+        };
+        self.executor.send(message).map_err(|_| Stopped)?;
         receiver.await.map_err(|_| Stopped)
     }
 
@@ -265,6 +278,9 @@ pub struct Actor<
     participants: BTreeMap<u64, Set<PublicKey>>,
     /// Signing authorizations committed on this node, by `(round, nonce)`.
     authorizations: HashMap<(u64, u64), Committed>,
+    /// Validator duty signing roots committed on this node, with the round of the ceremony that
+    /// signs them. A validator key's ceremony has only these, a development key's only the above.
+    duty_roots: HashSet<(u64, Root)>,
     parked: Parked,
     /// Blocks applied since start.
     blocks: u64,
@@ -287,6 +303,7 @@ impl<
         mailbox: mpsc::UnboundedReceiver<Message>,
         initial: Vec<Ceremony>,
         authorizations: Vec<Committed>,
+        duty_roots: Vec<(u64, Root)>,
     ) -> Self {
         Self {
             context: ContextCell::new(context),
@@ -307,6 +324,7 @@ impl<
                 .into_iter()
                 .map(|committed| ((committed.round(), committed.nonce()), committed))
                 .collect(),
+            duty_roots: duty_roots.into_iter().collect(),
             parked: Parked::default(),
             blocks: 0,
         }
@@ -336,6 +354,10 @@ impl<
                     let _ = response.send(self.share_status(&id));
                 }
                 Message::Authorized(committed) => self.authorized(committed),
+                Message::AuthorizedDuties(roots) => {
+                    self.duty_roots.extend(roots);
+                    self.release_parked();
+                }
                 Message::Partial {
                     ceremony,
                     nonce,
@@ -693,6 +715,11 @@ impl<
                 Refusal::NotCompleted
             });
         };
+        // A validator duty: its exact signing root was authorized, under slashing protection, for
+        // the key this ceremony signs for.
+        if self.duty_roots.contains(&(round, *payload_hash)) {
+            return Ok(signing::Message::Ethereum(*payload_hash).partial_sign(share));
+        }
         let authorization = self
             .authorizations
             .get(&(round, nonce))
@@ -765,10 +792,17 @@ impl<
                 authorization,
             );
         }
-        let (ids, authorizations) = (&self.ids, &self.authorizations);
+        self.release_parked();
+    }
+
+    /// Answer the parked requests whose authorization is now committed.
+    fn release_parked(&mut self) {
+        let (ids, authorizations, duty_roots) = (&self.ids, &self.authorizations, &self.duty_roots);
         let ready = self.parked.take(|request| {
-            ids.get(&request.ceremony)
-                .is_some_and(|round| authorizations.contains_key(&(*round, request.nonce)))
+            ids.get(&request.ceremony).is_some_and(|round| {
+                authorizations.contains_key(&(*round, request.nonce))
+                    || duty_roots.contains(&(*round, request.payload_hash))
+            })
         });
         for (from, request) in ready {
             self.on_sign_request(from, request);

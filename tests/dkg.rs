@@ -56,7 +56,10 @@ fn id(name: &str) -> CeremonyId {
 /// Start `name` through node `via` with the default configuration.
 async fn start(cluster: &Cluster, via: usize, name: &str) -> StartOutcome {
     let dkg = &cluster.dkg[via];
-    dkg.start(dkg.config(id(name))).await.unwrap().outcome
+    dkg.start(dkg.config(id(name)), false)
+        .await
+        .unwrap()
+        .outcome
 }
 
 /// Wait until the given nodes see the ceremony with `status` and, once completed, have settled
@@ -439,7 +442,7 @@ fn conflicting_ceremony_is_rejected() {
         threshold.threshold = 2;
         assert_eq!(
             cluster.dkg[1]
-                .start(threshold.clone())
+                .start(threshold.clone(), false)
                 .await
                 .unwrap()
                 .outcome,
@@ -448,7 +451,7 @@ fn conflicting_ceremony_is_rejected() {
         let mut version = dkg.config(id("validator-001"));
         version.version = 2;
         assert_eq!(
-            cluster.dkg[2].start(version).await.unwrap().outcome,
+            cluster.dkg[2].start(version, false).await.unwrap().outcome,
             StartOutcome::Conflict(0)
         );
         let mut participants = dkg.config(id("validator-001"));
@@ -461,14 +464,18 @@ fn conflicting_ceremony_is_rejected() {
             .try_into()
             .unwrap();
         assert_eq!(
-            cluster.dkg[3].start(participants).await.unwrap().outcome,
+            cluster.dkg[3]
+                .start(participants, false)
+                .await
+                .unwrap()
+                .outcome,
             StartOutcome::Conflict(0)
         );
 
         // The unsupported parameters are not started under a fresh id either.
         threshold.id = id("validator-002");
         assert!(matches!(
-            dkg.start(threshold).await.unwrap().outcome,
+            dkg.start(threshold, false).await.unwrap().outcome,
             StartOutcome::Unsupported(Unsupported::Threshold { expected: 3, .. })
         ));
         assert!(dkg.ceremony(id("validator-002")).await.unwrap().is_none());

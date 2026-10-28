@@ -1,14 +1,29 @@
 //! HTTP API for clients.
 //!
-//! - `POST /sign` `{"ceremony_id": "validator-001", "nonce": 100, "payload_hash": "0x<64 hex>"}`:
-//!   authorizes (through consensus, once per `(ceremony_id, nonce)`) and signs the 32-byte
-//!   Ethereum signing root with the ceremony's threshold key. Returns the 96-byte signature.
+//! Ethereum validator signing (Web3Signer API, see `eth::web3signer` and docs/ethereum-signing.md):
+//!
+//! - `GET /api/v1/eth2/publicKeys`: the validator public keys this network signs for.
+//! - `POST /api/v1/eth2/sign/{public key}`: sign a validator duty, under slashing protection
+//!   decided by consensus. `200` with the signature, `400` bad or unsupported request, `404`
+//!   unknown key, `412` refused by slashing protection, `503`/`504` not ready or not in time.
+//! - `GET /upcheck`: `OK` while the HTTP server runs.
+//!
+//! Development API (`dev-api` feature only, never in a deployment):
+//!
+//! - `POST /sign` `{"ceremony_id": "dev-001", "nonce": 100, "payload_hash": "0x<64 hex>"}`:
+//!   authorizes (through consensus, once per `(ceremony_id, nonce)`) and signs the 32-byte payload
+//!   with a development ceremony's threshold key. Refused for validator keys.
 //! - `GET /authorizations/{ceremony_id}/{nonce}`: the finalized authorization, if any.
+//!
+//! Operations:
+//!
 //! - `GET /status`: last applied height, number of authorizations, mempool size, signing load and
 //!   readiness (see `readiness`).
 //! - `GET /ready`: the readiness alone; `200` when ready, `503` otherwise (same body).
-//! - `POST /dkg/start` `{"ceremony_id": "validator-001"}`: starts one distributed DKG ceremony
-//!   (idempotent; a different configuration under a used id is rejected with 409).
+//! - `POST /dkg/start` `{"ceremony_id": "validator-001", "validator": true}`: starts one
+//!   distributed DKG ceremony; `validator` makes its key an Ethereum validator key (signs only
+//!   validator duties), otherwise a development key (idempotent; a different configuration or
+//!   purpose under a used id is rejected with 409).
 //! - `GET /dkg/status/{ceremony_id}`: ceremony status, and the group public key once completed.
 //! - `GET /dkg/public-key/{ceremony_id}`: the group public key of a completed ceremony.
 //!
@@ -26,28 +41,39 @@ use crate::{
         format_key,
     },
     engine::Recovery,
+    eth::{
+        duty::{DutyRequest, format_validator},
+        web3signer::{parse_identifier, parse_request},
+    },
     executor::{Client, Status, Stopped},
     readiness::{Readiness, Reason, State as ReadinessState},
+    signer::coordinator::{self, SignError},
+    slashing::Refusal as DutyRefusal,
+};
+#[cfg(feature = "dev-api")]
+use crate::{
     signer::{
-        coordinator::{self, AuthorizationKind, SignError, Timings},
+        coordinator::{AuthorizationKind, Timings},
         wire::Refusal,
     },
     types::{PayloadHash, SignRequest, format_hash},
 };
+#[cfg(feature = "dev-api")]
+use axum::extract::rejection::JsonRejection;
 use axum::{
     Json, Router,
-    extract::{Path, State, rejection::JsonRejection},
-    http::StatusCode,
+    body::Bytes,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use commonware_codec::Encode as _;
 use commonware_utils::ordered::Quorum as _;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeMap,
-    time::{Duration, SystemTime},
-};
+#[cfg(feature = "dev-api")]
+use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime};
 
 /// How long `POST /dkg/start` waits for finalization.
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -57,6 +83,7 @@ const SIGN_TIMEOUT: Duration = Duration::from_secs(60);
 
 type ApiError = (StatusCode, String);
 
+#[cfg(feature = "dev-api")]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SignBody {
@@ -66,6 +93,7 @@ struct SignBody {
     payload_hash: String,
 }
 
+#[cfg(feature = "dev-api")]
 #[derive(Serialize)]
 struct SignResponse {
     ceremony_id: String,
@@ -84,6 +112,7 @@ struct SignResponse {
     timings_ms: Timings,
 }
 
+#[cfg(feature = "dev-api")]
 #[derive(Serialize)]
 struct SignFailure {
     ceremony_id: String,
@@ -104,6 +133,7 @@ struct SignFailure {
     reasons: Vec<Reason>,
 }
 
+#[cfg(feature = "dev-api")]
 #[derive(Serialize)]
 struct AuthorizationResponse {
     ceremony_id: String,
@@ -165,6 +195,9 @@ struct ConsensusResponse {
 #[derive(Deserialize)]
 struct StartBody {
     ceremony_id: String,
+    /// The key is an Ethereum validator key (default: a development key).
+    #[serde(default)]
+    validator: bool,
     /// Defaults to the committee threshold (`n - f`).
     threshold: Option<u32>,
     /// Defaults to the current protocol version.
@@ -188,6 +221,8 @@ struct CeremonyResponse {
     participant_index: Option<u32>,
     /// State of this node's share (never the share itself).
     share: ShareStatus,
+    /// An Ethereum validator key (signs only validator duties).
+    validator: bool,
 }
 
 #[derive(Serialize)]
@@ -218,22 +253,136 @@ pub fn router(
     signer: coordinator::Client,
     recovery: Recovery,
 ) -> Router {
-    Router::new()
-        .route("/sign", post(sign))
-        .route("/authorizations/{ceremony_id}/{nonce}", get(authorization))
+    let router = Router::new()
+        .route("/api/v1/eth2/publicKeys", get(eth2_public_keys))
+        .route("/api/v1/eth2/sign/{identifier}", post(eth2_sign))
+        .route("/upcheck", get(|| async { "OK" }))
         .route("/status", get(status))
         .route("/ready", get(ready))
         .route("/dkg/start", post(dkg_start))
         .route("/dkg/status/{ceremony_id}", get(dkg_status))
-        .route("/dkg/public-key/{ceremony_id}", get(dkg_public_key))
-        .with_state(Api {
-            client,
-            dkg,
-            signer,
-            recovery,
-        })
+        .route("/dkg/public-key/{ceremony_id}", get(dkg_public_key));
+    #[cfg(feature = "dev-api")]
+    let router = router
+        .route("/sign", post(sign))
+        .route("/authorizations/{ceremony_id}/{nonce}", get(authorization));
+    router.with_state(Api {
+        client,
+        dkg,
+        signer,
+        recovery,
+    })
 }
 
+async fn eth2_public_keys(State(api): State<Api>) -> Result<Json<Vec<String>>, ApiError> {
+    let validators = api.client.validators().await.map_err(unavailable)?;
+    Ok(Json(
+        validators
+            .iter()
+            .map(|validator| format_validator(&validator.key))
+            .collect(),
+    ))
+}
+
+#[derive(Serialize)]
+struct Eth2Error {
+    error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refusal: Option<DutyRefusal>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    reasons: Vec<Reason>,
+}
+
+fn eth2_error(status: StatusCode, error: String) -> Response {
+    (
+        status,
+        Json(Eth2Error {
+            error,
+            refusal: None,
+            reasons: Vec::new(),
+        }),
+    )
+        .into_response()
+}
+
+/// Whether the client asked for a JSON response (Web3Signer answers `text/plain` otherwise).
+fn accepts_json(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| value.contains("application/json"))
+}
+
+async fn eth2_sign(
+    State(api): State<Api>,
+    Path(identifier): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let parsed = parse_identifier(&identifier)
+        .and_then(|validator| parse_request(&body).map(|request| (validator, request)));
+    let (validator, request) = match parsed {
+        Ok(parsed) => parsed,
+        Err(err) => return eth2_error(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+    let duty = DutyRequest {
+        validator,
+        fork: request.fork,
+        duty: request.duty,
+    };
+    let result = tokio::time::timeout(
+        SIGN_TIMEOUT,
+        api.signer.sign_duty(duty, request.signing_root),
+    )
+    .await;
+    let error = match result {
+        Ok(Ok(signed)) => {
+            let signature = format!("0x{}", hex::encode(signed.signature.encode()));
+            return if accepts_json(&headers) {
+                Json(serde_json::json!({ "signature": signature })).into_response()
+            } else {
+                ([(header::CONTENT_TYPE, "text/plain")], signature).into_response()
+            };
+        }
+        Ok(Err(error)) => error,
+        Err(_) => {
+            return eth2_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "signing did not finish in time".into(),
+            );
+        }
+    };
+    let status = match &error {
+        SignError::UnknownValidator | SignError::Refused(DutyRefusal::UnknownValidator) => {
+            StatusCode::NOT_FOUND
+        }
+        SignError::RootMismatch(_) | SignError::Refused(DutyRefusal::SourceAfterTarget { .. }) => {
+            StatusCode::BAD_REQUEST
+        }
+        SignError::Refused(_) => StatusCode::PRECONDITION_FAILED,
+        SignError::NotReady(_)
+        | SignError::InsufficientSigners { .. }
+        | SignError::Busy
+        | SignError::Stopped => StatusCode::SERVICE_UNAVAILABLE,
+        SignError::AuthorizationTimeout | SignError::Timeout { .. } => StatusCode::GATEWAY_TIMEOUT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    let body = Eth2Error {
+        error: error.to_string(),
+        refusal: match &error {
+            SignError::Refused(refusal) => Some(*refusal),
+            _ => None,
+        },
+        reasons: match error {
+            SignError::NotReady(reasons) => reasons,
+            _ => Vec::new(),
+        },
+    };
+    (status, Json(body)).into_response()
+}
+
+#[cfg(feature = "dev-api")]
 async fn sign(State(api): State<Api>, body: Result<Json<SignBody>, JsonRejection>) -> Response {
     let Json(body) = match body {
         Ok(body) => body,
@@ -308,7 +457,11 @@ async fn sign(State(api): State<Api>, body: Result<Json<SignBody>, JsonRejection
         }
         SignError::Timeout { .. } => (StatusCode::GATEWAY_TIMEOUT, "SIGNING_TIMEOUT"),
         SignError::Busy | SignError::Stopped => (StatusCode::SERVICE_UNAVAILABLE, "UNAVAILABLE"),
-        SignError::Invalid => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL"),
+        SignError::ValidatorKey => (StatusCode::FORBIDDEN, "VALIDATOR_KEY"),
+        SignError::Invalid
+        | SignError::UnknownValidator
+        | SignError::RootMismatch(_)
+        | SignError::Refused(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL"),
     };
     let (status, mut response) = failure(status, result, message);
     match error {
@@ -333,6 +486,7 @@ async fn sign(State(api): State<Api>, body: Result<Json<SignBody>, JsonRejection
     (status, Json(response)).into_response()
 }
 
+#[cfg(feature = "dev-api")]
 async fn authorization(
     State(Api { client, .. }): State<Api>,
     Path((ceremony_id, nonce)): Path<(String, u64)>,
@@ -428,9 +582,15 @@ async fn dkg_start(
         config.version = version;
     }
 
-    // An id is never reused: the same request returns the ceremony, a different one is rejected.
+    // An id is never reused: the same request returns the ceremony, a different one (including
+    // another purpose) is rejected.
     if let Some(existing) = api.dkg.ceremony(id.clone()).await.map_err(unavailable)? {
-        if existing.config != config {
+        let validator = api
+            .client
+            .is_validator_round(existing.round)
+            .await
+            .map_err(unavailable)?;
+        if existing.config != config || validator != body.validator {
             return Err(conflict(&id));
         }
         return describe(&api, existing).await;
@@ -439,7 +599,7 @@ async fn dkg_start(
         .check(api.dkg.committee())
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
 
-    let receipt = tokio::time::timeout(SUBMIT_TIMEOUT, api.dkg.start(config))
+    let receipt = tokio::time::timeout(SUBMIT_TIMEOUT, api.dkg.start(config, body.validator))
         .await
         .map_err(|_| {
             (
@@ -512,7 +672,13 @@ async fn describe(api: &Api, ceremony: Ceremony) -> Result<Json<CeremonyResponse
         .await
         .map_err(unavailable)?;
     let me = api.dkg.me();
+    let validator = api
+        .client
+        .is_validator_round(ceremony.round)
+        .await
+        .map_err(unavailable)?;
     Ok(Json(CeremonyResponse {
+        validator,
         ceremony_id: ceremony.config.id.to_string(),
         status: ceremony.status,
         public_key: ceremony.public_key().map(format_key),
@@ -541,6 +707,7 @@ fn conflict(id: &CeremonyId) -> ApiError {
     )
 }
 
+#[cfg(feature = "dev-api")]
 fn parse_hash(value: &str) -> Result<PayloadHash, ApiError> {
     let bytes = hex::decode(value.strip_prefix("0x").unwrap_or(value))
         .map_err(|err| (StatusCode::BAD_REQUEST, format!("payload_hash: {err}")))?;

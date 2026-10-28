@@ -243,9 +243,8 @@ fn files(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     files
 }
 
-/// Partitions a refused start leaves byte for byte: the replicated state, the key shares, the
-/// consensus journal and marshal's progress. (Opening the block archives, needed to read marshal's
-/// progress, rewrites their own metadata and repairs torn tails, as on any start.)
+/// Partitions whose contents are evidence: the replicated state, the key shares, the consensus
+/// journal and marshal's progress.
 const EVIDENCE: [&str; 4] = [
     "registry-state",
     "registry-secrets",
@@ -253,8 +252,22 @@ const EVIDENCE: [&str; 4] = [
     "registry-marshal-application-metadata",
 ];
 
+/// Where a node saves, before opening its stores, the copies that fail their integrity check.
+const DIAGNOSTICS: &str = "registry-diagnostics";
+
+/// Contents of every file node 3 saved for investigation.
+fn saved_copies(network: &TestNetwork) -> Vec<Vec<u8>> {
+    let dir = network.data_dir(3).join(DIAGNOSTICS);
+    if !dir.exists() {
+        return Vec::new();
+    }
+    files(&dir).into_values().collect()
+}
+
 /// After a damaged restart, node 3 must stop (fail closed, exit status not 0) instead of running
-/// with durable state that contradicts itself, delete no file, and leave [EVIDENCE] as it was.
+/// with durable state that contradicts itself, and delete no file. A file of [EVIDENCE] may change
+/// only through commonware's recovery of a copy that failed its integrity check, and then its
+/// original bytes are saved in [DIAGNOSTICS].
 fn assert_fails_closed(network: &TestNetwork, why: &str) {
     let data = network.data_dir(3);
     let before = files(&data);
@@ -263,6 +276,7 @@ fn assert_fails_closed(network: &TestNetwork, why: &str) {
     assert!(!status.success(), "{why}: node 3 exited with {status}");
     assert!(network.count(3, "refusing to start") > 0, "{why}");
     let after = files(&data);
+    let saved = saved_copies(network);
     let relative = |path: &Path| path.strip_prefix(&data).unwrap().to_path_buf();
     let removed: Vec<PathBuf> = before
         .keys()
@@ -270,25 +284,25 @@ fn assert_fails_closed(network: &TestNetwork, why: &str) {
         .map(|path| relative(path))
         .collect();
     assert!(removed.is_empty(), "{why}: removed {removed:?}");
-    let changed: Vec<PathBuf> = before
+    let lost: Vec<PathBuf> = before
         .iter()
         .filter(|(path, contents)| {
             EVIDENCE
                 .iter()
                 .any(|partition| relative(path).starts_with(partition))
                 && after.get(*path) != Some(contents)
+                && !saved.contains(contents)
         })
         .map(|(path, _)| relative(path))
         .collect();
-    assert!(changed.is_empty(), "{why}: changed {changed:?}");
+    assert!(
+        lost.is_empty(),
+        "{why}: changed without a saved copy {lost:?}"
+    );
 }
 
-/// F4: the copy of the replicated state written last is damaged after its block was acknowledged
-/// to marshal (pinned: the node is held on the next block). The other copy is a block behind, which
-/// marshal will not re-deliver: the node must stop instead of skipping the block.
-#[test]
-fn f4_corrupted_state_fails_closed() {
-    let (network, _) = network_with_key();
+/// The damaged newest state copy of a node held after its last acknowledged block (F4's setup).
+fn damage_acknowledged_state(network: &TestNetwork) -> PathBuf {
     let hold = network.dir.join("hold-3");
     network.restart_node_with(
         3,
@@ -300,8 +314,7 @@ fn f4_corrupted_state_fails_closed() {
     network.wait_for_ready(&[3]);
     let (status, body) = network.sign(0, KEY, 100, root(0xaa));
     assert_eq!(status, 200, "{body}");
-    wait_applied(&network, &network.all(), 100);
-
+    wait_applied(network, &network.all(), 100);
     let held = network.count(3, "test hook: holding block execution");
     fs::write(&hold, b"").unwrap();
     network.wait_until("node 3 to hold the next block", || {
@@ -309,7 +322,18 @@ fn f4_corrupted_state_fails_closed() {
     });
     network.stop_node(3);
     fs::remove_file(&hold).unwrap();
-    flip_last_byte(&newest_state_copy(&network, 3));
+    let copy = newest_state_copy(network, 3);
+    flip_last_byte(&copy);
+    copy
+}
+
+/// F4: the copy of the replicated state written last is damaged after its block was acknowledged
+/// to marshal (pinned: the node is held on the next block). The other copy is a block behind, which
+/// marshal will not re-deliver: the node must stop instead of skipping the block.
+#[test]
+fn f4_corrupted_state_fails_closed() {
+    let (network, _) = network_with_key();
+    damage_acknowledged_state(&network);
     assert_fails_closed(&network, "state one block behind its acknowledged history");
     assert!(network.count(3, "blocks are missing") > 0);
 }
@@ -445,4 +469,39 @@ fn r5_share_without_state_fails_closed() {
     }
     assert_fails_closed(&network, "state and history deleted, key share kept");
     assert!(network.count(3, "a key share of ceremony round 0 is stored") > 0);
+}
+
+/// R5: the damaged copy is saved, durably, before any store is opened: a start interrupted right
+/// after saving leaves the working copy untouched; the following starts let commonware recover it
+/// and refuse, and the saved evidence stays exactly one unchanged copy.
+#[test]
+fn r5_damaged_copy_is_saved_before_opening() {
+    let (network, _) = network_with_key();
+    let copy = damage_acknowledged_state(&network);
+    let damaged = fs::read(&copy).unwrap();
+
+    network.restart_node_with(
+        3,
+        vec![("ETH_MPC_SIGNER_CRASH_AT".into(), "after-diagnostics".into())],
+    );
+    assert!(!network.wait_exit(3).success());
+    assert!(network.count(3, "test hook: crashing at after-diagnostics") > 0);
+    assert_eq!(saved_copies(&network), std::slice::from_ref(&damaged));
+    assert_eq!(
+        fs::read(&copy).unwrap(),
+        damaged,
+        "the working copy is untouched"
+    );
+
+    for attempt in 1..=2 {
+        network.restart_node_with(3, Vec::new());
+        assert!(!network.wait_exit(3).success(), "start {attempt}");
+        assert_eq!(
+            saved_copies(&network),
+            std::slice::from_ref(&damaged),
+            "start {attempt}"
+        );
+    }
+    assert!(network.count(3, "blocks are missing") >= 2);
+    assert!(network.count(3, "a copy fails its integrity check") >= 1);
 }
