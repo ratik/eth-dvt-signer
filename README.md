@@ -448,6 +448,11 @@ Fast (unit tests and 4-node simulations in commonware's deterministic runtime, ~
 cargo test
 ```
 
+Unit tests live in `tests/unit/`, one file per module: `tests/unit/slashing.rs` tests
+`src/slashing.rs`. Each file is compiled into the library as that module's `tests` child
+(`#[cfg(test)] #[path = "..."] mod tests;`), so it reaches private items, and keeps its name:
+`slashing::tests::...`.
+
 Real processes (the actual binary, 4 OS processes, real p2p, HTTP and storage, ~3 min), built only
 with the `test-hooks` feature:
 

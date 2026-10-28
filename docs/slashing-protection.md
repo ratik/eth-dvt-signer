@@ -279,7 +279,7 @@ watermarks.
 
 | What | Tests |
 | ---- | ----- |
-| Rules: proposals, double and surround votes in both directions, history older than the latest attestation, bounded duties, other chain, invalid and unknown | `slashing::tests` (unit) |
+| Rules: proposals, double and surround votes in both directions, history older than the latest attestation, bounded duties, other chain, invalid and unknown | `slashing::tests` (unit, `tests/unit/slashing.rs`; `storage::tests` is `tests/unit/storage.rs`) |
 | Activation: required, once, immutable, unknown keys; chains pinned by the previous version | `slashing::tests::a_validator_signs_only_once_activated_and_for_its_chain`, `a_chain_pinned_by_an_earlier_version_must_be_confirmed`, `storage::tests::validator::legacy_validator_records_are_not_activated` |
 | Ordered-neighbour attestation checks against the full scan | `slashing::tests::logarithmic_checks_match_the_exhaustive_reference` (`SLASHING_SEEDS=<n>`), `long_histories_match_the_exhaustive_reference` |
 | Records persist with the authorization; activation persists; purposes stay separate; decisions identical after restart; restarting a validator ceremony resets nothing | `storage::tests::validator::duties_and_their_history_survive_restart` |

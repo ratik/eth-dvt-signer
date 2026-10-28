@@ -87,7 +87,9 @@ validate() {
 			done
 			step l1-reproducer fail cargo test --locked --features test-hooks --test e2e \
 				eth2::e2e_eth_l1 -- --ignored
-			grep -H "^test result" "$OUT"/*.txt >>"$OUT/summary.txt" || true
+			for log in "$OUT"/*.txt; do
+				[ "$log" = "$OUT/summary.txt" ] || grep -H "^test result" "$log" || true
+			done >>"$OUT/summary.txt"
 			exit $failed'
 }
 
