@@ -27,7 +27,7 @@ A real Lighthouse v8.3.2 validator client has run against it on a local proof-of
 independent audit, and slashing history that a rollback of every node would lose
 ([Limitations](#limitations-next-steps)).
 
-Design notes: [docs/architecture.md](docs/architecture.md) (signing, E2E harness, future Ethereum
+Design notes: [docs/architecture.md](docs/architecture.md) (signing, E2E harness, Ethereum
 integration), [docs/security-review.md](docs/security-review.md) and the adversarial audit
 [docs/audit.md](docs/audit.md) (findings, fault model, coverage).
 
@@ -613,8 +613,10 @@ Signing an existing authorization costs one p2p round trip and four pairings.
 - Ethereum: mainnet preset only. No validator registrations, Phase 0 and Altair blocks or Gloas
   types. Deposits only on a node started with `--enable-deposit-signing`, one deposit message per
   key. The client's fork versions are trusted for the domain (the chain is the explicit
-  activation). EIP-3076 import is accepted for imported keys only. No validator client has been run against
-  the API ([docs/ethereum-signing.md](docs/ethereum-signing.md#lighthouse-v832)).
+  activation). EIP-3076 import is accepted for imported keys only, and cannot be undone (audit
+  L-17); the export's compatibility with other signers is modeled, not tested. Only Lighthouse
+  v8.3.2 has been run against the API, on a local devnet
+  ([docs/ethereum-signing.md](docs/ethereum-signing.md#compatibility-evidence)).
 - `POST /sign` (`dev-api` builds only) is generic authorization, not slashing protection: the
   nonce is caller-chosen, and the caller computes the signing root.
 - Authorizations and slashing history are kept forever, and every new one rewrites the state
@@ -635,5 +637,6 @@ Signing an existing authorization costs one p2p round trip and four pairings.
 - The mempool is not persisted: requests not yet in a block are lost if their node crashes.
 - Two nodes restarted together can stall consensus for seconds after they are back (6.3 to 9.7 s
   measured when they missed a certificate), enough to miss Ethereum duties
-  ([docs/audit.md](docs/audit.md) L-14). Restart one node at a time.
+  ([docs/audit.md](docs/audit.md) L-14). Restart one node at a time. One node stopping can
+  delay duties by a 2 s leader timeout, late for sync committee messages with 4 s slots (L-16).
 - No state sync: a node behind by more than the retention window must be restored by hand.

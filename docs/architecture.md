@@ -68,7 +68,8 @@ scenarios can run against nodes started elsewhere.
 ```
 Kurtosis devnet (ethereum-package): geth + Lighthouse beacon node + genesis validators
           │ beacon API
-Lighthouse validator client v8.3.2: one web3signer validator, the DKG key, no keystore
+Lighthouse validator client v8.3.2: web3signer validators only, no keystore (the DKG key;
+                                    after the migration scenario, also a genesis key)
           │ Web3Signer HTTP API
 failover proxy (development)  ──>  4 eth-mpc-signer nodes (this repository)
 ```
@@ -78,8 +79,9 @@ failover proxy (development)  ──>  4 eth-mpc-signer nodes (this repository)
    first plan: the request's `signingRoot` is not trusted, and there is no nonce. The duty is sent
    typed, and the state machine computes its root.
 2. Done: slashing protection inside the replicated state machine, the specification's rules over
-   the whole history ([slashing-protection.md](slashing-protection.md)). Not done: EIP-3076
-   import and export, pruning, and an anchor against whole-network rollback (designed only).
+   the whole history ([slashing-protection.md](slashing-protection.md)). EIP-3076 import (for
+   imported keys) and export are done. Not done: pruning, and an anchor against whole-network
+   rollback (designed only).
 3. Done: validator onboarding. The DKG key is activated for the devnet's chain, the MPC network
    signs its one deposit message (`DEPOSIT`, behind `--enable-deposit-signing`), and the deposit
    goes through the deposit contract.
@@ -87,6 +89,10 @@ failover proxy (development)  ──>  4 eth-mpc-signer nodes (this repository)
    Lighthouse validator client performs duties with the MPC network as its only signer, through a
    development failover proxy. The run also covers a keyholder offline, a coordinator failure and
    a coordinator crash mid-request, with acceptance checked in the beacon state.
+5. Done: import of an existing validator key ([key-import.md](key-import.md)). An offline trusted
+   dealer splits an EIP-2335 keystore into the network's sharing; the key is registered,
+   installed, given its previous signer's EIP-3076 history and activated through consensus. The
+   devnet migrates a genesis validator from Lighthouse's local keystore.
 
 ## Anvil
 

@@ -8,9 +8,9 @@ root, applies slashing protection ([slashing-protection.md](slashing-protection.
 authorizes it through consensus. Then 3 of the 4 nodes sign it with their key shares.
 
 **Not production-ready.** There is no authentication: the HTTP API binds to `127.0.0.1` only. The
-validator set is fixed and the keys are development keys. No validator client has been run against
-it (see [Compatibility evidence](#compatibility-evidence)). Do not use it for a validator with
-real stake.
+validator set is fixed and the keys are development keys. One validator client, Lighthouse
+v8.3.2, has run against it, on a local devnet only ([ethereum-devnet.md](ethereum-devnet.md)). Do
+not use it for a validator with real stake.
 
 ## Endpoints
 
@@ -347,9 +347,15 @@ What the evidence is:
 - **E2E.** Every supported duty is signed through HTTP on four real processes. Each signature is
   verified with blst against the validator key and the expected root (`tests/e2e/eth2.rs`).
 
-No validator client (Lighthouse, Teku, Prysm, Nimbus, Lodestar) has been run against this API,
-and no beacon chain has accepted its signatures. Compatibility is therefore claimed only for the
-requests Lighthouse v8.3.2's code builds, as checked above, not for a running client.
+- **A running client.** Lighthouse v8.3.2's validator client has signed through this API on a
+  local devnet. The beacon chain accepted its attestations, its blocks (with their RANDAO
+  reveals) and its deposit. Aggregates, and for the migrated validator sync committee messages
+  and contributions, were published (Lighthouse's log), not checked in the beacon state
+  ([ethereum-devnet.md](ethereum-devnet.md#results)).
+
+No other validator client (Teku, Prysm, Nimbus, Lodestar) has been run against this API, and no
+public network. Compatibility is claimed for Lighthouse v8.3.2 on that devnet, and for the requests
+its code builds, as checked above.
 
 ## Performance
 

@@ -209,7 +209,9 @@ the time the operator takes.
    ```
 10. **Point the validator client at the network** (Web3Signer API) and check that it attests in the
     beacon chain. `GET /slashing-protection/export/{public_key}` gives the history the network
-    holds, for a later move or an audit.
+    holds, for an audit. It is not a way to move the key out: the network has no command that stops
+    it signing for a key, and the export is served while it may sign
+    ([slashing-protection.md](slashing-protection.md#compared-with-eip-3076)).
 
 ## Failure recovery
 
@@ -258,6 +260,13 @@ elsewhere.
   attestation per validator ([slashing-protection.md](slashing-protection.md#imported-history-eip-3076)).
   That is what makes import safe for histories of any size, and why the network refuses even the
   exact repetition of the previous signer's latest messages.
+- **Imports cannot be undone.** Floors only rise. An interchange with a wrong far-future slot or
+  epoch stops the key for good, and the key cannot be registered again. Any client of the node API
+  can submit one (no authentication). Check the dry run's latest block and attestation before
+  importing (audit L-17).
+- **Interoperability of the export is modeled, not tested.** It is checked against a reference
+  implementation of EIP-3076's conditions and by reading Lighthouse's import; no other client has
+  imported one ([slashing-protection.md](slashing-protection.md#compared-with-eip-3076)).
 - **The node operations are HTTP endpoints** of the existing localhost-only node API (like
   `/dkg/start` and `/validators/activate`), because they are consensus commands of the running node.
   The offline steps are the CLI.

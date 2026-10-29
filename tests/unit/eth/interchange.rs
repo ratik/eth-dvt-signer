@@ -10,6 +10,7 @@ use crate::{
     },
 };
 use serde::Deserialize;
+use std::collections::BTreeSet;
 
 const KEY_A: &str = "0xa99a76ed7796f7be22d5b7e85deeb7c5677e88e511e0b337618f8c4eb61349b4bf2d153f649f7b53359fe8b94a38e44c";
 const KEY_B: &str = "0xb89bebc699769726a318c8e9971bd3171297c61aea4a6578a7a4f94b547dcba5bac16a89108b6b6a1fe3695d1a874a0b";
@@ -576,30 +577,41 @@ fn a_missing_signing_root_is_conservative() {
 // Export.
 
 /// Every duty in a grid of slots and epochs that `protection` refuses for `id`, the protection an
-/// export of it gives a fresh signer also refuses.
+/// export of it gives a fresh signer also refuses: this network, and a signer that follows
+/// EIP-3076's conditions as written ([Reference]).
 fn assert_export_is_conservative(protection: &Protection, id: u64, key: ValidatorKey) {
     let exported = protection.export(id);
     let json = export(&chain(GVR), &[(key, exported)]);
     let mut receiver = self::protection(&[key], chain(GVR));
     import_into(&mut receiver, serde_json::to_value(&json).unwrap()).unwrap();
+    let mut reference = Reference::default();
+    reference.import(&from_json(&json).unwrap().validators[&key]);
     for slot in 0..40 {
         let mut ours = protection.clone();
-        let mut theirs = receiver.clone();
         if !sign_block(&mut ours, id, slot, root(0xee)) {
             assert!(
-                !sign_block(&mut theirs, 0, slot, root(0xee)),
+                !sign_block(&mut receiver.clone(), 0, slot, root(0xee)),
                 "block {slot}"
+            );
+            assert!(
+                !reference.clone().sign_block(slot, root(0xee)),
+                "block {slot} (reference)"
             );
         }
     }
     for source in 0..12 {
         for target in source..14 {
             let mut ours = protection.clone();
-            let mut theirs = receiver.clone();
             if !sign_attestation(&mut ours, id, source, target, root(0xee)) {
                 assert!(
-                    !sign_attestation(&mut theirs, 0, source, target, root(0xee)),
+                    !sign_attestation(&mut receiver.clone(), 0, source, target, root(0xee)),
                     "attestation {source}->{target}"
+                );
+                assert!(
+                    !reference
+                        .clone()
+                        .sign_attestation(source, target, root(0xee)),
+                    "attestation {source}->{target} (reference)"
                 );
             }
         }
@@ -686,4 +698,237 @@ fn assert_conservative_and_repeatable(protection: &Protection, key: ValidatorKey
         serde_json::to_string(&export(&chain(GVR), &[(key, protection.export(0))])).unwrap(),
         serde_json::to_string(&export(&chain(GVR), &[(key, protection.export(0))])).unwrap()
     );
+}
+
+// The specification as a reference.
+
+/// A signer that follows EIP-3076's conditions as written, independently of `slashing`. After each
+/// import it refuses (1) a block slashable with respect to a recorded block, (2) a block at or
+/// below the import's minimum slot, (3) an attestation slashable with respect to a recorded
+/// attestation, (4) an attestation with a source below the import's minimum source, (5) one with
+/// a target at or below the import's minimum target; (2) and (5) except a repeat (the same
+/// message, as determined by the signing root). An absent signing root matches nothing. What it
+/// signs is kept in full, like the imported messages.
+#[derive(Clone, Default)]
+struct Reference {
+    blocks: Vec<(u64, Option<Root>)>,
+    attestations: Vec<(u64, u64, Option<Root>)>,
+    /// The highest of the imports' minimum slots, sources and targets.
+    min_slot: Option<u64>,
+    min_source: Option<u64>,
+    min_target: Option<u64>,
+}
+
+impl Reference {
+    fn import(&mut self, history: &History) {
+        self.min_slot = self.min_slot.max(history.blocks.keys().min().copied());
+        self.min_source = self.min_source.max(
+            history
+                .attestations
+                .values()
+                .map(|(source, _)| *source)
+                .min(),
+        );
+        self.min_target = self
+            .min_target
+            .max(history.attestations.keys().min().copied());
+        self.blocks
+            .extend(history.blocks.iter().map(|(&slot, &root)| (slot, root)));
+        self.attestations.extend(
+            history
+                .attestations
+                .iter()
+                .map(|(&target, &(source, root))| (source, target, root)),
+        );
+    }
+
+    fn sign_block(&mut self, slot: u64, root: Root) -> bool {
+        if self.blocks.contains(&(slot, Some(root))) {
+            return true;
+        }
+        if self.blocks.iter().any(|&(signed, _)| signed == slot)
+            || self.min_slot.is_some_and(|min| slot <= min)
+        {
+            return false;
+        }
+        self.blocks.push((slot, Some(root)));
+        true
+    }
+
+    fn sign_attestation(&mut self, source: u64, target: u64, root: Root) -> bool {
+        // Condition (4) has no exception for repeats.
+        if source > target || self.min_source.is_some_and(|min| source < min) {
+            return false;
+        }
+        if self.attestations.contains(&(source, target, Some(root))) {
+            return true;
+        }
+        let slashable = self.attestations.iter().any(|&(s, t, _)| {
+            t == target || (source < s && t < target) || (s < source && target < t)
+        });
+        if slashable || self.min_target.is_some_and(|min| target <= min) {
+            return false;
+        }
+        self.attestations.push((source, target, Some(root)));
+        true
+    }
+}
+
+/// xorshift64*, for reproducible randomized tests.
+struct Rng(u64);
+
+impl Rng {
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) % n
+    }
+
+    fn chance(&mut self, percent: u64) -> bool {
+        self.below(100) < percent
+    }
+}
+
+/// The signing root of one block: a message per (slot, variant).
+fn block_root(slot: u64, variant: u64) -> Root {
+    let mut root = [1; 32];
+    root[1..9].copy_from_slice(&slot.to_be_bytes());
+    root[9..17].copy_from_slice(&variant.to_be_bytes());
+    root
+}
+
+/// The signing root of one attestation: a message per (source, target, variant).
+fn attestation_root(source: u64, target: u64, variant: u64) -> Root {
+    let mut root = [2; 32];
+    root[1..9].copy_from_slice(&source.to_be_bytes());
+    root[9..17].copy_from_slice(&target.to_be_bytes());
+    root[17..25].copy_from_slice(&variant.to_be_bytes());
+    root
+}
+
+/// A history that is not slashable in itself, over the same slots and epochs as the duties, with
+/// absent signing roots.
+fn random_history(rng: &mut Rng) -> serde_json::Value {
+    let mut blocks = BTreeMap::new();
+    for _ in 0..rng.below(4) {
+        let slot = rng.below(40);
+        let root = rng.chance(70).then(|| block_root(slot, rng.below(2)));
+        blocks.entry(slot).or_insert(root);
+    }
+    let mut attestations = Vec::new();
+    let mut source = rng.below(8);
+    let mut target = source + rng.below(3);
+    for _ in 0..rng.below(4) {
+        let root = rng
+            .chance(70)
+            .then(|| attestation_root(source, target, rng.below(2)));
+        attestations.push((source, target, root));
+        source += rng.below(3);
+        target = (target + 1).max(source) + rng.below(2);
+    }
+    let hex = |root: &Option<Root>| root.map(|root| hex0x(&root));
+    serde_json::json!({
+        "pubkey": KEY_A,
+        "signed_blocks": blocks.iter().map(|(slot, root)| match hex(root) {
+            Some(root) => serde_json::json!({"slot": slot.to_string(), "signing_root": root}),
+            None => serde_json::json!({"slot": slot.to_string()}),
+        }).collect::<Vec<_>>(),
+        "signed_attestations": attestations.iter().map(|(source, target, root)| {
+            let mut entry = serde_json::json!({
+                "source_epoch": source.to_string(), "target_epoch": target.to_string()});
+            if let Some(root) = hex(root) {
+                entry["signing_root"] = root.into();
+            }
+            entry
+        }).collect::<Vec<_>>(),
+    })
+}
+
+/// Random imports and duties on an imported key. At every duty, this network refuses whatever the
+/// specification's conditions refuse, except the exact repeat of a message the network itself
+/// signed (re-signed below a later import's source minimum, which condition (4) would refuse:
+/// the same message gives the same signature, so nothing new can be slashed; documented in
+/// docs/slashing-protection.md). At the end, a specification signer that imports the export
+/// refuses whatever this network refuses. `INTERCHANGE_SEEDS=<n>` runs more seeds.
+#[test]
+fn imports_and_exports_are_at_least_as_strict_as_the_specification() {
+    let seeds: u64 = std::env::var("INTERCHANGE_SEEDS")
+        .ok()
+        .and_then(|seeds| seeds.parse().ok())
+        .unwrap_or(300);
+    let a = key(KEY_A);
+    for seed in 0..seeds {
+        let mut rng = Rng(seed * 2 + 1);
+        let mut ours = protection(&[a], chain(GVR));
+        let mut reference = Reference::default();
+        let mut own_blocks = BTreeSet::new();
+        let mut own_attestations = BTreeSet::new();
+        for step in 0..12 {
+            match rng.below(3) {
+                0 => {
+                    let json = document(serde_json::json!([random_history(&mut rng)]));
+                    let history = interchange(json.clone()).unwrap().validators[&a].clone();
+                    if import_into(&mut ours, json).is_ok() {
+                        reference.import(&history);
+                    }
+                }
+                1 => {
+                    let slot = rng.below(44);
+                    let root = block_root(slot, rng.below(2));
+                    let allowed = reference.clone().sign_block(slot, root);
+                    if sign_block(&mut ours, 0, slot, root) {
+                        assert!(
+                            allowed || own_blocks.contains(&(slot, root)),
+                            "seed {seed} step {step}: block {slot} signed, the specification refuses it"
+                        );
+                        reference.sign_block(slot, root);
+                        own_blocks.insert((slot, root));
+                    }
+                }
+                _ => {
+                    let source = rng.below(14);
+                    let target = source + rng.below(4);
+                    let root = attestation_root(source, target, rng.below(2));
+                    let allowed = reference.clone().sign_attestation(source, target, root);
+                    if sign_attestation(&mut ours, 0, source, target, root) {
+                        assert!(
+                            allowed || own_attestations.contains(&(source, target, root)),
+                            "seed {seed} step {step}: attestation {source}->{target} signed, the \
+                             specification refuses it"
+                        );
+                        reference.sign_attestation(source, target, root);
+                        own_attestations.insert((source, target, root));
+                    }
+                }
+            }
+        }
+        let json = export(&chain(GVR), &[(a, ours.export(0))]);
+        let mut receiver = Reference::default();
+        receiver.import(&from_json(&json).unwrap().validators[&a]);
+        for slot in 0..44 {
+            for variant in [0, 1, 7] {
+                let root = block_root(slot, variant);
+                if !sign_block(&mut ours.clone(), 0, slot, root) {
+                    assert!(
+                        !receiver.clone().sign_block(slot, root),
+                        "seed {seed}: the export lets block {slot} be signed"
+                    );
+                }
+            }
+        }
+        for source in 0..14 {
+            for target in source..source + 6 {
+                for variant in [0, 1, 7] {
+                    let root = attestation_root(source, target, variant);
+                    if !sign_attestation(&mut ours.clone(), 0, source, target, root) {
+                        assert!(
+                            !receiver.clone().sign_attestation(source, target, root),
+                            "seed {seed}: the export lets attestation {source}->{target} be signed"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

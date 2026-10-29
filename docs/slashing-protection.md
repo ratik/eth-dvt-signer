@@ -124,15 +124,102 @@ accepted only for imported keys (`not_imported` for a DKG key, `unknown_validato
 the key's activation's, or its earlier imports' (`other_chain`). An import that conflicts with what
 this network signed for the key (a double proposal, double vote or surround against its records)
 is refused whole (`conflict`): two signers used the key. The API checks every record of the full
-interchange this way before submitting it, and consensus checks the summary again.
+interchange this way before submitting it; consensus checks the summary (the command carries
+nothing more). A command submitted without the API (by a Byzantine node) can therefore hide such a
+conflict, but not weaken protection: whatever it imports only raises floors.
 
 **Dry run.** `"dry_run": true` runs every check against the committed state and answers with the
 summary; nothing is submitted.
 
+**Irreversible.** No command lowers a floor. An interchange with a far-future slot or epoch, honest
+or not, stops the key from signing for good, and the key cannot be registered again. Any client of
+a node's API can submit one (no authentication, audit L-6), as can a Byzantine node. This costs
+liveness, never safety (audit L-17).
+
+### Compared with EIP-3076
+
+EIP-3076 requires a signer, after importing an interchange `data`, to refuse:
+
+1. a block slashable with respect to `data.signed_blocks`;
+2. a block with a slot at or below the minimum slot in `data`, except a repeat (same signing root);
+3. an attestation slashable with respect to `data.signed_attestations`;
+4. an attestation whose source is below the minimum source in `data`;
+5. an attestation whose target is at or below the minimum target in `data`, except a repeat.
+
+A block whose signing root is absent makes every new block at its slot slashable. The EIP's
+advice for minimal databases is to take the maximum slot, source and target of the interchange and
+merge them with existing values. That is what the floors are, so they imply conditions 1 to 5
+(above).
+
+**Pruned histories and gaps.** The conditions use each interchange's minimum and assume nothing
+was signed and left out between its oldest and latest records. Clients prune (Lighthouse kept 5
+blocks and 2 attestations of 29 epochs in the devnet run). The floors use the maximum, so they
+assume nothing about what lies below it: a gap anywhere in an imported history is covered.
+
+**Absent signing roots.** A record without a root matches nothing: not a new message, not a
+network record (the import is refused as a conflict), not another record of the file at the same
+slot or target (the file is refused). Two identical entries without roots are one record; the
+protection is the same either way, since such a record never allows a repeat. The EIP states the
+rule for blocks; attestations are treated the same.
+
+Deliberate restrictions beyond the EIP:
+
+- **No repeat of the previous signer's messages.** Conditions 2 and 5 allow re-signing an imported
+  message with the same signing root; the floors refuse it. The cost is a refused re-broadcast of
+  the previous signer's latest message, after it stopped.
+- **Nothing at or below the maximum.** Messages between an interchange's minimum and maximum are
+  refused even when nothing there conflicts (above).
+- **Self-slashable files refused whole.** The EIP does not say how to treat them; the interchange
+  tests allow refusing them.
+- **Strict format.** Unknown fields are refused, although the EIP's schema does not forbid them;
+  numbers only as decimal strings; version `"5"` only. A file with extra fields must be cleaned by
+  the operator.
+- **Chain, atomicity, scope.** An interchange for another `genesis_validators_root` than the key's
+  is refused, an import is all or nothing, and only imported keys take one (the EIP says nothing on
+  these).
+
+Deviations from the EIP's wording. Only the first lets through a message that a literal reading
+forbids, and that message is identical to one the network already signed:
+
+- **The network's own exact repeats.** After an import that raises the floors, the network still
+  re-signs a message it signed itself, with the same root (idempotent retries). Condition 4 has no
+  repeat exception: an attestation the network signed with a source below a later import's minimum
+  source would be refused by a literal reading. Re-signing the identical message gives the
+  identical signature, so nothing new can be slashed. Not changed in this milestone.
+- **Import and export while signing.** The EIP advises importing and exporting only when the
+  signer is stopped. Here an import is a consensus command, ordered with the duties and applied
+  atomically between them, so it is accepted while the key signs; it only adds restrictions. An
+  export is served while the key may sign (below).
+- **Minimum conditions at all times.** The EIP recommends refusing anything at or below the minimum
+  of a signer's whole history, imported or not. The network's own history is never pruned, so its
+  only gaps are those of imported histories, which the floors cover.
+
+**Verified** by `eth::interchange::tests::imports_and_exports_are_at_least_as_strict_as_the_specification`,
+against a reference signer written from the five conditions alone (minimum of each import, repeat
+exceptions, absent roots matching nothing, condition 4 without exception): random imports and
+duties, 300 seeds by default; 100 000 seeds run once (`INTERCHANGE_SEEDS=100000`). At every duty
+the network refuses whatever the reference refuses, except the identical repeats above. Two
+deliberate bugs (a floor refusing `slot < floor` instead of `≤`; an export without its floor
+records) each made it fail at once. The 38 files of the official interchange tests pass as well.
+
 **Export.** `GET /slashing-protection/export/{public_key}` is an interchange of what the network
 holds. For an imported key: one record at each floor (with its root when the network itself signed
-exactly that message) and every record it signed above them. For a DKG key: every record. A signer
-importing the export with EIP-3076's conditions refuses at least what this network refuses.
+exactly that message) and every record it signed above them. For a DKG key: every record. In the
+same test, a reference signer that imports the export refuses everything the network refuses.
+Lighthouse v8.3.2's import, read in its source (`validator_client/slashing_protection`), keeps
+only the highest block slot and the highest source and target of each validator, and refuses
+anything at or below them: more than the network refuses.
+
+Not verified, and not claimed:
+
+- **No other client's software has imported an export.** Lighthouse, Teku, Prysm, Nimbus, Lodestar
+  and Web3Signer have not been run on one. The property is shown against a model of the EIP and
+  by reading Lighthouse's code, not by interoperability tests.
+- **An export is not a way out.** There is no command that stops the network signing for a key, and
+  an export is served while it may sign. A message signed after the export is not in it; importing
+  that export elsewhere and signing there can then be slashable. An export is only safe to use
+  elsewhere if no request for the key can reach any node afterwards, which the network cannot
+  enforce.
 
 ## Atomicity and the signing gate
 
@@ -350,7 +437,7 @@ watermarks.
 | Startup refuses a lost proposal or attestation, a lost validator, validator purpose or activation, records of an unknown validator, a replaced key, a corrupt entry, surrounding attestations | `storage::tests::validator::altered_history_fails_closed` |
 | Every duty signed and verified; refusals; root mismatch; another chain; concurrent conflicts; activation (explicit, concurrent, immutable, after restart); a stale node and another chain; the authorization-binding scenarios; a failed coordinator; an isolated node; a full restart | `tests/eth_duties.rs` (4 simulated nodes) |
 | The same over HTTP on real processes, plus activation, crashes before and after applying a duty, a coordinator crash with 2 partials, a client hanging up after authorization, a lagging node, a rolled-back node (before a duty and before the activation), the binding on the wire | `tests/e2e/eth2.rs` (E2E-ETH-1 to 9) |
-| EIP-3076: the official interchange tests (38 cases of `v5.3.0`, `tests/vectors/eip3076`); malformed and self-slashable files; the summary and digest; floors only rise and never contradict local records; other chain, unknown and DKG keys; missing roots; export conservative and re-importable | `eth::interchange::tests` (`tests/unit/eth/interchange.rs`) |
+| EIP-3076: the official interchange tests (38 cases of `v5.3.0`, `tests/vectors/eip3076`); malformed and self-slashable files; the summary and digest; floors only rise and never contradict local records; other chain, unknown and DKG keys; missing roots; export conservative and re-importable; imports and exports at least as strict as a reference signer of the EIP's conditions (randomized, `INTERCHANGE_SEEDS=<n>`) | `eth::interchange::tests` (`tests/unit/eth/interchange.rs`) |
 | Imported keys in the state machine and on disk | `storage::tests::validator::imported` |
 | Imported history over HTTP on real processes: dry run, import, idempotence, another chain, self-slashable, floors refusing the previous signer's messages, export | `tests/e2e/import.rs` (E2E-IMP-1) |
 | Whole-network rollback | `eth2::e2e_eth_l1_whole_network_rollback_signs_a_double_proposal` (ignored, fails) |

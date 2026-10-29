@@ -325,8 +325,9 @@ The signing path is the same for both keys. The imported key's figures are highe
 signed about 7 requests per slot (its sync committee duties), against fewer than one for the DKG
 key, and its attestation and block samples are small. Share collection after authorization:
 p50 16.9 ms for the imported key, 16.5 ms for the DKG key. 10 of the 2 010 requests took more than
-1.33 s, all at 21:45:55-59, when node 2 was stopped (one consensus leader timeout, 2 s): 2 sync
-committee messages (slots 1090 and 1091) and 8 selection proofs for later slots.
+1.33 s, all at 21:45:55-59, when node 2 was stopped: their authorization waited one consensus
+leader timeout (2 s). 2 sync committee messages (slots 1090 and 1091) were late; the other 8 were
+selection proofs for later slots. Recorded as audit L-16; consensus is unchanged.
 
 Not verified on chain: runs B and C covered only the observed epochs. Of the blocks signed in
 those runs, 12 of 16 and 9 of 24 were checked; run D checks the whole period and every block.
