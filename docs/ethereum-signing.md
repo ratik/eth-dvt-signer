@@ -38,11 +38,11 @@ DKG ceremony started as a validator key ──> completed: the key exists, inact
 curl -s localhost:8080/dkg/start -H 'content-type: application/json' \
   -d '{"ceremony_id": "validator-eth", "validator": true}'
 curl -s localhost:8080/validators
-# [{"public_key":"0xa1b2..","ceremony_id":"validator-eth","origin":"dkg","status":"inactive"}]
+# [{"public_key":"0xa1b2..","ceremony_id":"validator-eth","origin":"dkg","status":"inactive","generation":0}]
 curl -s localhost:8080/validators/activate -H 'content-type: application/json' \
   -d '{"public_key": "0xa1b2..", "genesis_validators_root": "0x0470.."}'
 # {"public_key":"0xa1b2..","ceremony_id":"validator-eth","origin":"dkg","status":"active",
-#  "genesis_validators_root":"0x0470..","activated_at":42}
+#  "genesis_validators_root":"0x0470..","activated_at":42,"generation":0}
 curl -s localhost:8080/api/v1/eth2/publicKeys   # ["0xa1b2.."]
 ```
 
@@ -64,6 +64,24 @@ curl -s localhost:8080/api/v1/eth2/publicKeys   # ["0xa1b2.."]
   are not signed again, until an explicit activation. That activation must name the recorded
   chain; another one is refused (`refusal.reason: recorded_chain`). Nothing is assigned
   automatically.
+
+### Share generations (resharing)
+
+A validator key signs with exactly one **share generation**: the ceremony `ceremony_id` names in
+`GET /validators`, with `generation` counting the reshares activated so far. A reshare gives the key
+new shares within the committee, through consensus ([resharing.md](resharing.md)):
+
+| Endpoint | Does |
+| -------- | ---- |
+| `POST /validators/reshare` | `{"public_key": "0x..", "ceremony_id": ".."}`: start a reshare of an activated key (`StartResharing`); one at a time per key |
+| `GET /validators/reshare/{ceremony_id}` | Its state (`in_progress`, `awaiting_shares`, `ready`, `active`, `retired`, `aborted`), the generation it refreshes, acknowledged shares, this node's share, and once completed the key (unchanged), the verification shares and the generation id |
+| `POST /validators/reshare/activate` | Make a `ready` reshare the active generation (`ActivateGeneration`, every new share acknowledged); refusals: `not_reshare`, `not_completed`, `aborted`, `stale`, `not_ready` |
+| `POST /validators/reshare/abort` | Abort a reshare that is not and never was active |
+
+Nothing else changes for a client: the same key, the same `fork_info`, the same slashing history.
+Signing requests between nodes name the generation, and a keyholder signs only with the one it has
+committed as active: an older one is refused (`stale_generation`, and the coordinator asks again with
+the active one), a newer one waits until the node applies its activation.
 
 ### Imported keys
 

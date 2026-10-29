@@ -762,7 +762,7 @@ mod validator {
         use rand::{SeedableRng as _, rngs::StdRng};
 
         /// A manifest for the key `seed`, split among `committee`.
-        fn manifest(ceremony: &str, committee: &Set<PublicKey>, seed: u64) -> Manifest {
+        pub(super) fn manifest(ceremony: &str, committee: &Set<PublicKey>, seed: u64) -> Manifest {
             let secret = Private::new(Scalar::from_u64(seed + 1000));
             let split =
                 dealer::split(&secret, committee, &mut StdRng::seed_from_u64(seed)).unwrap();
@@ -789,7 +789,7 @@ mod validator {
             tx(Command::RegisterImportedKey(Box::new(manifest.clone())))
         }
 
-        fn history(
+        pub(super) fn history(
             key: ValidatorKey,
             genesis: u8,
             slot: u64,
@@ -816,7 +816,7 @@ mod validator {
             })))
         }
 
-        fn activate_imported(
+        pub(super) fn activate_imported(
             key: ValidatorKey,
             genesis: u8,
             acknowledgment: Acknowledgment,
@@ -828,7 +828,7 @@ mod validator {
             })
         }
 
-        const ACKNOWLEDGED: Acknowledgment = Acknowledgment {
+        pub(super) const ACKNOWLEDGED: Acknowledgment = Acknowledgment {
             previous_signer_stopped: true,
             no_other_active_signer: true,
             history_exported_after_stop: true,
@@ -837,7 +837,7 @@ mod validator {
 
         /// Register an imported key at height 1, its history at 2, 3 acknowledgements at 3, and
         /// activate it at 4 (for the chain of [fork]). Returns its key.
-        async fn activated<E: Context + CryptoRng>(
+        pub(super) async fn activated<E: Context + CryptoRng>(
             context: &mut E,
             store: &mut Store<E>,
             signers: &[PrivateKey],
@@ -853,7 +853,7 @@ mod validator {
                     signers[..3]
                         .iter()
                         .map(|signer| {
-                            tx(Command::ImportedShareReady(Box::new(ReadyAck::sign(
+                            tx(Command::ShareReady(Box::new(ReadyAck::sign(
                                 signer,
                                 0,
                                 manifest.digest(),
@@ -1002,28 +1002,28 @@ mod validator {
                         4,
                         &block,
                         &[
-                            tx(Command::ImportedShareReady(Box::new(ReadyAck::sign(
+                            tx(Command::ShareReady(Box::new(ReadyAck::sign(
                                 &signers[0],
                                 0,
                                 digest,
                             )))),
-                            tx(Command::ImportedShareReady(Box::new(ReadyAck::sign(
+                            tx(Command::ShareReady(Box::new(ReadyAck::sign(
                                 &signers[1],
                                 0,
                                 digest,
                             )))),
-                            tx(Command::ImportedShareReady(Box::new(ReadyAck::sign(
+                            tx(Command::ShareReady(Box::new(ReadyAck::sign(
                                 &signers[1],
                                 0,
                                 digest,
                             )))),
-                            tx(Command::ImportedShareReady(Box::new(forged))),
-                            tx(Command::ImportedShareReady(Box::new(ReadyAck::sign(
+                            tx(Command::ShareReady(Box::new(forged))),
+                            tx(Command::ShareReady(Box::new(ReadyAck::sign(
                                 &signers[2],
                                 0,
                                 [0; 32].into(),
                             )))),
-                            tx(Command::ImportedShareReady(Box::new(ReadyAck::sign(
+                            tx(Command::ShareReady(Box::new(ReadyAck::sign(
                                 &outsider, 0, digest,
                             )))),
                             activate_imported(key, 9, ACKNOWLEDGED),
@@ -1069,7 +1069,7 @@ mod validator {
                         5,
                         &block,
                         &[
-                            tx(Command::ImportedShareReady(Box::new(ReadyAck::sign(
+                            tx(Command::ShareReady(Box::new(ReadyAck::sign(
                                 &signers[2],
                                 0,
                                 digest,
@@ -1285,7 +1285,7 @@ mod validator {
                     history(key, 8, far, far, far),
                     register(&manifest),
                     register(&other_id),
-                    tx(Command::ImportedShareReady(Box::new(ReadyAck::sign(
+                    tx(Command::ShareReady(Box::new(ReadyAck::sign(
                         &signers[3],
                         0,
                         manifest.digest(),
@@ -1462,6 +1462,498 @@ mod validator {
                         Ok(_) => panic!("{case}: a store with altered import state started"),
                     }
                 }
+            });
+        }
+    }
+
+    mod reshare {
+        use super::*;
+        use crate::{
+            dkg::{
+                Faults,
+                ceremony::{
+                    AbortOutcome, GenerationOutcome, GenerationRefusal, ReadyAck, ReshareOutcome,
+                    tests::reshare::deal_reshare,
+                },
+            },
+            import::dealer,
+            slashing::Floors,
+        };
+        use commonware_cryptography::Signer as _;
+        use commonware_cryptography::{
+            bls12381::primitives::group::{Private, Scalar, Share},
+            ed25519,
+        };
+        use commonware_parallel::Sequential;
+        use commonware_utils::ordered::Quorum as _;
+        use rand::{SeedableRng as _, rngs::StdRng};
+
+        fn start(key: ValidatorKey, name: &str) -> Transaction {
+            tx(Command::StartResharing {
+                validator: key,
+                ceremony: id(name),
+            })
+        }
+
+        fn activate_generation(key: ValidatorKey, round: u64) -> Transaction {
+            tx(Command::ActivateGeneration {
+                validator: key,
+                round,
+            })
+        }
+
+        fn abort(key: ValidatorKey, round: u64) -> Transaction {
+            tx(Command::AbortResharing {
+                validator: key,
+                round,
+            })
+        }
+
+        fn ready(signer: &PrivateKey, ceremony: &Ceremony) -> Transaction {
+            tx(Command::ShareReady(Box::new(ReadyAck::sign(
+                signer,
+                ceremony.round,
+                ceremony.session,
+            ))))
+        }
+
+        /// An activated DKG validator key (round 0, heights 1 to 3) and every node's share of it,
+        /// by node.
+        async fn active_dkg_validator<E: Context + CryptoRng>(
+            context: &mut E,
+            store: &mut Store<E>,
+            signers: &[PrivateKey],
+        ) -> (ValidatorKey, Vec<Share>) {
+            let block = Sha256::hash(&[b"block"]);
+            let config = CeremonyConfig::new(id("v"), committee(signers));
+            let applied = store
+                .apply_block(
+                    1,
+                    &block,
+                    &[tx(Command::StartValidatorCeremony(config))],
+                    context,
+                )
+                .await
+                .unwrap();
+            let (players, logs) = deal(context, &applied.changed[0], signers, &[]);
+            let logs: Vec<_> = logs
+                .into_iter()
+                .map(|log| {
+                    tx(Command::DealerLog {
+                        round: 0,
+                        log: Box::new(log),
+                    })
+                })
+                .collect();
+            let applied = store.apply_block(2, &block, &logs, context).await.unwrap();
+            let ceremony = applied.changed[0].clone();
+            let key = group_key(&ceremony).unwrap();
+            let shares = players
+                .into_iter()
+                .map(|player| {
+                    player
+                        .finalize::<Faults, ed25519::Batch>(context, ceremony.logs(), &Sequential)
+                        .unwrap()
+                        .1
+                })
+                .collect();
+            store
+                .apply_block(3, &block, &[activate(key, 9)], context)
+                .await
+                .unwrap();
+            (key, shares)
+        }
+
+        /// Complete the reshare `round` at `height` with every dealer's log (each dealing its
+        /// `shares`, by node). Returns the completed ceremony.
+        async fn complete<E: Context + CryptoRng>(
+            context: &mut E,
+            store: &mut Store<E>,
+            signers: &[PrivateKey],
+            round: u64,
+            shares: &[Share],
+            height: u64,
+        ) -> Ceremony {
+            let block = Sha256::hash(&[b"block"]);
+            let started = store.ceremonies().by_round(round).unwrap().clone();
+            let (_, logs) = deal_reshare(context, &started, signers, shares, &[]);
+            let logs: Vec<_> = logs
+                .into_iter()
+                .map(|log| {
+                    tx(Command::DealerLog {
+                        round,
+                        log: Box::new(log),
+                    })
+                })
+                .collect();
+            let applied = store
+                .apply_block(height, &block, &logs, context)
+                .await
+                .unwrap();
+            let ceremony = applied
+                .changed
+                .iter()
+                .find(|ceremony| ceremony.round == round)
+                .unwrap()
+                .clone();
+            assert_eq!(ceremony.status, DkgStatus::Completed);
+            ceremony
+        }
+
+        /// A DKG validator key is reshared through consensus: one reshare at a time, activated
+        /// only once completed and every new share acknowledged, then the key signs with the new
+        /// generation and keeps its whole history (the same refusals before and after), its
+        /// activation and its identity. Aborts, the generation states and a restart.
+        #[test]
+        fn a_reshared_key_keeps_its_history_and_activates_only_when_ready() {
+            deterministic::Runner::default().start(|mut context| async move {
+                let signers = signers();
+                let committee = committee(&signers);
+                let block = Sha256::hash(&[b"block"]);
+                let mut store = Store::init(context.child("first"), "node", committee.clone())
+                    .await
+                    .unwrap();
+                let (key, shares0) = active_dkg_validator(&mut context, &mut store, &signers).await;
+                let (validator_id, before) = store.protection().validator_of(&key).unwrap();
+                let activation = before.activation;
+
+                // Generation 0 signs.
+                let signed = [
+                    propose(key, 10, 1),
+                    attestation(key, 1, 2),
+                    attestation(key, 2, 5),
+                ];
+                let applied = store
+                    .apply_block(
+                        4,
+                        &block,
+                        &signed.iter().map(submit).collect::<Vec<_>>(),
+                        &mut context,
+                    )
+                    .await
+                    .unwrap();
+                for effect in &applied.effects {
+                    assert!(
+                        matches!(effect, Effect::Duty(Decision::Accepted, _)),
+                        "{effect:?}"
+                    );
+                }
+
+                // Start: once; the same again is idempotent; another is pending; unknown key.
+                let applied = store
+                    .apply_block(
+                        5,
+                        &block,
+                        &[
+                            start(key, "v-g1"),
+                            start(key, "v-g1"),
+                            start(key, "v-g1b"),
+                            start([0xaa; 48], "v-other"),
+                            activate_generation(key, 1),
+                        ],
+                        &mut context,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    applied.effects,
+                    vec![
+                        Effect::Reshare(ReshareOutcome::Started(1)),
+                        Effect::Reshare(ReshareOutcome::Exists(1)),
+                        Effect::Reshare(ReshareOutcome::Pending(1)),
+                        Effect::Reshare(ReshareOutcome::UnknownValidator),
+                        Effect::Generation(GenerationOutcome::Refused(
+                            GenerationRefusal::NotCompleted
+                        )),
+                    ]
+                );
+                assert_eq!(applied.designated, vec![1]);
+
+                // Generation 0 keeps signing while the reshare runs.
+                let applied = store
+                    .apply_block(6, &block, &[submit(&propose(key, 11, 1))], &mut context)
+                    .await
+                    .unwrap();
+                assert_eq!(applied.duties[0].round, 0);
+
+                let g1 = complete(&mut context, &mut store, &signers, 1, &shares0, 7).await;
+                assert_eq!(
+                    g1.public_key(),
+                    store.ceremonies().by_round(0).unwrap().public_key()
+                );
+                assert_eq!(store.protection().validator_of(&key).unwrap().1.round, 0);
+
+                // Activation: every new share must be acknowledged.
+                let applied = store
+                    .apply_block(
+                        8,
+                        &block,
+                        &[
+                            activate_generation(key, 1),
+                            ready(&signers[0], &g1),
+                            ready(&signers[1], &g1),
+                            ready(&signers[2], &g1),
+                            activate_generation(key, 1),
+                        ],
+                        &mut context,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    applied.effects[0],
+                    Effect::Generation(GenerationOutcome::Refused(GenerationRefusal::NotReady {
+                        ready: 0,
+                        required: 4
+                    }))
+                );
+                assert_eq!(
+                    applied.effects[4],
+                    Effect::Generation(GenerationOutcome::Refused(GenerationRefusal::NotReady {
+                        ready: 3,
+                        required: 4
+                    }))
+                );
+                let applied = store
+                    .apply_block(
+                        9,
+                        &block,
+                        &[
+                            ready(&signers[3], &g1),
+                            activate_generation(key, 1),
+                            activate_generation(key, 1),
+                            abort(key, 1),
+                        ],
+                        &mut context,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    applied.effects[1..],
+                    [
+                        Effect::Generation(GenerationOutcome::Activated { from: 0 }),
+                        Effect::Generation(GenerationOutcome::AlreadyActive),
+                        Effect::Abort(AbortOutcome::Refused(GenerationRefusal::Active)),
+                    ]
+                );
+                assert_eq!(applied.generations, vec![(key, 1)]);
+                let (id_after, after) = store.protection().validator_of(&key).unwrap();
+                assert_eq!(
+                    (id_after, after.round, after.activation),
+                    (validator_id, 1, activation)
+                );
+
+                // The same history: conflicts refused exactly as before, repeats idempotent, new
+                // duties authorized for generation 1.
+                let cases = [
+                    (
+                        propose(key, 10, 2),
+                        Decision::Refused(Refusal::DoubleProposal { slot: 10 }),
+                    ),
+                    (propose(key, 10, 1), Decision::AlreadyAccepted),
+                    (
+                        {
+                            let mut request = attestation(key, 1, 2);
+                            if let Duty::Attestation(data) = &mut request.duty {
+                                data.beacon_block_root = [9; 32];
+                            }
+                            request
+                        },
+                        Decision::Refused(Refusal::DoubleVote { target: 2 }),
+                    ),
+                    (
+                        attestation(key, 0, 6),
+                        Decision::Refused(Refusal::SurroundsSigned {
+                            source_epoch: 2,
+                            target_epoch: 5,
+                        }),
+                    ),
+                    (
+                        attestation(key, 3, 4),
+                        Decision::Refused(Refusal::SurroundedBySigned {
+                            source_epoch: 2,
+                            target_epoch: 5,
+                        }),
+                    ),
+                    (propose(key, 12, 1), Decision::Accepted),
+                ];
+                let applied = store
+                    .apply_block(
+                        10,
+                        &block,
+                        &cases
+                            .iter()
+                            .map(|(request, _)| submit(request))
+                            .collect::<Vec<_>>(),
+                        &mut context,
+                    )
+                    .await
+                    .unwrap();
+                for ((request, expected), effect) in cases.iter().zip(&applied.effects) {
+                    assert_eq!(*effect, Effect::Duty(*expected, request.signing_root()));
+                }
+                assert!(applied.duties.iter().all(|duty| duty.round == 1));
+
+                // A second reshare, from generation 1, aborted; activation of it refused; a third.
+                let applied = store
+                    .apply_block(
+                        11,
+                        &block,
+                        &[
+                            start(key, "v-g2"),
+                            abort(key, 2),
+                            abort(key, 2),
+                            activate_generation(key, 2),
+                            start(key, "v-g3"),
+                            abort(key, 0),
+                        ],
+                        &mut context,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    applied.effects,
+                    vec![
+                        Effect::Reshare(ReshareOutcome::Started(2)),
+                        Effect::Abort(AbortOutcome::Aborted),
+                        Effect::Abort(AbortOutcome::AlreadyAborted),
+                        Effect::Generation(GenerationOutcome::Refused(GenerationRefusal::Aborted)),
+                        Effect::Reshare(ReshareOutcome::Started(3)),
+                        Effect::Abort(AbortOutcome::Refused(GenerationRefusal::NotReshare)),
+                    ]
+                );
+                let before = (
+                    store.protection().clone(),
+                    store.ceremonies().iter().cloned().collect::<Vec<_>>(),
+                );
+                drop(store);
+
+                // Restart: a retired generation (0), the active one (1), an aborted reshare (2), one
+                // in progress (3): the same state, verified.
+                let store = Store::init(context.child("second"), "node", committee.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(store.protection(), &before.0);
+                assert_eq!(
+                    store.ceremonies().iter().cloned().collect::<Vec<_>>(),
+                    before.1
+                );
+                assert_eq!(store.protection().validator_of(&key).unwrap().1.round, 1);
+            });
+        }
+
+        /// An imported key is reshared through the same protocol; its imported floors, chain and
+        /// import state stay, and imports stay refused.
+        #[test]
+        fn an_imported_key_reshares_and_keeps_its_floors() {
+            deterministic::Runner::default().start(|mut context| async move {
+                let signers = signers();
+                let committee = committee(&signers);
+                let block = Sha256::hash(&[b"block"]);
+                let mut store = Store::init(context.child("first"), "node", committee.clone())
+                    .await
+                    .unwrap();
+                let key = super::imported::activated(&mut context, &mut store, &signers).await;
+                let (validator_id, _) = store.protection().validator_of(&key).unwrap();
+                let imported = *store.protection().imported(validator_id).unwrap();
+                // The split behind the manifest (seed 1), shares by node.
+                let split = dealer::split(
+                    &Private::new(Scalar::from_u64(1001)),
+                    &committee,
+                    &mut StdRng::seed_from_u64(1),
+                )
+                .unwrap();
+                let shares: Vec<Share> = signers
+                    .iter()
+                    .map(|signer| {
+                        let index = committee.index(&signer.public_key()).unwrap();
+                        split
+                            .shares
+                            .iter()
+                            .find(|share| share.index == index)
+                            .unwrap()
+                            .clone()
+                    })
+                    .collect();
+
+                let applied = store
+                    .apply_block(5, &block, &[start(key, "imported-g1")], &mut context)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    applied.effects,
+                    vec![Effect::Reshare(ReshareOutcome::Started(1))]
+                );
+                let g1 = complete(&mut context, &mut store, &signers, 1, &shares, 6).await;
+                let mut transactions: Vec<_> =
+                    signers.iter().map(|signer| ready(signer, &g1)).collect();
+                transactions.push(activate_generation(key, 1));
+                let applied = store
+                    .apply_block(7, &block, &transactions, &mut context)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    applied.effects[4],
+                    Effect::Generation(GenerationOutcome::Activated { from: 0 })
+                );
+
+                // Same import state (floors, chain, import round 0), refusals by the floors, no
+                // import accepted.
+                assert_eq!(
+                    *store.protection().imported(validator_id).unwrap(),
+                    imported
+                );
+                assert_eq!(
+                    imported.floors,
+                    Floors {
+                        block: Some(100),
+                        attestation: Some((10, 11))
+                    }
+                );
+                let applied = store
+                    .apply_block(
+                        8,
+                        &block,
+                        &[
+                            submit(&propose(key, 100, 1)),
+                            submit(&attestation(key, 10, 11)),
+                            submit(&propose(key, 101, 1)),
+                            super::imported::history(key, 9, 50, 1, 2),
+                        ],
+                        &mut context,
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    applied.effects[0],
+                    Effect::Duty(Decision::Refused(Refusal::BlockAtOrBelowImported { .. }), _)
+                ));
+                assert!(matches!(
+                    applied.effects[1],
+                    Effect::Duty(
+                        Decision::Refused(Refusal::TargetAtOrBelowImported { .. }),
+                        _
+                    )
+                ));
+                assert!(matches!(
+                    applied.effects[2],
+                    Effect::Duty(Decision::Accepted, _)
+                ));
+                assert!(matches!(
+                    applied.effects[3],
+                    Effect::History(HistoryOutcome::Refused(
+                        crate::slashing::HistoryRefusal::Activated { .. }
+                    ))
+                ));
+                assert_eq!(applied.duties[0].round, 1);
+                drop(store);
+                let store = Store::init(context.child("second"), "node", committee)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    *store.protection().imported(validator_id).unwrap(),
+                    imported
+                );
+                assert_eq!(store.protection().validator_of(&key).unwrap().1.round, 1);
             });
         }
     }

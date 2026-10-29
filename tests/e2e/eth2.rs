@@ -209,7 +209,7 @@ fn e2e_eth_1_web3signer_signs_every_supported_duty() {
     assert_eq!(status, 200, "{validators}");
     assert_eq!(
         validators,
-        json!([{ "public_key": key, "ceremony_id": VALIDATOR, "origin": "dkg", "status": "inactive" }])
+        json!([{ "public_key": key, "ceremony_id": VALIDATOR, "origin": "dkg", "status": "inactive", "generation": 0 }])
     );
     let (status, keys) = network.get(2, "/api/v1/eth2/publicKeys");
     assert_eq!((status, keys), (200, json!([])));

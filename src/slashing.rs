@@ -18,7 +18,8 @@
 //!   withdrawal credentials of its first deposit cannot be replaced through the signer.
 //!
 //! History is keyed by the validator public key, never by ceremony: a ceremony is only how the key
-//! signs today (a future resharing would move the key to another ceremony and keep its history).
+//! signs today. A reshare moves the key to another ceremony (its new share generation,
+//! [Protection::move_validator]) and keeps its history, activation and import state.
 //!
 //! A validator key signs nothing until it is activated: an `ActivateValidator` command, decided by
 //! consensus, sets the chain it signs for ([ChainIdentity], the genesis validators root). The
@@ -515,6 +516,15 @@ impl Protection {
         );
         self.by_key.insert(key, id);
         id
+    }
+
+    /// Validator `id`'s key now signs with the ceremony `round`: a new share generation of the
+    /// same key, activated by consensus (`dkg::ceremony`, resharing). Its history, activation and
+    /// import state stay as they are: they belong to the key, not to a generation.
+    pub fn move_validator(&mut self, id: u64, round: u64) -> Vec<Record> {
+        debug_assert!(self.is_validator_round(round));
+        self.validators.get_mut(&id).expect("known validator").round = round;
+        vec![Record::Validator(id)]
     }
 
     /// Activate `key` for `chain` in the block at `height`, or confirm the activation it has.
@@ -1250,7 +1260,8 @@ impl Protection {
                 .validators
                 .get(id)
                 .ok_or(format!("import state of unknown validator {id}"))?;
-            if validator.round != imported.round {
+            // It signs with the import's round, or with a later share generation of the key.
+            if validator.round < imported.round {
                 return Err(format!(
                     "imported validator {id} signs with round {} but was imported at round {}",
                     validator.round, imported.round

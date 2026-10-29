@@ -19,6 +19,7 @@ mod lifecycle;
 mod limits;
 mod readiness;
 mod recovery;
+mod reshare;
 mod rollback;
 mod signing;
 

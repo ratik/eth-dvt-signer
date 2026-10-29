@@ -82,6 +82,11 @@ existing key: there is no delete or reset command, an imported key is registered
 registration of the same key is refused, whatever the ceremony id), and an import only adds
 restrictions (below). Restarting a validator ceremony id returns the existing ceremony.
 
+A reshare ([resharing.md](resharing.md)) moves the key to a new ceremony, its new share generation,
+when consensus activates it: only the validator's `round` changes. Its records, activation, chain,
+floors and import state are not touched, so every duty signed before is refused or repeated exactly
+as before (`storage::tests::validator::reshare`, E2E-RSH-1 and RSH-5).
+
 ## Imported history (EIP-3076)
 
 A key imported from another signer ([key-import.md](key-import.md)) brings that signer's history
@@ -287,6 +292,7 @@ next to the authorizations, written in the same commit:
 | 16 + duty type | `(validator id, period)` | up to 8 signing roots with their heights |
 | 7 | `(validator id, 0)` | an imported key's import state: its round, the history's chain, floors, number of imports, acknowledgment height |
 | 2 (ceremonies) | `(round, 0)` | an imported key's ceremony (value tag 8): the manifest, its sharing and the acknowledged shares |
+| 2 (ceremonies) | `(round, 0)` | a reshare (value tag 10): the DKG fields, the key, the generation it refreshes, that generation's public output, the acknowledged shares |
 
 The format version did not change. A state written before these entries existed reads as a state
 without validators. A validator entry in the previous layout (value tag 3) reads as not activated
@@ -353,7 +359,10 @@ and refuses to start (`refusing to start`, exit status 1, storage left as is) wh
   is not a validator key or not the round its validator signs with, or its ceremony acknowledges
   shares of unknown participants;
 - an imported key has floors or a chain but no import, or is activated without its history for
-  that chain or without the operator's acknowledgment.
+  that chain or without the operator's acknowledgment;
+- a completed validator ceremony is neither its key's active generation, a retired one (the key
+  moved to a later round), nor a reshare awaiting activation (the key still at the round it
+  refreshes).
 
 These checks are added to the recovery checks of [recovery.md](recovery.md) §2: the state must not
 be behind the finalized blocks the node acknowledged, and every share must have its ceremony. A

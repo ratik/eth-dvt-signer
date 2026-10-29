@@ -93,8 +93,9 @@ pub enum Command {
     },
     /// Register an imported key (`import`): its manifest, public data only.
     RegisterImportedKey(Box<Manifest>),
-    /// A keyholder's signed acknowledgement that it verified and stored its imported share.
-    ImportedShareReady(Box<ReadyAck>),
+    /// A keyholder's signed acknowledgement that it verified and stored its share of an imported
+    /// key or of a completed reshare.
+    ShareReady(Box<ReadyAck>),
     /// Import another signer's slashing-protection history (EIP-3076, minimal form).
     ImportSlashingProtection(Box<HistoryImport>),
     /// Activate an imported key, with the operator's acknowledgement.
@@ -103,6 +104,17 @@ pub enum Command {
         chain: ChainIdentity,
         acknowledgment: Acknowledgment,
     },
+    /// Start a reshare of an activated validator key: a new share generation of the same key, as
+    /// the ceremony `ceremony` (`dkg::ceremony`, resharing).
+    StartResharing {
+        validator: ValidatorKey,
+        ceremony: CeremonyId,
+    },
+    /// Make the completed reshare `round` the key's active share generation (every new share
+    /// acknowledged). The previous generation is retired.
+    ActivateGeneration { validator: ValidatorKey, round: u64 },
+    /// Abort the reshare `round` (in progress or not activated): the active generation stays.
+    AbortResharing { validator: ValidatorKey, round: u64 },
 }
 
 /// Most validators one history import may name.
@@ -255,7 +267,7 @@ impl Write for Command {
                 6u8.write(buf);
                 manifest.write(buf);
             }
-            Self::ImportedShareReady(ack) => {
+            Self::ShareReady(ack) => {
                 7u8.write(buf);
                 ack.write(buf);
             }
@@ -272,6 +284,24 @@ impl Write for Command {
                 buf.put_slice(validator);
                 buf.put_slice(&chain.genesis_validators_root);
                 acknowledgment.to_bits().write(buf);
+            }
+            Self::StartResharing {
+                validator,
+                ceremony,
+            } => {
+                10u8.write(buf);
+                buf.put_slice(validator);
+                ceremony.write(buf);
+            }
+            Self::ActivateGeneration { validator, round } => {
+                11u8.write(buf);
+                buf.put_slice(validator);
+                UInt(*round).write(buf);
+            }
+            Self::AbortResharing { validator, round } => {
+                12u8.write(buf);
+                buf.put_slice(validator);
+                UInt(*round).write(buf);
             }
         }
     }
@@ -306,7 +336,7 @@ impl Read for Command {
                 })
             }
             6 => Ok(Self::RegisterImportedKey(Box::new(Manifest::read(buf)?))),
-            7 => Ok(Self::ImportedShareReady(Box::new(ReadyAck::read(buf)?))),
+            7 => Ok(Self::ShareReady(Box::new(ReadyAck::read(buf)?))),
             8 => Ok(Self::ImportSlashingProtection(Box::new(
                 HistoryImport::read(buf)?,
             ))),
@@ -323,6 +353,18 @@ impl Read for Command {
                     acknowledgment,
                 })
             }
+            10 => Ok(Self::StartResharing {
+                validator: <[u8; 48]>::read(buf)?,
+                ceremony: CeremonyId::read(buf)?,
+            }),
+            11 => Ok(Self::ActivateGeneration {
+                validator: <[u8; 48]>::read(buf)?,
+                round: UInt::read(buf)?.into(),
+            }),
+            12 => Ok(Self::AbortResharing {
+                validator: <[u8; 48]>::read(buf)?,
+                round: UInt::read(buf)?.into(),
+            }),
             tag => Err(Error::InvalidEnum(tag)),
         }
     }
@@ -338,9 +380,13 @@ impl EncodeSize for Command {
             Self::Duty(request) => request.encode_size(),
             Self::ActivateValidator { .. } => 48 + 32,
             Self::RegisterImportedKey(manifest) => manifest.encode_size(),
-            Self::ImportedShareReady(ack) => ack.encode_size(),
+            Self::ShareReady(ack) => ack.encode_size(),
             Self::ImportSlashingProtection(import) => import.encode_size(),
             Self::ActivateImportedValidator { .. } => 48 + 32 + 1,
+            Self::StartResharing { ceremony, .. } => 48 + ceremony.encode_size(),
+            Self::ActivateGeneration { round, .. } | Self::AbortResharing { round, .. } => {
+                48 + UInt(*round).encode_size()
+            }
         }
     }
 }

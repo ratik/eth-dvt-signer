@@ -20,7 +20,8 @@ use crate::{
     dkg::{
         CeremonyId, DkgStatus,
         ceremony::{
-            Ceremonies, Ceremony, Ignored, ImportOutcome, Origin, ReadyIgnored, StartOutcome,
+            AbortOutcome, Ceremonies, Ceremony, GenerationOutcome, GenerationRefusal, Ignored,
+            ImportOutcome, Origin, ReadyIgnored, ReshareOutcome, StartOutcome,
         },
     },
     eth::{
@@ -110,6 +111,8 @@ enum Value {
     /// The ceremony of an imported key (stored under its round, like a DKG ceremony).
     ImportedCeremony(Box<Ceremony>),
     ImportedValidator(ImportedValidator),
+    /// A reshare ceremony: a share generation of a validator key (stored under its round).
+    ReshareCeremony(Box<Ceremony>),
 }
 
 fn write_optional_u64(value: Option<u64>, buf: &mut impl BufMut) {
@@ -301,6 +304,10 @@ impl Write for Value {
                 9u8.write(buf);
                 write_imported(imported, buf);
             }
+            Self::ReshareCeremony(ceremony) => {
+                10u8.write(buf);
+                ceremony.write_reshare(buf);
+            }
         }
     }
 }
@@ -358,6 +365,9 @@ impl Read for Value {
                 buf,
             )?))),
             9 => Ok(Self::ImportedValidator(read_imported(buf)?)),
+            10 => Ok(Self::ReshareCeremony(Box::new(Ceremony::read_reshare(
+                buf,
+            )?))),
             tag => Err(CodecError::InvalidEnum(tag)),
         }
     }
@@ -384,6 +394,7 @@ impl EncodeSize for Value {
             }
             Self::ImportedCeremony(ceremony) => ceremony.imported_encode_size(),
             Self::ImportedValidator(imported) => imported_size(imported),
+            Self::ReshareCeremony(ceremony) => ceremony.reshare_encode_size(),
         }
     }
 }
@@ -453,6 +464,12 @@ pub enum Effect {
     Ready(Result<u32, ReadyIgnored>),
     /// The outcome of a slashing-protection history import.
     History(HistoryOutcome),
+    /// The outcome of a reshare's start.
+    Reshare(ReshareOutcome),
+    /// The outcome of a share generation's activation.
+    Generation(GenerationOutcome),
+    /// The outcome of a reshare's abort.
+    Abort(AbortOutcome),
 }
 
 /// Result of applying a block, once it is durably committed.
@@ -467,6 +484,8 @@ pub struct Applied {
     pub duties: Vec<DutyAuthorization>,
     /// Ceremony rounds the block started as validator keys.
     pub designated: Vec<u64>,
+    /// Share generations the block activated: `(validator key, its new round)`.
+    pub generations: Vec<(ValidatorKey, u64)>,
 }
 
 /// In-memory replicated state mirrored to disk.
@@ -569,7 +588,8 @@ impl<E: Context> Store<E> {
                 ((META_PREFIX, 0, 0), Some(Value::Number(h))) => height = *h,
                 ((META_PREFIX, 1, 0), Some(Value::Number(_))) => {}
                 ((CEREMONY_PREFIX, _, 0), Some(Value::Ceremony(ceremony)))
-                | ((CEREMONY_PREFIX, _, 0), Some(Value::ImportedCeremony(ceremony))) => {
+                | ((CEREMONY_PREFIX, _, 0), Some(Value::ImportedCeremony(ceremony)))
+                | ((CEREMONY_PREFIX, _, 0), Some(Value::ReshareCeremony(ceremony))) => {
                     ceremonies.restore(ceremony.as_ref().clone());
                 }
                 ((IMPORTED_PREFIX, id, 0), Some(Value::ImportedValidator(imported))) => {
@@ -617,6 +637,9 @@ impl<E: Context> Store<E> {
             .iter()
             .map(|ceremony| (ceremony.round, ceremony))
             .collect();
+        // Every completed validator ceremony belongs to its key's validator: the key's active
+        // generation, a retired one (the key moved to a later round), or a reshare awaiting
+        // activation (the key still signs with the generation it refreshes).
         for round in protection.validator_rounds() {
             let ceremony = by_round.get(&round).ok_or(format!(
                 "validator ceremony round {round} is not in the state"
@@ -625,52 +648,71 @@ impl<E: Context> Store<E> {
                 continue;
             }
             let key = group_key(ceremony).ok_or(format!("ceremony round {round} has no key"))?;
-            match protection.validator_of(&key) {
-                Some((_, validator)) if validator.round == round => {}
-                _ => {
-                    return Err(format!(
-                        "completed validator ceremony round {round} has no validator record for \
-                         its key"
-                    ));
-                }
+            let Some((_, validator)) = protection.validator_of(&key) else {
+                return Err(format!(
+                    "completed validator ceremony round {round} has no validator record for \
+                     its key"
+                ));
+            };
+            let consistent = match ceremony.reshare() {
+                Some(reshare) => reshare.validator == key && validator.round >= reshare.from,
+                None => validator.round >= round,
+            };
+            if !consistent {
+                return Err(format!(
+                    "validator ceremony round {round} and its validator (round {}) disagree",
+                    validator.round
+                ));
             }
         }
         for (id, validator) in protection.validators() {
-            let key = by_round
-                .get(&validator.round)
-                .and_then(|ceremony| group_key(ceremony));
+            let active = by_round.get(&validator.round);
+            let key = active.and_then(|ceremony| group_key(ceremony));
             if key != Some(validator.key) {
                 return Err(format!(
                     "validator {id} does not match the key of ceremony round {}",
                     validator.round
                 ));
             }
-            // An imported key's validator has its import state, and only an imported key has one.
-            let imported_ceremony = by_round
-                .get(&validator.round)
-                .is_some_and(|ceremony| ceremony.imported().is_some());
-            if imported_ceremony != protection.imported(id).is_some() {
-                return Err(format!(
-                    "validator {id} and ceremony round {} disagree on whether the key was imported",
-                    validator.round
-                ));
+            // An imported key's validator has its import state, kept at the import's round
+            // whatever generation it signs with; a key that was not imported has none.
+            match protection.imported(id) {
+                Some(imported) => {
+                    let origin = by_round.get(&imported.round);
+                    if !origin.is_some_and(|ceremony| {
+                        ceremony.imported().is_some() && group_key(ceremony) == Some(validator.key)
+                    }) {
+                        return Err(format!(
+                            "validator {id} was imported at round {}, which is not its import",
+                            imported.round
+                        ));
+                    }
+                }
+                None if active.is_some_and(|ceremony| ceremony.imported().is_some()) => {
+                    return Err(format!(
+                        "validator {id} and ceremony round {} disagree on whether the key was \
+                         imported",
+                        validator.round
+                    ));
+                }
+                None => {}
             }
         }
         for ceremony in ceremonies.iter() {
-            if let Some(imported) = ceremony.imported() {
+            if ceremony.imported().is_some() || ceremony.reshare().is_some() {
                 if !protection.is_validator_round(ceremony.round) {
                     return Err(format!(
-                        "imported key round {} is not a validator key",
+                        "imported key or reshare round {} is not a validator key",
                         ceremony.round
                     ));
                 }
-                if imported
-                    .ready
-                    .iter()
-                    .any(|index| *index as usize >= ceremony.config.participants.len())
-                {
+                if ceremony.ready().is_some_and(|ready| {
+                    ready
+                        .iter()
+                        .any(|index| *index as usize >= ceremony.config.participants.len())
+                }) {
                     return Err(format!(
-                        "imported key round {} has acknowledgements of unknown shares",
+                        "round {} has acknowledgements of unknown shares",
                         ceremony.round
                     ));
                 }
@@ -741,6 +783,7 @@ impl<E: Context> Store<E> {
         let mut authorized = Vec::new();
         let mut duties = Vec::new();
         let mut designated = Vec::new();
+        let mut generations = Vec::new();
         let effects = transactions
             .iter()
             .map(|transaction| match &transaction.command {
@@ -850,7 +893,7 @@ impl<E: Context> Store<E> {
                     }
                     Effect::Register(outcome)
                 }
-                Command::ImportedShareReady(ack) => Effect::Ready(self.ceremonies.ready(ack)),
+                Command::ShareReady(ack) => Effect::Ready(self.ceremonies.ready(ack)),
                 Command::ImportSlashingProtection(import) => {
                     let (outcome, records) = self.protection.import_history(import);
                     for record in records {
@@ -884,6 +927,44 @@ impl<E: Context> Store<E> {
                     }
                     Effect::Activate(outcome)
                 }
+                Command::StartResharing {
+                    validator,
+                    ceremony,
+                } => {
+                    let outcome = match self.protection.validator_of(validator) {
+                        None => ReshareOutcome::UnknownValidator,
+                        Some((_, entry)) if entry.activation.is_none() => {
+                            ReshareOutcome::NotActivated
+                        }
+                        Some((_, entry)) => {
+                            let from = entry.round;
+                            self.ceremonies.reshare(
+                                ceremony.clone(),
+                                *validator,
+                                from,
+                                height,
+                                digest,
+                            )
+                        }
+                    };
+                    if let ReshareOutcome::Started(round) = outcome {
+                        // The new generation signs only validator duties, like the key's others.
+                        self.protection.designate(round);
+                        metadata.put(key(VALIDATOR_ROUND_PREFIX, round, 0), Value::Number(1));
+                        designated.push(round);
+                    }
+                    Effect::Reshare(outcome)
+                }
+                Command::ActivateGeneration { validator, round } => {
+                    let outcome = self.activate_generation(validator, *round, &mut metadata);
+                    if let GenerationOutcome::Activated { .. } = outcome {
+                        generations.push((*validator, *round));
+                    }
+                    Effect::Generation(outcome)
+                }
+                Command::AbortResharing { validator, round } => {
+                    Effect::Abort(self.abort_resharing(validator, *round))
+                }
             })
             .collect();
         self.ceremonies.advance(height, rng);
@@ -892,14 +973,21 @@ impl<E: Context> Store<E> {
             let value = match ceremony.origin {
                 Origin::Dkg => Value::Ceremony(Box::new(ceremony.clone())),
                 Origin::Imported(_) => Value::ImportedCeremony(Box::new(ceremony.clone())),
+                Origin::Reshare(_) => Value::ReshareCeremony(Box::new(ceremony.clone())),
             };
             metadata.put(key(CEREMONY_PREFIX, ceremony.round, 0), value);
             // A completed validator DKG ceremony: its key now signs validator duties. (An imported
-            // key is registered with its registration, above.)
+            // key is registered with its registration, above; a reshare signs once activated.) A
+            // ceremony changed again later, such as a generation its key moved away from, does
+            // not move the key back.
             if ceremony.status == DkgStatus::Completed
                 && ceremony.origin == Origin::Dkg
                 && self.protection.is_validator_round(ceremony.round)
                 && let Some(key) = group_key(ceremony)
+                && self
+                    .protection
+                    .validator_of(&key)
+                    .is_none_or(|(_, validator)| validator.round < ceremony.round)
             {
                 let id = self.protection.register(ceremony.round, key);
                 persist(&mut metadata, &self.protection, Record::Validator(id));
@@ -915,7 +1003,90 @@ impl<E: Context> Store<E> {
             authorized,
             duties,
             designated,
+            generations,
         })
+    }
+
+    /// `ActivateGeneration`: the completed reshare `round` of `validator` becomes its active share
+    /// generation, if it refreshes the active one and every keyholder acknowledged its new share.
+    fn activate_generation(
+        &mut self,
+        validator: &ValidatorKey,
+        round: u64,
+        metadata: &mut Metadata<E, Key, Value>,
+    ) -> GenerationOutcome {
+        use GenerationRefusal::*;
+        let Some((id, active)) = self
+            .protection
+            .validator_of(validator)
+            .map(|(id, entry)| (id, entry.round))
+        else {
+            return GenerationOutcome::Refused(UnknownValidator);
+        };
+        let Some(ceremony) = self.ceremonies.by_round(round) else {
+            return GenerationOutcome::Refused(NotReshare);
+        };
+        let Some(reshare) = ceremony
+            .reshare()
+            .filter(|reshare| reshare.validator == *validator)
+        else {
+            return GenerationOutcome::Refused(NotReshare);
+        };
+        if active == round {
+            return GenerationOutcome::AlreadyActive;
+        }
+        match ceremony.status {
+            DkgStatus::Completed => {}
+            DkgStatus::Failed => return GenerationOutcome::Refused(Aborted),
+            _ => return GenerationOutcome::Refused(NotCompleted),
+        }
+        let from = reshare.from;
+        if from != active {
+            return GenerationOutcome::Refused(Stale { from, active });
+        }
+        let (ready, required) = (
+            reshare.ready.len() as u32,
+            ceremony.config.participants.len() as u32,
+        );
+        if ready < required {
+            return GenerationOutcome::Refused(NotReady { ready, required });
+        }
+        for record in self.protection.move_validator(id, round) {
+            persist(metadata, &self.protection, record);
+        }
+        // Both ceremonies' roles changed: the keyholders retire the old shares.
+        self.ceremonies.touch(from);
+        self.ceremonies.touch(round);
+        GenerationOutcome::Activated { from }
+    }
+
+    /// `AbortResharing`: the reshare `round` of `validator`, unless it is or was active.
+    fn abort_resharing(&mut self, validator: &ValidatorKey, round: u64) -> AbortOutcome {
+        use GenerationRefusal::*;
+        let Some(active) = self
+            .protection
+            .validator_of(validator)
+            .map(|(_, entry)| entry.round)
+        else {
+            return AbortOutcome::Refused(UnknownValidator);
+        };
+        let Some(ceremony) = self.ceremonies.by_round(round) else {
+            return AbortOutcome::Refused(NotReshare);
+        };
+        if !ceremony
+            .reshare()
+            .is_some_and(|reshare| reshare.validator == *validator)
+        {
+            return AbortOutcome::Refused(NotReshare);
+        }
+        if ceremony.status == DkgStatus::Failed {
+            return AbortOutcome::AlreadyAborted;
+        }
+        if round <= active {
+            return AbortOutcome::Refused(Active);
+        }
+        self.ceremonies.abort(round);
+        AbortOutcome::Aborted
     }
 }
 

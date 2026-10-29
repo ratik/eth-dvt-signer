@@ -696,41 +696,73 @@ async fn sign_duty<E: Clock, S: Sender<PublicKey = PublicKey>>(
     hooks::crash_point("authorized");
     hooks::pause_point(context, "authorized").await;
 
-    // 2. Partial signatures of exactly that root, from the ceremony that signs for the key: each
-    //    participant checks the duty authorization of this validator in its own state.
-    let found = lookup(&deps.executor, validator.ceremony.clone(), 0).await?;
-    let ceremony = found.ceremony.ok_or(SignError::UnknownValidator)?;
-    // The ceremony's public sharing, whether its key came from the DKG or was imported.
-    let sharing = ceremony
-        .sharing()
-        .cloned()
-        .ok_or(SignError::UnknownValidator)?;
-    if sharing.public().encode().as_ref() != request.validator.as_slice() {
-        return Err(SignError::UnknownValidator);
-    }
+    // 2. Partial signatures of exactly that root, from the validator's active share generation
+    //    (the ceremony that signs for the key): each participant checks the duty authorization of
+    //    this validator, and that it is the generation active in its own state. If consensus
+    //    activated a newer generation meanwhile, participants that applied it refuse the old one
+    //    (`stale_generation`), and this coordinator asks once more with the generation now
+    //    active. Partials of different generations are never combined: each collection checks
+    //    every partial against its own generation's public sharing.
     let authorization = Authorization {
         payload_hash: signing_root,
         height,
     };
-    // `nonce` is not used for duties: the wire request names the validator instead.
-    let payload = SignRequest {
-        ceremony: validator.ceremony,
-        nonce: 0,
-        payload_hash: signing_root,
+    let mut generation = validator.ceremony;
+    let mut retried = false;
+    let (sharing, payload, collected) = loop {
+        let found = lookup(&deps.executor, generation.clone(), 0).await?;
+        let ceremony = found.ceremony.ok_or(SignError::UnknownValidator)?;
+        // The ceremony's public sharing, whether its key came from the DKG, an import or a reshare.
+        let sharing = ceremony
+            .sharing()
+            .cloned()
+            .ok_or(SignError::UnknownValidator)?;
+        if sharing.public().encode().as_ref() != request.validator.as_slice() {
+            return Err(SignError::UnknownValidator);
+        }
+        // `nonce` is not used for duties: the wire request names the validator instead.
+        let payload = SignRequest {
+            ceremony: generation.clone(),
+            nonce: 0,
+            payload_hash: signing_root,
+        };
+        let reference = AuthorizationRef::Duty {
+            validator: request.validator,
+        };
+        match collect(
+            context,
+            deps,
+            &ceremony,
+            &sharing,
+            &payload,
+            reference,
+            authorization,
+        )
+        .await
+        {
+            Ok(collected) => break (sharing, payload, collected),
+            Err(err) if !retried => {
+                let active = check_duty(&deps.executor, request.clone())
+                    .await?
+                    .validator
+                    .map(|validator| validator.ceremony);
+                match active {
+                    Some(active) if active != generation => {
+                        info!(
+                            validator = %format_validator(&request.validator),
+                            from = %generation,
+                            to = %active,
+                            "share generation changed during signing, asking the active one"
+                        );
+                        generation = active;
+                        retried = true;
+                    }
+                    _ => return Err(err),
+                }
+            }
+            Err(err) => return Err(err),
+        }
     };
-    let reference = AuthorizationRef::Duty {
-        validator: request.validator,
-    };
-    let collected = collect(
-        context,
-        deps,
-        &ceremony,
-        &sharing,
-        &payload,
-        reference,
-        authorization,
-    )
-    .await?;
 
     // 3. The validator's signature, checked against its public key.
     let threshold_at = context.current();
@@ -754,6 +786,7 @@ async fn sign_duty<E: Clock, S: Sender<PublicKey = PublicKey>>(
         epoch = request.duty.epoch(),
         signing_root = %format_root(&signing_root),
         height,
+        generation = %payload.ceremony,
         coordinator = %deps.me,
         ?kind,
         ?signers,

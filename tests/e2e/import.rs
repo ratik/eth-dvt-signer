@@ -18,10 +18,10 @@ use std::{
 /// The EIP-2335 test vector (tests/fixtures/eip2335): its key is the one imported.
 const PASSWORD: &str = "𝔱𝔢𝔰𝔱𝔭𝔞𝔰𝔰𝔴𝔬𝔯𝔡🔑";
 const SECRET: &str = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
-const PUBKEY: &str = "0x9612d7a727c9d0a22e185a1c768478dfe919cada9266988cb32359c11f2b7b27f4ae4040902382ae2910c15e2b420d07";
-const CEREMONY: &str = "imported-validator";
+pub(crate) const PUBKEY: &str = "0x9612d7a727c9d0a22e185a1c768478dfe919cada9266988cb32359c11f2b7b27f4ae4040902382ae2910c15e2b420d07";
+pub(crate) const CEREMONY: &str = "imported-validator";
 
-const ACKNOWLEDGED: &str = r#"{"previous_signer_stopped": true, "no_other_active_signer": true, "history_exported_after_stop": true, "automatic_restart_disabled": true}"#;
+pub(crate) const ACKNOWLEDGED: &str = r#"{"previous_signer_stopped": true, "no_other_active_signer": true, "history_exported_after_stop": true, "automatic_restart_disabled": true}"#;
 
 fn write_secret(path: &Path, contents: &[u8]) {
     use std::io::Write as _;
@@ -49,7 +49,7 @@ fn keytool(args: &[&str]) -> std::process::Output {
 
 /// A network whose nodes each have a share-encryption key, and the directory of the import
 /// (keys, committee, keystore, password).
-fn import_network() -> (TestNetwork, PathBuf) {
+pub(crate) fn import_network() -> (TestNetwork, PathBuf) {
     let dir = std::env::temp_dir().join(format!(
         "eth-mpc-signer-import-{}-{}",
         std::process::id(),
@@ -86,7 +86,12 @@ fn rand_suffix() -> u128 {
 }
 
 /// Split the vector keystore for the network's committee (as `GET /identity` gives it) into `out`.
-fn split(network: &TestNetwork, dir: &Path, ceremony: &str, out: &str) -> (Value, Vec<Value>) {
+pub(crate) fn split(
+    network: &TestNetwork,
+    dir: &Path,
+    ceremony: &str,
+    out: &str,
+) -> (Value, Vec<Value>) {
     let participants: Vec<Value> = network
         .all()
         .into_iter()
@@ -145,7 +150,7 @@ fn split(network: &TestNetwork, dir: &Path, ceremony: &str, out: &str) -> (Value
     (manifest, envelopes)
 }
 
-fn interchange(pubkey: &str, gvr: &str, blocks: Value, attestations: Value) -> Value {
+pub(crate) fn interchange(pubkey: &str, gvr: &str, blocks: Value, attestations: Value) -> Value {
     json!({
         "metadata": {"interchange_format_version": "5", "genesis_validators_root": gvr},
         "data": [{"pubkey": pubkey, "signed_blocks": blocks, "signed_attestations": attestations}],
@@ -159,7 +164,7 @@ fn status(network: &TestNetwork, node: usize) -> Value {
 }
 
 /// The signature the original key gives `root` (blst, directly): what the network must produce.
-fn original_signature(root: &[u8; 32]) -> String {
+pub(crate) fn original_signature(root: &[u8; 32]) -> String {
     let secret = hex::decode(SECRET).unwrap();
     let signature = blst::min_pk::SecretKey::from_bytes(&secret)
         .unwrap()

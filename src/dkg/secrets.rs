@@ -104,7 +104,7 @@ impl KeyShare {
     /// `ceremony` must be completed (a DKG ceremony with its output, or an imported key).
     pub fn new(ceremony: &Ceremony, share: Share) -> Self {
         let public = match &ceremony.origin {
-            Origin::Dkg => {
+            Origin::Dkg | Origin::Reshare(_) => {
                 SharePublic::Dkg(ceremony.output.clone().expect("ceremony is completed"))
             }
             Origin::Imported(imported) => SharePublic::Imported(imported.sharing.clone()),
@@ -124,7 +124,9 @@ impl KeyShare {
     /// Check that this is `me`'s share of the agreed result of `ceremony`, of the same origin.
     pub fn verify(&self, me: &PublicKey, ceremony: &Ceremony) -> Result<(), Inconsistent> {
         let public = match (&self.public, &ceremony.origin) {
-            (SharePublic::Dkg(output), Origin::Dkg) => Some(output) == ceremony.output.as_ref(),
+            (SharePublic::Dkg(output), Origin::Dkg | Origin::Reshare(_)) => {
+                Some(output) == ceremony.output.as_ref()
+            }
             (SharePublic::Imported(sharing), Origin::Imported(imported)) => {
                 *sharing == imported.sharing
             }
@@ -414,6 +416,28 @@ impl<E: Context> Secrets<E> {
             metadata.put(Key::new(SHARE_PREFIX, round), Value::Share(Box::new(share)));
         })
         .await
+    }
+
+    /// Erase everything of `round`, its share included: a share generation that was retired (its
+    /// key moved to a newer one) or a reshare that was aborted. Written twice, so that neither of
+    /// the store's two copies keeps it. Erasure is best effort: what the file system or a backup
+    /// kept is out of reach.
+    pub async fn erase(&mut self, round: u64) -> Result<(), Error> {
+        if self.seed(round).is_none()
+            && self.dealings(round).is_empty()
+            && self.share(round).is_none()
+        {
+            return Ok(());
+        }
+        for _ in 0..2 {
+            self.commit(|metadata| {
+                metadata.remove(&Key::new(SEED_PREFIX, round));
+                metadata.remove(&Key::new(DEALINGS_PREFIX, round));
+                metadata.remove(&Key::new(SHARE_PREFIX, round));
+            })
+            .await?;
+        }
+        Ok(())
     }
 
     /// Drop the round's seed and dealings (the ceremony ended without a share for this node).

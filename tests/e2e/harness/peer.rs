@@ -2,7 +2,9 @@
 //! authenticated and encrypted commonware-p2p, speaking only the signing protocol.
 //!
 //! It reports every signing message it receives and answers with whatever its responder returns,
-//! so tests can send arbitrary (valid or malicious) signing traffic to real nodes.
+//! so tests can send arbitrary (valid or malicious) signing traffic to real nodes. It can also send
+//! raw messages on the other channels ([FakePeer::send_on]): DKG messages, or transactions to the
+//! mempool, which consensus orders like any other.
 
 use super::TestNetwork;
 use commonware_codec::DecodeExt as _;
@@ -26,7 +28,7 @@ pub type Responder =
     Box<dyn FnMut(&[Share], usize, &wire::Message) -> Vec<(usize, Vec<u8>)> + Send>;
 
 pub struct FakePeer {
-    commands: Option<mpsc::UnboundedSender<(usize, Vec<u8>)>>,
+    commands: Option<mpsc::UnboundedSender<(u64, usize, Vec<u8>)>>,
     events: std_mpsc::Receiver<(usize, wire::Message)>,
     thread: Option<JoinHandle<()>>,
 }
@@ -55,7 +57,7 @@ impl FakePeer {
         let listen = network.p2p_addr(node);
         let storage = network.dir.join(format!("peer-{node}"));
         let shares = network.data_dir(node);
-        let (commands, mut inbox) = mpsc::unbounded_channel::<(usize, Vec<u8>)>();
+        let (commands, mut inbox) = mpsc::unbounded_channel::<(u64, usize, Vec<u8>)>();
         let (report, events) = std_mpsc::channel();
 
         let thread = std::thread::spawn(move || {
@@ -90,7 +92,7 @@ impl FakePeer {
                 let (mut sender, mut receiver) = network.register(engine::SIGNING_CHANNEL, quota);
                 // Real nodes send on every channel; a message on an unregistered one makes
                 // commonware-p2p drop the connection. Accept and discard the others.
-                let mut others = Vec::new();
+                let mut others = std::collections::BTreeMap::new();
                 for channel in [
                     engine::VOTES_CHANNEL,
                     engine::CERTIFICATES_CHANNEL,
@@ -101,7 +103,7 @@ impl FakePeer {
                     engine::DKG_CHANNEL,
                 ] {
                     let (other_sender, mut other_receiver) = network.register(channel, quota);
-                    others.push(other_sender);
+                    others.insert(channel, other_sender);
                     context.child("drain").spawn(move |_| async move {
                         while other_receiver.recv().await.is_ok() {}
                     });
@@ -110,8 +112,13 @@ impl FakePeer {
                 loop {
                     select! {
                         command = inbox.recv() => {
-                            let Some((to, bytes)) = command else { return };
-                            sender.send(Recipients::One(keys[to].clone()), bytes, false);
+                            let Some((channel, to, bytes)) = command else { return };
+                            let recipient = Recipients::One(keys[to].clone());
+                            if channel == engine::SIGNING_CHANNEL {
+                                sender.send(recipient, bytes, false);
+                            } else if let Some(other) = others.get_mut(&channel) {
+                                other.send(recipient, bytes, false);
+                            }
                         },
                         message = receiver.recv() => {
                             let Ok((from, bytes)) = message else { return };
@@ -137,7 +144,16 @@ impl FakePeer {
 
     /// Send raw bytes to node `to` on the signing channel.
     pub fn send(&self, to: usize, bytes: Vec<u8>) {
-        self.commands.as_ref().unwrap().send((to, bytes)).unwrap();
+        self.send_on(engine::SIGNING_CHANNEL, to, bytes);
+    }
+
+    /// Send raw bytes to node `to` on `channel` (`engine::*_CHANNEL`).
+    pub fn send_on(&self, channel: u64, to: usize, bytes: Vec<u8>) {
+        self.commands
+            .as_ref()
+            .unwrap()
+            .send((channel, to, bytes))
+            .unwrap();
     }
 
     /// The next signing message received, with its sender.

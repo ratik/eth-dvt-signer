@@ -144,6 +144,7 @@ signing requests the proxy forwarded (`requests/`, duty data only).
 | Coordinator failure | node 0, the proxy's first choice, stopped for 3 epochs | the proxy fails over to node 1; duties continue |
 | In-flight failure | node 0 restarted with the `authorized` crash point, re-armed (up to 3 crashes) until a crash follows a new authorization: one node 0 itself submitted, which consensus then accepted | node 0 dies after the authorization, before answering; the proxy retries on another node, which returns the signature of the same authorization; the duty is accepted at exactly one height |
 | Migration | a genesis validator moves from Lighthouse's local keystore to the MPC network ([below](#migration-of-a-genesis-validator)), then node 2 is stopped for 2 epochs | the key's duties before, during and after; the same public key; the imported history refuses the previous signer's messages; 3 keyholders keep signing |
+| Resharing | both MPC validator keys (the DKG key, then the migrated imported key) get a new share generation while Lighthouse signs ([resharing.md](resharing.md)), then node 2 is stopped for an epoch | the same keys; every verification share and the generation ids changed; every node switched and the old shares retired; signatures with the old generation while the new one is prepared and with the new one after; duties in the beacon state; interruptions, retries, latency before and after; node 2 back with the new generation |
 
 The proxy retries only on a connection failure, `502`, `503` or `504`, never on `4xx`. That is
 safe because the state machine decides each duty once: an identical retry is `AlreadyAccepted`
@@ -227,25 +228,26 @@ the report counts Lighthouse's requests apart from theirs.
 
 ## Results
 
-Four full runs on a Linux host (x86_64, 12 cores, 62 GB), each from nothing: a new devnet, a new
+Five full runs on a Linux host (x86_64, 12 cores, 62 GB), each from nothing: a new devnet, a new
 DKG key, its deposit, activation, the scenarios, the security checks. Logs are on the test host,
 in `~/eth-mpc-it/runs/<directory>/`. Runs B and C used the 10 s nullify retry; run D used the
 3 s retry and the final scripts (whole-period recorder, every signed block checked, in-flight
 re-arming); run E added the migration of a genesis validator
-([below](#migration-run-e)). The rows below are the DKG validator's.
+([below](#migration-run-e)), run F resharing ([below](#resharing-run-f)). The rows below are the
+DKG validator's.
 
-| | Run B | Run C | Run D | Run E |
-| --- | --- | --- | --- | --- |
-| Directory | `20261028T113358Z` | `20261028T124404Z` | `20261028T143415Z` | `20261028T203033Z` |
-| Deposit included | execution block 2, 21 s after the MPC signature | block 2, 22 s | block 2, 21 s | block 2 |
-| Validator active | epoch 11, 23 min after the deposit, index 32 | epoch 11, 23 min | epoch 11, 23 min | epoch 11, 23 min |
-| Whole run | 64 min | 64 min | 66 min | 84 min |
-| Attestations, observed epochs | 10 of 10, correct target and head | 10 of 10 | 10 of 10 | 10 of 10 |
-| Whole active period | not recorded | not recorded (old states pruned) | epochs 11 to 26: 16 of 16 correct target and head; 15 of 15 proposals canonical | epochs 11 to 36: 26 of 26; 21 of 21 canonical |
-| Blocks signed for Lighthouse | 16; 12 checked, all canonical | 24; 9 checked, all canonical | 18, all canonical, 15 finalized at the end | 22, all canonical, 21 finalized |
-| Lighthouse's signing requests | 86, all signed | 102, all signed | 91, all signed | 125 for the DKG key and 1 885 for the migrated key, all signed |
-| Published by Lighthouse (its log) | 18 attestations, 18 aggregates, 16 blocks; no signing error | 18, 18, 24; none | 18, 18, 18; none | both keys: 36, 36, 27, plus 290 sync committee messages and 146 sync contributions; none |
-| Security checks | 7 of 7 | 7 of 7 | 7 of 7 | 7 of 7 |
+| | Run B | Run C | Run D | Run E | Run F |
+| --- | --- | --- | --- | --- | --- |
+| Directory | `20261028T113358Z` | `20261028T124404Z` | `20261028T143415Z` | `20261028T203033Z` | `20261029T105830Z` |
+| Deposit included | execution block 2, 21 s after the MPC signature | block 2, 22 s | block 2, 21 s | block 2 | block 2 |
+| Validator active | epoch 11, 23 min after the deposit, index 32 | epoch 11, 23 min | epoch 11, 23 min | epoch 11, 23 min | epoch 11, 23 min |
+| Whole run | 64 min | 64 min | 66 min | 84 min | 99 min |
+| Attestations, observed epochs | 10 of 10, correct target and head | 10 of 10 | 10 of 10 | 10 of 10 | 13 of 13 |
+| Whole active period | not recorded | not recorded (old states pruned) | epochs 11 to 26: 16 of 16 correct target and head; 15 of 15 proposals canonical | epochs 11 to 36: 26 of 26; 21 of 21 canonical | epochs 11 to 43: 33 of 33; 30 of 30 canonical |
+| Blocks signed for Lighthouse | 16; 12 checked, all canonical | 24; 9 checked, all canonical | 18, all canonical, 15 finalized at the end | 22, all canonical, 21 finalized | 32, all canonical, 30 finalized |
+| Lighthouse's signing requests | 86, all signed | 102, all signed | 91, all signed | 125 for the DKG key and 1 885 for the migrated key, all signed | 3 320 for both keys, all signed |
+| Published by Lighthouse (its log) | 18 attestations, 18 aggregates, 16 blocks; no signing error | 18, 18, 24; none | 18, 18, 18; none | both keys: 36, 36, 27, plus 290 sync committee messages and 146 sync contributions; none | both keys: 50, 50, 44, 513, 263; none |
+| Security checks | 7 of 7 | 7 of 7 | 7 of 7 | 7 of 7 | 7 of 7 |
 
 The DKG validator was never assigned sync committee duties (256-epoch periods). The migrated
 genesis validator of run E is in the current sync committee: its sync committee messages, selection
@@ -331,6 +333,50 @@ selection proofs for later slots. Recorded as audit L-16; consensus is unchanged
 
 Not verified on chain: runs B and C covered only the observed epochs. Of the blocks signed in
 those runs, 12 of 16 and 9 of 24 were checked; run D checks the whole period and every block.
+
+### Resharing (run F)
+
+Run F repeated every scenario of run E, the migration included, then reshared both MPC validator
+keys on the running devnet ([resharing.md](resharing.md)). The DKG key (validator 32) was reshared
+first, then the migrated imported key (genesis validator 30), while Lighthouse kept signing both.
+
+| | DKG key | Imported (migrated) key |
+| --- | --- | --- |
+| Key | `0xb84eada5…10ef`, unchanged | `0x81ea9f74…58cb`, unchanged |
+| Generations | round 0 (`validator-devnet`) → round 2 (`validator-devnet-g1`) | round 1 (`migrated-validator`) → round 3 (`migrated-validator-g1`) |
+| Generation id | `0x447ef99f…1ed0` → `0xc4366696…09ed` | a new one for round 3 (the old one was not recorded) |
+| Verification shares | all four changed (checked) | not compared in this run (E2E-RSH-5 and the unit tests check imported keys) |
+| Ceremony (start to all 4 shares acknowledged) | 1.5 s | 1.7 s |
+| Ready to activation decided | 0.2 s | 0.2 s |
+| Activation to every node switched | 0.1 s | under 0.1 s |
+| Consensus transactions | 1 start, 4 dealer logs, 4 acknowledgements, 1 activation | the same |
+| Old shares | retired and erased on every node | the same |
+
+Signing around the reshares:
+
+- **Old generation during preparation.** The imported key signed 5 duties with its old generation
+  while its new one was prepared: 4 sync selection proofs and the sync committee message of
+  slot 1220. The DKG key had no duty during its 1.7 s.
+- **Switch-over.** The first signature with the new generation came 2.1 s after the activation, at
+  the next duty. Every later signature used the new generations: 33 for the DKG key and 1 257 for
+  the imported key by the end of the run (signer logs).
+- **No interruption.** No Lighthouse request failed. The longest gap between two signatures around
+  the reshares was 3.9 s, the slot cadence. There were no coordinator retries on a generation
+  change, and no gap over 2.5 s between applied blocks.
+- **Duties.** In the 3 observed epochs after the reshares, every attestation was correct (target
+  and head) and both proposals (slots 1257 and 1258) were canonical.
+- **Latency.** End to end, p50 / p95: 279 / 524 ms in the window before the reshares (n = 1 287)
+  and 282 / 520 ms after (n = 1 289).
+- **One keyholder offline.** With node 2 stopped for an epoch, 3 keyholders signed with the new
+  generation (epoch 43 attested). Node 2 came back with it (390 s after its stop, mostly the
+  observed epoch). Four requests took 2.3 to 2.4 s right after node 2 stopped (2.4 and 9.0 s after):
+  one leader timeout each, audit L-16, unrelated to resharing.
+- **History.** The security checks afterwards refused a double vote and a double proposal and
+  returned the same signature for a retried attestation (7 of 7).
+
+The migration in run F missed one proposal, slot 929, in the 5.0 s between the original signer's
+stop and Lighthouse signing through the network: the switch-over cost of the migration, not of
+resharing. Run E had no proposal in its gap.
 
 ## Troubleshooting
 

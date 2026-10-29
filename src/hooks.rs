@@ -28,6 +28,22 @@
 //! - `after-diagnostics`: at startup, damaged metadata copies are saved, no store is opened yet.
 //! - `before-partial-send`: a participant computed a partial for a peer, before sending it.
 //! - `after-partial-send`: right after sending it.
+//!
+//! Resharing (`dkg::ceremony`, a new share generation of a validator key):
+//!
+//! - `reshare-before-dealing`: a node joined a reshare, before choosing its dealer randomness.
+//! - `reshare-after-seed`: its dealer seed is persisted, nothing sent yet.
+//! - `reshare-after-dealings-sent`: its dealings are sent.
+//! - `reshare-after-first-dealing`: it persisted the first dealing it received.
+//! - `reshare-after-all-dealings`: it persisted a dealing of every dealer.
+//! - `reshare-after-share-stored`: its new share is derived, verified and persisted, before its
+//!   acknowledgement.
+//! - `reshare-after-ready`: its acknowledgement is submitted.
+//! - `before-apply-activation`: the executor got a finalized block activating a share generation,
+//!   before applying it.
+//! - `after-apply-activation`: that block is durably applied, before the keyholder learns of it.
+//! - `new-generation-partial`: a participant computed a partial with a share generation it
+//!   activated, before sending it.
 
 #[cfg(feature = "test-hooks")]
 mod enabled {

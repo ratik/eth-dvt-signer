@@ -17,7 +17,8 @@ Replicated state        src/executor, storage,  validator activations (chain ide
                                                 Decided by consensus, committed atomically per block.
 Keyholder               src/dkg/actor           shares; signs only committed authorizations of the
                                                 kind a request names: (validator key, root) for a
-                                                validator key's ceremony, (ceremony, nonce) for a
+                                                validator key's ceremony (its active share
+                                                generation only), (ceremony, nonce) for a
                                                 development key's.
 Crypto                  src/dkg/signing         Ethereum ciphersuite over raw 32-byte roots.
 Ethereum types          src/eth                 containers, SSZ hash_tree_root, domains, roots.
@@ -93,6 +94,10 @@ failover proxy (development)  ──>  4 eth-mpc-signer nodes (this repository)
    dealer splits an EIP-2335 keystore into the network's sharing; the key is registered,
    installed, given its previous signer's EIP-3076 history and activated through consensus. The
    devnet migrates a genesis validator from Lighthouse's local keystore.
+6. Done: resharing (R1) ([resharing.md](resharing.md)). A validator key (DKG or imported) gets new
+   shares within the committee through commonware's Feldman-Desmedt reshare; the key, history
+   and activation stay; the new share generation is activated by consensus, and signing requests
+   name the generation they use. Not done: replacing a keyholder (R2).
 
 ## Anvil
 

@@ -442,6 +442,12 @@ where
     let authorizations = store.authorizations();
     let validator_rounds = store.protection().validator_rounds().collect();
     let duties = store.protection().authorized_duties();
+    // Every validator key's active share generation: the keyholder signs with no other.
+    let generations = store
+        .protection()
+        .validators()
+        .map(|(_, validator)| (validator.key, validator.round))
+        .collect();
     let mempool = Mempool::default();
     let executed = Arc::new(AtomicU64::new(0));
     let tip = Arc::new(AtomicU64::new(0));
@@ -485,6 +491,7 @@ where
         authorizations,
         validator_rounds,
         duties,
+        generations,
         config.share_key,
     )
     .start();

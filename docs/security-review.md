@@ -100,12 +100,30 @@ checks, and what it cannot:
 | Does an export keep its protection in another signer? | Against a reference implementation of EIP-3076's conditions, yes (randomized test); Lighthouse's import, read in its source, is stricter. No other client has imported one, and an export taken while the network signs can be stale. | Modeled, not tested ([slashing-protection.md](slashing-protection.md#compared-with-eip-3076)) |
 | Two signers for one key | **Not detectable.** The original keystore still exists; whether the previous signer is stopped is the operator's statement (the acknowledgment), recorded but not verified. A duplicate signer is slashable whatever this network does. | Operational ([key-import.md](key-import.md#assumptions)) |
 
+## Resharing
+
+A validator key's shares are refreshed within the committee ([resharing.md](resharing.md)).
+
+| Question | Answer | Status |
+| -------- | ------ | ------ |
+| Can a reshare change the key? | No. Commonware refuses a dealing whose constant commitment is not its dealer's previous public share, and the interpolated result must keep the previous public key. The new generation's public key equals the old one byte for byte. | Implemented (commonware), tested (12 seeds, two reshares each; E2E-RSH-1, RSH-5) |
+| Is the private key reconstructed? | No. Each player interpolates only its own share from the selected dealings; nobody holds a quorum of shares. | By construction |
+| Can generations be mixed? | No. A signing request names its generation; each partial is verified against that generation's verification shares; an old share's partial fails against the new ones, and an interpolation of mixed partials does not verify. | Implemented, tested |
+| Can a node sign with an uncommitted or stale generation? | No. A keyholder signs a duty only with the generation its committed state has active; older: `stale_generation`; newer: parked until it applies the activation. | Implemented, tested (E2E-RSH-3, 10 crash points) |
+| Can a failed or Byzantine reshare disturb the active generation? | No. The active generation and its shares are untouched until a committed activation, which requires a completed round and every new share acknowledged; an aborted or failed reshare's material is erased. | Implemented, tested (E2E-RSH-2, RSH-4) |
+| Is the history preserved? | Yes: only the validator's round changes; records, activation and import state stay. | Implemented, tested |
+| Does it revoke old shares? | No. Old shares remain a valid sharing of the same key; erasing them is best effort and operational. | Documented |
+| A keyholder acknowledging readiness without a share | Counted (consensus checks only its signature): the new generation then works with 3 shares. Availability, not safety. | Documented, E2E-RSH-4 |
+| Liveness | All four keyholders are needed (no reveals); a reshare does not restore fault tolerance after a node is lost. | Documented (audit L-18) |
+
 ## Not provided
 
 - Slashing protection that survives a rollback of every node (an anchor is proposed in
   [slashing-protection.md](slashing-protection.md), not implemented). It applies to imported keys
   unchanged (L-1).
 - Detection of a second signer of an imported key outside the network.
+- Revocation of old key shares by resharing (erasure is operational), resharing with a node
+  offline, and replacing a keyholder (R2).
 - Slashing protection for the development API (`dev-api` builds; nonces are caller-chosen).
 - Client authentication, authorization policy, rate limiting.
 - Encryption of shares at rest, HSM or TEE isolation.

@@ -64,12 +64,15 @@ use crate::{
     dkg::{
         CeremonyId, DkgStatus,
         actor::{self as dkg, Health, ShareStatus},
-        ceremony::{Ceremony, StartOutcome},
+        ceremony::{
+            AbortOutcome, Ceremony, GenerationOutcome, GenerationRefusal, ReshareOutcome,
+            StartOutcome,
+        },
         format_key,
     },
     engine::Recovery,
     eth::{
-        duty::{Duty, DutyRequest, format_root, format_validator},
+        duty::{Duty, DutyRequest, ValidatorKey, format_root, format_validator},
         web3signer::{parse_identifier, parse_request},
     },
     executor::{Client, Status, Stopped},
@@ -99,7 +102,7 @@ use axum::{
     routing::{get, post},
 };
 use commonware_codec::Encode as _;
-use commonware_utils::ordered::Quorum as _;
+use commonware_utils::{Participant, ordered::Quorum as _};
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "dev-api")]
 use std::collections::BTreeMap;
@@ -253,6 +256,23 @@ struct CeremonyResponse {
     share: ShareStatus,
     /// An Ethereum validator key (signs only validator duties).
     validator: bool,
+    /// Once completed: every participant's public verification share, by share index, and the
+    /// share generation's identifier (both change with a reshare; the key does not).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification_shares: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generation_id: Option<String>,
+}
+
+/// Every participant's public verification share of `ceremony`'s key, by share index.
+fn verification_shares(ceremony: &Ceremony) -> Option<Vec<String>> {
+    let sharing = ceremony.sharing()?;
+    Some(
+        (0..ceremony.config.participants.len() as u32)
+            .filter_map(|index| sharing.partial_public(Participant::new(index)).ok())
+            .map(|public| format!("0x{}", hex::encode(public.encode())))
+            .collect(),
+    )
 }
 
 #[derive(Serialize)]
@@ -309,6 +329,10 @@ pub fn router(
         .route("/dkg/public-key/{ceremony_id}", get(dkg_public_key))
         .route("/validators", get(validators))
         .route("/validators/activate", post(activate_validator))
+        .route("/validators/reshare", post(start_resharing))
+        .route("/validators/reshare/activate", post(activate_generation))
+        .route("/validators/reshare/abort", post(abort_resharing))
+        .route("/validators/reshare/{ceremony_id}", get(reshare_status))
         .route("/identity", get(identity))
         .route("/keys/import", post(register_import))
         .route("/keys/import/share", post(install_share))
@@ -359,6 +383,9 @@ struct ValidatorResponse {
     /// Height of the block that activated it.
     #[serde(skip_serializing_if = "Option::is_none")]
     activated_at: Option<u64>,
+    /// Share generations activated since the key's first (resharing); `ceremony_id` is the
+    /// active generation's ceremony.
+    generation: u64,
 }
 
 impl From<&crate::executor::ValidatorEntry> for ValidatorResponse {
@@ -376,6 +403,7 @@ impl From<&crate::executor::ValidatorEntry> for ValidatorResponse {
                 .activation
                 .map(|activation| format_root(&activation.chain.genesis_validators_root)),
             activated_at: entry.activation.map(|activation| activation.height),
+            generation: entry.generation,
         }
     }
 }
@@ -955,7 +983,274 @@ async fn describe(api: &Api, ceremony: Ceremony) -> Result<Json<CeremonyResponse
             .index(me)
             .map(|index| index.get()),
         share,
+        verification_shares: verification_shares(&ceremony),
+        generation_id: ceremony
+            .generation_id()
+            .map(|digest| format!("0x{}", hex::encode(digest))),
     }))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Resharing: share generations of a validator key (docs/resharing.md)
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReshareBody {
+    public_key: String,
+    ceremony_id: String,
+}
+
+#[derive(Serialize)]
+struct GenerationError {
+    error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refusal: Option<GenerationRefusal>,
+}
+
+fn generation_error(
+    status: StatusCode,
+    error: String,
+    refusal: Option<GenerationRefusal>,
+) -> Response {
+    (status, Json(GenerationError { error, refusal })).into_response()
+}
+
+fn reshare_body(body: &ReshareBody) -> Result<(ValidatorKey, CeremonyId), Box<Response>> {
+    let key = parse_identifier(&body.public_key).map_err(|err| {
+        Box::new(generation_error(
+            StatusCode::BAD_REQUEST,
+            err.to_string(),
+            None,
+        ))
+    })?;
+    let id = CeremonyId::new(body.ceremony_id.clone()).map_err(|err| {
+        Box::new(generation_error(
+            StatusCode::BAD_REQUEST,
+            err.to_string(),
+            None,
+        ))
+    })?;
+    Ok((key, id))
+}
+
+/// `POST /validators/reshare`: start a new share generation of an activated validator key.
+async fn start_resharing(State(api): State<Api>, Json(body): Json<ReshareBody>) -> Response {
+    let (key, id) = match reshare_body(&body) {
+        Ok(parsed) => parsed,
+        Err(response) => return *response,
+    };
+    let receipt =
+        match tokio::time::timeout(SUBMIT_TIMEOUT, api.client.start_resharing(key, id.clone()))
+            .await
+        {
+            Ok(Ok(receipt)) => receipt,
+            Ok(Err(err)) => {
+                return generation_error(StatusCode::SERVICE_UNAVAILABLE, err.to_string(), None);
+            }
+            Err(_) => {
+                return generation_error(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "reshare start not finalized in time (it may still be)".into(),
+                    None,
+                );
+            }
+        };
+    let (status, error) = match receipt.outcome {
+        ReshareOutcome::Started(_) | ReshareOutcome::Exists(_) => {
+            return describe_reshare(&api, id).await;
+        }
+        ReshareOutcome::Conflict(round) => (
+            StatusCode::CONFLICT,
+            format!("ceremony id {id} is already used (round {round})"),
+        ),
+        ReshareOutcome::Pending(round) => (
+            StatusCode::CONFLICT,
+            format!(
+                "another reshare of this key (round {round}) is in progress or awaiting \
+                 activation: one at a time"
+            ),
+        ),
+        ReshareOutcome::UnknownValidator => {
+            (StatusCode::NOT_FOUND, "unknown validator public key".into())
+        }
+        ReshareOutcome::NotActivated => (
+            StatusCode::CONFLICT,
+            "the validator is not activated: only an active key is reshared".into(),
+        ),
+        ReshareOutcome::NoGeneration => (
+            StatusCode::CONFLICT,
+            "the key's active generation has no public output to reshare".into(),
+        ),
+        ReshareOutcome::Unsupported(reason) => (StatusCode::BAD_REQUEST, reason.to_string()),
+    };
+    generation_error(status, error, None)
+}
+
+/// `GET /validators/reshare/{ceremony_id}`.
+async fn reshare_status(State(api): State<Api>, Path(ceremony_id): Path<String>) -> Response {
+    match CeremonyId::new(ceremony_id) {
+        Ok(id) => describe_reshare(&api, id).await,
+        Err(err) => generation_error(StatusCode::BAD_REQUEST, err.to_string(), None),
+    }
+}
+
+/// The ceremony round of the reshare `id` of `key`.
+async fn reshare_round(
+    api: &Api,
+    key: &ValidatorKey,
+    id: CeremonyId,
+) -> Result<u64, Box<Response>> {
+    let status = api.client.import_status(id.clone()).await.map_err(|err| {
+        Box::new(generation_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            err.to_string(),
+            None,
+        ))
+    })?;
+    match status {
+        Some(status)
+            if status
+                .ceremony
+                .reshare()
+                .is_some_and(|reshare| reshare.validator == *key) =>
+        {
+            Ok(status.ceremony.round)
+        }
+        _ => Err(Box::new(generation_error(
+            StatusCode::NOT_FOUND,
+            format!("no reshare {id} of this validator key"),
+            Some(GenerationRefusal::NotReshare),
+        ))),
+    }
+}
+
+/// `POST /validators/reshare/activate`: make a completed reshare the key's active generation.
+async fn activate_generation(State(api): State<Api>, Json(body): Json<ReshareBody>) -> Response {
+    let (key, id) = match reshare_body(&body) {
+        Ok(parsed) => parsed,
+        Err(response) => return *response,
+    };
+    let round = match reshare_round(&api, &key, id.clone()).await {
+        Ok(round) => round,
+        Err(response) => return *response,
+    };
+    let receipt = match tokio::time::timeout(
+        SUBMIT_TIMEOUT,
+        api.client.activate_generation(key, round),
+    )
+    .await
+    {
+        Ok(Ok(receipt)) => receipt,
+        Ok(Err(err)) => {
+            return generation_error(StatusCode::SERVICE_UNAVAILABLE, err.to_string(), None);
+        }
+        Err(_) => {
+            return generation_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "activation not finalized in time (it may still be)".into(),
+                None,
+            );
+        }
+    };
+    match receipt.outcome {
+        GenerationOutcome::Activated { .. } | GenerationOutcome::AlreadyActive => {
+            describe_reshare(&api, id).await
+        }
+        GenerationOutcome::Refused(refusal) => {
+            generation_error(StatusCode::CONFLICT, refusal.to_string(), Some(refusal))
+        }
+    }
+}
+
+/// `POST /validators/reshare/abort`: abort a reshare that is not (and was never) active.
+async fn abort_resharing(State(api): State<Api>, Json(body): Json<ReshareBody>) -> Response {
+    let (key, id) = match reshare_body(&body) {
+        Ok(parsed) => parsed,
+        Err(response) => return *response,
+    };
+    let round = match reshare_round(&api, &key, id.clone()).await {
+        Ok(round) => round,
+        Err(response) => return *response,
+    };
+    let receipt =
+        match tokio::time::timeout(SUBMIT_TIMEOUT, api.client.abort_resharing(key, round)).await {
+            Ok(Ok(receipt)) => receipt,
+            Ok(Err(err)) => {
+                return generation_error(StatusCode::SERVICE_UNAVAILABLE, err.to_string(), None);
+            }
+            Err(_) => {
+                return generation_error(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "abort not finalized in time (it may still be)".into(),
+                    None,
+                );
+            }
+        };
+    match receipt.outcome {
+        AbortOutcome::Aborted | AbortOutcome::AlreadyAborted => describe_reshare(&api, id).await,
+        AbortOutcome::Refused(refusal) => {
+            generation_error(StatusCode::CONFLICT, refusal.to_string(), Some(refusal))
+        }
+    }
+}
+
+/// A reshare as committed: its state, the generation it refreshes, the acknowledged shares, this
+/// node's share, and its public sharing once completed (the key, unchanged, and every
+/// participant's public share, which change).
+async fn describe_reshare(api: &Api, id: CeremonyId) -> Response {
+    let status = match api.client.import_status(id.clone()).await {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            return generation_error(StatusCode::NOT_FOUND, format!("no ceremony {id}"), None);
+        }
+        Err(err) => {
+            return generation_error(StatusCode::SERVICE_UNAVAILABLE, err.to_string(), None);
+        }
+    };
+    let ceremony = &status.ceremony;
+    let Some(reshare) = ceremony.reshare() else {
+        return generation_error(
+            StatusCode::NOT_FOUND,
+            format!("ceremony {id} is not a reshare"),
+            None,
+        );
+    };
+    let share = match api.dkg.share(id.clone()).await {
+        Ok(share) => share,
+        Err(err) => {
+            return generation_error(StatusCode::SERVICE_UNAVAILABLE, err.to_string(), None);
+        }
+    };
+    let active = status.validator.as_ref().map(|validator| validator.round);
+    let state = match ceremony.status {
+        DkgStatus::InProgress | DkgStatus::NotStarted => "in_progress",
+        DkgStatus::Failed => "aborted",
+        DkgStatus::Completed if active == Some(ceremony.round) => "active",
+        DkgStatus::Completed if active.is_some_and(|active| active > ceremony.round) => "retired",
+        DkgStatus::Completed if reshare.ready.len() == ceremony.config.participants.len() => {
+            "ready"
+        }
+        DkgStatus::Completed => "awaiting_shares",
+    };
+    let sharing = ceremony.sharing();
+    Json(serde_json::json!({
+        "ceremony_id": id.to_string(),
+        "validator_public_key": format_validator(&reshare.validator),
+        "round": ceremony.round,
+        "session": format!("0x{}", hex::encode(ceremony.session)),
+        "from_round": reshare.from,
+        "status": state,
+        "started_at": ceremony.started,
+        "participants": ceremony.config.participants.len(),
+        "ready_shares": reshare.ready.iter().collect::<Vec<_>>(),
+        "share": share,
+        "public_key": sharing.map(|sharing| format!("0x{}", hex::encode(sharing.public().encode()))),
+        "verification_shares": verification_shares(ceremony),
+        "generation_id": ceremony.generation_id().map(|digest| format!("0x{}", hex::encode(digest))),
+        "active_generation": status.validator.as_ref().map(|validator| validator.generation),
+        "active_ceremony_id": status.validator.as_ref().map(|validator| validator.ceremony.to_string()),
+    }))
+    .into_response()
 }
 
 fn parse_id(value: String) -> Result<CeremonyId, ApiError> {

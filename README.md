@@ -15,6 +15,10 @@ A 4-node threshold signer built on [commonware](https://github.com/commonwarexyz
   previous signer's EIP-3076 slashing history is imported before it can sign
   ([docs/key-import.md](docs/key-import.md)). This is a trusted-dealer split, not a DKG: the key
   existed in full before it;
+- resharing (R1): new, independently random shares of a validator key (DKG or imported) inside
+  the same committee, with commonware's Feldman-Desmedt reshare; the key, its identity and its
+  slashing history unchanged, the new share generation activated through consensus
+  ([docs/resharing.md](docs/resharing.md));
 - for development builds only (`dev-api` feature): `POST /sign` authorizes
   `(ceremony_id, nonce) -> payload_hash` once, through consensus, and returns the threshold
   signature of any 32-byte payload (see [Signing](#signing)).
@@ -521,6 +525,14 @@ Key import ([docs/key-import.md](docs/key-import.md)):
   state refused at startup;
 - `tests/e2e/import.rs` (E2E-IMP-1, E2E-IMP-2): the whole import on real processes.
 
+Resharing ([docs/resharing.md](docs/resharing.md)):
+- `dkg::ceremony::tests::reshare`: the key unchanged and every share refreshed over many seeds,
+  any 3 new shares sign and 2 cannot, old and new shares never combine, dealings that would change
+  the key or conflict refused, replays, an imported key;
+- `storage::tests::validator::reshare`: the lifecycle through consensus with the same slashing
+  history and refusals before and after, aborts, restarts, an imported key's floors;
+- `tests/e2e/reshare.rs` (E2E-RSH-1 to RSH-5, and 10 crash points): real processes.
+
 `tests/signing.rs`: signing through the coordinator, verified with blst (combinations of signers,
 another root, another ceremony's key); concurrent identical and conflicting requests; a
 coordinator dying after the authorization or holding partials; one node offline and a lagging
@@ -622,10 +634,14 @@ Signing an existing authorization costs one p2p round trip and four pairings.
 - Authorizations and slashing history are kept forever, and every new one rewrites the state
   partition (O(n) per block). Pruning slashing history needs low watermarks (EIP-3076).
 - DKG: the committee is the 4 configured nodes and the threshold is fixed (`n - f`). There is no
-  resharing and no committee change.
+  committee change.
 - Key import is a trusted-dealer split: whoever keeps the original keystore can still sign outside
   the network, and that the previous signer is stopped is the operator's statement, not a check
   ([docs/key-import.md](docs/key-import.md#assumptions)).
+- Resharing needs all four keyholders online, and does not restore fault tolerance after a node
+  is lost. Old shares still sign for the same key until they are erased, which is operational. It
+  keeps the committee (no replacement of a keyholder, R2)
+  ([docs/resharing.md](docs/resharing.md)).
   - Liveness: every participant must be online, and a single non-cooperating player can make a
     ceremony fail; safety is not affected. Like every Feldman-Desmedt DKG, the key is not
     guaranteed to be uniformly random (bias of a few bits), and timing assumes synchrony.

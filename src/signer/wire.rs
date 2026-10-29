@@ -167,6 +167,10 @@ pub enum Refusal {
     /// duty request to a development key).
     #[error("the ceremony's key has another purpose")]
     WrongPurpose,
+    /// The ceremony is an older share generation of the validator's key than the one this node
+    /// has committed: a coordinator asks again with the active generation.
+    #[error("stale share generation")]
+    StaleGeneration,
 }
 
 impl Refusal {
@@ -188,6 +192,7 @@ impl Refusal {
             4 => Self::Conflict,
             5 => Self::NotParticipant,
             6 => Self::WrongPurpose,
+            7 => Self::StaleGeneration,
             _ => return None,
         })
     }

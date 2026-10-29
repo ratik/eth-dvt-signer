@@ -1052,6 +1052,87 @@ def proxy_records():
 
 
 # ---------------------------------------------------------------------------------------------
+# Resharing: a new share generation of a validator key (docs/resharing.md)
+
+
+def generation_of(node, key):
+    """`(generation, active ceremony id)` of `key` on node `node`."""
+    status, validators = http("GET", f"{node_url(node)}/validators")
+    for validator in validators if status == 200 else []:
+        if validator["public_key"] == key:
+            return validator.get("generation"), validator["ceremony_id"]
+    return None, None
+
+
+def reshare_key(key, name):
+    """Reshare `key` as ceremony `name` and activate it; timings and the generations' public data."""
+    started = time.time()
+    status, body = http("POST", f"{node_url(0)}/validators/reshare",
+                        {"public_key": key, "ceremony_id": name}, timeout=40)
+    if status != 200:
+        raise Failure("reshare", f"start {name}: {status} {body}")
+    from_round = body["from_round"]
+    for node in range(NODES):
+        wait(f"reshare {name} ready on node {node}", "reshare", 180, 0.2,
+             lambda node=node: http("GET", f"{node_url(node)}/validators/reshare/{name}")[1]
+             .get("status") == "ready")
+    ready = time.time()
+    status, active = http("POST", f"{node_url(1)}/validators/reshare/activate",
+                          {"public_key": key, "ceremony_id": name}, timeout=40)
+    if status != 200 or active.get("status") != "active":
+        raise Failure("reshare", f"activate {name}: {status} {active}")
+    activated = time.time()
+    for node in range(NODES):
+        wait(f"generation {name} on node {node}", "reshare", 60, 0.1,
+             lambda node=node: generation_of(node, key)[1] == name)
+    switched = time.time()
+    log(f"reshare: {name} ready {ready - started:.1f} s after its start, activated "
+        f"{activated - ready:.1f} s later, every node switched {switched - activated:.1f} s later")
+    return {"name": name, "round": active["round"], "from_round": from_round,
+            "public_key": active["public_key"], "generation_id": active["generation_id"],
+            "verification_shares": active["verification_shares"], "started": started,
+            "ready": ready, "activated": activated, "switched": switched}
+
+
+def resharing(chain, key, index, migrated_key, observed=2, offline=1):
+    """Reshare both MPC validator keys while Lighthouse signs: the DKG key, then the migrated
+    (imported) key. Same keys, new shares and verification shares, every node switched; duties
+    observed with the new generations, one keyholder offline, then back with them."""
+    def body():
+        before = http("GET", f"{node_url(0)}/dkg/status/{CEREMONY}")[1]
+        dkg = reshare_key(key, f"{CEREMONY}-g1")
+        if dkg["public_key"] != key or before["public_key"] != key:
+            raise Failure("reshare", f"the key changed: {before['public_key']} -> {dkg['public_key']}")
+        if dkg["generation_id"] == before["generation_id"] or any(
+                old == new for old, new in zip(before["verification_shares"], dkg["verification_shares"])):
+            raise Failure("reshare", "a verification share or the generation id did not change")
+        for node in range(NODES):
+            wait(f"node {node} to retire generation 0", "reshare", 60, 0.2,
+                 lambda node=node: http("GET", f"{node_url(node)}/dkg/status/{CEREMONY}")[1]
+                 .get("share") == "retired")
+        imported = None
+        if migrated_key:
+            imported = reshare_key(migrated_key, f"{MIGRATED_CEREMONY}-g1")
+            if imported["public_key"] != migrated_key:
+                raise Failure("reshare", "the migrated key changed")
+        observe("resharing", index, observed, chain)
+        signer_stop(2)
+        stopped = time.time()
+        observe("resharing-node-offline", index, offline, chain)
+        signer_start(2)
+        wait("node 2 ready", "environment", 300, 1, lambda: ready(2))
+        wait("all nodes at the same height", "environment", 300, 1, lambda: converged(range(NODES)))
+        wait("node 2 with the new generation", "reshare", 60, 0.5,
+             lambda: generation_of(2, key)[1] == dkg["name"])
+        back = time.time()
+        log(f"reshare: node 2 back {back - stopped:.1f} s after its stop, signing with {dkg['name']}")
+        return {"dkg": {**dkg, "before_generation_id": before["generation_id"],
+                        "before_round": before["round"]},
+                "imported": imported, "node_offline": [stopped, back]}
+    return body
+
+
+# ---------------------------------------------------------------------------------------------
 # Security checks on the live devnet
 
 
@@ -1286,6 +1367,7 @@ def report(chain=None):
         "scenario_details": scenarios,
         "security": load("security.json", []),
         "migration": migration,
+        "resharing": resharing_report(scenarios, proxy, signed, index, migration),
         "finalized_epoch": finalized,
     }
     save("report.json", result)
@@ -1341,6 +1423,7 @@ def report(chain=None):
                              f"{'new' if new else 'existing'} authorization, accepted by consensus at "
                              f"heights {evidence['authorized_at']}, signed by nodes {evidence['signed_by']}")
     lines.extend(migration_lines(migration))
+    lines.extend(resharing_lines(result["resharing"]))
     lines.append("")
     for item in result["security"]:
         lines.append(f"- security: {'ok' if item['passed'] else 'FAILED'}: {item['check']} ({item['detail']})")
@@ -1404,6 +1487,88 @@ def migration_report(scenarios, proxy, signed, dkg_index):
             "before": tally(before), "during": tally(during), "after": tally(after),
             "latency_imported": latency(key), "latency_dkg": latency(dkg_key) if dkg_key else None,
             "refusals": details["refusals"]}
+
+
+def resharing_report(scenarios, proxy, signed, dkg_index, migration):
+    """Both reshares: their timings, the signing around them (interruption, retries, latency before
+    and after, by generation), missed duties and consensus stalls."""
+    details = next((s for s in scenarios if s["name"] == "resharing"), None)
+    if not details or "dkg" not in details:
+        return None
+    dkg, imported = details["dkg"], details.get("imported")
+    first, last = dkg["started"], (imported or dkg)["switched"]
+    keys = {(load("validator.json") or {}).get("public_key"), (migration or {}).get("public_key")}
+    lighthouse = sorted((r for r in proxy if r["status"] == 200 and key_of(r) in keys),
+                        key=lambda r: r["ts"])
+    around = [r for r in lighthouse if first - 30 <= r["ts"] <= last + 30]
+    gaps = [round(b["ts"] - a["ts"], 1) for a, b in zip(around, around[1:])]
+    failed = [r for r in proxy if r.get("type") and r.get("client") != PROBE_AGENT
+              and first <= r["ts"] <= last + 30 and r["status"] != 200]
+    # Signatures with each key's old generation while its new one was being prepared.
+    during = sum(1 for reshare, old in ((dkg, CEREMONY), (imported, MIGRATED_CEREMONY)) if reshare
+                 for record in signed if record["ok"] and record.get("generation") == old
+                 and reshare["started"] <= record["ts"] <= reshare["activated"])
+    by_generation = {}
+    for record in signed:
+        if record["ok"] and record.get("generation"):
+            by_generation[record["generation"]] = by_generation.get(record["generation"], 0) + 1
+
+    def latency(start, end):
+        return percentiles([r["ms"] for r in lighthouse if start <= r["ts"] <= end])
+    span = details["end"] - last
+    epochs = [json.loads(l) for l in read(f"{WORK}/epochs.jsonl").splitlines() if l.strip()]
+    observed = [e for e in epochs if e["scenario"].startswith("resharing")]
+    retries = sum(read(f"{WORK}/logs/signer-{node}.log").count("share generation changed during signing")
+                  for node in range(NODES))
+    return {
+        "dkg": {k: dkg[k] for k in ("name", "round", "from_round", "public_key", "generation_id",
+                                    "before_generation_id", "before_round")},
+        "imported": None if not imported else {k: imported[k] for k in ("name", "round", "from_round",
+                                                                         "public_key", "generation_id")},
+        "timings_s": {name: {"ceremony": round(r["ready"] - r["started"], 1),
+                             "ready_to_activation": round(r["activated"] - r["ready"], 1),
+                             "activation_to_all_nodes": round(r["switched"] - r["activated"], 1)}
+                      for name, r in (("dkg", dkg), ("imported", imported)) if r},
+        "lighthouse_requests_failed": len(failed),
+        "longest_gap_between_signatures_s": max(gaps) if gaps else None,
+        "coordinator_generation_retries": retries,
+        "signatures_by_generation": by_generation,
+        "signed_with_the_old_generation_during_preparation": during,
+        "latency_before_ms": latency(first - span, first),
+        "latency_after_ms": latency(last, details["end"]),
+        "observed_epochs": len(observed),
+        "missed_attestations": [e["epoch"] for e in observed if not e["target_attester"]],
+        "proposals": [(p["slot"], proposed(p, dkg_index)) for e in observed for p in e["proposals"]],
+    }
+
+
+def resharing_lines(r):
+    if not r:
+        return []
+
+    def ms(p):
+        return f"{p.get('p50')}/{p.get('p95')} ({p['n']})"
+    lines = ["", "## Resharing on the live devnet", "",
+             f"- DKG key `{r['dkg']['public_key']}`: generation round {r['dkg']['before_round']} -> "
+             f"{r['dkg']['round']} (`{r['dkg']['name']}`), generation id {r['dkg']['before_generation_id']} -> "
+             f"{r['dkg']['generation_id']}, the key unchanged"]
+    if r["imported"]:
+        lines.append(f"- imported key `{r['imported']['public_key']}`: round {r['imported']['from_round']} -> "
+                     f"{r['imported']['round']} (`{r['imported']['name']}`), the key unchanged")
+    for name, t in r["timings_s"].items():
+        lines.append(f"- {name}: ceremony {t['ceremony']} s, ready to activation {t['ready_to_activation']} s, "
+                     f"activation to every node {t['activation_to_all_nodes']} s")
+    lines += [f"- Lighthouse requests that failed around the reshares: {r['lighthouse_requests_failed']}; "
+              f"longest gap between two signatures: {r['longest_gap_between_signatures_s']} s; coordinator "
+              f"retries on a generation change: {r['coordinator_generation_retries']}",
+              f"- signatures by generation (signer logs, every node): {r['signatures_by_generation']}; "
+              f"with the old generation while the new one was prepared: "
+              f"{r['signed_with_the_old_generation_during_preparation']}",
+              f"- latency end to end p50/p95 ms (n): before {ms(r['latency_before_ms'])}, after "
+              f"{ms(r['latency_after_ms'])}",
+              f"- observed epochs after the reshares: {r['observed_epochs']}, missed attestations "
+              f"{r['missed_attestations']}, proposals (slot, canonical) {r['proposals']}"]
+    return lines
 
 
 def migration_lines(m):
@@ -1488,6 +1653,7 @@ def run_all(observed=3, proposal_epochs=12):
     scenario("coordinator-failover", coordinator_failover(index, chain, observed))
     scenario("inflight-retry", inflight_retry(index, chain))
     scenario("migration", migration(chain, key, migrated_key, migrated_index))
+    scenario("resharing", resharing(chain, key, index, migrated_key))
     security_checks(key, chain)
     recorder.stop()
     migrated_recorder.stop()

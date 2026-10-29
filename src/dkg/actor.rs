@@ -16,6 +16,14 @@
 //! ([Message::InstallShare]), which it opens with its own share-encryption key, verifies against
 //! the commitments registered by consensus, and stores durably before acknowledging it (a signed
 //! [ReadyAck] through consensus). Until then the key's share is pending here, never claimed.
+//!
+//! Share generations (resharing, `dkg::ceremony`): a reshare is dealt with this node's share of
+//! the generation it refreshes and completes like a DKG; the new share is derived, verified and
+//! stored durably before this node acknowledges it. A validator key signs with exactly one
+//! generation: the one consensus activated, which this node learns once the activating block is
+//! durable here ([Message::Generations]). A request for an older generation is refused for good
+//! ([Refusal::StaleGeneration]); one for a generation not activated here yet is parked until it is.
+//! A retired generation's share is erased.
 
 use super::{
     CeremonyConfig, CeremonyId, DkgStatus, Faults, Variant,
@@ -87,6 +95,9 @@ pub enum Message {
     AuthorizedDuties(Vec<DutyAuthorization>),
     /// Ceremony rounds a block started as validator keys, sent before anything else of it.
     ValidatorRounds(Vec<u64>),
+    /// Share generations a block activated (`(validator key, its new round)`), sent once the block
+    /// is durable here, before the ceremonies it retired.
+    Generations(Vec<(ValidatorKey, u64)>),
     /// This node's partial signature for an authorization (from its own coordinator).
     Partial {
         ceremony: CeremonyId,
@@ -149,6 +160,8 @@ pub enum ShareStatus {
     Stored,
     /// The ceremony completed but this node has no usable share (lost or inconsistent).
     Unavailable,
+    /// A share generation its key moved away from: its share is erased.
+    Retired,
 }
 
 /// Interface to this node's DKG (ceremony lifecycle and threshold partial signatures).
@@ -371,8 +384,12 @@ pub struct Actor<
     share_key: Option<ShareKey>,
     /// Imported keys, by round (their registered manifest and acknowledged shares).
     imported: BTreeMap<u64, Ceremony>,
-    /// Imported rounds whose share acknowledgement this process submitted.
+    /// Imported rounds and reshares whose share acknowledgement this process submitted.
     ready_sent: HashSet<u64>,
+    /// Reshare ceremonies, by round: the key they refresh.
+    reshares: HashMap<u64, ValidatorKey>,
+    /// Share generations retired here (their share erased).
+    retired: BTreeSet<u64>,
 }
 
 impl<
@@ -394,8 +411,17 @@ impl<
         authorizations: Vec<Committed>,
         validator_rounds: Vec<u64>,
         duties: Vec<DutyAuthorization>,
+        generations: Vec<(ValidatorKey, u64)>,
         share_key: Option<ShareKey>,
     ) -> Self {
+        let mut validators = HashMap::new();
+        for (key, round) in duties
+            .iter()
+            .map(|duty| (duty.validator, duty.round))
+            .chain(generations)
+        {
+            advance(&mut validators, key, round);
+        }
         Self {
             context: ContextCell::new(context),
             me: signer.public_key(),
@@ -416,10 +442,7 @@ impl<
                 .map(|committed| ((committed.round(), committed.nonce()), committed))
                 .collect(),
             validator_rounds: validator_rounds.into_iter().collect(),
-            validators: duties
-                .iter()
-                .map(|duty| (duty.validator, duty.round))
-                .collect(),
+            validators,
             duty_roots: duties
                 .iter()
                 .map(|duty| (duty.validator, duty.signing_root))
@@ -429,6 +452,8 @@ impl<
             share_key,
             imported: BTreeMap::new(),
             ready_sent: HashSet::new(),
+            reshares: HashMap::new(),
+            retired: BTreeSet::new(),
         }
     }
 
@@ -458,12 +483,19 @@ impl<
                 Message::Authorized(committed) => self.authorized(committed),
                 Message::AuthorizedDuties(duties) => {
                     for duty in duties {
-                        self.validators.insert(duty.validator, duty.round);
+                        advance(&mut self.validators, duty.validator, duty.round);
                         self.duty_roots.insert((duty.validator, duty.signing_root));
                     }
                     self.release_parked();
                 }
                 Message::ValidatorRounds(rounds) => self.validator_rounds.extend(rounds),
+                Message::Generations(generations) => {
+                    for (key, round) in generations {
+                        info!(validator = %crate::eth::duty::format_validator(&key), round, "share generation activated");
+                        advance(&mut self.validators, key, round);
+                    }
+                    self.release_parked();
+                }
                 Message::Partial {
                     ceremony,
                     authorization,
@@ -477,12 +509,21 @@ impl<
                     let _ = response.send(self.install(&envelope).await);
                 }
                 Message::Health { response } => {
+                    // A reshare not activated here is not used for signing: a missing share of it
+                    // does not make this node less able to sign (its activation waits for it).
+                    let pending = |round: &u64| {
+                        self.reshares
+                            .get(round)
+                            .is_some_and(|key| self.validators.get(key) != Some(round))
+                    };
                     let _ = response.send(Health {
                         parked: self.parked.len(),
                         unavailable: self
                             .ids
                             .iter()
-                            .filter(|(_, round)| self.unavailable.contains(round))
+                            .filter(|(_, round)| {
+                                self.unavailable.contains(round) && !pending(round)
+                            })
                             .map(|(id, _)| id.clone())
                             .collect(),
                     });
@@ -496,6 +537,9 @@ impl<
         self.ids.insert(ceremony.config.id.clone(), round);
         self.participants
             .insert(round, ceremony.config.participants.clone());
+        if let Some(reshare) = ceremony.reshare() {
+            self.reshares.insert(round, reshare.validator);
+        }
         if ceremony.config.participants.position(&self.me).is_none() {
             return;
         }
@@ -510,25 +554,75 @@ impl<
                     session.log = None;
                 }
             }
+            DkgStatus::Completed if self.is_retired(&ceremony) => self.retire(&ceremony).await,
             DkgStatus::Completed => self.complete(&ceremony).await,
             DkgStatus::Failed => {
                 if self.sessions.remove(&round).is_some() {
                     warn!(ceremony = %ceremony.config.id, round, "dkg ceremony failed");
                 }
-                self.secrets
-                    .forget(round)
-                    .await
-                    .expect("failed to update secret store");
+                if ceremony.reshare().is_some() {
+                    // An aborted reshare: its share, if derived, is never used.
+                    self.shares.remove(&round);
+                    self.unavailable.remove(&round);
+                    self.secrets
+                        .erase(round)
+                        .await
+                        .expect("failed to update secret store");
+                } else {
+                    self.secrets
+                        .forget(round)
+                        .await
+                        .expect("failed to update secret store");
+                }
             }
             DkgStatus::NotStarted => {}
         }
     }
 
-    /// Join a ceremony in progress as dealer and player (again, after a restart).
+    /// Whether `ceremony` is a share generation its validator key moved away from.
+    fn is_retired(&self, ceremony: &Ceremony) -> bool {
+        let Some(key) = ceremony
+            .public_key()
+            .and_then(|key| <ValidatorKey>::try_from(key.encode().as_ref()).ok())
+        else {
+            return false;
+        };
+        self.validator_rounds.contains(&ceremony.round)
+            && self
+                .validators
+                .get(&key)
+                .is_some_and(|active| *active > ceremony.round)
+    }
+
+    /// A retired generation: drop and erase this node's share of it. It never signs again.
+    async fn retire(&mut self, ceremony: &Ceremony) {
+        let round = ceremony.round;
+        if self.retired.insert(round) {
+            info!(ceremony = %ceremony.config.id, round, "share generation retired, erasing its share");
+        }
+        self.shares.remove(&round);
+        self.unavailable.remove(&round);
+        self.sessions.remove(&round);
+        self.secrets
+            .erase(round)
+            .await
+            .expect("failed to update secret store");
+    }
+
+    /// Join a ceremony in progress as dealer and player (again, after a restart). A reshare's
+    /// dealer deals its share of the generation refreshed; without one, this node only plays.
     async fn open(&mut self, ceremony: &Ceremony) {
         let round = ceremony.round;
         let info = ceremony.info();
-        info!(ceremony = %ceremony.config.id, round, "joining dkg ceremony");
+        let reshare = ceremony.reshare().is_some();
+        info!(ceremony = %ceremony.config.id, round, reshare, "joining dkg ceremony");
+        if reshare {
+            crate::hooks::crash_point("reshare-before-dealing");
+        }
+        let previous = match ceremony.reshare() {
+            None => Some(None),
+            Some(reshare) => self.shares.get(&reshare.from).cloned().map(Some),
+        };
 
         // The player replays the dealings it acknowledged before a restart.
         let (player, acks) = match Player::resume::<Faults>(
@@ -547,29 +641,40 @@ impl<
         // The dealer's randomness comes from a fresh random seed persisted before anything is
         // sent, so a restart replays the same dealing instead of equivocating. A dealer whose log
         // is already finalized has nothing left to do.
-        let dealing = if ceremony.logs.contains_key(&self.me) {
-            None
-        } else {
-            let seed = match self.secrets.seed(round) {
-                Some(seed) => seed,
-                None => {
-                    let seed = Summary::random(&mut *self.context);
-                    self.secrets
-                        .put_seed(round, seed)
-                        .await
-                        .expect("failed to persist dealer seed");
-                    seed
+        let dealing = match previous {
+            _ if ceremony.logs.contains_key(&self.me) => None,
+            None => {
+                warn!(ceremony = %ceremony.config.id, round, "no share of the generation being refreshed: playing only");
+                None
+            }
+            Some(previous) => {
+                let seed = match self.secrets.seed(round) {
+                    Some(seed) => seed,
+                    None => {
+                        let seed = Summary::random(&mut *self.context);
+                        self.secrets
+                            .put_seed(round, seed)
+                            .await
+                            .expect("failed to persist dealer seed");
+                        seed
+                    }
+                };
+                if reshare {
+                    crate::hooks::crash_point("reshare-after-seed");
                 }
-            };
-            let rng = Transcript::resume(seed, Version::V1).noise(DEALER_NOISE);
-            let (dealer, commitment, dealings) =
-                Dealer::start::<Faults>(rng, info, self.signer.clone(), None)
-                    .expect("a participant can deal");
-            Some(Dealing {
-                dealer,
-                commitment,
-                pending: dealings.into_iter().collect(),
-            })
+                let rng = Transcript::resume(seed, Version::V1).noise(DEALER_NOISE);
+                match Dealer::start::<Faults>(rng, info, self.signer.clone(), previous) {
+                    Ok((dealer, commitment, dealings)) => Some(Dealing {
+                        dealer,
+                        commitment,
+                        pending: dealings.into_iter().collect(),
+                    }),
+                    Err(err) => {
+                        error!(ceremony = %ceremony.config.id, round, %err, "cannot deal");
+                        None
+                    }
+                }
+            }
         };
 
         let own = dealing.as_ref().map(|dealing| {
@@ -595,6 +700,9 @@ impl<
                 .await;
         }
         self.send_dealings(round);
+        if reshare {
+            crate::hooks::crash_point("reshare-after-dealings-sent");
+        }
     }
 
     fn send_dealings(&mut self, round: u64) {
@@ -649,6 +757,19 @@ impl<
                     .await
                     .expect("failed to persist dealing");
                 session.acks.insert(dealer.clone(), ack.clone());
+                if self.reshares.contains_key(&round) {
+                    let held = self.secrets.dealings(round).len();
+                    if held == 1 {
+                        crate::hooks::crash_point("reshare-after-first-dealing");
+                    }
+                    if self
+                        .participants
+                        .get(&round)
+                        .is_some_and(|participants| held == participants.len())
+                    {
+                        crate::hooks::crash_point("reshare-after-all-dealings");
+                    }
+                }
                 ack
             }
             // A retransmission (or a conflicting dealing: the first one stays).
@@ -732,6 +853,9 @@ impl<
         let round = ceremony.round;
         let session = self.sessions.remove(&round);
         if self.shares.contains_key(&round) || self.unavailable.contains(&round) {
+            if self.shares.contains_key(&round) {
+                self.acknowledge(ceremony);
+            }
             return;
         }
         let id = &ceremony.config.id;
@@ -743,6 +867,7 @@ impl<
                 Ok(()) => {
                     info!(ceremony = %id, round, %public_key, index = stored.share.index.get(), "loaded key share");
                     self.shares.insert(round, stored.share.clone());
+                    self.acknowledge(ceremony);
                 }
                 Err(err) => {
                     error!(ceremony = %id, round, %err, "stored key share is unusable");
@@ -793,6 +918,12 @@ impl<
             .expect("failed to persist key share");
         info!(ceremony = %id, round, %public_key, index, "dkg ceremony completed, key share stored");
         self.shares.insert(round, share);
+        if ceremony.reshare().is_some() {
+            // Durable and verified, then announced: never the other way round.
+            crate::hooks::crash_point("reshare-after-share-stored");
+            self.acknowledge(ceremony);
+            crate::hooks::crash_point("reshare-after-ready");
+        }
     }
 
     /// An imported key was registered (or acknowledged): load this node's stored share if there is
@@ -822,23 +953,24 @@ impl<
         }
     }
 
-    /// Submit this node's signed share acknowledgement if consensus does not have it yet (once per
-    /// process; consensus ignores a repeat).
+    /// Submit this node's signed share acknowledgement (an imported key's or a reshare's share) if
+    /// consensus does not have it yet (once per process; consensus ignores a repeat). Called only
+    /// with a share that is verified and durably stored.
     fn acknowledge(&mut self, ceremony: &Ceremony) {
-        let Some(imported) = ceremony.imported() else {
+        let Some(ready) = ceremony.ready() else {
             return;
         };
         let Some(index) = ceremony.config.participants.index(&self.me) else {
             return;
         };
-        if imported.ready.contains(&index.get()) || !self.ready_sent.insert(ceremony.round) {
+        if ready.contains(&index.get()) || !self.ready_sent.insert(ceremony.round) {
             return;
         }
         let ack = ReadyAck::sign(&self.signer, ceremony.round, ceremony.session);
         let _ = self
             .executor
             .send(executor::Message::SubmitReady { ack: Box::new(ack) });
-        info!(ceremony = %ceremony.config.id, round = ceremony.round, index = index.get(), "submitted imported share acknowledgement");
+        info!(ceremony = %ceremony.config.id, round = ceremony.round, index = index.get(), "submitted share acknowledgement");
     }
 
     /// Install this node's share of an imported key from `envelope`: open it with this node's
@@ -902,6 +1034,7 @@ impl<
 
     fn share_status(&self, id: &CeremonyId) -> ShareStatus {
         match self.ids.get(id) {
+            Some(round) if self.retired.contains(round) => ShareStatus::Retired,
             Some(round) if self.shares.contains_key(round) => ShareStatus::Stored,
             Some(round) if self.unavailable.contains(round) => ShareStatus::Unavailable,
             _ => ShareStatus::Pending,
@@ -913,8 +1046,10 @@ impl<
     /// committed in this node's state for exactly `payload_hash`:
     ///
     /// - development `(ceremony, nonce)`: its committed payload;
-    /// - duty of `validator`: the ceremony holds the validator's key (its current round), and the
-    ///   root is one of the validator's slashing records.
+    /// - duty of `validator`: the ceremony is the validator's active share generation here, and
+    ///   the root is one of the validator's slashing records. An older generation is refused for
+    ///   good; a newer one is not authorized yet (consensus may have activated it, and this node
+    ///   not applied the block yet).
     fn partial(
         &self,
         ceremony: &CeremonyId,
@@ -922,6 +1057,15 @@ impl<
         payload_hash: &PayloadHash,
     ) -> Result<PartialSignature<Variant>, Refusal> {
         let &round = self.ids.get(ceremony).ok_or(Refusal::UnknownCeremony)?;
+        if let AuthorizationRef::Duty { validator } = authorization
+            && self.validator_rounds.contains(&round)
+            && self
+                .validators
+                .get(validator)
+                .is_some_and(|active| *active > round)
+        {
+            return Err(Refusal::StaleGeneration);
+        }
         let Some(share) = self.shares.get(&round) else {
             return Err(if self.unavailable.contains(&round) {
                 Refusal::NoShare
@@ -983,6 +1127,13 @@ impl<
         let signed = result.is_ok();
         let reply = match result {
             Ok(partial) => {
+                if self
+                    .ids
+                    .get(&request.ceremony)
+                    .is_some_and(|round| self.reshares.contains_key(round))
+                {
+                    crate::hooks::crash_point("new-generation-partial");
+                }
                 crate::hooks::crash_point("before-partial-send");
                 sign_wire::Message::Partial {
                     request: request.id,
@@ -1027,9 +1178,15 @@ impl<
         self.release_parked();
     }
 
-    /// Answer the parked requests whose authorization is now committed.
+    /// Answer the parked requests whose authorization is now committed (for a duty: under the
+    /// validator's active generation here).
     fn release_parked(&mut self) {
-        let (ids, authorizations, duty_roots) = (&self.ids, &self.authorizations, &self.duty_roots);
+        let (ids, authorizations, duty_roots, validators) = (
+            &self.ids,
+            &self.authorizations,
+            &self.duty_roots,
+            &self.validators,
+        );
         let ready = self.parked.take(|request| {
             ids.get(&request.ceremony)
                 .is_some_and(|round| match request.authorization {
@@ -1038,6 +1195,7 @@ impl<
                     }
                     AuthorizationRef::Duty { validator } => {
                         duty_roots.contains(&(validator, request.payload_hash))
+                            && validators.get(&validator) == Some(round)
                     }
                 })
         });
@@ -1045,6 +1203,13 @@ impl<
             self.on_sign_request(from, request);
         }
     }
+}
+
+/// Move `key`'s active round forward to `round` (never back: rounds increase, and a key only moves
+/// to a newer generation), whatever order the messages arrive in.
+fn advance(validators: &mut HashMap<ValidatorKey, u64>, key: ValidatorKey, round: u64) {
+    let active = validators.entry(key).or_insert(round);
+    *active = (*active).max(round);
 }
 
 /// Forward DKG messages from peers to the actor.
