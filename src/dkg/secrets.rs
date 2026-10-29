@@ -12,18 +12,25 @@
 //! - the dealings this player acknowledged: needed to derive the share after a restart. Deleted
 //!   when the ceremony ends.
 //! - the final [KeyShare]: written once, never overwritten, verified against the public
-//!   polynomial before use.
+//!   polynomial before use. For an imported key, the share the node opened from its envelope and
+//!   verified against the registered commitments (`import`), stored the same way.
 //!
 //! Nothing here is encrypted at rest: protection relies on the data directory's permissions.
 //! Encryption, an HSM or a TEE would replace this module without changing the protocol code.
 
-use super::{CeremonyId, MAX_PARTICIPANTS, Variant, ceremony::Ceremony};
+use super::{
+    CeremonyId, MAX_PARTICIPANTS, Variant,
+    ceremony::{Ceremony, Origin},
+};
 use bytes::{Buf, BufMut};
 use commonware_codec::{EncodeSize, Error as CodecError, Read, ReadExt as _, Write, varint::UInt};
 use commonware_cryptography::{
     bls12381::{
         dkg::feldman_desmedt::{DealerPrivMsg, DealerPubMsg, Output},
-        primitives::{group::Share, sharing::ModeVersion},
+        primitives::{
+            group::Share,
+            sharing::{ModeVersion, Sharing},
+        },
     },
     ed25519::PublicKey,
     sha256::Digest,
@@ -42,6 +49,10 @@ const SEED_PREFIX: u8 = 0;
 const DEALINGS_PREFIX: u8 = 1;
 const SHARE_PREFIX: u8 = 2;
 
+/// Value tags. A DKG share keeps the tag and layout it always had.
+const DKG_SHARE_TAG: u8 = 2;
+const IMPORTED_SHARE_TAG: u8 = 3;
+
 /// A dealing acknowledged by this player: `(dealer, commitment, private share)`.
 pub type Dealing = (PublicKey, DealerPubMsg<Variant>, DealerPrivMsg);
 
@@ -55,9 +66,27 @@ pub struct KeyShare {
     pub threshold: u32,
     pub participants: Set<PublicKey>,
     /// Public polynomial (group key and every participant's public share).
-    pub output: Output<Variant, PublicKey>,
+    pub public: SharePublic,
     /// Private share. Its `Debug` output is redacted.
     pub share: Share,
+}
+
+/// The public data a share is checked against.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SharePublic {
+    /// The DKG's output.
+    Dkg(Output<Variant, PublicKey>),
+    /// The registered commitments of an imported key (`session` is the manifest digest).
+    Imported(Sharing<Variant>),
+}
+
+impl SharePublic {
+    pub fn sharing(&self) -> &Sharing<Variant> {
+        match self {
+            Self::Dkg(output) => output.public(),
+            Self::Imported(sharing) => sharing,
+        }
+    }
 }
 
 /// A stored share does not match the agreed ceremony.
@@ -72,8 +101,14 @@ pub enum Inconsistent {
 }
 
 impl KeyShare {
-    /// `ceremony` must be completed.
+    /// `ceremony` must be completed (a DKG ceremony with its output, or an imported key).
     pub fn new(ceremony: &Ceremony, share: Share) -> Self {
+        let public = match &ceremony.origin {
+            Origin::Dkg => {
+                SharePublic::Dkg(ceremony.output.clone().expect("ceremony is completed"))
+            }
+            Origin::Imported(imported) => SharePublic::Imported(imported.sharing.clone()),
+        };
         Self {
             ceremony: ceremony.config.id.clone(),
             round: ceremony.round,
@@ -81,21 +116,28 @@ impl KeyShare {
             version: ceremony.config.version,
             threshold: ceremony.config.threshold,
             participants: ceremony.config.participants.clone(),
-            output: ceremony.output.clone().expect("ceremony is completed"),
+            public,
             share,
         }
     }
 
-    /// Check that this is `me`'s share of the agreed result of `ceremony`.
+    /// Check that this is `me`'s share of the agreed result of `ceremony`, of the same origin.
     pub fn verify(&self, me: &PublicKey, ceremony: &Ceremony) -> Result<(), Inconsistent> {
-        let agreed = self.ceremony == ceremony.config.id
+        let public = match (&self.public, &ceremony.origin) {
+            (SharePublic::Dkg(output), Origin::Dkg) => Some(output) == ceremony.output.as_ref(),
+            (SharePublic::Imported(sharing), Origin::Imported(imported)) => {
+                *sharing == imported.sharing
+            }
+            _ => false,
+        };
+        let agreed = public
+            && self.ceremony == ceremony.config.id
             && self.round == ceremony.round
             && self.session == ceremony.session
             && self.version == ceremony.config.version
             && self.threshold == ceremony.config.threshold
             && self.participants == ceremony.config.participants
-            && Some(&self.output) == ceremony.output.as_ref()
-            && self.output.public().required() == self.threshold;
+            && self.public.sharing().required() == self.threshold;
         if !agreed {
             return Err(Inconsistent::Ceremony);
         }
@@ -103,8 +145,8 @@ impl KeyShare {
             return Err(Inconsistent::Index);
         }
         let expected = self
-            .output
-            .public()
+            .public
+            .sharing()
             .partial_public(self.share.index)
             .map_err(|_| Inconsistent::Share)?;
         if self.share.public::<Variant>() != expected {
@@ -122,23 +164,43 @@ impl Write for KeyShare {
         self.version.write(buf);
         UInt(self.threshold).write(buf);
         self.participants.write(buf);
-        self.output.write(buf);
+        match &self.public {
+            SharePublic::Dkg(output) => output.write(buf),
+            SharePublic::Imported(sharing) => sharing.write(buf),
+        }
         self.share.write(buf);
     }
 }
 
-impl Read for KeyShare {
-    type Cfg = ();
-
-    fn read_cfg(buf: &mut impl Buf, _: &()) -> Result<Self, CodecError> {
+impl KeyShare {
+    /// Read a share whose public data is a DKG output (`imported: false`) or an imported key's
+    /// sharing; the layout is otherwise the same.
+    fn read_as(buf: &mut impl Buf, imported: bool) -> Result<Self, CodecError> {
+        let ceremony = CeremonyId::read(buf)?;
+        let round = UInt::read(buf)?.into();
+        let session = Digest::read(buf)?;
+        let version = u8::read(buf)?;
+        let threshold = UInt::read(buf)?.into();
+        let participants = Set::read_cfg(buf, &((1..=MAX_PARTICIPANTS.get() as usize).into(), ()))?;
+        let public = if imported {
+            SharePublic::Imported(Sharing::read_cfg(
+                buf,
+                &(MAX_PARTICIPANTS, ModeVersion::v0()),
+            )?)
+        } else {
+            SharePublic::Dkg(Output::read_cfg(
+                buf,
+                &(MAX_PARTICIPANTS, ModeVersion::v0()),
+            )?)
+        };
         Ok(Self {
-            ceremony: CeremonyId::read(buf)?,
-            round: UInt::read(buf)?.into(),
-            session: Digest::read(buf)?,
-            version: u8::read(buf)?,
-            threshold: UInt::read(buf)?.into(),
-            participants: Set::read_cfg(buf, &((1..=MAX_PARTICIPANTS.get() as usize).into(), ()))?,
-            output: Output::read_cfg(buf, &(MAX_PARTICIPANTS, ModeVersion::v0()))?,
+            ceremony,
+            round,
+            session,
+            version,
+            threshold,
+            participants,
+            public,
             share: Share::read(buf)?,
         })
     }
@@ -152,7 +214,10 @@ impl EncodeSize for KeyShare {
             + self.version.encode_size()
             + UInt(self.threshold).encode_size()
             + self.participants.encode_size()
-            + self.output.encode_size()
+            + match &self.public {
+                SharePublic::Dkg(output) => output.encode_size(),
+                SharePublic::Imported(sharing) => sharing.encode_size(),
+            }
             + self.share.encode_size()
     }
 }
@@ -182,7 +247,10 @@ impl Write for Value {
                 }
             }
             Self::Share(share) => {
-                2u8.write(buf);
+                match share.public {
+                    SharePublic::Dkg(_) => DKG_SHARE_TAG.write(buf),
+                    SharePublic::Imported(_) => IMPORTED_SHARE_TAG.write(buf),
+                }
                 share.write(buf);
             }
         }
@@ -211,7 +279,8 @@ impl Read for Value {
                     .collect::<Result<_, _>>()
                     .map(Self::Dealings)
             }
-            2 => Ok(Self::Share(Box::new(KeyShare::read(buf)?))),
+            DKG_SHARE_TAG => Ok(Self::Share(Box::new(KeyShare::read_as(buf, false)?))),
+            IMPORTED_SHARE_TAG => Ok(Self::Share(Box::new(KeyShare::read_as(buf, true)?))),
             tag => Err(CodecError::InvalidEnum(tag)),
         }
     }

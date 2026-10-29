@@ -208,6 +208,17 @@ impl TestNetwork {
         args: Vec<String>,
         env: impl Fn(usize) -> Vec<(String, String)>,
     ) -> Self {
+        Self::start_with_node_args(n, args, |_| Vec::new(), env)
+    }
+
+    /// Like [TestNetwork::start_with_args], plus arguments of node `i` alone (`node_args(i)`, kept
+    /// for its restarts).
+    pub fn start_with_node_args(
+        n: usize,
+        args: Vec<String>,
+        node_args: impl Fn(usize) -> Vec<String>,
+        env: impl Fn(usize) -> Vec<(String, String)>,
+    ) -> Self {
         let slot = Slot::acquire();
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -234,7 +245,7 @@ impl TestNetwork {
                         child: None,
                         stdin: None,
                         env: env(i),
-                        args: Vec::new(),
+                        args: node_args(i),
                     })
                     .collect(),
             ),

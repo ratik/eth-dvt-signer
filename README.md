@@ -10,6 +10,11 @@ A 4-node threshold signer built on [commonware](https://github.com/commonwarexyz
   signing root, applies slashing protection and authorizes it through consensus. Then 3 of the 4
   nodes sign it ([docs/ethereum-signing.md](docs/ethereum-signing.md),
   [docs/slashing-protection.md](docs/slashing-protection.md));
+- migration of an existing validator without changing its public key: an offline tool
+  (`mpc-keytool`) splits its EIP-2335 keystore into 3-of-4 shares, one encrypted per node, and its
+  previous signer's EIP-3076 slashing history is imported before it can sign
+  ([docs/key-import.md](docs/key-import.md)). This is a trusted-dealer split, not a DKG: the key
+  existed in full before it;
 - for development builds only (`dev-api` feature): `POST /sign` authorizes
   `(ceremony_id, nonce) -> payload_hash` once, through consensus, and returns the threshold
   signature of any 32-byte payload (see [Signing](#signing)).
@@ -506,6 +511,16 @@ Ethereum signing ([docs/ethereum-signing.md](docs/ethereum-signing.md#compatibil
   against the full scan, `SLASHING_SEEDS=<n>`), `storage::tests::validator` (persistence,
   activation, purposes, earlier data, a torn duty block, startup refusal of altered history).
 
+Key import ([docs/key-import.md](docs/key-import.md)):
+- `tests/key_import.rs`: the EIP-2335 test vectors, wrong passwords and malformed keystores, any 3
+  shares signing exactly as the original key (compared with blst) and 2 not, manifests,
+  envelopes bound to their node, manifest and ceremony, and the `mpc-keytool` CLI;
+- `eth::interchange::tests`: the official EIP-3076 interchange tests (`tests/vectors/eip3076`),
+  malformed and self-slashable interchanges, floors, export;
+- `storage::tests::validator::imported`: the lifecycle in the state machine, and altered import
+  state refused at startup;
+- `tests/e2e/import.rs` (E2E-IMP-1, E2E-IMP-2): the whole import on real processes.
+
 `tests/signing.rs`: signing through the coordinator, verified with blst (combinations of signers,
 another root, another ceremony's key); concurrent identical and conflicting requests; a
 coordinator dying after the authorization or holding partials; one node offline and a lagging
@@ -598,14 +613,17 @@ Signing an existing authorization costs one p2p round trip and four pairings.
 - Ethereum: mainnet preset only. No validator registrations, Phase 0 and Altair blocks or Gloas
   types. Deposits only on a node started with `--enable-deposit-signing`, one deposit message per
   key. The client's fork versions are trusted for the domain (the chain is the explicit
-  activation). No EIP-3076 interchange import or export. No validator client has been run against
+  activation). EIP-3076 import is accepted for imported keys only. No validator client has been run against
   the API ([docs/ethereum-signing.md](docs/ethereum-signing.md#lighthouse-v832)).
 - `POST /sign` (`dev-api` builds only) is generic authorization, not slashing protection: the
   nonce is caller-chosen, and the caller computes the signing root.
 - Authorizations and slashing history are kept forever, and every new one rewrites the state
   partition (O(n) per block). Pruning slashing history needs low watermarks (EIP-3076).
 - DKG: the committee is the 4 configured nodes and the threshold is fixed (`n - f`). There is no
-  resharing, no committee change and no key import.
+  resharing and no committee change.
+- Key import is a trusted-dealer split: whoever keeps the original keystore can still sign outside
+  the network, and that the previous signer is stopped is the operator's statement, not a check
+  ([docs/key-import.md](docs/key-import.md#assumptions)).
   - Liveness: every participant must be online, and a single non-cooperating player can make a
     ceremony fail; safety is not affected. Like every Feldman-Desmedt DKG, the key is not
     guaranteed to be uniformly random (bias of a few bits), and timing assumes synchrony.

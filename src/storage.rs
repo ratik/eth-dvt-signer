@@ -12,12 +12,16 @@
 //! (`slashing`) are records of their own in the same partition, committed in the same `sync` as
 //! the rest of their block: an authorized validator signature and its slashing record become
 //! durable together or not at all. A state without such records (written before they existed)
-//! reads as one without validator keys; an older binary refuses a state that has them.
+//! reads as one without validator keys; an older binary refuses a state that has them. The same
+//! holds for imported keys: their ceremonies and import state are entries of their own, and a
+//! state without them reads as before.
 
 use crate::{
     dkg::{
         CeremonyId, DkgStatus,
-        ceremony::{Ceremonies, Ceremony, Ignored, StartOutcome},
+        ceremony::{
+            Ceremonies, Ceremony, Ignored, ImportOutcome, Origin, ReadyIgnored, StartOutcome,
+        },
     },
     eth::{
         duty::{DutyKind, ValidatorKey},
@@ -25,7 +29,7 @@ use crate::{
     },
     slashing::{
         Activation, ActivationOutcome, Attested, ChainIdentity, Decision, DutyAuthorization,
-        Protection, Record, Signed, Validator,
+        Floors, HistoryOutcome, ImportedValidator, Protection, Record, Signed, Validator,
     },
     state::{self, Authorization, State},
     types::{Command, Outcome, PayloadHash, Transaction},
@@ -78,6 +82,8 @@ const VALIDATOR_PREFIX: u8 = 4;
 const PROPOSAL_PREFIX: u8 = 5;
 /// `(validator, target epoch)`: signed attestations.
 const ATTESTATION_PREFIX: u8 = 6;
+/// `(validator, 0)`: the import state of an imported key.
+const IMPORTED_PREFIX: u8 = 7;
 /// `16 + duty kind`, `(validator, period)`: authorized roots of non-slashable duties.
 const BOUNDED_PREFIX: u8 = 16;
 
@@ -101,6 +107,81 @@ enum Value {
     Signed(Signed),
     Attested(Attested),
     Roots(Vec<Signed>),
+    /// The ceremony of an imported key (stored under its round, like a DKG ceremony).
+    ImportedCeremony(Box<Ceremony>),
+    ImportedValidator(ImportedValidator),
+}
+
+fn write_optional_u64(value: Option<u64>, buf: &mut impl BufMut) {
+    match value {
+        Some(value) => {
+            1u8.write(buf);
+            value.write(buf);
+        }
+        None => 0u8.write(buf),
+    }
+}
+
+fn read_optional_u64(buf: &mut impl Buf) -> Result<Option<u64>, CodecError> {
+    match u8::read(buf)? {
+        0 => Ok(None),
+        1 => Ok(Some(u64::read(buf)?)),
+        tag => Err(CodecError::InvalidEnum(tag)),
+    }
+}
+
+fn write_imported(imported: &ImportedValidator, buf: &mut impl BufMut) {
+    imported.round.write(buf);
+    write_optional_root(
+        imported
+            .chain
+            .as_ref()
+            .map(|chain| &chain.genesis_validators_root),
+        buf,
+    );
+    write_optional_u64(imported.floors.block, buf);
+    match imported.floors.attestation {
+        Some((source, target)) => {
+            1u8.write(buf);
+            source.write(buf);
+            target.write(buf);
+        }
+        None => 0u8.write(buf),
+    }
+    imported.imports.write(buf);
+    write_optional_u64(imported.acknowledged, buf);
+}
+
+fn read_imported(buf: &mut impl Buf) -> Result<ImportedValidator, CodecError> {
+    Ok(ImportedValidator {
+        round: u64::read(buf)?,
+        chain: read_optional_root(buf)?.map(|genesis_validators_root| ChainIdentity {
+            genesis_validators_root,
+        }),
+        floors: Floors {
+            block: read_optional_u64(buf)?,
+            attestation: match u8::read(buf)? {
+                0 => None,
+                1 => Some((u64::read(buf)?, u64::read(buf)?)),
+                tag => return Err(CodecError::InvalidEnum(tag)),
+            },
+        },
+        imports: u64::read(buf)?,
+        acknowledged: read_optional_u64(buf)?,
+    })
+}
+
+fn imported_size(imported: &ImportedValidator) -> usize {
+    u64::SIZE
+        + 1
+        + imported.chain.map_or(0, |_| 32)
+        + 1
+        + imported.floors.block.map_or(0, |_| u64::SIZE)
+        + 1
+        + imported.floors.attestation.map_or(0, |_| 2 * u64::SIZE)
+        + u64::SIZE
+        + 1
+        + imported.acknowledged.map_or(0, |_| u64::SIZE)
 }
 
 fn write_signed(signed: &Signed, buf: &mut impl BufMut) {
@@ -212,6 +293,14 @@ impl Write for Value {
                     write_signed(signed, buf);
                 }
             }
+            Self::ImportedCeremony(ceremony) => {
+                8u8.write(buf);
+                ceremony.write_imported(buf);
+            }
+            Self::ImportedValidator(imported) => {
+                9u8.write(buf);
+                write_imported(imported, buf);
+            }
         }
     }
 }
@@ -265,6 +354,10 @@ impl Read for Value {
                     .collect::<Result<_, _>>()
                     .map(Self::Roots)
             }
+            8 => Ok(Self::ImportedCeremony(Box::new(Ceremony::read_imported(
+                buf,
+            )?))),
+            9 => Ok(Self::ImportedValidator(read_imported(buf)?)),
             tag => Err(CodecError::InvalidEnum(tag)),
         }
     }
@@ -289,6 +382,8 @@ impl EncodeSize for Value {
             Self::Roots(roots) => {
                 UInt(roots.len() as u32).encode_size() + roots.len() * (32 + u64::SIZE)
             }
+            Self::ImportedCeremony(ceremony) => ceremony.imported_encode_size(),
+            Self::ImportedValidator(imported) => imported_size(imported),
         }
     }
 }
@@ -350,8 +445,14 @@ pub enum Effect {
     Log(Result<PublicKey, Ignored>),
     /// The decision on a validator duty, and the signing root the state machine computed.
     Duty(Decision, Root),
-    /// The outcome of a validator activation.
+    /// The outcome of a validator activation (DKG or imported key).
     Activate(ActivationOutcome),
+    /// The outcome of an imported key's registration.
+    Register(ImportOutcome),
+    /// The share index acknowledged as ready, or why the acknowledgement was ignored.
+    Ready(Result<u32, ReadyIgnored>),
+    /// The outcome of a slashing-protection history import.
+    History(HistoryOutcome),
 }
 
 /// Result of applying a block, once it is durably committed.
@@ -420,6 +521,10 @@ fn persist<E: Context>(
             key(BOUNDED_PREFIX + kind as u8, id, period),
             Value::Roots(protection.bounded(id, kind, period).to_vec()),
         ),
+        Record::Imported(id) => metadata.put(
+            key(IMPORTED_PREFIX, id, 0),
+            Value::ImportedValidator(*protection.imported(id).expect("recorded import")),
+        ),
     };
 }
 
@@ -463,8 +568,12 @@ impl<E: Context> Store<E> {
                 }
                 ((META_PREFIX, 0, 0), Some(Value::Number(h))) => height = *h,
                 ((META_PREFIX, 1, 0), Some(Value::Number(_))) => {}
-                ((CEREMONY_PREFIX, _, 0), Some(Value::Ceremony(ceremony))) => {
+                ((CEREMONY_PREFIX, _, 0), Some(Value::Ceremony(ceremony)))
+                | ((CEREMONY_PREFIX, _, 0), Some(Value::ImportedCeremony(ceremony))) => {
                     ceremonies.restore(ceremony.as_ref().clone());
+                }
+                ((IMPORTED_PREFIX, id, 0), Some(Value::ImportedValidator(imported))) => {
+                    protection.restore_imported(id, *imported);
                 }
                 ((VALIDATOR_ROUND_PREFIX, round, 0), Some(Value::Number(1))) => {
                     protection.designate(round);
@@ -535,6 +644,36 @@ impl<E: Context> Store<E> {
                     "validator {id} does not match the key of ceremony round {}",
                     validator.round
                 ));
+            }
+            // An imported key's validator has its import state, and only an imported key has one.
+            let imported_ceremony = by_round
+                .get(&validator.round)
+                .is_some_and(|ceremony| ceremony.imported().is_some());
+            if imported_ceremony != protection.imported(id).is_some() {
+                return Err(format!(
+                    "validator {id} and ceremony round {} disagree on whether the key was imported",
+                    validator.round
+                ));
+            }
+        }
+        for ceremony in ceremonies.iter() {
+            if let Some(imported) = ceremony.imported() {
+                if !protection.is_validator_round(ceremony.round) {
+                    return Err(format!(
+                        "imported key round {} is not a validator key",
+                        ceremony.round
+                    ));
+                }
+                if imported
+                    .ready
+                    .iter()
+                    .any(|index| *index as usize >= ceremony.config.participants.len())
+                {
+                    return Err(format!(
+                        "imported key round {} has acknowledgements of unknown shares",
+                        ceremony.round
+                    ));
+                }
             }
         }
         Ok(())
@@ -694,17 +833,71 @@ impl<E: Context> Store<E> {
                 Command::DealerLog { round, log } => {
                     Effect::Log(self.ceremonies.record(*round, log.as_ref().clone()))
                 }
+                Command::RegisterImportedKey(manifest) => {
+                    // An id and a key are registered once, whatever ceremony holds them (every
+                    // validator key is a ceremony's key): its history is never reset.
+                    let outcome = self.ceremonies.import(manifest.as_ref().clone(), height);
+                    if let ImportOutcome::Registered(round) = outcome {
+                        let (_, records) = self
+                            .protection
+                            .register_imported(round, manifest.validator)
+                            .expect("a new key");
+                        metadata.put(key(VALIDATOR_ROUND_PREFIX, round, 0), Value::Number(1));
+                        designated.push(round);
+                        for record in records {
+                            persist(&mut metadata, &self.protection, record);
+                        }
+                    }
+                    Effect::Register(outcome)
+                }
+                Command::ImportedShareReady(ack) => Effect::Ready(self.ceremonies.ready(ack)),
+                Command::ImportSlashingProtection(import) => {
+                    let (outcome, records) = self.protection.import_history(import);
+                    for record in records {
+                        persist(&mut metadata, &self.protection, record);
+                    }
+                    Effect::History(outcome)
+                }
+                Command::ActivateImportedValidator {
+                    validator,
+                    chain,
+                    acknowledgment,
+                } => {
+                    let shares = self
+                        .protection
+                        .validator_of(validator)
+                        .and_then(|(_, validator)| self.ceremonies.by_round(validator.round))
+                        .and_then(|ceremony| {
+                            let imported = ceremony.imported()?;
+                            Some((imported.ready.len() as u32, ceremony.config.threshold))
+                        })
+                        .unwrap_or((0, u32::MAX));
+                    let (outcome, records) = self.protection.activate_imported(
+                        validator,
+                        *chain,
+                        *acknowledgment,
+                        shares,
+                        height,
+                    );
+                    for record in records {
+                        persist(&mut metadata, &self.protection, record);
+                    }
+                    Effect::Activate(outcome)
+                }
             })
             .collect();
         self.ceremonies.advance(height, rng);
         let changed = self.ceremonies.take_changed();
         for ceremony in &changed {
-            metadata.put(
-                key(CEREMONY_PREFIX, ceremony.round, 0),
-                Value::Ceremony(Box::new(ceremony.clone())),
-            );
-            // A completed validator ceremony: its key now signs validator duties.
+            let value = match ceremony.origin {
+                Origin::Dkg => Value::Ceremony(Box::new(ceremony.clone())),
+                Origin::Imported(_) => Value::ImportedCeremony(Box::new(ceremony.clone())),
+            };
+            metadata.put(key(CEREMONY_PREFIX, ceremony.round, 0), value);
+            // A completed validator DKG ceremony: its key now signs validator duties. (An imported
+            // key is registered with its registration, above.)
             if ceremony.status == DkgStatus::Completed
+                && ceremony.origin == Origin::Dkg
                 && self.protection.is_validator_round(ceremony.round)
                 && let Some(key) = group_key(ceremony)
             {

@@ -24,6 +24,18 @@
 //! consensus, sets the chain it signs for ([ChainIdentity], the genesis validators root). The
 //! activation is immutable; duties for another chain are refused.
 //!
+//! # Imported keys
+//!
+//! A key imported from another signer (`import`) brings that signer's history as an EIP-3076
+//! interchange. It enters the state reduced to EIP-3076's minimal form ([HistorySummary]: the
+//! latest block and the latest attestation of each validator), and imports merge by maximum
+//! ([Floors]): a block at or below the block floor, an attestation with a source below the source
+//! floor or a target at or below the target floor, is refused. The network's own records keep the
+//! complete history above them. An older or repeated import never lowers a floor, and a key is
+//! registered once, so no lifecycle operation can erase history. An imported key is activated only
+//! once its history is imported for the activation's chain, enough keyholders hold verified shares,
+//! and the operator acknowledged that the previous signer is stopped ([Protection::activate_imported]).
+//!
 //! # Attestation checks in logarithmic time
 //!
 //! The authorized attestations of a validator are pairwise neither double votes nor surround
@@ -100,11 +112,192 @@ pub struct Attested {
     pub height: u64,
 }
 
+/// The lowest values an imported history leaves signable: what is at or below them may have been
+/// signed by the previous signer (EIP-3076's minimal conditions, merged by maximum).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Floors {
+    /// Blocks at or below this slot are refused.
+    pub block: Option<u64>,
+    /// Attestations with a source below the first, or a target at or below the second, are refused.
+    pub attestation: Option<(u64, u64)>,
+}
+
+impl Floors {
+    /// The floors of both (by maximum: never lower than either).
+    pub fn merge(self, summary: &HistorySummary) -> Self {
+        let max = |a: Option<u64>, b: Option<u64>| a.max(b);
+        Self {
+            block: max(self.block, summary.block.map(|block| block.slot)),
+            attestation: match (self.attestation, summary.attestation) {
+                (Some((s1, t1)), Some(att)) => Some((s1.max(att.source), t1.max(att.target))),
+                (None, Some(att)) => Some((att.source, att.target)),
+                (floors, None) => floors,
+            },
+        }
+    }
+}
+
+/// The latest signed block of an imported history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImportedBlock {
+    pub slot: u64,
+    /// Absent in the interchange: any block at this slot is assumed slashable.
+    pub signing_root: Option<Root>,
+}
+
+/// The latest signed attestation of an imported history (the greatest target; in a history with
+/// no double or surround vote, also the greatest source).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImportedAttestation {
+    pub source: u64,
+    pub target: u64,
+    pub signing_root: Option<Root>,
+}
+
+/// One validator's imported history in EIP-3076's minimal form.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HistorySummary {
+    pub block: Option<ImportedBlock>,
+    pub attestation: Option<ImportedAttestation>,
+}
+
+/// An EIP-3076 import, as decided by consensus: the chain of the interchange, its digest, and one
+/// summary per validator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryImport {
+    pub chain: ChainIdentity,
+    /// SHA-256 of the canonical interchange (`eth::interchange`), for the record.
+    pub digest: Root,
+    pub validators: Vec<(ValidatorKey, HistorySummary)>,
+}
+
+/// An imported validator key and its lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImportedValidator {
+    /// Round of the import (its ceremony).
+    pub round: u64,
+    /// The chain of its imported history (set by the first import).
+    pub chain: Option<ChainIdentity>,
+    pub floors: Floors,
+    /// Imports that changed something.
+    pub imports: u64,
+    /// Height of the activation that carried the operator's acknowledgement.
+    pub acknowledged: Option<u64>,
+}
+
+/// The operator's statements required to activate an imported key. The software cannot check
+/// them: they record, in the chain, that the operator made them (docs/key-import.md).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Acknowledgment {
+    /// The previous signer of this key is stopped.
+    pub previous_signer_stopped: bool,
+    /// No other signer controls this key.
+    pub no_other_active_signer: bool,
+    /// The imported history was exported after the previous signer stopped.
+    pub history_exported_after_stop: bool,
+    /// The previous signer cannot restart on its own.
+    pub automatic_restart_disabled: bool,
+}
+
+impl Acknowledgment {
+    pub const fn complete(&self) -> bool {
+        self.previous_signer_stopped
+            && self.no_other_active_signer
+            && self.history_exported_after_stop
+            && self.automatic_restart_disabled
+    }
+
+    pub const fn to_bits(self) -> u8 {
+        self.previous_signer_stopped as u8
+            | (self.no_other_active_signer as u8) << 1
+            | (self.history_exported_after_stop as u8) << 2
+            | (self.automatic_restart_disabled as u8) << 3
+    }
+
+    pub const fn from_bits(bits: u8) -> Option<Self> {
+        if bits & !0b1111 != 0 {
+            return None;
+        }
+        Some(Self {
+            previous_signer_stopped: bits & 1 != 0,
+            no_other_active_signer: bits & 2 != 0,
+            history_exported_after_stop: bits & 4 != 0,
+            automatic_restart_disabled: bits & 8 != 0,
+        })
+    }
+}
+
+/// Why a history import is refused (the whole import: nothing is applied).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, thiserror::Error)]
+#[serde(rename_all = "snake_case", tag = "reason")]
+pub enum HistoryRefusal {
+    #[error("the import names no validator, or one twice")]
+    Validators,
+    #[error(
+        "unknown validator public key {}",
+        crate::eth::duty::format_validator(key)
+    )]
+    UnknownValidator {
+        #[serde(with = "hex_bytes")]
+        key: ValidatorKey,
+    },
+    #[error(
+        "{} is not an imported key: only imported keys take another signer's history",
+        crate::eth::duty::format_validator(key)
+    )]
+    NotImported {
+        #[serde(with = "hex_bytes")]
+        key: ValidatorKey,
+    },
+    #[error(
+        "{} signs for another chain (genesis validators root)",
+        crate::eth::duty::format_validator(key)
+    )]
+    OtherChain {
+        #[serde(with = "hex_bytes")]
+        key: ValidatorKey,
+        #[serde(with = "hex_bytes")]
+        genesis_validators_root: Root,
+    },
+    #[error(
+        "an attestation of {} has its source after its target",
+        crate::eth::duty::format_validator(key)
+    )]
+    SourceAfterTarget {
+        #[serde(with = "hex_bytes")]
+        key: ValidatorKey,
+    },
+    /// The history is slashable with respect to what this network signed for the key: two signers
+    /// used it. Nothing is imported; the operator must investigate.
+    #[error(
+        "the imported history of {} is slashable with respect to this signer's records: {refusal}",
+        crate::eth::duty::format_validator(key)
+    )]
+    Conflict {
+        #[serde(with = "hex_bytes")]
+        key: ValidatorKey,
+        refusal: Refusal,
+    },
+}
+
+/// Result of [Protection::import_history].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryOutcome {
+    /// Applied: floors or chain changed for at least one validator.
+    Imported,
+    /// Applied, nothing changed (identical or older history).
+    Unchanged,
+    Refused(HistoryRefusal),
+}
+
 /// What a decision changed, for the store to persist.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Record {
     /// The validator `id` (its activation or record count).
     Validator(u64),
+    /// The import state of validator `id`.
+    Imported(u64),
     /// Proposal of validator `id` at `slot`.
     Proposal { id: u64, slot: u64 },
     /// Attestation of validator `id` with target `target`.
@@ -159,6 +352,16 @@ pub enum Refusal {
         period: u64,
         max: usize,
     },
+    /// The imported history ends at `floor`: a block at or below it may have been signed by the
+    /// previous signer.
+    #[error("slot {slot} is at or below the imported history's latest block (slot {floor})")]
+    BlockAtOrBelowImported { slot: u64, floor: u64 },
+    #[error("source epoch {source_epoch} is below the imported history's latest source ({floor})")]
+    SourceBelowImported { source_epoch: u64, floor: u64 },
+    #[error(
+        "target epoch {target_epoch} is at or below the imported history's latest target ({floor})"
+    )]
+    TargetAtOrBelowImported { target_epoch: u64, floor: u64 },
 }
 
 impl Refusal {
@@ -170,6 +373,9 @@ impl Refusal {
                 | Self::DoubleVote { .. }
                 | Self::SurroundsSigned { .. }
                 | Self::SurroundedBySigned { .. }
+                | Self::BlockAtOrBelowImported { .. }
+                | Self::SourceBelowImported { .. }
+                | Self::TargetAtOrBelowImported { .. }
         )
     }
 }
@@ -192,6 +398,25 @@ pub enum ActivationRefusal {
         #[serde(with = "hex_bytes")]
         genesis_validators_root: Root,
     },
+    /// An imported key is activated only with the operator's acknowledgement.
+    #[error(
+        "an imported key needs the imported-key activation (with the operator's acknowledgement)"
+    )]
+    ImportedKey,
+    /// The imported-key activation for a key that was not imported.
+    #[error("not an imported key")]
+    NotImported,
+    #[error("the previous signer's slashing-protection history is not imported")]
+    NoImportedHistory,
+    #[error("the imported history is for another chain")]
+    HistoryForAnotherChain {
+        #[serde(with = "hex_bytes")]
+        genesis_validators_root: Root,
+    },
+    #[error("{ready} keyholders acknowledged a verified share; {required} are required")]
+    SharesNotReady { ready: u32, required: u32 },
+    #[error("the operator acknowledgement is incomplete")]
+    NotAcknowledged,
 }
 
 /// Result of [Protection::activate].
@@ -229,6 +454,17 @@ pub struct Protection {
     proposals: BTreeMap<(u64, u64), Signed>,
     attestations: BTreeMap<(u64, u64), Attested>,
     bounded: BTreeMap<(u64, DutyKind, u64), Vec<Signed>>,
+    /// Imported keys, by validator id.
+    imported: BTreeMap<u64, ImportedValidator>,
+}
+
+/// One validator's history as an EIP-3076 interchange holds it ([Protection::export]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Exported {
+    /// `(slot, signing root)`, by slot.
+    pub blocks: Vec<(u64, Option<Root>)>,
+    /// `(source, target, signing root)`, by target.
+    pub attestations: Vec<(u64, u64, Option<Root>)>,
 }
 
 impl Protection {
@@ -283,8 +519,16 @@ impl Protection {
                 Vec::new(),
             );
         };
-        let validator = self.validators.get_mut(&id).expect("indexed validator");
         let refused = |refusal| (ActivationOutcome::Refused(refusal), Vec::new());
+        if self.imported.contains_key(&id) {
+            return match self.validators[&id].activation {
+                Some(activation) if activation.chain == chain => {
+                    (ActivationOutcome::AlreadyActivated(activation), Vec::new())
+                }
+                _ => refused(ActivationRefusal::ImportedKey),
+            };
+        }
+        let validator = self.validators.get_mut(&id).expect("indexed validator");
         match (validator.activation, validator.legacy_chain) {
             (Some(activation), _) if activation.chain == chain => {
                 (ActivationOutcome::AlreadyActivated(activation), Vec::new())
@@ -302,6 +546,285 @@ impl Protection {
                 validator.legacy_chain = None;
                 (ActivationOutcome::Activated, vec![Record::Validator(id)])
             }
+        }
+    }
+
+    /// The imported key of ceremony `round` (registered by consensus) now signs for `key`, not yet
+    /// activated. A key is registered once: an existing key is refused, so its history is never
+    /// reset by registering it again.
+    pub fn register_imported(
+        &mut self,
+        round: u64,
+        key: ValidatorKey,
+    ) -> Option<(u64, Vec<Record>)> {
+        if self.by_key.contains_key(&key) {
+            return None;
+        }
+        self.designate(round);
+        let id = self.register(round, key);
+        self.imported.insert(
+            id,
+            ImportedValidator {
+                round,
+                chain: None,
+                floors: Floors::default(),
+                imports: 0,
+                acknowledged: None,
+            },
+        );
+        Some((id, vec![Record::Validator(id), Record::Imported(id)]))
+    }
+
+    pub fn imported(&self, id: u64) -> Option<&ImportedValidator> {
+        self.imported.get(&id)
+    }
+
+    /// Apply an EIP-3076 import, whole or not at all. Every named validator must be an imported
+    /// key, of the import's chain, and each summary must not be slashable against the records
+    /// this network signed for it. Floors only rise.
+    pub fn import_history(&mut self, import: &HistoryImport) -> (HistoryOutcome, Vec<Record>) {
+        let changes = match self.prepare_import(import) {
+            Ok(changes) => changes,
+            Err(refusal) => return (HistoryOutcome::Refused(refusal), Vec::new()),
+        };
+        if changes.is_empty() {
+            return (HistoryOutcome::Unchanged, Vec::new());
+        }
+        let records = changes
+            .into_iter()
+            .map(|(id, floors)| {
+                let imported = self.imported.get_mut(&id).expect("checked");
+                imported.chain = Some(import.chain);
+                imported.floors = floors;
+                imported.imports += 1;
+                Record::Imported(id)
+            })
+            .collect();
+        (HistoryOutcome::Imported, records)
+    }
+
+    /// What [Self::import_history] checks, without changing anything: the validators' new floors
+    /// (only those that change).
+    fn prepare_import(&self, import: &HistoryImport) -> Result<Vec<(u64, Floors)>, HistoryRefusal> {
+        let keys: BTreeSet<ValidatorKey> = import.validators.iter().map(|(key, _)| *key).collect();
+        if import.validators.is_empty() || keys.len() != import.validators.len() {
+            return Err(HistoryRefusal::Validators);
+        }
+        let mut changes = Vec::new();
+        for (key, summary) in &import.validators {
+            let (id, imported) = self.importable(key, &import.chain)?;
+            if let Some(attestation) = summary.attestation
+                && attestation.source > attestation.target
+            {
+                return Err(HistoryRefusal::SourceAfterTarget { key: *key });
+            }
+            self.check_summary(id, summary)
+                .map_err(|refusal| HistoryRefusal::Conflict { key: *key, refusal })?;
+            let floors = imported.floors.merge(summary);
+            if floors != imported.floors || imported.chain.is_none() {
+                changes.push((id, floors));
+            }
+        }
+        Ok(changes)
+    }
+
+    /// The imported validator `key`, if it may take a history for `chain`: an imported key, of
+    /// that chain (its activation's, or its earlier imports').
+    fn importable(
+        &self,
+        key: &ValidatorKey,
+        chain: &ChainIdentity,
+    ) -> Result<(u64, &ImportedValidator), HistoryRefusal> {
+        let (id, validator) = self
+            .validator_of(key)
+            .ok_or(HistoryRefusal::UnknownValidator { key: *key })?;
+        let imported = self
+            .imported
+            .get(&id)
+            .ok_or(HistoryRefusal::NotImported { key: *key })?;
+        let known = validator
+            .activation
+            .map(|activation| activation.chain)
+            .or(imported.chain);
+        if let Some(known) = known
+            && known != *chain
+        {
+            return Err(HistoryRefusal::OtherChain {
+                key: *key,
+                genesis_validators_root: known.genesis_validators_root,
+            });
+        }
+        Ok((id, imported))
+    }
+
+    /// The check of a dry run, and of the API before it submits an import: what
+    /// [Self::import_history] would decide for `import`, and every record of the full histories it
+    /// was reduced from against what this network signed (the same double and surround checks).
+    /// Nothing changes.
+    pub fn check_history(
+        &self,
+        import: &HistoryImport,
+        histories: &BTreeMap<ValidatorKey, crate::eth::interchange::History>,
+    ) -> Result<HistoryOutcome, HistoryRefusal> {
+        let changes = self.prepare_import(import)?;
+        for (key, _) in &import.validators {
+            let Some(history) = histories.get(key) else {
+                continue;
+            };
+            let (id, _) = self.importable(key, &import.chain)?;
+            let conflict = |refusal| HistoryRefusal::Conflict { key: *key, refusal };
+            for (&slot, root) in &history.blocks {
+                if let Some(signed) = self.proposals.get(&(id, slot))
+                    && Some(signed.signing_root) != *root
+                {
+                    return Err(conflict(Refusal::DoubleProposal { slot }));
+                }
+            }
+            for (&target, &(source, root)) in &history.attestations {
+                match self.attestations.get(&(id, target)) {
+                    Some(signed) if Some(signed.signing_root) == root => {}
+                    Some(_) => return Err(conflict(Refusal::DoubleVote { target })),
+                    None => self.check_surround(id, source, target).map_err(conflict)?,
+                }
+            }
+        }
+        Ok(if changes.is_empty() {
+            HistoryOutcome::Unchanged
+        } else {
+            HistoryOutcome::Imported
+        })
+    }
+
+    /// The summary's records against what this network signed for validator `id`: the same
+    /// double and surround checks as a new duty, a missing signing root matching nothing.
+    fn check_summary(&self, id: u64, summary: &HistorySummary) -> Result<(), Refusal> {
+        if let Some(block) = summary.block
+            && let Some(signed) = self.proposals.get(&(id, block.slot))
+            && Some(signed.signing_root) != block.signing_root
+        {
+            return Err(Refusal::DoubleProposal { slot: block.slot });
+        }
+        if let Some(attestation) = summary.attestation {
+            match self.attestations.get(&(id, attestation.target)) {
+                Some(signed) if Some(signed.signing_root) == attestation.signing_root => {}
+                Some(_) => {
+                    return Err(Refusal::DoubleVote {
+                        target: attestation.target,
+                    });
+                }
+                None => self.check_surround(id, attestation.source, attestation.target)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Activate the imported key `key` for `chain`, once: its history must be imported for that
+    /// chain, at least `required` keyholders must have acknowledged a verified share (`ready`),
+    /// and the operator's acknowledgement must be complete.
+    pub fn activate_imported(
+        &mut self,
+        key: &ValidatorKey,
+        chain: ChainIdentity,
+        acknowledgment: Acknowledgment,
+        (ready, required): (u32, u32),
+        height: u64,
+    ) -> (ActivationOutcome, Vec<Record>) {
+        let refused = |refusal| (ActivationOutcome::Refused(refusal), Vec::new());
+        let Some(&id) = self.by_key.get(key) else {
+            return refused(ActivationRefusal::UnknownValidator);
+        };
+        let Some(imported) = self.imported.get(&id).copied() else {
+            return refused(ActivationRefusal::NotImported);
+        };
+        match self.validators[&id].activation {
+            Some(activation) if activation.chain == chain => {
+                return (ActivationOutcome::AlreadyActivated(activation), Vec::new());
+            }
+            Some(activation) => {
+                return refused(ActivationRefusal::OtherChain {
+                    genesis_validators_root: activation.chain.genesis_validators_root,
+                });
+            }
+            None => {}
+        }
+        match imported.chain {
+            None => return refused(ActivationRefusal::NoImportedHistory),
+            Some(history) if history != chain => {
+                return refused(ActivationRefusal::HistoryForAnotherChain {
+                    genesis_validators_root: history.genesis_validators_root,
+                });
+            }
+            Some(_) => {}
+        }
+        if ready < required {
+            return refused(ActivationRefusal::SharesNotReady { ready, required });
+        }
+        if !acknowledgment.complete() {
+            return refused(ActivationRefusal::NotAcknowledged);
+        }
+        let validator = self.validators.get_mut(&id).expect("indexed validator");
+        validator.activation = Some(Activation { chain, height });
+        self.imported.get_mut(&id).expect("checked").acknowledged = Some(height);
+        (
+            ActivationOutcome::Activated,
+            vec![Record::Validator(id), Record::Imported(id)],
+        )
+    }
+
+    /// Validator `id`'s history as an EIP-3076 interchange holds it, safe for another signer that
+    /// applies EIP-3076's conditions: with an imported history, a record at each floor (its root
+    /// when this network signed exactly it) and every record above; otherwise every record. Such a
+    /// signer's minimum-based conditions then refuse at least what this network refuses.
+    pub fn export(&self, id: u64) -> Exported {
+        let floors = self
+            .imported
+            .get(&id)
+            .map(|imported| imported.floors)
+            .unwrap_or_default();
+        let proposals = self.proposals.range((id, 0)..=(id, u64::MAX));
+        let blocks = match floors.block {
+            None => proposals
+                .map(|(&(_, slot), signed)| (slot, Some(signed.signing_root)))
+                .collect(),
+            Some(floor) => std::iter::once((
+                floor,
+                self.proposals
+                    .get(&(id, floor))
+                    .map(|signed| signed.signing_root),
+            ))
+            .chain(
+                proposals
+                    .filter(|((_, slot), _)| *slot > floor)
+                    .map(|(&(_, slot), signed)| (slot, Some(signed.signing_root))),
+            )
+            .collect(),
+        };
+        let attested = self.attestations.range((id, 0)..=(id, u64::MAX));
+        let attestations = match floors.attestation {
+            None => attested
+                .map(|(&(_, target), attested)| {
+                    (attested.source, target, Some(attested.signing_root))
+                })
+                .collect(),
+            Some((source, target)) => {
+                let at_floor = self.attestations.get(&(id, target));
+                std::iter::once(match at_floor {
+                    Some(attested) => (attested.source, target, Some(attested.signing_root)),
+                    None => (source, target, None),
+                })
+                .chain(
+                    attested
+                        .filter(|((_, signed_target), _)| *signed_target > target)
+                        .map(|(&(_, target), attested)| {
+                            (attested.source, target, Some(attested.signing_root))
+                        }),
+                )
+                .collect()
+            }
+        };
+        Exported {
+            blocks,
+            attestations,
         }
     }
 
@@ -380,11 +903,55 @@ impl Protection {
             Ok(None) => return (root, Decision::AlreadyAccepted, Vec::new()),
             Err(refusal) => return (root, Decision::Refused(refusal), Vec::new()),
         };
+        let records = self.record(
+            id,
+            request.duty.protection(),
+            request.duty.kind(),
+            root,
+            height,
+        );
+        (root, Decision::Accepted, records)
+    }
+
+    /// The slashing rules alone for validator `id` (no activation, chain or duty check), recording
+    /// what they accept: for the EIP-3076 test vectors, which give a slot or epochs and a root.
+    #[cfg(test)]
+    pub(crate) fn authorize_raw(
+        &mut self,
+        id: u64,
+        rule: Rule,
+        root: Root,
+        height: u64,
+    ) -> Decision {
+        let kind = match rule {
+            Rule::Proposal { .. } => DutyKind::BlockProposal,
+            Rule::Attestation { .. } => DutyKind::Attestation,
+            Rule::Bounded { .. } => DutyKind::RandaoReveal,
+        };
+        match self.decide_rule(id, rule, kind, &root) {
+            Ok(Some(id)) => {
+                self.record(id, rule, kind, root, height);
+                Decision::Accepted
+            }
+            Ok(None) => Decision::AlreadyAccepted,
+            Err(refusal) => Decision::Refused(refusal),
+        }
+    }
+
+    /// Record an accepted signing root of validator `id`.
+    fn record(
+        &mut self,
+        id: u64,
+        rule: Rule,
+        kind: DutyKind,
+        root: Root,
+        height: u64,
+    ) -> Vec<Record> {
         let signed = Signed {
             signing_root: root,
             height,
         };
-        let record = match request.duty.protection() {
+        let record = match rule {
             Rule::Proposal { slot } => {
                 self.proposals.insert((id, slot), signed);
                 Record::Proposal { id, slot }
@@ -401,7 +968,6 @@ impl Protection {
                 Record::Attestation { id, target }
             }
             Rule::Bounded { period } => {
-                let kind = request.duty.kind();
                 self.bounded
                     .entry((id, kind, period))
                     .or_default()
@@ -411,11 +977,7 @@ impl Protection {
         };
         let validator = self.validators.get_mut(&id).expect("decided validator");
         validator.records += 1;
-        (
-            root,
-            Decision::Accepted,
-            vec![record, Record::Validator(id)],
-        )
+        vec![record, Record::Validator(id)]
     }
 
     /// `Ok(Some(id))`: new authorization for validator `id`; `Ok(None)`: already authorized.
@@ -448,45 +1010,62 @@ impl Protection {
                 }
             }
         }
-        match request.duty.protection() {
+        self.decide_rule(id, request.duty.protection(), request.duty.kind(), root)
+    }
+
+    /// The slashing rules for validator `id`: `Ok(Some(id))` new, `Ok(None)` already authorized.
+    fn decide_rule(
+        &self,
+        id: u64,
+        rule: Rule,
+        kind: DutyKind,
+        root: &Root,
+    ) -> Result<Option<u64>, Refusal> {
+        // An imported history's floors refuse what the previous signer may have signed. The
+        // network's own exact repeats stay idempotent.
+        let floors = self
+            .imported
+            .get(&id)
+            .map(|imported| imported.floors)
+            .unwrap_or_default();
+        match rule {
             Rule::Proposal { slot } => match self.proposals.get(&(id, slot)) {
                 Some(signed) if signed.signing_root == *root => Ok(None),
+                _ if floors.block.is_some_and(|floor| slot <= floor) => {
+                    Err(Refusal::BlockAtOrBelowImported {
+                        slot,
+                        floor: floors.block.expect("checked"),
+                    })
+                }
                 Some(_) => Err(Refusal::DoubleProposal { slot }),
                 None => Ok(Some(id)),
             },
             Rule::Attestation { source, target } => {
                 match self.attestations.get(&(id, target)) {
                     Some(signed) if signed.signing_root == *root => return Ok(None),
-                    Some(_) => return Err(Refusal::DoubleVote { target }),
-                    None => {}
+                    _ => {}
                 }
-                // Sources never decrease with targets (module docs): the closest attestation on
-                // each side has the extreme source of that side.
-                // The new attestation surrounds a signed one: earlier target, later source.
-                if let Some((&(_, signed_target), signed)) =
-                    self.attestations.range((id, 0)..(id, target)).next_back()
-                    && signed.source > source
-                {
-                    return Err(Refusal::SurroundsSigned {
-                        source_epoch: signed.source,
-                        target_epoch: signed_target,
-                    });
+                if let Some((source_floor, target_floor)) = floors.attestation {
+                    if source < source_floor {
+                        return Err(Refusal::SourceBelowImported {
+                            source_epoch: source,
+                            floor: source_floor,
+                        });
+                    }
+                    if target <= target_floor {
+                        return Err(Refusal::TargetAtOrBelowImported {
+                            target_epoch: target,
+                            floor: target_floor,
+                        });
+                    }
                 }
-                // A signed attestation surrounds the new one: later target, earlier source.
-                if let Some(after) = target.checked_add(1)
-                    && let Some((&(_, signed_target), signed)) =
-                        self.attestations.range((id, after)..=(id, u64::MAX)).next()
-                    && signed.source < source
-                {
-                    return Err(Refusal::SurroundedBySigned {
-                        source_epoch: signed.source,
-                        target_epoch: signed_target,
-                    });
+                if self.attestations.contains_key(&(id, target)) {
+                    return Err(Refusal::DoubleVote { target });
                 }
+                self.check_surround(id, source, target)?;
                 Ok(Some(id))
             }
             Rule::Bounded { period } => {
-                let kind = request.duty.kind();
                 let roots = self.bounded(id, kind, period);
                 if roots.iter().any(|signed| signed.signing_root == *root) {
                     Ok(None)
@@ -501,6 +1080,34 @@ impl Protection {
                 }
             }
         }
+    }
+
+    /// Whether `(source, target)` surrounds, or is surrounded by, a signed attestation of `id`.
+    fn check_surround(&self, id: u64, source: u64, target: u64) -> Result<(), Refusal> {
+        // Sources never decrease with targets (module docs): the closest attestation on each side
+        // has the extreme source of that side.
+        // The new attestation surrounds a signed one: earlier target, later source.
+        if let Some((&(_, signed_target), signed)) =
+            self.attestations.range((id, 0)..(id, target)).next_back()
+            && signed.source > source
+        {
+            return Err(Refusal::SurroundsSigned {
+                source_epoch: signed.source,
+                target_epoch: signed_target,
+            });
+        }
+        // A signed attestation surrounds the new one: later target, earlier source.
+        if let Some(after) = target.checked_add(1)
+            && let Some((&(_, signed_target), signed)) =
+                self.attestations.range((id, after)..=(id, u64::MAX)).next()
+            && signed.source < source
+        {
+            return Err(Refusal::SurroundedBySigned {
+                source_epoch: signed.source,
+                target_epoch: signed_target,
+            });
+        }
+        Ok(())
     }
 
     /// The duty authorization of `root` for validator `id`, as the keyholder knows it.
@@ -566,6 +1173,10 @@ impl Protection {
         self.bounded.insert((id, kind, period), roots);
     }
 
+    pub fn restore_imported(&mut self, id: u64, imported: ImportedValidator) {
+        self.imported.insert(id, imported);
+    }
+
     /// Consistency of restored history: every record belongs to a known validator, validator ids
     /// are dense and keys unique, and each validator has exactly the number of records it counted
     /// (a lost or extra record means the history cannot be trusted).
@@ -619,6 +1230,33 @@ impl Protection {
                 return Err(format!(
                     "validator {id} has {} records but no chain identity: its activation is lost",
                     validator.records
+                ));
+            }
+        }
+        // Imported keys: their own round, no activation without history for its chain and the
+        // operator's acknowledgement, and floors only from imports.
+        for (id, imported) in &self.imported {
+            let validator = self
+                .validators
+                .get(id)
+                .ok_or(format!("import state of unknown validator {id}"))?;
+            if validator.round != imported.round {
+                return Err(format!(
+                    "imported validator {id} signs with round {} but was imported at round {}",
+                    validator.round, imported.round
+                ));
+            }
+            if imported.imports == 0
+                && (imported.chain.is_some() || imported.floors != Floors::default())
+            {
+                return Err(format!("imported validator {id} has history but no import"));
+            }
+            if let Some(activation) = validator.activation
+                && (imported.chain != Some(activation.chain) || imported.acknowledged.is_none())
+            {
+                return Err(format!(
+                    "imported validator {id} is activated without its history for that chain or \
+                     the operator's acknowledgement"
                 ));
             }
         }

@@ -10,6 +10,9 @@ participants:
     vc_image: sigp/lighthouse:v8.3.2
     # Fulu (PeerDAS): the only beacon node must custody every data column.
     supernode: true
+    # The genesis validators' client serves the keymanager API (inside the isolated environment):
+    # the migration scenario stops one key with it and gets the key's EIP-3076 history.
+    keymanager_enabled: true
     count: 1
 network_params:
   preset: mainnet

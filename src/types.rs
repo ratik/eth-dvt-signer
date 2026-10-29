@@ -1,9 +1,16 @@
 //! Wire types shared by every node: the command, its outcome and the block that orders commands.
 
 use crate::{
-    dkg::{CeremonyConfig, CeremonyId, MAX_PARTICIPANTS, ceremony::SignedLog},
+    dkg::{
+        CeremonyConfig, CeremonyId, MAX_PARTICIPANTS,
+        ceremony::{ReadyAck, SignedLog},
+    },
     eth::duty::{DutyRequest, ValidatorKey},
-    slashing::ChainIdentity,
+    import::manifest::Manifest,
+    slashing::{
+        Acknowledgment, ChainIdentity, HistoryImport, HistorySummary, ImportedAttestation,
+        ImportedBlock,
+    },
 };
 use bytes::{Buf, BufMut};
 use commonware_codec::{Encode, EncodeSize, Error, Read, ReadExt, Write, varint::UInt};
@@ -84,6 +91,132 @@ pub enum Command {
         validator: ValidatorKey,
         chain: ChainIdentity,
     },
+    /// Register an imported key (`import`): its manifest, public data only.
+    RegisterImportedKey(Box<Manifest>),
+    /// A keyholder's signed acknowledgement that it verified and stored its imported share.
+    ImportedShareReady(Box<ReadyAck>),
+    /// Import another signer's slashing-protection history (EIP-3076, minimal form).
+    ImportSlashingProtection(Box<HistoryImport>),
+    /// Activate an imported key, with the operator's acknowledgement.
+    ActivateImportedValidator {
+        validator: ValidatorKey,
+        chain: ChainIdentity,
+        acknowledgment: Acknowledgment,
+    },
+}
+
+/// Most validators one history import may name.
+pub const MAX_IMPORT_VALIDATORS: usize = 1024;
+
+fn write_optional_root(root: &Option<[u8; 32]>, buf: &mut impl BufMut) {
+    match root {
+        Some(root) => {
+            1u8.write(buf);
+            buf.put_slice(root);
+        }
+        None => 0u8.write(buf),
+    }
+}
+
+fn read_optional_root(buf: &mut impl Buf) -> Result<Option<[u8; 32]>, Error> {
+    match u8::read(buf)? {
+        0 => Ok(None),
+        1 => Ok(Some(<[u8; 32]>::read(buf)?)),
+        tag => Err(Error::InvalidEnum(tag)),
+    }
+}
+
+impl Write for HistoryImport {
+    fn write(&self, buf: &mut impl BufMut) {
+        buf.put_slice(&self.chain.genesis_validators_root);
+        buf.put_slice(&self.digest);
+        UInt(self.validators.len() as u32).write(buf);
+        for (key, summary) in &self.validators {
+            buf.put_slice(key);
+            match summary.block {
+                Some(block) => {
+                    1u8.write(buf);
+                    block.slot.write(buf);
+                    write_optional_root(&block.signing_root, buf);
+                }
+                None => 0u8.write(buf),
+            }
+            match summary.attestation {
+                Some(attestation) => {
+                    1u8.write(buf);
+                    attestation.source.write(buf);
+                    attestation.target.write(buf);
+                    write_optional_root(&attestation.signing_root, buf);
+                }
+                None => 0u8.write(buf),
+            }
+        }
+    }
+}
+
+impl Read for HistoryImport {
+    type Cfg = ();
+
+    fn read_cfg(buf: &mut impl Buf, _: &()) -> Result<Self, Error> {
+        let genesis_validators_root = <[u8; 32]>::read(buf)?;
+        let digest = <[u8; 32]>::read(buf)?;
+        let count = u32::from(UInt::<u32>::read(buf)?) as usize;
+        if count > MAX_IMPORT_VALIDATORS {
+            return Err(Error::Invalid("HistoryImport", "too many validators"));
+        }
+        let validators = (0..count)
+            .map(|_| {
+                let key = <[u8; 48]>::read(buf)?;
+                let block = match u8::read(buf)? {
+                    0 => None,
+                    1 => Some(ImportedBlock {
+                        slot: u64::read(buf)?,
+                        signing_root: read_optional_root(buf)?,
+                    }),
+                    tag => return Err(Error::InvalidEnum(tag)),
+                };
+                let attestation = match u8::read(buf)? {
+                    0 => None,
+                    1 => Some(ImportedAttestation {
+                        source: u64::read(buf)?,
+                        target: u64::read(buf)?,
+                        signing_root: read_optional_root(buf)?,
+                    }),
+                    tag => return Err(Error::InvalidEnum(tag)),
+                };
+                Ok((key, HistorySummary { block, attestation }))
+            })
+            .collect::<Result<_, Error>>()?;
+        Ok(Self {
+            chain: ChainIdentity {
+                genesis_validators_root,
+            },
+            digest,
+            validators,
+        })
+    }
+}
+
+impl EncodeSize for HistoryImport {
+    fn encode_size(&self) -> usize {
+        let root = |root: &Option<[u8; 32]>| 1 + root.map_or(0, |_| 32);
+        32 + 32
+            + UInt(self.validators.len() as u32).encode_size()
+            + self
+                .validators
+                .iter()
+                .map(|(_, summary)| {
+                    48 + 1
+                        + summary
+                            .block
+                            .map_or(0, |block| 8 + root(&block.signing_root))
+                        + 1
+                        + summary
+                            .attestation
+                            .map_or(0, |attestation| 16 + root(&attestation.signing_root))
+                })
+                .sum::<usize>()
+    }
 }
 
 // `SignedLog` only implements `PartialEq`, but its equality is a full equivalence.
@@ -118,6 +251,28 @@ impl Write for Command {
                 buf.put_slice(validator);
                 buf.put_slice(&chain.genesis_validators_root);
             }
+            Self::RegisterImportedKey(manifest) => {
+                6u8.write(buf);
+                manifest.write(buf);
+            }
+            Self::ImportedShareReady(ack) => {
+                7u8.write(buf);
+                ack.write(buf);
+            }
+            Self::ImportSlashingProtection(import) => {
+                8u8.write(buf);
+                import.write(buf);
+            }
+            Self::ActivateImportedValidator {
+                validator,
+                chain,
+                acknowledgment,
+            } => {
+                9u8.write(buf);
+                buf.put_slice(validator);
+                buf.put_slice(&chain.genesis_validators_root);
+                acknowledgment.to_bits().write(buf);
+            }
         }
     }
 }
@@ -150,6 +305,24 @@ impl Read for Command {
                     },
                 })
             }
+            6 => Ok(Self::RegisterImportedKey(Box::new(Manifest::read(buf)?))),
+            7 => Ok(Self::ImportedShareReady(Box::new(ReadyAck::read(buf)?))),
+            8 => Ok(Self::ImportSlashingProtection(Box::new(
+                HistoryImport::read(buf)?,
+            ))),
+            9 => {
+                let validator = <[u8; 48]>::read(buf)?;
+                let genesis_validators_root = <[u8; 32]>::read(buf)?;
+                let acknowledgment = Acknowledgment::from_bits(u8::read(buf)?)
+                    .ok_or(Error::Invalid("Command", "acknowledgment"))?;
+                Ok(Self::ActivateImportedValidator {
+                    validator,
+                    chain: ChainIdentity {
+                        genesis_validators_root,
+                    },
+                    acknowledgment,
+                })
+            }
             tag => Err(Error::InvalidEnum(tag)),
         }
     }
@@ -164,6 +337,10 @@ impl EncodeSize for Command {
             Self::StartValidatorCeremony(config) => config.encode_size(),
             Self::Duty(request) => request.encode_size(),
             Self::ActivateValidator { .. } => 48 + 32,
+            Self::RegisterImportedKey(manifest) => manifest.encode_size(),
+            Self::ImportedShareReady(ack) => ack.encode_size(),
+            Self::ImportSlashingProtection(import) => import.encode_size(),
+            Self::ActivateImportedValidator { .. } => 48 + 32 + 1,
         }
     }
 }

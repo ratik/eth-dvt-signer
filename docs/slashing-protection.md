@@ -15,6 +15,9 @@ What this protects against, and what it does not:
 | One node lagging, rolled back (supported recovery) or restored from a peer | No | Its history is a prefix of the finalized one. It refuses what it has not applied, and replays the rest before deciding. |
 | HTTP request that fails or times out after authorization | No | The authorization stays; the conflict stays refused. |
 | Missing, altered or inconsistent history found at startup | Node does not start | Startup checks (below). |
+| An imported key's previous signer, stopped before its complete history was exported | No | The imported floors refuse everything at or below its latest block and attestation ([below](#imported-history-eip-3076)). |
+| An imported key's previous signer still running, or a copy of the key used elsewhere | **Yes** | Outside this network: its signatures are not in this network's records. The activation acknowledgment is the operator's statement, not a check ([key-import.md](key-import.md#assumptions)). |
+| An imported history that is incomplete (exported before the stop, or from the wrong signer) | **Possible** | The network protects against what the history contains, nothing more. |
 | **Every node rolled back** to storage from before a duty (L-1) | **Yes** | Nothing in the network remembers the duty. Not detected (below). |
 | **History rewritten consistently** by someone with write access to the storage of 2 or more nodes | **Yes** | The same as a rollback: beyond the fault model. |
 | More than `f` Byzantine nodes | Possible | Beyond consensus' assumptions. |
@@ -75,8 +78,61 @@ version, for example) is a conflicting duty.
 History is keyed by the validator public key. A ceremony is only how the key signs: completing a
 validator ceremony registers its key, or keeps the key's id and history if the key is already
 known. A new ceremony creates a new key, with a new, empty history. Nothing resets the history of an
-existing key: there is no import, delete or reset command. Restarting a validator ceremony id
-returns the existing ceremony.
+existing key: there is no delete or reset command, an imported key is registered once (a second
+registration of the same key is refused, whatever the ceremony id), and an import only adds
+restrictions (below). Restarting a validator ceremony id returns the existing ceremony.
+
+## Imported history (EIP-3076)
+
+A key imported from another signer ([key-import.md](key-import.md)) brings that signer's history
+as an EIP-3076 interchange, format version 5 (`src/eth/interchange.rs`,
+`POST /slashing-protection/import`).
+
+**Parsing.** Strict: decimal strings, `0x` hex of the right length, no unknown fields, version `"5"`
+only. Entries of one key are merged, exact duplicates kept once. A history that is slashable with
+respect to itself is refused whole: two different blocks for one slot (a missing signing root
+matches nothing), two different attestations for one target, a source after its target, or
+attestations surrounding each other. The interchange tests allow refusing such a file, and
+importing part of it would hide that the key was used by two signers.
+
+**What enters consensus.** EIP-3076's minimal form: for each validator, the latest block (slot and
+root) and the attestation with the greatest target (source, target and root), with the chain and a
+SHA-256 digest of the interchange's canonical encoding. At most 1 024 validators per import; the
+command's size does not depend on the length of the history.
+
+**Floors.** Each import is merged into the key's floors by component-wise maximum: the highest
+block slot, the highest source and the highest target. A new duty of an imported key is refused,
+before the double and surround checks, when:
+
+| Duty | Refused when | Reason |
+| ---- | ------------ | ------ |
+| Block proposal | slot `≤` block floor | `block_at_or_below_imported` |
+| Attestation | source `<` source floor | `source_below_imported` |
+| Attestation | target `≤` target floor | `target_at_or_below_imported` |
+
+Every message slashable with respect to the imported records is below these floors (a double
+proposal or vote is at or below them; a surround vote has a source below the source floor or a
+target at or below the target floor), so they imply EIP-3076's conditions. The exact repetition
+of the previous signer's latest message is refused too: its root may be absent from the
+interchange, and the network never signed it. The network's own records stay complete above the
+floors, and its own exact repeats stay idempotent. These refusals count as slashing refusals
+(`412`).
+
+**Only more restrictive.** A later import can only raise floors. An older or identical
+interchange changes nothing (`outcome: unchanged`), before or after activation. Imports are
+accepted only for imported keys (`not_imported` for a DKG key, `unknown_validator`), for one chain:
+the key's activation's, or its earlier imports' (`other_chain`). An import that conflicts with what
+this network signed for the key (a double proposal, double vote or surround against its records)
+is refused whole (`conflict`): two signers used the key. The API checks every record of the full
+interchange this way before submitting it, and consensus checks the summary again.
+
+**Dry run.** `"dry_run": true` runs every check against the committed state and answers with the
+summary; nothing is submitted.
+
+**Export.** `GET /slashing-protection/export/{public_key}` is an interchange of what the network
+holds. For an imported key: one record at each floor (with its root when the network itself signed
+exactly that message) and every record it signed above them. For a DKG key: every record. A signer
+importing the export with EIP-3076's conditions refuses at least what this network refuses.
 
 ## Atomicity and the signing gate
 
@@ -136,6 +192,8 @@ next to the authorizations, written in the same commit:
 | 5 | `(validator id, slot)` | proposal: signing root, height |
 | 6 | `(validator id, target epoch)` | attestation: source epoch, signing root, height |
 | 16 + duty type | `(validator id, period)` | up to 8 signing roots with their heights |
+| 7 | `(validator id, 0)` | an imported key's import state: its round, the history's chain, floors, number of imports, acknowledgment height |
+| 2 (ceremonies) | `(round, 0)` | an imported key's ceremony (value tag 8): the manifest, its sharing and the acknowledged shares |
 
 The format version did not change. A state written before these entries existed reads as a state
 without validators. A validator entry in the previous layout (value tag 3) reads as not activated
@@ -197,7 +255,12 @@ and refuses to start (`refusing to start`, exit status 1, storage left as is) wh
   its ceremony's group key;
 - a validator has records but no chain identity (its activation was lost);
 - an attestation's source is after its target, or a validator's attestations surround each other
-  (sources decreasing as targets increase): the history was altered.
+  (sources decreasing as targets increase): the history was altered;
+- a validator and its ceremony disagree on whether the key was imported, an imported key's round
+  is not a validator key or not the round its validator signs with, or its ceremony acknowledges
+  shares of unknown participants;
+- an imported key has floors or a chain but no import, or is activated without its history for
+  that chain or without the operator's acknowledgment.
 
 These checks are added to the recovery checks of [recovery.md](recovery.md) §2: the state must not
 be behind the finalized blocks the node acknowledged, and every share must have its ceremony. A
@@ -287,4 +350,7 @@ watermarks.
 | Startup refuses a lost proposal or attestation, a lost validator, validator purpose or activation, records of an unknown validator, a replaced key, a corrupt entry, surrounding attestations | `storage::tests::validator::altered_history_fails_closed` |
 | Every duty signed and verified; refusals; root mismatch; another chain; concurrent conflicts; activation (explicit, concurrent, immutable, after restart); a stale node and another chain; the authorization-binding scenarios; a failed coordinator; an isolated node; a full restart | `tests/eth_duties.rs` (4 simulated nodes) |
 | The same over HTTP on real processes, plus activation, crashes before and after applying a duty, a coordinator crash with 2 partials, a client hanging up after authorization, a lagging node, a rolled-back node (before a duty and before the activation), the binding on the wire | `tests/e2e/eth2.rs` (E2E-ETH-1 to 9) |
+| EIP-3076: the official interchange tests (38 cases of `v5.3.0`, `tests/vectors/eip3076`); malformed and self-slashable files; the summary and digest; floors only rise and never contradict local records; other chain, unknown and DKG keys; missing roots; export conservative and re-importable | `eth::interchange::tests` (`tests/unit/eth/interchange.rs`) |
+| Imported keys in the state machine and on disk | `storage::tests::validator::imported` |
+| Imported history over HTTP on real processes: dry run, import, idempotence, another chain, self-slashable, floors refusing the previous signer's messages, export | `tests/e2e/import.rs` (E2E-IMP-1) |
 | Whole-network rollback | `eth2::e2e_eth_l1_whole_network_rollback_signs_a_double_proposal` (ignored, fails) |

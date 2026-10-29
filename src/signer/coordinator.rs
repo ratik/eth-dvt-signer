@@ -32,7 +32,7 @@ use crate::{
 };
 use commonware_codec::Encode as _;
 use commonware_cryptography::{
-    bls12381::{dkg::feldman_desmedt::Output, primitives::variant::PartialSignature},
+    bls12381::primitives::{sharing::Sharing, variant::PartialSignature},
     ed25519::PublicKey,
     sha256::Digest,
 };
@@ -515,7 +515,7 @@ async fn sign<E: Clock, S: Sender<PublicKey = PublicKey>>(
     // 1. The finalized authorization, decided by consensus if there is none yet.
     let found = lookup(&deps.executor, request.ceremony.clone(), request.nonce).await?;
     let ceremony = found.ceremony.ok_or(SignError::UnknownCeremony)?;
-    let Some(output) = ceremony.output.clone() else {
+    let Some(sharing) = ceremony.sharing().cloned() else {
         return Err(SignError::NotCompleted(ceremony.status));
     };
     let (authorization, kind) = match found.authorization {
@@ -566,7 +566,7 @@ async fn sign<E: Clock, S: Sender<PublicKey = PublicKey>>(
         context,
         deps,
         &ceremony,
-        &output,
+        &sharing,
         &request,
         reference,
         authorization,
@@ -575,11 +575,11 @@ async fn sign<E: Clock, S: Sender<PublicKey = PublicKey>>(
 
     // 3. Group signature.
     let threshold_at = context.current();
-    let signature = signing::recover(output.public(), collected.partials.values())
-        .map_err(|_| SignError::Invalid)?;
+    let signature =
+        signing::recover(&sharing, collected.partials.values()).map_err(|_| SignError::Invalid)?;
     let message = signing::Message::Ethereum(request.payload_hash);
     message
-        .verify(output.public().public(), &signature)
+        .verify(sharing.public(), &signature)
         .map_err(|_| SignError::Invalid)?;
     let done = context.current();
 
@@ -700,8 +700,12 @@ async fn sign_duty<E: Clock, S: Sender<PublicKey = PublicKey>>(
     //    participant checks the duty authorization of this validator in its own state.
     let found = lookup(&deps.executor, validator.ceremony.clone(), 0).await?;
     let ceremony = found.ceremony.ok_or(SignError::UnknownValidator)?;
-    let output = ceremony.output.clone().ok_or(SignError::UnknownValidator)?;
-    if output.public().public().encode().as_ref() != request.validator.as_slice() {
+    // The ceremony's public sharing, whether its key came from the DKG or was imported.
+    let sharing = ceremony
+        .sharing()
+        .cloned()
+        .ok_or(SignError::UnknownValidator)?;
+    if sharing.public().encode().as_ref() != request.validator.as_slice() {
         return Err(SignError::UnknownValidator);
     }
     let authorization = Authorization {
@@ -721,7 +725,7 @@ async fn sign_duty<E: Clock, S: Sender<PublicKey = PublicKey>>(
         context,
         deps,
         &ceremony,
-        &output,
+        &sharing,
         &payload,
         reference,
         authorization,
@@ -730,10 +734,10 @@ async fn sign_duty<E: Clock, S: Sender<PublicKey = PublicKey>>(
 
     // 3. The validator's signature, checked against its public key.
     let threshold_at = context.current();
-    let signature = signing::recover(output.public(), collected.partials.values())
-        .map_err(|_| SignError::Invalid)?;
+    let signature =
+        signing::recover(&sharing, collected.partials.values()).map_err(|_| SignError::Invalid)?;
     signing::Message::Ethereum(signing_root)
-        .verify(output.public().public(), &signature)
+        .verify(sharing.public(), &signature)
         .map_err(|_| SignError::Invalid)?;
     let done = context.current();
     timings.first_partial_ms = collected
@@ -783,13 +787,13 @@ async fn collect<E: Clock, S: Sender<PublicKey = PublicKey>>(
     context: &E,
     deps: &Deps<S>,
     ceremony: &Ceremony,
-    output: &Output<Variant, PublicKey>,
+    sharing: &Sharing<Variant>,
     request: &SignRequest,
     reference: AuthorizationRef,
     authorization: Authorization,
 ) -> Result<Collected, SignError> {
     let participants = &ceremony.config.participants;
-    let threshold = output.public().required() as usize;
+    let threshold = sharing.required() as usize;
     let message = signing::Message::Ethereum(request.payload_hash);
     let wire_request = Request::with(request.ceremony.clone(), reference, request.payload_hash);
     let id = wire_request.id;
@@ -857,7 +861,7 @@ async fn collect<E: Clock, S: Sender<PublicKey = PublicKey>>(
                         // signature must verify against that index's public share.
                         let reason = if partial.index.get() != index {
                             Some("forged participant index")
-                        } else if message.verify_partial(output.public(), &partial).is_err() {
+                        } else if message.verify_partial(sharing, &partial).is_err() {
                             Some("invalid signature")
                         } else {
                             None

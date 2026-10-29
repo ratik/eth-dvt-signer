@@ -87,6 +87,27 @@ struct Args {
     /// the README's recovery procedure describes.
     #[arg(long)]
     allow_missing_consensus_journal: bool,
+
+    /// This node's share-encryption key file (`mpc-keytool share-key`), needed to install shares
+    /// of imported keys. It must be readable by its owner only.
+    #[arg(long)]
+    share_encryption_key: Option<PathBuf>,
+}
+
+/// Load the share-encryption key: owner-only permissions, or the node refuses to start.
+fn load_share_key(
+    path: &std::path::Path,
+) -> Result<eth_mpc_signer::import::envelope::ShareKey, String> {
+    let metadata = std::fs::metadata(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(format!(
+            "{} is readable by others: it holds a secret key (chmod 600)",
+            path.display()
+        ));
+    }
+    let text = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    eth_mpc_signer::import::envelope::ShareKey::from_file(&text)
+        .map_err(|err| format!("{}: {err}", path.display()))
 }
 
 fn main() {
@@ -118,6 +139,19 @@ fn main() {
         Ipv4Addr::LOCALHOST,
         args.http_port + u16::try_from(args.id).expect("id too large"),
     ));
+    let share_key = match args
+        .share_encryption_key
+        .as_deref()
+        .map(load_share_key)
+        .transpose()
+    {
+        Ok(share_key) => share_key,
+        Err(err) => {
+            error!(%err, "refusing to start");
+            std::process::exit(1);
+        }
+    };
+    let share_key_public = share_key.as_ref().map(|key| *key.public());
     let storage = args.data_dir.join(format!("node-{}", args.id));
     // The node directory holds private key shares (not encrypted): owner access only.
     std::fs::create_dir_all(&storage).expect("failed to create data directory");
@@ -169,6 +203,7 @@ fn main() {
                     ..Default::default()
                 },
                 allow_missing_consensus_journal: args.allow_missing_consensus_journal,
+                share_key,
             },
             channels,
         )
@@ -192,6 +227,7 @@ fn main() {
             node.recovery,
             rpc::Options {
                 deposit_signing: args.enable_deposit_signing,
+                share_key: share_key_public,
             },
         );
         let rpc_handle = context.child("rpc").spawn(move |_| async move {

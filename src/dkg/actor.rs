@@ -11,10 +11,15 @@
 //! ([AuthorizationRef]); a development key's ceremony checks only development authorizations
 //! ([Committed]), a validator key's only duty authorizations of that validator
 //! ([DutyAuthorization]).
+//!
+//! An imported key's share is not derived: the operator hands this node its envelope
+//! ([Message::InstallShare]), which it opens with its own share-encryption key, verifies against
+//! the commitments registered by consensus, and stores durably before acknowledging it (a signed
+//! [ReadyAck] through consensus). Until then the key's share is pending here, never claimed.
 
 use super::{
     CeremonyConfig, CeremonyId, DkgStatus, Faults, Variant,
-    ceremony::{Ceremony, SignedLog},
+    ceremony::{Ceremony, ReadyAck, SignedLog},
     format_key,
     parked::Parked,
     secrets::{KeyShare, Secrets},
@@ -23,6 +28,7 @@ use super::{
 use crate::{
     eth::{duty::ValidatorKey, types::Root},
     executor::{self, StartReceipt, Stopped},
+    import::envelope::{self, EncryptedShare, ShareKey},
     signer::wire::{self as sign_wire, AuthorizationRef, Refusal},
     slashing::DutyAuthorization,
     storage::Committed,
@@ -47,7 +53,7 @@ use commonware_runtime::{ContextCell, Handle, Spawner, spawn_cell};
 use commonware_storage::Context;
 use commonware_utils::{
     channel::{mpsc, oneshot},
-    ordered::Set,
+    ordered::{Quorum as _, Set},
 };
 use rand_core::CryptoRng;
 use serde::Serialize;
@@ -95,6 +101,33 @@ pub enum Message {
     },
     /// Parked requests and shares that cannot be used.
     Health { response: oneshot::Sender<Health> },
+    /// Install this node's share of an imported key from its envelope.
+    InstallShare {
+        envelope: Box<EncryptedShare>,
+        response: oneshot::Sender<Result<Installed, InstallError>>,
+    },
+}
+
+/// An installed imported share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct Installed {
+    /// This node's share index.
+    pub index: u32,
+    /// `false`: the share was already stored (nothing changed).
+    pub new: bool,
+}
+
+/// Why an imported share was not installed.
+#[derive(Debug, thiserror::Error)]
+pub enum InstallError {
+    #[error("no imported key with this ceremony id is registered (register its manifest first)")]
+    UnknownImport,
+    #[error("this node has no share-encryption key (--share-encryption-key)")]
+    NoShareKey,
+    #[error("{0}")]
+    Envelope(#[from] envelope::Error),
+    #[error("the share does not match the registered key: {0}")]
+    Inconsistent(#[from] super::secrets::Inconsistent),
 }
 
 /// What this node's keyholder can serve.
@@ -250,6 +283,21 @@ impl Client {
         receiver.await.map_err(|_| Stopped)
     }
 
+    /// Install this node's share of an imported key from its envelope (see [Message::InstallShare]).
+    pub async fn install_share(
+        &self,
+        envelope: EncryptedShare,
+    ) -> Result<Result<Installed, InstallError>, Stopped> {
+        let (response, receiver) = oneshot::channel();
+        self.actor
+            .send(Message::InstallShare {
+                envelope: Box::new(envelope),
+                response,
+            })
+            .map_err(|_| Stopped)?;
+        receiver.await.map_err(|_| Stopped)
+    }
+
     /// Submit a dealer log to consensus. The actor submits its own; this is for logs of other
     /// dealers, which consensus validates like any other.
     pub fn submit_log(&self, round: u64, log: SignedLog) -> Result<(), Stopped> {
@@ -319,6 +367,12 @@ pub struct Actor<
     parked: Parked,
     /// Blocks applied since start.
     blocks: u64,
+    /// This node's share-encryption key (imported keys), if it has one.
+    share_key: Option<ShareKey>,
+    /// Imported keys, by round (their registered manifest and acknowledged shares).
+    imported: BTreeMap<u64, Ceremony>,
+    /// Imported rounds whose share acknowledgement this process submitted.
+    ready_sent: HashSet<u64>,
 }
 
 impl<
@@ -340,6 +394,7 @@ impl<
         authorizations: Vec<Committed>,
         validator_rounds: Vec<u64>,
         duties: Vec<DutyAuthorization>,
+        share_key: Option<ShareKey>,
     ) -> Self {
         Self {
             context: ContextCell::new(context),
@@ -371,6 +426,9 @@ impl<
                 .collect(),
             parked: Parked::default(),
             blocks: 0,
+            share_key,
+            imported: BTreeMap::new(),
+            ready_sent: HashSet::new(),
         }
     }
 
@@ -415,6 +473,9 @@ impl<
                     let _ = response.send(self.partial(&ceremony, &authorization, &payload_hash));
                 }
                 Message::SignRequest { from, request } => self.on_sign_request(from, request),
+                Message::InstallShare { envelope, response } => {
+                    let _ = response.send(self.install(&envelope).await);
+                }
                 Message::Health { response } => {
                     let _ = response.send(Health {
                         parked: self.parked.len(),
@@ -665,6 +726,9 @@ impl<
 
     /// The ceremony is finalized as completed: load or derive this node's share.
     async fn complete(&mut self, ceremony: &Ceremony) {
+        if ceremony.imported().is_some() {
+            return self.complete_imported(ceremony);
+        }
         let round = ceremony.round;
         let session = self.sessions.remove(&round);
         if self.shares.contains_key(&round) || self.unavailable.contains(&round) {
@@ -729,6 +793,103 @@ impl<
             .expect("failed to persist key share");
         info!(ceremony = %id, round, %public_key, index, "dkg ceremony completed, key share stored");
         self.shares.insert(round, share);
+    }
+
+    /// An imported key was registered (or acknowledged): load this node's stored share if there is
+    /// one. Without one the share stays pending until the operator installs it ([Self::install]).
+    fn complete_imported(&mut self, ceremony: &Ceremony) {
+        let round = ceremony.round;
+        self.imported.insert(round, ceremony.clone());
+        if !self.shares.contains_key(&round) && !self.unavailable.contains(&round) {
+            let Some(stored) = self.secrets.share(round) else {
+                return;
+            };
+            let id = &ceremony.config.id;
+            match stored.verify(&self.me, ceremony) {
+                Ok(()) => {
+                    info!(ceremony = %id, round, index = stored.share.index.get(), "loaded imported key share");
+                    self.shares.insert(round, stored.share.clone());
+                }
+                Err(err) => {
+                    error!(ceremony = %id, round, %err, "stored imported key share is unusable");
+                    self.unavailable.insert(round);
+                    return;
+                }
+            }
+        }
+        if self.shares.contains_key(&round) {
+            self.acknowledge(ceremony);
+        }
+    }
+
+    /// Submit this node's signed share acknowledgement if consensus does not have it yet (once per
+    /// process; consensus ignores a repeat).
+    fn acknowledge(&mut self, ceremony: &Ceremony) {
+        let Some(imported) = ceremony.imported() else {
+            return;
+        };
+        let Some(index) = ceremony.config.participants.index(&self.me) else {
+            return;
+        };
+        if imported.ready.contains(&index.get()) || !self.ready_sent.insert(ceremony.round) {
+            return;
+        }
+        let ack = ReadyAck::sign(&self.signer, ceremony.round, ceremony.session);
+        let _ = self
+            .executor
+            .send(executor::Message::SubmitReady { ack: Box::new(ack) });
+        info!(ceremony = %ceremony.config.id, round = ceremony.round, index = index.get(), "submitted imported share acknowledgement");
+    }
+
+    /// Install this node's share of an imported key from `envelope`: open it with this node's
+    /// share-encryption key, verify it against the registered commitments, store it durably, then
+    /// acknowledge it.
+    async fn install(&mut self, envelope: &EncryptedShare) -> Result<Installed, InstallError> {
+        let ceremony_id = CeremonyId::new(envelope.ceremony_id.clone())
+            .map_err(|_| InstallError::UnknownImport)?;
+        let round = *self
+            .ids
+            .get(&ceremony_id)
+            .ok_or(InstallError::UnknownImport)?;
+        let ceremony = self
+            .imported
+            .get(&round)
+            .cloned()
+            .ok_or(InstallError::UnknownImport)?;
+        let imported = ceremony.imported().expect("an imported ceremony");
+        let key = self.share_key.as_ref().ok_or(InstallError::NoShareKey)?;
+        let share = envelope::open(
+            envelope,
+            &imported.manifest,
+            &imported.sharing,
+            &self.me,
+            key,
+        )?;
+        let index = share.index.get();
+        if let Some(stored) = self.secrets.share(round) {
+            // A share is written once: an identical one is a repeat, anything else is refused.
+            stored.verify(&self.me, &ceremony)?;
+            if stored.share != share {
+                return Err(InstallError::Inconsistent(
+                    super::secrets::Inconsistent::Share,
+                ));
+            }
+            self.complete_imported(&ceremony);
+            return Ok(Installed { index, new: false });
+        }
+        let key_share = KeyShare::new(&ceremony, share);
+        key_share.verify(&self.me, &ceremony)?;
+        let share = key_share.share.clone();
+        // Durable before use, and before acknowledging it.
+        self.secrets
+            .put_share(key_share)
+            .await
+            .expect("failed to persist key share");
+        info!(ceremony = %ceremony.config.id, round, index, "imported key share stored");
+        self.unavailable.remove(&round);
+        self.shares.insert(round, share);
+        self.acknowledge(&ceremony);
+        Ok(Installed { index, new: true })
     }
 
     async fn give_up(&mut self, round: u64) {

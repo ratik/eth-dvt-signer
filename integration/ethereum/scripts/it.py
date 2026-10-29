@@ -36,12 +36,16 @@ SRC = f"{IT}/src"
 WORK = os.environ.get("IT_WORK", f"{IT}/work")
 KURTOSIS = f"{IT}/bin/kurtosis"
 SIGNER = f"{IT}/target/release/eth-mpc-signer"
+KEYTOOL = f"{IT}/target/release/mpc-keytool"
 HERE = f"{SRC}/integration/ethereum"
 NETWORK_ARGS = f"{HERE}/kurtosis/network.yaml"
 
 ENCLAVE = "eth-mpc-it"
 CL_SERVICE = "cl-1-lighthouse-geth"
 EL_SERVICE = "el-1-geth-lighthouse"
+# The genesis validators' client (local keystores); the migration scenario moves one of its keys.
+ORIGINAL_VC = "vc-1-geth-lighthouse"
+MIGRATED_CEREMONY = "migrated-validator"
 NODES = 4
 P2P_BASE = 47000
 HTTP_BASE = 47100
@@ -232,6 +236,9 @@ class Chain:
     def epoch_seconds(self):
         return self.seconds_per_slot * self.slots_per_epoch
 
+    def epoch_at(self, when):
+        return max(0, int((when - self.genesis_time) // self.epoch_seconds()))
+
     def wait_epoch(self, epoch, stage="timeout"):
         start = self.genesis_time + epoch * self.epoch_seconds()
         wait(f"epoch {epoch}", stage, max(0, start - time.time()) + 60, 1,
@@ -255,13 +262,27 @@ def node_url(node):
     return f"http://127.0.0.1:{HTTP_BASE + node}"
 
 
+def keytool(*args, network="none"):
+    """`mpc-keytool` in the runtime image, with no network (the dealer is offline)."""
+    return run(["docker", "run", "--rm", "--network", network, "--user", f"{UID}:{GID}",
+                "-v", f"{IT}:{IT}", VERSIONS["RUNTIME_IMAGE"], KEYTOOL, *args])
+
+
+def share_key(node):
+    """Node `node`'s share-encryption key file, created once (`mpc-keytool share-key`)."""
+    path = f"{WORK}/signers/share-key-{node}.json"
+    if not os.path.exists(path):
+        keytool("share-key", "--out", path)
+    return path
+
+
 def signer_start(node, env=None):
     name = f"it-signer-{node}"
     run(["docker", "rm", "-f", name], check=False)
     args = [SIGNER, "--id", str(node), "--participants", str(NODES),
             "--p2p-port", str(P2P_BASE), "--http-port", str(HTTP_BASE),
             "--data-dir", f"{WORK}/signers", "--signing-timeout", "2",
-            "--authorization-timeout", "4"]
+            "--authorization-timeout", "4", "--share-encryption-key", share_key(node)]
     if node == 0:
         # Validator onboarding: node 0 alone accepts the one DEPOSIT signing request.
         args.append("--enable-deposit-signing")
@@ -452,23 +473,29 @@ def proxy_stop():
         pass
 
 
-def vc_start(key):
-    """Lighthouse's validator client with one remote-signer validator: the DKG key, signed by the
-    MPC network through the proxy. No keystore exists anywhere."""
+def vc_start(key, *more):
+    """Lighthouse's validator client with remote-signer validators only: the DKG key (and, after
+    the migration, the migrated key), signed by the MPC network through the proxy. Its own
+    slashing database is kept across restarts. No keystore exists in it."""
     datadir = workdir("vc")
     workdir("vc", "validators")
     workdir("vc-home")
+    keys = [(key, "DKG-generated key, signed by the MPC network")] + [
+        (extra, "imported key (migrated from a local keystore), signed by the MPC network")
+        for extra in more]
     with open(f"{datadir}/validators/validator_definitions.yml", "w") as file:
-        file.write(
-            "---\n"
-            "- enabled: true\n"
-            f'  voting_public_key: "{key}"\n'
-            '  description: "DKG-generated key, signed by the MPC network"\n'
-            "  type: web3signer\n"
-            f'  url: "http://127.0.0.1:{PROXY_PORT}"\n'
-            "  request_timeout_ms: 12000\n")
+        file.write("---\n")
+        for public_key, description in keys:
+            file.write(
+                "- enabled: true\n"
+                f'  voting_public_key: "{public_key}"\n'
+                f'  description: "{description}"\n'
+                "  type: web3signer\n"
+                f'  url: "http://127.0.0.1:{PROXY_PORT}"\n'
+                "  request_timeout_ms: 12000\n")
     own(datadir)
     run(["docker", "rm", "-f", "it-vc"], check=False)
+    started = len(read(f"{WORK}/logs/vc.log"))
     devnet = endpoints()
     command = (
         f"exec lighthouse --testnet-dir {devnet['testnet_dir']} vc --datadir {datadir} "
@@ -481,14 +508,14 @@ def vc_start(key):
          VERSIONS["LIGHTHOUSE_IMAGE"], "-c", command])
 
     def enabled():
-        text = read(f"{WORK}/logs/vc.log")
-        if "Enabled validator" in text and key[2:10] in text.lower():
+        text = read(f"{WORK}/logs/vc.log")[started:].lower()
+        if all("enabled validator" in text and public_key[2:10] in text for public_key, _ in keys):
             return True
         if not run(["docker", "inspect", "-f", "{{.State.Running}}", "it-vc"], check=False).startswith("true"):
             raise Failure("lighthouse", "the validator client exited (logs/vc.log)")
         return False
-    wait("Lighthouse to enable the remote-signer validator", "lighthouse", 120, 1, enabled)
-    log("lighthouse: validator client running, the DKG key enabled as a web3signer validator")
+    wait("Lighthouse to enable the remote-signer validators", "lighthouse", 120, 1, enabled)
+    log(f"lighthouse: validator client running, {len(keys)} key(s) enabled as web3signer validators")
 
 
 def vc_stop():
@@ -556,9 +583,10 @@ def block_at(slot):
 
 
 def proposals_of(index, epoch):
-    """The validator's assigned proposals in `epoch`, each with the block at its slot."""
+    """The validator's assigned proposals in `epoch`, each with the block at its slot. Slot 0 is the
+    genesis block: the API names a proposer for it, but nobody proposes it."""
     return [block_at(int(duty["slot"])) for duty in beacon(f"/eth/v1/validator/duties/proposer/{epoch}")
-            if int(duty["validator_index"]) == index]
+            if int(duty["validator_index"]) == index and int(duty["slot"]) > 0]
 
 
 def proposed(block, index):
@@ -571,9 +599,9 @@ class Recorder(threading.Thread):
     whole active period, including what the scenario windows leave out (restarts, waits). Kept in
     `lifetime.jsonl`; an epoch it could not read is recorded with the error."""
 
-    def __init__(self, index, first, chain):
-        super().__init__(name="recorder", daemon=True)
-        self.index, self.first, self.chain = index, first, chain
+    def __init__(self, index, first, chain, file="lifetime.jsonl"):
+        super().__init__(name=f"recorder-{index}", daemon=True)
+        self.index, self.first, self.chain, self.file = index, first, chain, file
         self.stopped = threading.Event()
 
     def run(self):
@@ -590,7 +618,7 @@ class Recorder(threading.Thread):
                          "proposals": proposals_of(self.index, epoch)}
             except Exception as error:  # noqa: BLE001 - recorded, the report counts it
                 entry = {"epoch": epoch, "error": str(error)}
-            with open(f"{WORK}/lifetime.jsonl", "a") as file:
+            with open(f"{WORK}/{self.file}", "a") as file:
                 file.write(json.dumps(entry) + "\n")
             epoch += 1
 
@@ -608,6 +636,7 @@ def observe(label, index, epochs, chain, until_proposal=0):
     while True:
         evidence = epoch_evidence(index, epoch, chain)
         evidence["scenario"] = label
+        evidence["index"] = index
         results.append(evidence)
         with open(f"{WORK}/epochs.jsonl", "a") as file:
             file.write(json.dumps(evidence) + "\n")
@@ -766,6 +795,252 @@ def duty_log(signing_root):
     return {"authorized_at": sorted(heights), "submitted": submitted, "signed_by": sorted(signed_by)}
 
 
+# ---------------------------------------------------------------------------------------------
+# Migration of an existing validator (docs/key-import.md)
+
+
+def original_vc():
+    """The genesis validators' client: its container, keymanager URL and API token."""
+    names = [name for name in run(["docker", "ps", "--format", "{{.Names}}"]).split()
+             if name.startswith(ORIGINAL_VC)]
+    if not names:
+        raise Failure("migration", f"no {ORIGINAL_VC} container")
+    container = names[0]
+    token_file = run(["docker", "exec", container, "find", "/validator-keys", "/keymanager",
+                      "-name", "api-token.txt"], check=False).split()
+    if not token_file:
+        raise Failure("migration", "the original validator client has no keymanager API token")
+    token = run(["docker", "exec", container, "cat", token_file[0]]).strip()
+    return container, port_print(ORIGINAL_VC, "http-validator"), token
+
+
+def keymanager(method, path, body=None):
+    container, url, token = original_vc()
+    return http(method, f"{url}{path}", body, timeout=60,
+                headers={"Authorization": f"Bearer {token}"})
+
+
+def migration_candidate():
+    """The genesis validator to migrate: the first key of the original client."""
+    status, answer = keymanager("GET", "/eth/v1/keystores")
+    if status != 200:
+        raise Failure("migration", f"keymanager GET /eth/v1/keystores: {status} {answer}")
+    keys = sorted(entry["validating_pubkey"] for entry in answer["data"])
+    if not keys:
+        raise Failure("migration", "the original validator client has no keys")
+    key = keys[0]
+    entry = validator(key)
+    if not entry or not entry["status"].startswith("active"):
+        raise Failure("migration", f"{key} is not an active validator")
+    return key, int(entry["index"])
+
+
+def copy_keystore(key, directory):
+    """The validator's EIP-2335 keystore and its password file, from the original client's
+    Lighthouse layout (`<validators-dir>/<key>/voting-keystore.json`, `<secrets-dir>/<key>`): the
+    operator's backup of the key. Taken before the stop, since Lighthouse's keymanager deletes the
+    keystore with the key."""
+    container, _, _ = original_vc()
+    found = run(["docker", "exec", container, "find", "/validator-keys", "-path", f"*{key}*"]).split()
+    keystores = [path for path in found if path.endswith(f"/{key}/voting-keystore.json")]
+    secrets = [path for path in found if path.endswith(f"/secrets/{key}")]
+    if len(keystores) != 1 or len(secrets) != 1:
+        raise Failure("migration", f"no single keystore and password of {key} ({found})")
+    run(["docker", "cp", f"{container}:{keystores[0]}", f"{directory}/keystore.json"])
+    run(["docker", "cp", f"{container}:{secrets[0]}", f"{directory}/password"])
+    own(directory)
+    os.chmod(f"{directory}/password", 0o600)
+
+
+def migration(chain, dkg_key, key, index, observed=3, offline=2):
+    """Move the genesis validator `key` (index `index`) from its local keystore to the MPC
+    network, never with two signers active: stop it in the original client and take its history
+    in one call (keymanager DELETE), split its keystore offline, register, install, import the
+    history, activate, then sign through Lighthouse's remote-signer client only."""
+    def body():
+        directory = workdir("migration")
+        os.chmod(directory, 0o700)
+        signed_before = [e for e in jsonl("migrated.jsonl") if e.get("target_attester")]
+        if len(signed_before) < 2:
+            raise Failure("migration", "the original signer did not attest before the migration")
+        log(f"migration: {key} (index {index}) attested {len(signed_before)} epochs with its local keystore")
+
+        # 0. The operator's keystore backup (Lighthouse deletes the keystore with the key).
+        copy_keystore(key, directory)
+
+        # 1. Stop the original signer for this key: the keymanager deletes it and returns its
+        #    EIP-3076 history in one call; it no longer lists the key.
+        stopped_epoch = chain.epoch()
+        status, answer = keymanager("DELETE", "/eth/v1/keystores", {"pubkeys": [key]})
+        stopped = time.time()
+        if status != 200 or answer["data"][0]["status"] != "deleted":
+            raise Failure("migration", f"keymanager DELETE: {status} {answer}")
+        history = json.loads(answer["slashing_protection"])
+        save("migration-history.json", history)
+        status, listed = keymanager("GET", "/eth/v1/keystores")
+        if any(entry["validating_pubkey"] == key for entry in listed["data"]):
+            raise Failure("migration", "the original client still lists the key after DELETE")
+        entries = [e for e in history["data"] if e["pubkey"] == key]
+        blocks = [int(b["slot"]) for e in entries for b in e["signed_blocks"]]
+        attestations = [(int(a["source_epoch"]), int(a["target_epoch"]))
+                        for e in entries for a in e["signed_attestations"]]
+        log(f"migration: original signer stopped at epoch {stopped_epoch}; its history has "
+            f"{len(blocks)} blocks and {len(attestations)} attestations")
+
+        # 2. Split the keystore with no network (the offline dealer), for the committee as the
+        #    nodes describe it, in committee order.
+        identities = sorted((http("GET", f"{node_url(node)}/identity")[1] for node in range(NODES)),
+                            key=lambda identity: identity["participant_index"])
+        participants = [{"identity": identity["identity"],
+                         "share_encryption_key": identity["share_encryption_key"]}
+                        for identity in identities]
+        with open(f"{directory}/committee.json", "w") as file:
+            json.dump({"participants": participants}, file)
+        own(directory)
+        shares = f"{directory}/shares"  # mpc-keytool refuses an existing directory
+        summary = json.loads(keytool("split", "--keystore", f"{directory}/keystore.json",
+                                     "--password-file", f"{directory}/password",
+                                     "--committee", f"{directory}/committee.json",
+                                     "--ceremony-id", MIGRATED_CEREMONY, "--output", shares))
+        if summary["validator_public_key"] != key:
+            raise Failure("migration", f"the split key {summary['validator_public_key']} is not {key}")
+        manifest = json.loads(read(f"{shares}/manifest.json"))
+
+        # 3. Register, install each node's own share, import the history, activate.
+        status, registered = http("POST", f"{node_url(0)}/keys/import", manifest, timeout=40)
+        if status != 200:
+            raise Failure("migration", f"registration: {status} {registered}")
+        for node in range(NODES):
+            wait(f"registration on node {node}", "migration", 60, 1,
+                 lambda node=node: http("GET", f"{node_url(node)}/keys/import/{MIGRATED_CEREMONY}")[0] == 200)
+            status, identity = http("GET", f"{node_url(node)}/identity")
+            envelope = json.loads(read(f"{shares}/node-{identity['participant_index']}.enc"))
+            status, installed = http("POST", f"{node_url(node)}/keys/import/share", envelope)
+            if status != 200:
+                raise Failure("migration", f"share install on node {node}: {status} {installed}")
+        wait("every share acknowledged", "migration", 120, 1, lambda: len(http(
+            "GET", f"{node_url(0)}/keys/import/{MIGRATED_CEREMONY}")[1]["ready_shares"]) == NODES)
+        status, early = http("POST", f"{node_url(1)}/validators/activate", {
+            "public_key": key, "genesis_validators_root": chain.genesis_validators_root,
+            "acknowledgment": ACKNOWLEDGED}, timeout=40)
+        if status != 409 or early.get("refusal", {}).get("reason") != "no_imported_history":
+            raise Failure("migration", f"activation before the history import: {status} {early}")
+        status, dry = http("POST", f"{node_url(2)}/slashing-protection/import",
+                           {"interchange": history, "validators": [key], "dry_run": True}, timeout=40)
+        if status != 200 or not dry["dry_run"]:
+            raise Failure("migration", f"history dry run: {status} {dry}")
+        status, imported = http("POST", f"{node_url(2)}/slashing-protection/import",
+                                {"interchange": history, "validators": [key]}, timeout=40)
+        if status != 200 or imported["outcome"] != "imported":
+            raise Failure("migration", f"history import: {status} {imported}")
+        status, activated = http("POST", f"{node_url(1)}/validators/activate", {
+            "public_key": key, "genesis_validators_root": chain.genesis_validators_root,
+            "acknowledgment": ACKNOWLEDGED}, timeout=40)
+        if status != 200 or activated["status"] != "active":
+            raise Failure("migration", f"activation: {status} {activated}")
+        activated_at = time.time()
+        status, import_state = http("GET", f"{node_url(0)}/keys/import/{MIGRATED_CEREMONY}")
+        log(f"migration: registered, 4 shares, history imported "
+            f"(floors {import_state['history']['floors']}), activated at height {activated['activated_at']}")
+
+        # 4. Lighthouse signs the key through the MPC network only (remote signer).
+        vc_stop()
+        vc_start(dkg_key, key)
+        resumed = time.time()
+        status, listed = http("GET", f"{node_url(0)}/api/v1/eth2/publicKeys")
+        if key not in listed:
+            raise Failure("migration", "the migrated key is not served by the Web3Signer API")
+
+        # 5. Duties, then the imported history's refusals, then one keyholder away.
+        observe("migration", index, observed, chain)
+        refusals = migrated_refusals(key, blocks, attestations, chain)
+        signer_stop(2)
+        observe("migration-node-offline", index, offline, chain)
+        signer_start(2)
+        wait("node 2 ready", "environment", 300, 1, lambda: ready(2))
+        wait("all nodes at the same height", "environment", 300, 1, lambda: converged(range(NODES)))
+
+        # 6. Still one signer: the original client does not list the key, the validator is not
+        #    slashed, and the network's export carries the imported floor.
+        status, listed = keymanager("GET", "/eth/v1/keystores")
+        if any(entry["validating_pubkey"] == key for entry in listed["data"]):
+            raise Failure("migration", "the original client lists the key again")
+        if validator(key)["validator"]["slashed"]:
+            raise Failure("migration", "the migrated validator was slashed")
+        status, exported = http("GET", f"{node_url(3)}/slashing-protection/export/{key}")
+        if status != 200:
+            raise Failure("migration", f"export: {status} {exported}")
+        save("migration-export.json", exported)
+        return {"key": key, "index": index, "stopped": stopped, "stopped_epoch": stopped_epoch,
+                "activated": activated_at, "activated_epoch": chain.epoch_at(activated_at),
+                "vc_resumed": resumed, "resumed_epoch": chain.epoch_at(resumed),
+                "history_blocks": len(blocks),
+                "history_attestations": len(attestations),
+                "floors": import_state["history"]["floors"], "refusals": refusals,
+                "manifest_digest": registered["manifest_digest"],
+                "exported_blocks": sum(len(e["signed_blocks"]) for e in exported["data"]),
+                "exported_attestations": sum(len(e["signed_attestations"]) for e in exported["data"])}
+    return body
+
+
+ACKNOWLEDGED = {"previous_signer_stopped": True, "no_other_active_signer": True,
+                "history_exported_after_stop": True, "automatic_restart_disabled": True}
+
+
+def migrated_refusals(key, blocks, attestations, chain):
+    """What the previous signer's history forbids, asked through the proxy: a block at the
+    latest imported slot, an attestation at the latest imported target, one with a source below
+    the latest imported source."""
+    proxy = f"http://127.0.0.1:{PROXY_PORT}"
+    roots = ssz()
+    results = []
+
+    def ask(kind, change, reason):
+        template = recorded(kind)
+        if not template:
+            results.append({"check": reason, "passed": False, "detail": f"no {kind} to adapt"})
+            return
+        request = json.loads(template["body"])
+        change(request)
+        request["signingRoot"] = "0x" + roots.signing_root(request, roots.preset(False)).hex()
+        status, answer = sign_via(proxy, f"/api/v1/eth2/sign/{key}", json.dumps(request))
+        got = answer.get("refusal", {}).get("reason") if isinstance(answer, dict) else None
+        passed = status == 412 and got == reason
+        results.append({"check": reason, "passed": passed, "detail": f"HTTP {status} {got}"})
+        log(f"migration: {'ok  ' if passed else 'FAIL'} {kind} refused as {reason}: HTTP {status} {got}")
+
+    if not blocks:
+        results.append({"check": "block_at_or_below_imported", "passed": None,
+                        "detail": "skipped: the previous signer signed no block"})
+    else:
+        def block(request):
+            header = request["beacon_block"]["block_header"]
+            header["slot"] = str(max(blocks))
+            header["body_root"] = "0x" + "ab" * 32
+        ask("BLOCK_V2", block, "block_at_or_below_imported")
+    if attestations:
+        source, target = max(attestations, key=lambda pair: pair[1])
+
+        def at_floor(request):
+            data = request["attestation"]
+            data["slot"] = str(target * chain.slots_per_epoch)
+            data["source"]["epoch"], data["target"]["epoch"] = str(source), str(target)
+            data["beacon_block_root"] = "0x" + "cd" * 32
+        ask("ATTESTATION", at_floor, "target_at_or_below_imported")
+        if source > 0:
+            def below(request):
+                later = chain.epoch() + 4
+                data = request["attestation"]
+                data["slot"] = str(later * chain.slots_per_epoch)
+                data["source"]["epoch"], data["target"]["epoch"] = str(source - 1), str(later)
+            ask("ATTESTATION", below, "source_below_imported")
+    return results
+
+
+def jsonl(name):
+    return [json.loads(line) for line in read(f"{WORK}/{name}").splitlines() if line.strip()]
+
+
 def proxy_records():
     records = []
     for line in read(f"{WORK}/logs/proxy.jsonl").splitlines():
@@ -780,13 +1055,15 @@ def proxy_records():
 # Security checks on the live devnet
 
 
-def recorded(kind):
-    """The latest signing request of `kind` that the MPC network signed (kept by the proxy)."""
+def recorded(kind, key=None):
+    """The latest signing request of `kind` that the MPC network signed (kept by the proxy), for
+    the validator `key` if given."""
     directory = f"{WORK}/requests"
     for name in sorted(os.listdir(directory), reverse=True):
         with open(f"{directory}/{name}") as file:
             record = json.load(file)
-        if record["status"] == 200 and json.loads(record["body"]).get("type") == kind:
+        if (record["status"] == 200 and json.loads(record["body"]).get("type") == kind
+                and (key is None or key_of(record) == key.lower())):
             return record
     return None
 
@@ -805,7 +1082,7 @@ def security_checks(key, chain):
         checks.append({"check": name, "passed": bool(passed), "detail": detail})
         log(f"security: {'ok  ' if passed else 'FAIL'} {name}: {detail}")
 
-    attestation = recorded("ATTESTATION")
+    attestation = recorded("ATTESTATION", key)
     if attestation:
         status, body = sign_via(proxy, attestation["path"], attestation["body"])
         same = status == 200 and body.get("signature") == json.loads(attestation["response"])["signature"]
@@ -822,7 +1099,7 @@ def security_checks(key, chain):
     else:
         check("a recorded attestation exists", False, "none signed")
 
-    block = recorded("BLOCK_V2")
+    block = recorded("BLOCK_V2", key)
     if block:
         conflicting = json.loads(block["body"])
         conflicting["beacon_block"]["block_header"]["body_root"] = "0x" + "ee" * 32
@@ -905,6 +1182,12 @@ def report(chain=None):
     def in_window(ts, name):
         return any(n == name and start <= ts <= end for n, start, end in windows)
 
+    def of(e, name):
+        return e["scenario"] == name or e["scenario"].startswith(f"{name}-")
+
+    def by(e):
+        return e.get("index", index)
+
     per_scenario = {}
     for name, _, _ in windows:
         requests = [r for r in proxy if in_window(r["ts"], name)]
@@ -919,13 +1202,13 @@ def report(chain=None):
             "authorization_ms": percentiles([float(s["authorization_ms"]) for s in fresh]),
             "collect_ms": percentiles([float(s["collect_ms"]) for s in fresh if s.get("collect_ms")]),
             "attestations": {
-                "epochs": sum(1 for e in epochs if e["scenario"] == name),
-                "missed": sum(1 for e in epochs if e["scenario"] == name and not e["target_attester"]),
+                "epochs": sum(1 for e in epochs if of(e, name)),
+                "missed": sum(1 for e in epochs if of(e, name) and not e["target_attester"]),
             },
             "proposals": {
-                "assigned": sum(len(e["proposals"]) for e in epochs if e["scenario"] == name),
-                "canonical": sum(1 for e in epochs if e["scenario"] == name for p in e["proposals"]
-                                 if proposed(p, index)),
+                "assigned": sum(len(e["proposals"]) for e in epochs if of(e, name)),
+                "canonical": sum(1 for e in epochs if of(e, name) for p in e["proposals"]
+                                 if proposed(p, by(e))),
             },
         }
         for s in scenarios:
@@ -943,6 +1226,9 @@ def report(chain=None):
         finalized = int(beacon("/eth/v1/beacon/states/head/finality_checkpoints")["finalized"]["epoch"])
     except Exception:
         pass
+    # The MPC (DKG) validator's epochs; the migrated validator has its own section.
+    migration = migration_report(scenarios, proxy, signed, index)
+    epochs = [e for e in epochs if by(e) == index]
     proposals = [p for e in epochs for p in e["proposals"]]
     slots_per_epoch = chain.slots_per_epoch if chain else 32
     # The whole active period and every block the MPC network signed for Lighthouse, while the
@@ -952,7 +1238,8 @@ def report(chain=None):
     whole = [json.loads(l) for l in read(f"{WORK}/lifetime.jsonl").splitlines() if l.strip()] or None
     blocks = None
     try:
-        blocks = [block_at(r["slot"]) for r in proxy if r["type"] == "BLOCK_V2" and r["status"] == 200]
+        blocks = [block_at(r["slot"]) for r in proxy if r["type"] == "BLOCK_V2" and r["status"] == 200
+                  and key_of(r) != (migration or {}).get("public_key")]
     except Exception as error:  # noqa: BLE001 - the report still has the per-epoch evidence
         log(f"report: no beacon evidence for the signed blocks ({error})")
     read_epochs = [e for e in whole or [] if "error" not in e]
@@ -998,6 +1285,7 @@ def report(chain=None):
         "scenarios": per_scenario,
         "scenario_details": scenarios,
         "security": load("security.json", []),
+        "migration": migration,
         "finalized_epoch": finalized,
     }
     save("report.json", result)
@@ -1052,6 +1340,7 @@ def report(chain=None):
                 lines.append(f"- {s['name']}: {r['type']} {duty_time(r)}: {attempts}; "
                              f"{'new' if new else 'existing'} authorization, accepted by consensus at "
                              f"heights {evidence['authorized_at']}, signed by nodes {evidence['signed_by']}")
+    lines.extend(migration_lines(migration))
     lines.append("")
     for item in result["security"]:
         lines.append(f"- security: {'ok' if item['passed'] else 'FAILED'}: {item['check']} ({item['detail']})")
@@ -1059,6 +1348,99 @@ def report(chain=None):
         file.write("\n".join(lines) + "\n")
     print("\n".join(lines))
     return result
+
+
+def key_of(record):
+    """The validator key of a proxied signing request (`/api/v1/eth2/sign/<key>`)."""
+    return record.get("path", "").rsplit("/", 1)[-1].lower() or None
+
+
+def migration_report(scenarios, proxy, signed, dkg_index):
+    """The migrated validator: its duties before, during and after the migration (`Recorder`), the
+    imported history, its signing latency next to the DKG key's, and the refusals."""
+    candidate = load("migration.json")
+    details = next((s for s in scenarios if s["name"] == "migration"), None)
+    if not candidate or not details or "key" not in details:
+        return None
+    key = details["key"]
+    lifetime = [e for e in jsonl("migrated.jsonl") if "error" not in e]
+
+    def tally(entries):
+        assigned = [p for e in entries for p in e["proposals"]]
+        return {"epochs": [e["epoch"] for e in entries[:1] + entries[-1:]],
+                "attested": sum(e["target_attester"] for e in entries),
+                "missed_attestation_epochs": [e["epoch"] for e in entries if not e["target_attester"]],
+                "proposals_assigned": len(assigned),
+                "proposals_canonical": sum(proposed(p, details["index"]) for p in assigned),
+                "missed_proposal_slots": [p["slot"] for p in assigned if not proposed(p, details["index"])]}
+    # Before: epochs fully signed by the original client (up to the one before the stop).
+    # During: from the stop's epoch to the first epoch after Lighthouse signs through the MPC
+    # network. After: from there on.
+    resumed = details["resumed_epoch"]
+    before = [e for e in lifetime if e["epoch"] < details["stopped_epoch"]]
+    during = [e for e in lifetime if details["stopped_epoch"] <= e["epoch"] <= resumed]
+    after = [e for e in lifetime if e["epoch"] > resumed]
+    since = details["vc_resumed"]
+
+    def latency(public_key):
+        requests = [r for r in proxy if r["status"] == 200 and r["ts"] >= since and key_of(r) == public_key]
+        fresh = [r for r in signed if r["ok"] and r["ts"] >= since and r.get("authorization_ms")
+                 and r.get("validator", "").lower() == public_key]
+        return {"end_to_end_ms": percentiles([r["ms"] for r in requests]),
+                "authorization_ms": percentiles([float(r["authorization_ms"]) for r in fresh]),
+                "collect_ms": percentiles([float(r["collect_ms"]) for r in fresh if r.get("collect_ms")]),
+                "by_type": {kind: sum(1 for r in requests if r["type"] == kind)
+                            for kind in sorted({r["type"] for r in requests})}}
+    dkg_key = (load("validator.json") or {}).get("public_key")
+    return {"public_key": key, "original_public_key": candidate["public_key"],
+            "same_public_key": key == candidate["public_key"], "index": details["index"],
+            "manifest_digest": details["manifest_digest"],
+            "history": {"blocks": details["history_blocks"], "attestations": details["history_attestations"],
+                        "floors": details["floors"]},
+            "export": {"blocks": details["exported_blocks"], "attestations": details["exported_attestations"]},
+            "stopped_epoch": details["stopped_epoch"], "activated_epoch": details["activated_epoch"],
+            "stop_to_activation_s": round(details["activated"] - details["stopped"], 1),
+            "stop_to_resumed_s": round(details["vc_resumed"] - details["stopped"], 1),
+            "before": tally(before), "during": tally(during), "after": tally(after),
+            "latency_imported": latency(key), "latency_dkg": latency(dkg_key) if dkg_key else None,
+            "refusals": details["refusals"]}
+
+
+def migration_lines(m):
+    if not m:
+        return []
+
+    def duties(t):
+        return (f"{t['attested']} of {len(range(t['epochs'][0], t['epochs'][-1] + 1)) if t['epochs'] else 0} "
+                f"epochs attested (epochs {t['epochs']}, missed {t['missed_attestation_epochs']}); proposals "
+                f"{t['proposals_canonical']} canonical of {t['proposals_assigned']} (missed {t['missed_proposal_slots']})")
+
+    def ms(p):
+        return f"{p.get('p50')}/{p.get('p95')} ({p['n']})"
+    lines = ["", "## Migration of a genesis validator to the MPC network", "",
+             f"- public key before: `{m['original_public_key']}`",
+             f"- public key after: `{m['public_key']}` ({'unchanged' if m['same_public_key'] else 'CHANGED'}), "
+             f"validator index {m['index']}, manifest `{m['manifest_digest']}`",
+             f"- EIP-3076 history from the original client: {m['history']['blocks']} blocks, "
+             f"{m['history']['attestations']} attestations; floors {m['history']['floors']}; the network's "
+             f"export afterwards: {m['export']['blocks']} blocks, {m['export']['attestations']} attestations",
+             f"- original signer stopped in epoch {m['stopped_epoch']}, MPC activation in epoch "
+             f"{m['activated_epoch']} ({m['stop_to_activation_s']} s), Lighthouse signing through the MPC "
+             f"network {m['stop_to_resumed_s']} s after the stop",
+             f"- before (local keystore): {duties(m['before'])}",
+             f"- during the migration: {duties(m['during'])}",
+             f"- after (MPC network): {duties(m['after'])}",
+             f"- latency after the migration, end-to-end p50/p95 ms (n): imported key "
+             f"{ms(m['latency_imported']['end_to_end_ms'])}, DKG key "
+             f"{ms(m['latency_dkg']['end_to_end_ms']) if m['latency_dkg'] else '-'}; authorization: imported "
+             f"{ms(m['latency_imported']['authorization_ms'])}, DKG "
+             f"{ms(m['latency_dkg']['authorization_ms']) if m['latency_dkg'] else '-'}; share collection: imported "
+             f"{ms(m['latency_imported']['collect_ms'])}, DKG "
+             f"{ms(m['latency_dkg']['collect_ms']) if m['latency_dkg'] else '-'}"]
+    for r in m["refusals"]:
+        state = "skipped" if r["passed"] is None else "ok" if r["passed"] else "FAILED"
+        lines.append(f"- imported history: {state}: {r['check']} ({r['detail']})")
+    return lines
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1082,6 +1464,11 @@ def run_all(observed=3, proposal_epochs=12):
     log(f"devnet: {chain.seconds_per_slot} s slots, {chain.slots_per_epoch} slots per epoch, "
         f"genesis fork version {chain.genesis_fork_version}")
     signers_start()
+    migrated_key, migrated_index = migration_candidate()
+    save("migration.json", {"public_key": migrated_key, "index": migrated_index})
+    log(f"migration: candidate {migrated_key} (genesis validator {migrated_index})")
+    migrated_recorder = Recorder(migrated_index, chain.epoch(), chain, "migrated.jsonl")
+    migrated_recorder.start()
     key = dkg()
     activation = activate(key, chain)
     deposit(key, chain)
@@ -1100,8 +1487,10 @@ def run_all(observed=3, proposal_epochs=12):
     scenario("node-offline", node_offline(index, chain, observed))
     scenario("coordinator-failover", coordinator_failover(index, chain, observed))
     scenario("inflight-retry", inflight_retry(index, chain))
+    scenario("migration", migration(chain, key, migrated_key, migrated_index))
     security_checks(key, chain)
     recorder.stop()
+    migrated_recorder.stop()
     return report(chain)
 
 

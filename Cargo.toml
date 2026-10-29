@@ -50,6 +50,17 @@ ethereum_ssz_derive = "0.10"
 ethereum_serde_utils = "0.8.1"
 typenum = "1"
 
+# Offline key import (`import`, `mpc-keytool`): EIP-2335 keystores and share encryption.
+aes = "0.9"
+ctr = "0.10"
+hpke = { version = "0.15", default-features = false, features = ["alloc", "getrandom", "x25519", "chacha"] }
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+rpassword = "7"
+scrypt = { version = "0.12", default-features = false }
+sha2 = "0.11"
+unicode-normalization = "0.1"
+zeroize = "1"
+
 [dev-dependencies]
 # Reference BLS implementation of Ethereum consensus clients (already used by commonware).
 blst = { version = "0.3.17", default-features = false, features = ["no-threads"] }
@@ -61,3 +72,16 @@ serde_yaml = "0.9"
 name = "e2e"
 path = "tests/e2e/main.rs"
 required-features = ["test-hooks"]
+
+# EIP-2335 key derivation (scrypt, PBKDF2) is slow without optimizations, also in tests.
+[profile.dev.package.scrypt]
+opt-level = 3
+
+[profile.dev.package.pbkdf2]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.salsa20]
+opt-level = 3

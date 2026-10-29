@@ -26,7 +26,7 @@ use std::{path::Path, time::Duration};
 const VALIDATOR: &str = "validator-eth";
 
 /// The chain of the fixtures (their `genesis_validators_root`).
-const CHAIN: &str = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+pub(crate) const CHAIN: &str = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
 
 /// Every supported duty.
 const FIXTURES: [&str; 10] = [
@@ -75,7 +75,7 @@ fn fixture(name: &str) -> Value {
 }
 
 /// The signing root of a request, as the signer computes it.
-fn signing_root(body: &Value) -> Root {
+pub(crate) fn signing_root(body: &Value) -> Root {
     let request = parse_request(body.to_string().as_bytes()).unwrap();
     request.duty.signing_root(&request.fork)
 }
@@ -118,7 +118,7 @@ fn activate(network: &TestNetwork, via: usize, key: &str, chain: &str) -> (u16, 
 }
 
 /// The activation of `key` as node `node` has it (`GET /validators`), if any.
-fn activation(network: &TestNetwork, node: usize, key: &str) -> Option<Value> {
+pub(crate) fn activation(network: &TestNetwork, node: usize, key: &str) -> Option<Value> {
     let (status, validators) = network.get(node, "/validators");
     assert_eq!(status, 200, "{validators}");
     validators
@@ -160,7 +160,7 @@ fn sign(network: &TestNetwork, via: usize, key: &str, body: &Value) -> (u16, Val
 }
 
 /// Sign `body` through `via` and check the signature against `key` and the request's root.
-fn signed(network: &TestNetwork, via: usize, key: &str, body: &Value) -> Value {
+pub(crate) fn signed(network: &TestNetwork, via: usize, key: &str, body: &Value) -> Value {
     let (status, answer) = sign(network, via, key, body);
     assert_eq!(status, 200, "node {via}: {answer} for {body}");
     let root: Root = signing_root(body);
@@ -172,7 +172,7 @@ fn signed(network: &TestNetwork, via: usize, key: &str, body: &Value) -> Value {
 }
 
 /// Expect slashing protection to refuse `body` through `via` with `reason`.
-fn refused(network: &TestNetwork, via: usize, key: &str, body: &Value, reason: &str) {
+pub(crate) fn refused(network: &TestNetwork, via: usize, key: &str, body: &Value, reason: &str) {
     let (status, answer) = sign(network, via, key, body);
     assert_eq!(status, 412, "node {via}: {answer}");
     assert_eq!(answer["refusal"]["reason"], reason, "{answer}");
@@ -209,7 +209,7 @@ fn e2e_eth_1_web3signer_signs_every_supported_duty() {
     assert_eq!(status, 200, "{validators}");
     assert_eq!(
         validators,
-        json!([{ "public_key": key, "ceremony_id": VALIDATOR, "status": "inactive" }])
+        json!([{ "public_key": key, "ceremony_id": VALIDATOR, "origin": "dkg", "status": "inactive" }])
     );
     let (status, keys) = network.get(2, "/api/v1/eth2/publicKeys");
     assert_eq!((status, keys), (200, json!([])));

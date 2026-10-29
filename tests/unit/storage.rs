@@ -739,4 +739,581 @@ mod validator {
             }
         });
     }
+
+    /// Imported keys: registration, acknowledged shares, history and the activation barriers,
+    /// through blocks and a restart.
+    mod imported {
+        use super::*;
+        use crate::{
+            dkg::{
+                PROTOCOL_VERSION,
+                ceremony::{ImportOutcome, ReadyAck, ReadyIgnored},
+            },
+            import::{
+                dealer,
+                manifest::{MANIFEST_VERSION, Manifest, Member},
+            },
+            slashing::{
+                Acknowledgment, HistoryImport, HistoryOutcome, HistoryRefusal, HistorySummary,
+                ImportedAttestation, ImportedBlock,
+            },
+        };
+        use commonware_cryptography::bls12381::primitives::group::{Private, Scalar};
+        use rand::{SeedableRng as _, rngs::StdRng};
+
+        /// A manifest for the key `seed`, split among `committee`.
+        fn manifest(ceremony: &str, committee: &Set<PublicKey>, seed: u64) -> Manifest {
+            let secret = Private::new(Scalar::from_u64(seed + 1000));
+            let split =
+                dealer::split(&secret, committee, &mut StdRng::seed_from_u64(seed)).unwrap();
+            Manifest {
+                version: MANIFEST_VERSION,
+                ceremony: id(ceremony),
+                import_id: [seed as u8; 16],
+                validator: split.sharing.public().encode().as_ref().try_into().unwrap(),
+                protocol_version: PROTOCOL_VERSION,
+                threshold: 3,
+                members: committee
+                    .iter()
+                    .enumerate()
+                    .map(|(index, identity)| Member {
+                        identity: identity.clone(),
+                        share_key: [index as u8 + 1; 32],
+                    })
+                    .collect(),
+                commitments: split.commitments,
+            }
+        }
+
+        fn register(manifest: &Manifest) -> Transaction {
+            tx(Command::RegisterImportedKey(Box::new(manifest.clone())))
+        }
+
+        fn history(
+            key: ValidatorKey,
+            genesis: u8,
+            slot: u64,
+            source: u64,
+            target: u64,
+        ) -> Transaction {
+            tx(Command::ImportSlashingProtection(Box::new(HistoryImport {
+                chain: chain(genesis),
+                digest: [7; 32],
+                validators: vec![(
+                    key,
+                    HistorySummary {
+                        block: Some(ImportedBlock {
+                            slot,
+                            signing_root: None,
+                        }),
+                        attestation: Some(ImportedAttestation {
+                            source,
+                            target,
+                            signing_root: None,
+                        }),
+                    },
+                )],
+            })))
+        }
+
+        fn activate_imported(
+            key: ValidatorKey,
+            genesis: u8,
+            acknowledgment: Acknowledgment,
+        ) -> Transaction {
+            tx(Command::ActivateImportedValidator {
+                validator: key,
+                chain: chain(genesis),
+                acknowledgment,
+            })
+        }
+
+        const ACKNOWLEDGED: Acknowledgment = Acknowledgment {
+            previous_signer_stopped: true,
+            no_other_active_signer: true,
+            history_exported_after_stop: true,
+            automatic_restart_disabled: true,
+        };
+
+        /// Register an imported key at height 1, its history at 2, 3 acknowledgements at 3, and
+        /// activate it at 4 (for the chain of [fork]). Returns its key.
+        async fn activated<E: Context + CryptoRng>(
+            context: &mut E,
+            store: &mut Store<E>,
+            signers: &[PrivateKey],
+        ) -> ValidatorKey {
+            let block = Sha256::hash(&[b"block"]);
+            let manifest = manifest("imported", &committee(signers), 1);
+            let key = manifest.validator;
+            for (height, transactions) in [
+                (1, vec![register(&manifest)]),
+                (2, vec![history(key, 9, 100, 10, 11)]),
+                (
+                    3,
+                    signers[..3]
+                        .iter()
+                        .map(|signer| {
+                            tx(Command::ImportedShareReady(Box::new(ReadyAck::sign(
+                                signer,
+                                0,
+                                manifest.digest(),
+                            ))))
+                        })
+                        .collect(),
+                ),
+                (4, vec![activate_imported(key, 9, ACKNOWLEDGED)]),
+            ] {
+                store
+                    .apply_block(height, &block, &transactions, context)
+                    .await
+                    .unwrap();
+            }
+            key
+        }
+
+        #[test]
+        fn imported_keys_activate_only_after_history_shares_and_acknowledgement() {
+            deterministic::Runner::default().start(|mut context| async move {
+                let signers = signers();
+                let committee = committee(&signers);
+                let block = Sha256::hash(&[b"block"]);
+                let mut store = Store::init(context.child("first"), "node", committee.clone())
+                    .await
+                    .unwrap();
+                let manifest = manifest("imported", &committee, 1);
+                let key = manifest.validator;
+
+                // Registration: once; the same manifest is idempotent; another manifest under the
+                // id, the key under another id, or an invalid manifest are refused.
+                let mut conflicting = manifest.clone();
+                conflicting.import_id = [9; 16];
+                let mut other_id = manifest.clone();
+                other_id.ceremony = id("imported-again");
+                let mut invalid = super::imported::manifest("invalid", &committee, 2);
+                invalid.threshold = 2;
+                let applied = store
+                    .apply_block(
+                        1,
+                        &block,
+                        &[
+                            register(&manifest),
+                            register(&manifest),
+                            register(&conflicting),
+                            register(&other_id),
+                            register(&invalid),
+                        ],
+                        &mut context,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    applied.effects[0],
+                    Effect::Register(ImportOutcome::Registered(0))
+                );
+                assert_eq!(
+                    applied.effects[1],
+                    Effect::Register(ImportOutcome::Exists(0))
+                );
+                assert_eq!(
+                    applied.effects[2],
+                    Effect::Register(ImportOutcome::Conflict(0))
+                );
+                assert_eq!(
+                    applied.effects[3],
+                    Effect::Register(ImportOutcome::KeyExists(0))
+                );
+                assert!(matches!(
+                    applied.effects[4],
+                    Effect::Register(ImportOutcome::Invalid(_))
+                ));
+                assert_eq!(applied.designated, vec![0]);
+                let (id0, validator) = store.protection().validator_of(&key).unwrap();
+                assert_eq!((id0, validator.activation), (0, None));
+
+                // Registered, nothing else: no duty, no plain activation, no imported activation.
+                let applied = store
+                    .apply_block(
+                        2,
+                        &block,
+                        &[
+                            submit(&propose(key, 200, 1)),
+                            activate(key, 9),
+                            activate_imported(key, 9, ACKNOWLEDGED),
+                        ],
+                        &mut context,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    applied.effects[0],
+                    Effect::Duty(
+                        Decision::Refused(Refusal::NotActivated),
+                        propose(key, 200, 1).signing_root()
+                    )
+                );
+                assert_eq!(
+                    applied.effects[1],
+                    Effect::Activate(ActivationOutcome::Refused(ActivationRefusal::ImportedKey))
+                );
+                assert_eq!(
+                    applied.effects[2],
+                    Effect::Activate(ActivationOutcome::Refused(
+                        ActivationRefusal::NoImportedHistory
+                    ))
+                );
+
+                // History for chain 9; then another chain is refused for history and activation.
+                let applied = store
+                    .apply_block(
+                        3,
+                        &block,
+                        &[
+                            history(key, 9, 100, 10, 11),
+                            history(key, 8, 100, 10, 11),
+                            activate_imported(key, 8, ACKNOWLEDGED),
+                        ],
+                        &mut context,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    applied.effects[0],
+                    Effect::History(HistoryOutcome::Imported)
+                );
+                assert!(matches!(
+                    applied.effects[1],
+                    Effect::History(HistoryOutcome::Refused(HistoryRefusal::OtherChain { .. }))
+                ));
+                assert!(matches!(
+                    applied.effects[2],
+                    Effect::Activate(ActivationOutcome::Refused(
+                        ActivationRefusal::HistoryForAnotherChain { .. }
+                    ))
+                ));
+
+                // Shares: two acknowledgements are not enough; bad ones are ignored.
+                let digest = manifest.digest();
+                let mut forged = ReadyAck::sign(&signers[3], 0, digest);
+                forged.round = 0;
+                forged.signature = ReadyAck::sign(&signers[2], 0, digest).signature;
+                let outsider = <PrivateKey as commonware_cryptography::Signer>::from_seed(99);
+                let applied = store
+                    .apply_block(
+                        4,
+                        &block,
+                        &[
+                            tx(Command::ImportedShareReady(Box::new(ReadyAck::sign(
+                                &signers[0],
+                                0,
+                                digest,
+                            )))),
+                            tx(Command::ImportedShareReady(Box::new(ReadyAck::sign(
+                                &signers[1],
+                                0,
+                                digest,
+                            )))),
+                            tx(Command::ImportedShareReady(Box::new(ReadyAck::sign(
+                                &signers[1],
+                                0,
+                                digest,
+                            )))),
+                            tx(Command::ImportedShareReady(Box::new(forged))),
+                            tx(Command::ImportedShareReady(Box::new(ReadyAck::sign(
+                                &signers[2],
+                                0,
+                                [0; 32].into(),
+                            )))),
+                            tx(Command::ImportedShareReady(Box::new(ReadyAck::sign(
+                                &outsider, 0, digest,
+                            )))),
+                            activate_imported(key, 9, ACKNOWLEDGED),
+                        ],
+                        &mut context,
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(applied.effects[0], Effect::Ready(Ok(_))));
+                assert_eq!(
+                    applied.effects[1], applied.effects[2],
+                    "a repeated acknowledgement"
+                );
+                assert_eq!(
+                    applied.effects[3],
+                    Effect::Ready(Err(ReadyIgnored::BadSignature))
+                );
+                assert_eq!(
+                    applied.effects[4],
+                    Effect::Ready(Err(ReadyIgnored::Manifest))
+                );
+                assert_eq!(
+                    applied.effects[5],
+                    Effect::Ready(Err(ReadyIgnored::NotParticipant))
+                );
+                assert_eq!(
+                    applied.effects[6],
+                    Effect::Activate(ActivationOutcome::Refused(
+                        ActivationRefusal::SharesNotReady {
+                            ready: 2,
+                            required: 3
+                        }
+                    ))
+                );
+
+                // A third share; then an incomplete acknowledgement, then the complete one.
+                let incomplete = Acknowledgment {
+                    automatic_restart_disabled: false,
+                    ..ACKNOWLEDGED
+                };
+                let applied = store
+                    .apply_block(
+                        5,
+                        &block,
+                        &[
+                            tx(Command::ImportedShareReady(Box::new(ReadyAck::sign(
+                                &signers[2],
+                                0,
+                                digest,
+                            )))),
+                            activate_imported(key, 9, incomplete),
+                            activate_imported(key, 9, ACKNOWLEDGED),
+                            activate_imported(key, 9, ACKNOWLEDGED),
+                            activate(key, 9),
+                        ],
+                        &mut context,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    applied.effects[1],
+                    Effect::Activate(ActivationOutcome::Refused(
+                        ActivationRefusal::NotAcknowledged
+                    ))
+                );
+                assert_eq!(
+                    applied.effects[2],
+                    Effect::Activate(ActivationOutcome::Activated)
+                );
+                assert!(matches!(
+                    applied.effects[3],
+                    Effect::Activate(ActivationOutcome::AlreadyActivated(_))
+                ));
+                assert!(matches!(
+                    applied.effects[4],
+                    Effect::Activate(ActivationOutcome::AlreadyActivated(_))
+                ));
+
+                // Duties: the same slashing protection as any validator, plus the imported floors.
+                let cases = [
+                    (
+                        propose(key, 100, 1),
+                        Decision::Refused(Refusal::BlockAtOrBelowImported {
+                            slot: 100,
+                            floor: 100,
+                        }),
+                    ),
+                    (propose(key, 101, 1), Decision::Accepted),
+                    (
+                        propose(key, 101, 2),
+                        Decision::Refused(Refusal::DoubleProposal { slot: 101 }),
+                    ),
+                    (
+                        attestation(key, 9, 12),
+                        Decision::Refused(Refusal::SourceBelowImported {
+                            source_epoch: 9,
+                            floor: 10,
+                        }),
+                    ),
+                    (
+                        attestation(key, 10, 11),
+                        Decision::Refused(Refusal::TargetAtOrBelowImported {
+                            target_epoch: 11,
+                            floor: 11,
+                        }),
+                    ),
+                    (attestation(key, 10, 12), Decision::Accepted),
+                ];
+                let transactions: Vec<_> =
+                    cases.iter().map(|(request, _)| submit(request)).collect();
+                let applied = store
+                    .apply_block(6, &block, &transactions, &mut context)
+                    .await
+                    .unwrap();
+                for ((request, expected), effect) in cases.iter().zip(&applied.effects) {
+                    assert_eq!(*effect, Effect::Duty(*expected, request.signing_root()));
+                }
+                // A registration of the same key never resets anything.
+                let applied = store
+                    .apply_block(
+                        7,
+                        &block,
+                        &[
+                            register(&manifest),
+                            register(&other_id),
+                            history(key, 9, 50, 1, 2),
+                        ],
+                        &mut context,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    applied.effects[0],
+                    Effect::Register(ImportOutcome::Exists(0))
+                );
+                assert_eq!(
+                    applied.effects[1],
+                    Effect::Register(ImportOutcome::KeyExists(0))
+                );
+                assert_eq!(
+                    applied.effects[2],
+                    Effect::History(HistoryOutcome::Unchanged)
+                );
+                let before = (
+                    store.protection().clone(),
+                    store.ceremonies().iter().cloned().collect::<Vec<_>>(),
+                );
+                drop(store);
+
+                // Restart: the same state, the same decisions.
+                let mut store = Store::init(context.child("second"), "node", committee.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(store.protection(), &before.0);
+                assert_eq!(
+                    store.ceremonies().iter().cloned().collect::<Vec<_>>(),
+                    before.1
+                );
+                assert_eq!(
+                    store
+                        .ceremonies()
+                        .by_round(0)
+                        .unwrap()
+                        .imported()
+                        .unwrap()
+                        .ready
+                        .len(),
+                    3
+                );
+                let applied = store
+                    .apply_block(
+                        8,
+                        &block,
+                        &[
+                            submit(&propose(key, 101, 3)),
+                            submit(&propose(key, 60, 3)),
+                            submit(&propose(key, 101, 1)),
+                        ],
+                        &mut context,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    applied.effects[0],
+                    Effect::Duty(
+                        Decision::Refused(Refusal::DoubleProposal { slot: 101 }),
+                        propose(key, 101, 3).signing_root()
+                    )
+                );
+                assert_eq!(
+                    applied.effects[1],
+                    Effect::Duty(
+                        Decision::Refused(Refusal::BlockAtOrBelowImported {
+                            slot: 60,
+                            floor: 100
+                        }),
+                        propose(key, 60, 3).signing_root()
+                    )
+                );
+                assert_eq!(
+                    applied.effects[2],
+                    Effect::Duty(
+                        Decision::AlreadyAccepted,
+                        propose(key, 101, 1).signing_root()
+                    )
+                );
+            });
+        }
+
+        /// Imported keys' state tampered with on disk: the next start refuses.
+        #[test]
+        fn altered_import_state_fails_closed() {
+            type Tamper = fn(&mut Metadata<deterministic::Context, Key, Value>);
+            let cases: [(&str, Tamper); 4] = [
+                ("import state removed", |metadata| {
+                    metadata.remove(&key(IMPORTED_PREFIX, 0, 0));
+                }),
+                ("acknowledgement removed", |metadata| {
+                    let Some(Value::ImportedValidator(imported)) =
+                        metadata.get(&key(IMPORTED_PREFIX, 0, 0)).cloned()
+                    else {
+                        panic!("import state")
+                    };
+                    let _ = metadata.put(
+                        key(IMPORTED_PREFIX, 0, 0),
+                        Value::ImportedValidator(ImportedValidator {
+                            acknowledged: None,
+                            ..imported
+                        }),
+                    );
+                }),
+                ("history removed", |metadata| {
+                    let Some(Value::ImportedValidator(imported)) =
+                        metadata.get(&key(IMPORTED_PREFIX, 0, 0)).cloned()
+                    else {
+                        panic!("import state")
+                    };
+                    let _ = metadata.put(
+                        key(IMPORTED_PREFIX, 0, 0),
+                        Value::ImportedValidator(ImportedValidator {
+                            chain: None,
+                            ..imported
+                        }),
+                    );
+                }),
+                ("imported ceremony replaced by a DKG one", |metadata| {
+                    let Some(Value::ImportedCeremony(ceremony)) =
+                        metadata.get(&key(CEREMONY_PREFIX, 0, 0)).cloned()
+                    else {
+                        panic!("imported ceremony")
+                    };
+                    // Same id and round, no key: the validator no longer matches a ceremony key.
+                    let _ = metadata.put(
+                        key(CEREMONY_PREFIX, 0, 0),
+                        Value::Ceremony(Box::new(Ceremony {
+                            origin: crate::dkg::ceremony::Origin::Dkg,
+                            status: DkgStatus::Failed,
+                            ..*ceremony
+                        })),
+                    );
+                }),
+            ];
+            deterministic::Runner::default().start(|mut context| async move {
+                let signers = signers();
+                let committee = committee(&signers);
+                for (case, tamper) in cases {
+                    let prefix = case.replace(' ', "-");
+                    let mut store = Store::init(context.child("store"), &prefix, committee.clone())
+                        .await
+                        .unwrap();
+                    activated(&mut context, &mut store, &signers).await;
+                    drop(store);
+                    let mut metadata = Metadata::<_, Key, Value>::init(
+                        context.child("tamper"),
+                        Config {
+                            partition: format!("{prefix}-state"),
+                            codec_config: (),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    tamper(&mut metadata);
+                    metadata.sync().await.unwrap();
+                    match Store::init(context.child("restart"), &prefix, committee.clone()).await {
+                        Err(Error::Slashing(reason)) => println!("{case}: {reason}"),
+                        Err(other) => panic!("{case}: unexpected error {other}"),
+                        Ok(_) => panic!("{case}: a store with altered import state started"),
+                    }
+                }
+            });
+        }
+    }
 }

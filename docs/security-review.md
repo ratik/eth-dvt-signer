@@ -82,10 +82,28 @@ validator key. The change makes every binding an explicit check at the keyholder
 consequence of invariants elsewhere. The protocol version is bound into every request id: nodes
 of different versions do not sign for each other.
 
+## Key import
+
+An existing key is split by a trusted dealer ([key-import.md](key-import.md)). What the network
+checks, and what it cannot:
+
+| Question | Answer | Status |
+| -------- | ------ | ------ |
+| Does the split give the original key? | The manifest's constant commitment must be the validator key (checked by the dealer, at registration by consensus, and by each node opening its share); each share must match the commitments. Any 3 shares give exactly the original key's signatures; 2 give nothing. | Implemented, tested (`tests/key_import.rs`, E2E-IMP-1 against blst with the original secret) |
+| Can a node install another node's share, a share of another split, or a modified one? | No. An envelope is HPKE-sealed to one node's X25519 key, with the manifest digest, ceremony, index, identity and recipient key in HPKE's `info` and the AEAD's associated data; the node checks each before decrypting, and the decrypted share against the registered commitments. | Implemented, tested (`envelopes_open_only_for_their_node_manifest_and_ceremony`, E2E-IMP-1) |
+| Can a coordinator or one node claim that shares were installed? | No. Each keyholder acknowledges its own share with an ed25519 signature under its consensus key (own namespace, round, manifest digest); consensus counts only valid acknowledgments of committee members. Activation needs the threshold. | Implemented, tested (E2E-IMP-1, `storage::tests::validator::imported`) |
+| Can an imported key sign before its history is imported, or for another chain? | No. Only `ActivateImportedValidator` activates it, decided by consensus once the history is imported for that chain, 3 shares are acknowledged and the acknowledgment is complete; `ActivateValidator` refuses it. Every duty is then checked against the activated chain. | Implemented, tested |
+| Can the history be reset or weakened? | No command removes a key or its records. A key is registered once (another registration is refused, whatever the ceremony id). Imports merge floors by maximum: an older or repeated interchange changes nothing. A startup check refuses import state that is inconsistent with the ceremony or the activation. | Implemented, tested (`interchange::tests`, `storage::tests::validator::imported::altered_import_state_fails_closed`) |
+| Is there a separate signing path for imported keys? | No. The coordinator and keyholders use the ceremony's `Sharing`, whatever its origin; the authorization, binding and slashing checks are the same, plus the floors. | By design |
+| Secrets in files and logs | No plaintext share in any file; shares and share-encryption keys never logged; passwords only from the terminal or a file; output files `0600` in a new `0700` directory, never overwritten; the node refuses a share-encryption key readable by others. Zeroization is best effort (`Zeroizing` buffers; library and OS copies are not controlled). | Implemented, tested (`keytool_splits_a_keystore_into_four_encrypted_shares`) |
+| Two signers for one key | **Not detectable.** The original keystore still exists; whether the previous signer is stopped is the operator's statement (the acknowledgment), recorded but not verified. A duplicate signer is slashable whatever this network does. | Operational ([key-import.md](key-import.md#assumptions)) |
+
 ## Not provided
 
 - Slashing protection that survives a rollback of every node (an anchor is proposed in
-  [slashing-protection.md](slashing-protection.md), not implemented), EIP-3076 import and export.
+  [slashing-protection.md](slashing-protection.md), not implemented). It applies to imported keys
+  unchanged (L-1).
+- Detection of a second signer of an imported key outside the network.
 - Slashing protection for the development API (`dev-api` builds; nonces are caller-chosen).
 - Client authentication, authorization policy, rate limiting.
 - Encryption of shares at rest, HSM or TEE isolation.

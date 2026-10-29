@@ -7,6 +7,7 @@ pub mod engine;
 pub mod eth;
 pub mod executor;
 pub mod hooks;
+pub mod import;
 pub mod readiness;
 pub mod rpc;
 pub mod signer;

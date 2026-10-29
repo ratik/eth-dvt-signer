@@ -13,6 +13,7 @@ mod crash;
 mod eth2;
 mod failures;
 mod harness;
+mod import;
 mod lag;
 mod lifecycle;
 mod limits;

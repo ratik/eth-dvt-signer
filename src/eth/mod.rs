@@ -2,5 +2,6 @@
 //! Web3Signer HTTP API.
 
 pub mod duty;
+pub mod interchange;
 pub mod types;
 pub mod web3signer;

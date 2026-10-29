@@ -1,6 +1,7 @@
 # Ethereum signing: the Web3Signer API
 
-The network signs Ethereum validator duties for the validator keys its DKG created, through the
+The network signs Ethereum validator duties for the validator keys its DKG created, and for
+existing keys imported from an EIP-2335 keystore ([key-import.md](key-import.md)), through the
 remote-signing API of Consensys Web3Signer. A key signs only after an explicit activation for one
 chain. The validator client sends a typed duty. The replicated state machine computes its signing
 root, applies slashing protection ([slashing-protection.md](slashing-protection.md)) and
@@ -37,10 +38,10 @@ DKG ceremony started as a validator key ──> completed: the key exists, inact
 curl -s localhost:8080/dkg/start -H 'content-type: application/json' \
   -d '{"ceremony_id": "validator-eth", "validator": true}'
 curl -s localhost:8080/validators
-# [{"public_key":"0xa1b2..","ceremony_id":"validator-eth","status":"inactive"}]
+# [{"public_key":"0xa1b2..","ceremony_id":"validator-eth","origin":"dkg","status":"inactive"}]
 curl -s localhost:8080/validators/activate -H 'content-type: application/json' \
   -d '{"public_key": "0xa1b2..", "genesis_validators_root": "0x0470.."}'
-# {"public_key":"0xa1b2..","ceremony_id":"validator-eth","status":"active",
+# {"public_key":"0xa1b2..","ceremony_id":"validator-eth","origin":"dkg","status":"active",
 #  "genesis_validators_root":"0x0470..","activated_at":42}
 curl -s localhost:8080/api/v1/eth2/publicKeys   # ["0xa1b2.."]
 ```
@@ -63,6 +64,30 @@ curl -s localhost:8080/api/v1/eth2/publicKeys   # ["0xa1b2.."]
   are not signed again, until an explicit activation. That activation must name the recorded
   chain; another one is refused (`refusal.reason: recorded_chain`). Nothing is assigned
   automatically.
+
+### Imported keys
+
+An imported key (`"origin": "imported"`) is registered, receives its shares and its previous
+signer's history, and is activated through its own endpoints. Once active it signs through the
+same `POST /api/v1/eth2/sign/{identifier}`, under the same checks, plus the floors of its imported
+history ([slashing-protection.md](slashing-protection.md#imported-history-eip-3076)).
+
+| Endpoint | Does |
+| -------- | ---- |
+| `GET /identity` | The node's consensus identity, committee index and share-encryption public key (input of `mpc-keytool split`) |
+| `POST /keys/import` | Registers a `manifest.json` through consensus (`RegisterImportedKey`); idempotent for the same manifest; `409` for a used id or an already known key |
+| `POST /keys/import/share` | This node opens, verifies and stores its own `node-<index>.enc`, then acknowledges it through consensus; `403` for another node's envelope |
+| `GET /keys/import/{ceremony_id}` | The import: manifest digest, acknowledged shares, this node's share, history (chain, floors, imports), activation |
+| `POST /slashing-protection/import` | `{"interchange": <EIP-3076>, "validators": ["0x.."], "dry_run": false}`; a dry run checks and decides nothing |
+| `GET /slashing-protection/export/{public_key}` | The validator's history as an EIP-3076 interchange (any validator key with a chain) |
+
+`POST /validators/activate` for an imported key needs an `acknowledgment` object with four flags
+(`previous_signer_stopped`, `no_other_active_signer`, `history_exported_after_stop`,
+`automatic_restart_disabled`), all `true`. Without it the answer is `400 imported_key`; a DKG key
+with it is `400`. Consensus refuses the activation until the history is imported for that chain
+(`no_imported_history`, `history_for_another_chain`), 3 keyholders acknowledged their share
+(`shares_not_ready`) and the acknowledgment is complete (`not_acknowledged`). The acknowledgment is
+the operator's statement; nothing checks it ([key-import.md](key-import.md#assumptions)).
 
 ## Request
 
@@ -195,7 +220,7 @@ of this signer (README, Ethereum compatibility).
 | Signed | 200 | `{"signature": "0x.."}` when `Accept` includes `application/json`; otherwise the signature as `text/plain` |
 | Malformed identifier, JSON, duty or `fork_info`; unsupported type or version; `signingRoot` different from the computed root; source epoch after target epoch | 400 | `{"error": ".."}` |
 | Unknown validator key, or a key that is not activated | 404 | `{"error": ".."}` |
-| Refused by slashing protection: double proposal, double vote, surround vote, another chain, too many roots in a period | 412 | `{"error": "..", "refusal": {"reason": "double_proposal", "slot": 64}}` |
+| Refused by slashing protection: double proposal, double vote, surround vote, at or below an imported history's floors, another chain, too many roots in a period | 412 | `{"error": "..", "refusal": {"reason": "double_proposal", "slot": 64}}` |
 | This node is not ready to submit a new authorization, too few signers, too many requests | 503 | `{"error": "..", "reasons": [..]}` when not ready |
 | Authorization or partial collection timed out | 504 | `{"error": ".."}` |
 | Anything else | 500 | `{"error": ".."}` |
@@ -204,7 +229,8 @@ of this signer (README, Ethereum compatibility).
 signer's transient failures. A client treats them as errors, and nothing was signed. The
 `refusal` reasons are `unknown_validator`, `not_activated`, `source_after_target`, `other_chain`,
 `deposit_for_another_key`, `double_proposal`, `double_vote`, `surrounds_signed`,
-`surrounded_by_signed` and `too_many_roots`.
+`surrounded_by_signed`, `too_many_roots`, and for imported keys `block_at_or_below_imported`,
+`source_below_imported` and `target_at_or_below_imported`.
 
 ## Retries and failures
 
@@ -342,3 +368,6 @@ milliseconds; the signing root and the slashing decision cost microseconds, what
 | `src/slashing.rs` | Slashing protection of the replicated state |
 | `src/rpc.rs` | Routes and status codes |
 | `src/signer/coordinator.rs` | `sign_duty`: decision, authorization, partials, verification |
+| `src/eth/interchange.rs` | EIP-3076 interchange: parsing, summary, digest, export |
+| `src/import/` | Key import: EIP-2335 decryption, the dealer's split, the manifest, share envelopes |
+| `src/bin/mpc-keytool.rs` | The offline CLI: share-encryption keys, `split`, `inspect` |

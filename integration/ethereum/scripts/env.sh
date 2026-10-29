@@ -8,7 +8,7 @@
 #   binds inside that container only: no other container shares its network, and nothing is
 #   published on the host. Nothing else on the host is touched.
 #
-# Usage: env.sh tools|build|validate [RUNS]|up|exec CMD...|status|down
+# Usage: env.sh tools|build|validate [RUNS]|cargo ARGS...|up|exec CMD...|status|down
 #   IT_HOME   work directory on the host (default: ~/eth-mpc-it): bin/, target/, runs/, validation/
 set -euo pipefail
 
@@ -39,14 +39,15 @@ tools() {
 
 build() {
 	# The signer with `test-hooks` (deterministic crash points for the in-flight scenario; it
-	# includes `dev-api`, whose `/sign` refuses validator keys), built in a pinned Rust image.
+	# includes `dev-api`, whose `/sign` refuses validator keys), and the offline `mpc-keytool`
+	# (the migration scenario), built in a pinned Rust image.
 	mkdir -p "$IT_HOME/target" "$IT_HOME/cargo-home"
 	log "building the signer in $RUST_IMAGE"
 	docker run --rm -u "$(id -u):$(id -g)" \
 		-v "$IT_HOME:/it" -v "$repo:/it/src:ro" \
 		-e CARGO_HOME=/it/cargo-home -w /it/src \
 		"$RUST_IMAGE" cargo build --locked --release --features test-hooks \
-		--bin eth-mpc-signer --target-dir /it/target
+		--bin eth-mpc-signer --bin mpc-keytool --target-dir /it/target
 }
 
 validate() {
@@ -93,6 +94,16 @@ validate() {
 			exit $failed'
 }
 
+cargo_image() {
+	# `cargo ARGS...` in the pinned Rust image, as the host user, with the repository mounted
+	# read-write (Cargo.lock may change) and the validation target directory: for development
+	# builds and tests on this host, never during an integration run.
+	mkdir -p "$IT_HOME/target-test" "$IT_HOME/cargo-home"
+	docker run --rm -u "$(id -u):$(id -g)" -v "$IT_HOME:/it" -v "$repo:/it/src" \
+		-e CARGO_HOME=/it/cargo-home -e CARGO_TARGET_DIR=/it/target-test -e TMPDIR=/it/tmp \
+		-w /it/src "$RUST_IMAGE" cargo "$@"
+}
+
 up() {
 	if docker inspect "$DIND" >/dev/null 2>&1; then
 		log "$DIND already exists"
@@ -137,6 +148,11 @@ case "${1:-}" in
 tools) tools ;;
 build) build ;;
 validate) validate "${2:-3}" ;;
+cargo)
+	shift
+	mkdir -p "$IT_HOME/tmp"
+	cargo_image "$@"
+	;;
 up) up ;;
 exec)
 	shift
@@ -149,7 +165,7 @@ status)
 	;;
 down) down ;;
 *)
-	echo "usage: $0 tools|build|validate [RUNS]|up|exec CMD...|status|down" >&2
+	echo "usage: $0 tools|build|validate [RUNS]|cargo ARGS...|up|exec CMD...|status|down" >&2
 	exit 2
 	;;
 esac

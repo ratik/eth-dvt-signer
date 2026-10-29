@@ -128,7 +128,10 @@ IT_HOME=~/eth-mpc-it ./integration/ethereum/scripts/env.sh validate 3
 ```
 
 What a run leaves: `$IT_HOME/runs/<time>/` with `report.md`, `report.json`, `epochs.jsonl` (beacon
-evidence per epoch), `scenarios.json`, `security.json`, `deposit.json`, `validator.json`, and
+evidence per epoch), `scenarios.json`, `security.json`, `deposit.json`, `validator.json`, the
+migration's `migration.json`, `migrated.jsonl` (the migrated validator's epochs),
+`migration-history.json` and `migration-export.json` (the interchanges), `migration/` (the devnet
+keystore's copy and password, the committee, the manifest and envelopes: test keys, mode `0700`), and
 `logs/` (each signer node, the proxy as JSON lines, the validator client, `kurtosis run`), and the
 signing requests the proxy forwarded (`requests/`, duty data only).
 
@@ -140,6 +143,7 @@ signing requests the proxy forwarded (`requests/`, duty data only).
 | One keyholder offline | node 2 stopped for 3 epochs, then restarted | duties continue with 3 of 4; node 2 ready and at the same height again (recovery time) |
 | Coordinator failure | node 0, the proxy's first choice, stopped for 3 epochs | the proxy fails over to node 1; duties continue |
 | In-flight failure | node 0 restarted with the `authorized` crash point, re-armed (up to 3 crashes) until a crash follows a new authorization: one node 0 itself submitted, which consensus then accepted | node 0 dies after the authorization, before answering; the proxy retries on another node, which returns the signature of the same authorization; the duty is accepted at exactly one height |
+| Migration | a genesis validator moves from Lighthouse's local keystore to the MPC network ([below](#migration-of-a-genesis-validator)), then node 2 is stopped for 2 epochs | the key's duties before, during and after; the same public key; the imported history refuses the previous signer's messages; 3 keyholders keep signing |
 
 The proxy retries only on a connection failure, `502`, `503` or `504`, never on `4xx`. That is
 safe because the state machine decides each duty once: an identical retry is `AlreadyAccepted`
@@ -155,6 +159,41 @@ kept by the proxy:
 - the development `/sign` refuses the validator key (`403`);
 - an activation for another chain is refused (`409`);
 - the validator client's directory holds no keystore.
+
+## Migration of a genesis validator
+
+The procedure of [key-import.md](key-import.md), on a validator that has signed with an ordinary
+EIP-2335 keystore since genesis. The genesis validators' client serves Lighthouse's keymanager API
+(`keymanager_enabled` in `kurtosis/network.yaml`, reachable only inside the isolated environment).
+
+1. **Before.** The validator is the first key the original client lists. A recorder reads its
+   attestations and proposals from the beacon state every epoch, from the start of the run.
+   The migration needs at least two attested epochs with the local keystore.
+2. **Keystore.** `voting-keystore.json` and its password are copied out of the original client
+   (Lighthouse's keymanager deletes the keystore along with the key: this is the operator's
+   backup).
+3. **Stop and export, in one call.** `DELETE /eth/v1/keystores` removes the key from the original
+   client and returns its EIP-3076 history; the client no longer lists the key. Its other 31
+   validators continue.
+4. **Split offline.** `mpc-keytool split` in a container with no network (`--network none`), for
+   the committee from each node's `GET /identity`, and each node's share-encryption key
+   (`mpc-keytool share-key`, passed to every node with `--share-encryption-key`). The split's
+   public key must be the validator's.
+5. **Register, install, import, activate.** The manifest through node 0, each envelope on its own
+   node, all four acknowledgments, then: an activation before the history import is refused
+   (`409 no_imported_history`), a dry run of the import, the import, and the activation with the
+   acknowledgment.
+6. **After.** Lighthouse's MPC validator client restarts with both keys as `web3signer`
+   validators; the migrated key's duties are read from the beacon state for 3 epochs. Through the
+   proxy: a block at the latest imported slot, an attestation at the latest imported target, and
+   one with a source below the latest imported source, are refused (`412` with the imported-floor
+   reasons). Then node 2 is stopped for 2 epochs, and duties continue with 3 keyholders.
+7. **Still one signer.** At the end, the original client does not list the key, the validator is
+   not slashed, and the network's export is taken.
+
+The report's migration section has the public key before and after, the duties before, during and
+after, the imported records, the time from the stop to Lighthouse signing through the network,
+the latency of the imported key next to the DKG key's, and the refusals.
 
 ## Evidence
 
@@ -188,27 +227,31 @@ the report counts Lighthouse's requests apart from theirs.
 
 ## Results
 
-Three full runs on a Linux host (x86_64, 12 cores, 62 GB), each from nothing: a new devnet, a new
-DKG key, its deposit, activation, the four scenarios, the security checks. Logs are on the test
-host, in `~/eth-mpc-it/runs/<directory>/`. Runs B and C used the 10 s nullify retry; run D used the
+Four full runs on a Linux host (x86_64, 12 cores, 62 GB), each from nothing: a new devnet, a new
+DKG key, its deposit, activation, the scenarios, the security checks. Logs are on the test host,
+in `~/eth-mpc-it/runs/<directory>/`. Runs B and C used the 10 s nullify retry; run D used the
 3 s retry and the final scripts (whole-period recorder, every signed block checked, in-flight
-re-arming).
+re-arming); run E added the migration of a genesis validator
+([below](#migration-run-e)). The rows below are the DKG validator's.
 
-| | Run B | Run C | Run D |
-| --- | --- | --- | --- |
-| Directory | `20261028T113358Z` | `20261028T124404Z` | `20261028T143415Z` |
-| Deposit included | execution block 2, 21 s after the MPC signature | block 2, 22 s | block 2, 21 s |
-| Validator active | epoch 11, 23 min after the deposit, index 32 | epoch 11, 23 min | epoch 11, 23 min |
-| Whole run | 64 min | 64 min | 66 min |
-| Attestations, observed epochs | 10 of 10, correct target and head | 10 of 10 | 10 of 10 |
-| Whole active period | not recorded | not recorded (old states pruned) | epochs 11 to 26: 16 of 16 correct target and head; 15 of 15 proposals canonical |
-| Blocks signed for Lighthouse | 16; 12 checked, all canonical | 24; 9 checked, all canonical | 18, all canonical, 15 finalized at the end |
-| Lighthouse's signing requests | 86, all signed | 102, all signed | 91, all signed |
-| Published by Lighthouse (its log) | 18 attestations, 18 aggregates, 16 blocks; no signing error | 18, 18, 24; none | 18, 18, 18; none |
-| Security checks | 7 of 7 | 7 of 7 | 7 of 7 |
+| | Run B | Run C | Run D | Run E |
+| --- | --- | --- | --- | --- |
+| Directory | `20261028T113358Z` | `20261028T124404Z` | `20261028T143415Z` | `20261028T203033Z` |
+| Deposit included | execution block 2, 21 s after the MPC signature | block 2, 22 s | block 2, 21 s | block 2 |
+| Validator active | epoch 11, 23 min after the deposit, index 32 | epoch 11, 23 min | epoch 11, 23 min | epoch 11, 23 min |
+| Whole run | 64 min | 64 min | 66 min | 84 min |
+| Attestations, observed epochs | 10 of 10, correct target and head | 10 of 10 | 10 of 10 | 10 of 10 |
+| Whole active period | not recorded | not recorded (old states pruned) | epochs 11 to 26: 16 of 16 correct target and head; 15 of 15 proposals canonical | epochs 11 to 36: 26 of 26; 21 of 21 canonical |
+| Blocks signed for Lighthouse | 16; 12 checked, all canonical | 24; 9 checked, all canonical | 18, all canonical, 15 finalized at the end | 22, all canonical, 21 finalized |
+| Lighthouse's signing requests | 86, all signed | 102, all signed | 91, all signed | 125 for the DKG key and 1 885 for the migrated key, all signed |
+| Published by Lighthouse (its log) | 18 attestations, 18 aggregates, 16 blocks; no signing error | 18, 18, 24; none | 18, 18, 18; none | both keys: 36, 36, 27, plus 290 sync committee messages and 146 sync contributions; none |
+| Security checks | 7 of 7 | 7 of 7 | 7 of 7 | 7 of 7 |
 
-Sync committee duties were never assigned (256-epoch periods). The aggregation selection proofs
-and aggregates were signed and published; the beacon state does not attribute aggregates.
+The DKG validator was never assigned sync committee duties (256-epoch periods). The migrated
+genesis validator of run E is in the current sync committee: its sync committee messages, selection
+proofs and contributions were signed through the network and published (Lighthouse's log); their
+inclusion in sync aggregates was not checked. The aggregation selection proofs and aggregates were
+signed and published; the beacon state does not attribute aggregates.
 
 Per scenario, runs B / C / D. Latency is end to end through the proxy. "Consensus" is the time
 from submission to finalization, for new authorizations only.
@@ -248,7 +291,42 @@ In-flight crash, per run:
 - **Run D.** The scenario now re-arms until a crash follows a new authorization, and needed one
   crash: slot 849 again, accepted at height 2160, signed by node 1.
 
-In every run the duty was accepted once and Lighthouse got `200`.
+In every run the duty was accepted once and Lighthouse got `200`. Run E's in-flight crash: an
+aggregation selection proof (slot 853), accepted at height 2152; node 0 dropped the connection
+after 375 ms, and node 1 returned the signature of that authorization in 5 ms.
+
+### Migration (run E)
+
+Genesis validator 30 (`0x81ea9f74…58cb`) moved from Lighthouse's local keystore to the network in
+epoch 29, then signed with the network's shares until the end of the run.
+
+| | Result |
+| --- | --- |
+| Public key | `0x81ea9f74ef7d935b807474e38954ae3934856219a23e074954b2e860c5a3c400f9aedb42cd27cb4ceb697ca36d1e58cb` before and after; manifest `0x4e3a1664…97bb` |
+| Before (local keystore), epochs 0 to 28 | 29 of 29 epochs with a correct target and head; 28 of 28 proposals canonical (the report also lists slot 0, the genesis block, as a missed proposal: the beacon API names a proposer for it, but no block is proposed at slot 0; the harness now skips it) |
+| Stop and export | `DELETE /eth/v1/keystores` in slot 928: 5 blocks (latest slot 927) and 2 attestations (latest 27 → 28). Lighthouse prunes its slashing database below finality, so its export holds the latest records, which is all the floors need |
+| Split to activation | 4.2 s: offline split, registration, 4 shares installed and acknowledged, the early activation refused (`no_imported_history`), dry run, import (floors: block 927, source 27, target 28), activation at height 2379 |
+| Stop to Lighthouse signing through the network | 5.9 s (slot 928 to slot 930) |
+| During the migration, epoch 29 | attested (the attestation, target 29, signed by the network at slot 932); no proposal assigned. Sync committee messages: the network's start at slot 930; at most slots 928 and 929 are missing (not checked in the beacon state) |
+| After (network), epochs 30 to 36 | 7 of 7 epochs with a correct target and head; 3 of 3 proposals canonical (5 blocks signed before the end of the run) |
+| One keyholder offline (node 2), epochs 35 and 36 | 2 of 2 attested, slot 1165 canonical |
+| Imported history | through the proxy: a block at slot 927, `412 block_at_or_below_imported`; an attestation 27 → 28, `412 target_at_or_below_imported`; an attestation 26 → 38, `412 source_below_imported`; each answered in under 1 ms |
+| Single signer at the end | the original client does not list the key; the validator is not slashed; the network's export: the floor records (block 927, attestation 27 → 28, no roots) and the 5 blocks and 9 attestations it signed |
+| Lighthouse | 1 885 requests for the migrated key (attestations, aggregates, blocks, RANDAO, 290 sync committee messages, 1 412 sync selection proofs, 146 contributions), all signed, none retried; no signing error in its log |
+
+Latency after the migration, end to end through the proxy (p50 / p95 / p99 / max ms):
+
+| Key | Requests | All | Attestations | Blocks |
+| --- | --- | --- | --- | --- |
+| Imported (migrated) | 1 885 | 285 / 518 / 627 / 2 198 | 370 / 573 (n = 9) | 382 / 460 (n = 5) |
+| DKG, the whole run | 125 | 253 / 472 / 582 / 638 | 260 / 517 (n = 27) | 265 / 412 (n = 22) |
+
+The signing path is the same for both keys. The imported key's figures are higher because it
+signed about 7 requests per slot (its sync committee duties), against fewer than one for the DKG
+key, and its attestation and block samples are small. Share collection after authorization:
+p50 16.9 ms for the imported key, 16.5 ms for the DKG key. 10 of the 2 010 requests took more than
+1.33 s, all at 21:45:55-59, when node 2 was stopped (one consensus leader timeout, 2 s): 2 sync
+committee messages (slots 1090 and 1091) and 8 selection proofs for later slots.
 
 Not verified on chain: runs B and C covered only the observed epochs. Of the blocks signed in
 those runs, 12 of 16 and 9 of 24 were checked; run D checks the whole period and every block.
@@ -271,8 +349,11 @@ those runs, 12 of 16 and 9 of 24 were checked; run D checks the whole period and
 - **Not production-ready.** Development node keys, test funds, no authentication, a single beacon
   node.
 - **L-1 is unresolved.** A rollback of every signer node loses slashing history.
-- **No EIP-3076 import or export**, key import, resharing or mixed-version clusters.
-- **Sync committee duties** are not exercised (period length).
+- **No resharing or mixed-version clusters.** The migrated validator's previous signer is
+  stopped by the scenario; that no other copy of its keystore signs is assumed, as on any network
+  ([key-import.md](key-import.md#assumptions)).
+- **Sync committee duties** are exercised only for the migrated genesis validator, and their
+  inclusion in sync aggregates is not checked.
 - **Two signer nodes restarting together can make the validator miss duties.** This happens even
   with the 3 s nullify retry. If both missed a consensus certificate, signing stalls for 6.3 to
   9.7 s after they are back (measured, audit L-14). That is beyond the 4 s attestation deadline of

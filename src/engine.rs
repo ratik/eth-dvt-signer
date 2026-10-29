@@ -106,6 +106,8 @@ pub struct Config<B, P> {
     pub signing: coordinator::Config,
     /// Start even though the consensus journal is missing (an operator decision, see the README).
     pub allow_missing_consensus_journal: bool,
+    /// This node's share-encryption key, to install shares of imported keys (`import`).
+    pub share_key: Option<crate::import::envelope::ShareKey>,
 }
 
 /// Registered p2p channels, one `(sender, receiver)` pair per purpose.
@@ -483,6 +485,7 @@ where
         authorizations,
         validator_rounds,
         duties,
+        config.share_key,
     )
     .start();
     let dkg_receiver_handle = context.child("dkg_receiver").spawn({
