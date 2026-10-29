@@ -78,7 +78,7 @@ history ([slashing-protection.md](slashing-protection.md#imported-history-eip-30
 | `POST /keys/import` | Registers a `manifest.json` through consensus (`RegisterImportedKey`); idempotent for the same manifest; `409` for a used id or an already known key |
 | `POST /keys/import/share` | This node opens, verifies and stores its own `node-<index>.enc`, then acknowledges it through consensus; `403` for another node's envelope |
 | `GET /keys/import/{ceremony_id}` | The import: manifest digest, acknowledged shares, this node's share, history (chain, floors, imports), activation |
-| `POST /slashing-protection/import` | `{"interchange": <EIP-3076>, "validators": ["0x.."], "dry_run": false}`; a dry run checks and decides nothing |
+| `POST /slashing-protection/import` | `{"interchange": <EIP-3076>, "validators": ["0x.."], "dry_run": false}`, before the key's activation only (`409 activated` after it); a dry run checks and decides nothing |
 | `GET /slashing-protection/export/{public_key}` | The validator's history as an EIP-3076 interchange (any validator key with a chain) |
 
 `POST /validators/activate` for an imported key needs an `acknowledgment` object with four flags

@@ -468,6 +468,34 @@ fn e2e_imp_1_an_imported_key_signs_only_once_safely_activated() {
         })
         .collect();
     assert_eq!(attestations, [("10", "11"), ("10", "12")]);
+
+    // The active key takes no history. A far-future one would stop it for good: refused, as a
+    // dry run and for real, through any node; the floors stay those it was activated with, and it
+    // signs a block that history would forbid.
+    let far = interchange(
+        PUBKEY,
+        CHAIN,
+        json!([{"slot": "1000000000000"}]),
+        json!([{"source_epoch": "1000000000", "target_epoch": "1000000001"}]),
+    );
+    for (node, body) in [
+        (1, json!({"interchange": far, "dry_run": true})),
+        (2, json!({"interchange": far})),
+    ] {
+        let (code, answer) = network.post(node, "/slashing-protection/import", &body);
+        assert_eq!(
+            (code, answer["refusal"]["reason"].as_str()),
+            (409, Some("activated")),
+            "{answer}"
+        );
+    }
+    for node in network.all() {
+        assert_eq!(
+            status(&network, node)["history"]["floors"],
+            json!({"block_slot": 100, "source_epoch": 10, "target_epoch": 11})
+        );
+    }
+    signed(&network, 2, PUBKEY, &block(104, 1));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

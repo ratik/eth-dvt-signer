@@ -1141,7 +1141,8 @@ mod validator {
                 for ((request, expected), effect) in cases.iter().zip(&applied.effects) {
                     assert_eq!(*effect, Effect::Duty(*expected, request.signing_root()));
                 }
-                // A registration of the same key never resets anything.
+                // A registration of the same key never resets anything, and the active key takes
+                // no history.
                 let applied = store
                     .apply_block(
                         7,
@@ -1165,7 +1166,7 @@ mod validator {
                 );
                 assert_eq!(
                     applied.effects[2],
-                    Effect::History(HistoryOutcome::Unchanged)
+                    Effect::History(HistoryOutcome::Refused(HistoryRefusal::Activated { key }))
                 );
                 let before = (
                     store.protection().clone(),
@@ -1229,6 +1230,154 @@ mod validator {
                         Decision::AlreadyAccepted,
                         propose(key, 101, 1).signing_root()
                     )
+                );
+            });
+        }
+
+        /// Once an imported key is activated, no command changes its import state (floors, chain,
+        /// imports, acknowledgement), whatever it is: a history (far in the future, older, the
+        /// same, another chain), a registration of the same key, another share acknowledgement,
+        /// an activation, a ceremony start under its id, a dealer log for its round, a duty, or a
+        /// development signing request. The same after a restart.
+        #[test]
+        fn an_activated_imported_key_keeps_its_floors_whatever_the_command() {
+            deterministic::Runner::default().start(|mut context| async move {
+                let signers = signers();
+                let committee = committee(&signers);
+                let block = Sha256::hash(&[b"block"]);
+                let mut store = Store::init(context.child("first"), "node", committee.clone())
+                    .await
+                    .unwrap();
+                let key = activated(&mut context, &mut store, &signers).await;
+                let (validator, _) = store.protection().validator_of(&key).unwrap();
+                let imported = *store.protection().imported(validator).unwrap();
+                assert_eq!(
+                    imported.floors,
+                    Floors {
+                        block: Some(100),
+                        attestation: Some((10, 11))
+                    }
+                );
+                let manifest = manifest("imported", &committee, 1);
+                let mut other_id = manifest.clone();
+                other_id.ceremony = id("imported-again");
+                // A development ceremony, for a well-formed dealer log addressed to the imported
+                // key's round.
+                let applied = store
+                    .apply_block(
+                        5,
+                        &block,
+                        &[tx(Command::StartCeremony(CeremonyConfig::new(
+                            id("other"),
+                            committee.clone(),
+                        )))],
+                        &mut context,
+                    )
+                    .await
+                    .unwrap();
+                let (_, logs) = deal(&mut context, &applied.changed[0], &signers, &[]);
+
+                let far = 1 << 40;
+                let transactions = vec![
+                    history(key, 9, far, far, far),
+                    history(key, 9, 50, 1, 2),
+                    history(key, 9, 100, 10, 11),
+                    history(key, 8, far, far, far),
+                    register(&manifest),
+                    register(&other_id),
+                    tx(Command::ImportedShareReady(Box::new(ReadyAck::sign(
+                        &signers[3],
+                        0,
+                        manifest.digest(),
+                    )))),
+                    activate_imported(key, 9, ACKNOWLEDGED),
+                    activate_imported(key, 8, ACKNOWLEDGED),
+                    activate(key, 9),
+                    activate(key, 8),
+                    tx(Command::StartValidatorCeremony(CeremonyConfig::new(
+                        id("imported"),
+                        committee.clone(),
+                    ))),
+                    tx(Command::StartCeremony(CeremonyConfig::new(
+                        id("imported"),
+                        committee.clone(),
+                    ))),
+                    tx(Command::DealerLog {
+                        round: 0,
+                        log: Box::new(logs[0].clone()),
+                    }),
+                    tx(Command::Sign(SignRequest {
+                        ceremony: id("imported"),
+                        nonce: 1,
+                        payload_hash: [1; 32],
+                    })),
+                    submit(&propose(key, 101, 1)),
+                    submit(&attestation(key, 11, 12)),
+                ];
+                let applied = store
+                    .apply_block(6, &block, &transactions, &mut context)
+                    .await
+                    .unwrap();
+                let effects = &applied.effects;
+                for effect in &effects[..4] {
+                    assert_eq!(
+                        *effect,
+                        Effect::History(HistoryOutcome::Refused(HistoryRefusal::Activated { key }))
+                    );
+                }
+                assert_eq!(effects[4], Effect::Register(ImportOutcome::Exists(0)));
+                assert_eq!(effects[5], Effect::Register(ImportOutcome::KeyExists(0)));
+                assert!(matches!(effects[6], Effect::Ready(Ok(_))));
+                assert!(matches!(
+                    effects[7],
+                    Effect::Activate(ActivationOutcome::AlreadyActivated(_))
+                ));
+                assert!(matches!(
+                    effects[8],
+                    Effect::Activate(ActivationOutcome::Refused(
+                        ActivationRefusal::OtherChain { .. }
+                    ))
+                ));
+                assert!(matches!(
+                    effects[9],
+                    Effect::Activate(ActivationOutcome::AlreadyActivated(_))
+                ));
+                assert!(matches!(
+                    effects[10],
+                    Effect::Activate(ActivationOutcome::Refused(_))
+                ));
+                for effect in &effects[11..13] {
+                    assert!(
+                        !matches!(effect, Effect::Start(StartOutcome::Started(_))),
+                        "{effect:?}"
+                    );
+                }
+                assert!(matches!(effects[13], Effect::Log(Err(_))));
+                assert_eq!(effects[14], Effect::Sign(Outcome::ValidatorKey, None));
+                assert_eq!(
+                    effects[15],
+                    Effect::Duty(Decision::Accepted, propose(key, 101, 1).signing_root())
+                );
+                assert_eq!(
+                    effects[16],
+                    Effect::Duty(Decision::Accepted, attestation(key, 11, 12).signing_root())
+                );
+                assert_eq!(*store.protection().imported(validator).unwrap(), imported);
+                drop(store);
+
+                // Restart: the same import state; a block the far-future history would have
+                // refused is signed.
+                let mut store = Store::init(context.child("second"), "node", committee.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(*store.protection().imported(validator).unwrap(), imported);
+                let applied = store
+                    .apply_block(7, &block, &[submit(&propose(key, 200, 1))], &mut context)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    applied.effects[0],
+                    Effect::Duty(Decision::Accepted, propose(key, 200, 1).signing_root())
                 );
             });
         }

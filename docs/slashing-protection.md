@@ -118,10 +118,16 @@ interchange, and the network never signed it. The network's own records stay com
 floors, and its own exact repeats stay idempotent. These refusals count as slashing refusals
 (`412`).
 
-**Only more restrictive.** A later import can only raise floors. An older or identical
-interchange changes nothing (`outcome: unchanged`), before or after activation. Imports are
-accepted only for imported keys (`not_imported` for a DKG key, `unknown_validator`), for one chain:
-the key's activation's, or its earlier imports' (`other_chain`). An import that conflicts with what
+**Only more restrictive, and only before the activation.** A later import can only raise floors.
+An older or identical interchange changes nothing (`outcome: unchanged`). Imports are accepted
+only for imported keys (`not_imported` for a DKG key, `unknown_validator`), not yet activated
+(`activated`), for one chain: their earlier imports' (`other_chain`). The state machine refuses an
+import of an active key, whatever it holds (far in the future, older, the same, another chain), so
+nothing changes the floors while the key signs. No other command touches them either: a
+registration of the same key is refused or idempotent, a second activation is idempotent or
+refused, and duties, share acknowledgements, ceremony starts, dealer logs and development requests
+never write import state
+(`storage::tests::validator::imported::an_activated_imported_key_keeps_its_floors_whatever_the_command`). An import that conflicts with what
 this network signed for the key (a double proposal, double vote or surround against its records)
 is refused whole (`conflict`): two signers used the key. The API checks every record of the full
 interchange this way before submitting it; consensus checks the summary (the command carries
@@ -131,10 +137,11 @@ conflict, but not weaken protection: whatever it imports only raises floors.
 **Dry run.** `"dry_run": true` runs every check against the committed state and answers with the
 summary; nothing is submitted.
 
-**Irreversible.** No command lowers a floor. An interchange with a far-future slot or epoch, honest
-or not, stops the key from signing for good, and the key cannot be registered again. Any client of
-a node's API can submit one (no authentication, audit L-6), as can a Byzantine node. This costs
-liveness, never safety (audit L-17).
+**Irreversible.** No command lowers a floor. Before the activation, an interchange with a
+far-future slot or epoch, honest or not, stops the key from signing for good, and the key cannot be
+registered again. Any client of a node's API can submit one (no authentication, audit L-6), as can
+a Byzantine node. This costs liveness, never safety, and the operator sees the floors before
+activating (audit L-17).
 
 ### Compared with EIP-3076
 
@@ -178,18 +185,16 @@ Deliberate restrictions beyond the EIP:
   is refused, an import is all or nothing, and only imported keys take one (the EIP says nothing on
   these).
 
-Deviations from the EIP's wording. Only the first lets through a message that a literal reading
-forbids, and that message is identical to one the network already signed:
+Deviations from the EIP's wording:
 
-- **The network's own exact repeats.** After an import that raises the floors, the network still
-  re-signs a message it signed itself, with the same root (idempotent retries). Condition 4 has no
-  repeat exception: an attestation the network signed with a source below a later import's minimum
-  source would be refused by a literal reading. Re-signing the identical message gives the
-  identical signature, so nothing new can be slashed. Not changed in this milestone.
-- **Import and export while signing.** The EIP advises importing and exporting only when the
-  signer is stopped. Here an import is a consensus command, ordered with the duties and applied
-  atomically between them, so it is accepted while the key signs; it only adds restrictions. An
-  export is served while the key may sign (below).
+- **Export while signing.** The EIP advises importing and exporting only when the signer is
+  stopped. Imports follow it: they are accepted only before the activation, while the key signs
+  nothing. An export is served while the key may sign (below).
+- **The network's own exact repeats** stay idempotent and are decided before the floors. A literal
+  reading of condition 4 (no repeat exception) would refuse re-signing an attestation of the
+  network's whose source is below a later import's minimum source. That needs an import after the
+  network signed, which the state machine refuses; and re-signing the identical message would
+  give the identical signature.
 - **Minimum conditions at all times.** The EIP recommends refusing anything at or below the minimum
   of a signer's whole history, imported or not. The network's own history is never pruned, so its
   only gaps are those of imported histories, which the floors cover.
@@ -198,7 +203,8 @@ forbids, and that message is identical to one the network already signed:
 against a reference signer written from the five conditions alone (minimum of each import, repeat
 exceptions, absent roots matching nothing, condition 4 without exception): random imports and
 duties, 300 seeds by default; 100 000 seeds run once (`INTERCHANGE_SEEDS=100000`). At every duty
-the network refuses whatever the reference refuses, except the identical repeats above. Two
+the network refuses whatever the reference refuses, except the identical repeats above (the test
+interleaves imports and duties more freely than the state machine allows). Two
 deliberate bugs (a floor refusing `slot < floor` instead of `≤`; an export without its floor
 records) each made it fail at once. The 38 files of the official interchange tests pass as well.
 

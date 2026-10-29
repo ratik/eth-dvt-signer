@@ -31,7 +31,8 @@
 //! latest block and the latest attestation of each validator), and imports merge by maximum
 //! ([Floors]): a block at or below the block floor, an attestation with a source below the source
 //! floor or a target at or below the target floor, is refused. The network's own records keep the
-//! complete history above them. An older or repeated import never lowers a floor, and a key is
+//! complete history above them. An older or repeated import never lowers a floor, an import is
+//! refused once the key is activated (its floors are fixed while it signs), and a key is
 //! registered once, so no lifecycle operation can erase history. An imported key is activated only
 //! once its history is imported for the activation's chain, enough keyholders hold verified shares,
 //! and the operator acknowledged that the previous signer is stopped ([Protection::activate_imported]).
@@ -247,6 +248,16 @@ pub enum HistoryRefusal {
         crate::eth::duty::format_validator(key)
     )]
     NotImported {
+        #[serde(with = "hex_bytes")]
+        key: ValidatorKey,
+    },
+    /// The key is activated. Its history is imported only before, while it signs nothing; once it
+    /// signs, no import changes what it may sign.
+    #[error(
+        "{} is activated: its history is imported only before the activation",
+        crate::eth::duty::format_validator(key)
+    )]
+    Activated {
         #[serde(with = "hex_bytes")]
         key: ValidatorKey,
     },
@@ -580,8 +591,8 @@ impl Protection {
     }
 
     /// Apply an EIP-3076 import, whole or not at all. Every named validator must be an imported
-    /// key, of the import's chain, and each summary must not be slashable against the records
-    /// this network signed for it. Floors only rise.
+    /// key, not activated, of the import's chain, and each summary must not be slashable against
+    /// the records this network signed for it. Floors only rise, and only before the activation.
     pub fn import_history(&mut self, import: &HistoryImport) -> (HistoryOutcome, Vec<Record>) {
         let changes = match self.prepare_import(import) {
             Ok(changes) => changes,
@@ -628,8 +639,8 @@ impl Protection {
         Ok(changes)
     }
 
-    /// The imported validator `key`, if it may take a history for `chain`: an imported key, of
-    /// that chain (its activation's, or its earlier imports').
+    /// The imported validator `key`, if it may take a history for `chain`: an imported key, not
+    /// activated, of that chain (its earlier imports', if any).
     fn importable(
         &self,
         key: &ValidatorKey,
@@ -642,11 +653,10 @@ impl Protection {
             .imported
             .get(&id)
             .ok_or(HistoryRefusal::NotImported { key: *key })?;
-        let known = validator
-            .activation
-            .map(|activation| activation.chain)
-            .or(imported.chain);
-        if let Some(known) = known
+        if validator.activation.is_some() {
+            return Err(HistoryRefusal::Activated { key: *key });
+        }
+        if let Some(known) = imported.chain
             && known != *chain
         {
             return Err(HistoryRefusal::OtherChain {

@@ -5,8 +5,8 @@ use super::*;
 use crate::{
     eth::duty::Protection as Rule,
     slashing::{
-        Activation, Decision, Floors, HistoryOutcome, HistoryRefusal, ImportedValidator,
-        Protection, Refusal, Validator,
+        Acknowledgment, Activation, ActivationOutcome, Decision, Floors, HistoryOutcome,
+        HistoryRefusal, ImportedValidator, Protection, Refusal, Validator,
     },
 };
 use serde::Deserialize;
@@ -30,7 +30,12 @@ fn chain(text: &str) -> ChainIdentity {
     }
 }
 
-/// A protection with `keys` as imported validators, activated for `chain` (rounds 0..).
+/// A protection with `keys` as imported validators of `chain`, not activated: a history is
+/// imported only before the activation (rounds 0..). The tests decide duties with
+/// [Protection::authorize_raw], the slashing rules without the activation gate, so they also
+/// interleave the network's own records with imports. The state machine never does (a key signs
+/// only once activated, and then takes no import); the merge and conflict rules are tested as a
+/// second line of defense.
 fn protection(keys: &[ValidatorKey], chain: ChainIdentity) -> Protection {
     let mut protection = Protection::default();
     for (id, key) in keys.iter().enumerate() {
@@ -41,7 +46,7 @@ fn protection(keys: &[ValidatorKey], chain: ChainIdentity) -> Protection {
             Validator {
                 key: *key,
                 round,
-                activation: Some(Activation { chain, height: 0 }),
+                activation: None,
                 legacy_chain: None,
                 records: 0,
             },
@@ -53,12 +58,19 @@ fn protection(keys: &[ValidatorKey], chain: ChainIdentity) -> Protection {
                 chain: Some(chain),
                 floors: Floors::default(),
                 imports: 1,
-                acknowledged: Some(0),
+                acknowledged: None,
             },
         );
     }
     protection
 }
+
+const ACKNOWLEDGED: Acknowledgment = Acknowledgment {
+    previous_signer_stopped: true,
+    no_other_active_signer: true,
+    history_exported_after_stop: true,
+    automatic_restart_disabled: true,
+};
 
 fn interchange(json: serde_json::Value) -> Result<Interchange, Error> {
     parse(&serde_json::to_vec(&json).unwrap())
@@ -551,6 +563,65 @@ fn imports_are_refused_for_another_chain_unknown_or_non_imported_keys() {
 }
 
 #[test]
+fn no_history_is_imported_once_the_key_is_activated() {
+    let a = key(KEY_A);
+    let mut protection = protection(&[a], chain(GVR));
+    let history = |slot: &str, source: &str, target: &str| {
+        document(
+            serde_json::json!([{"pubkey": KEY_A, "signed_blocks": [{"slot": slot}],
+            "signed_attestations": [{"source_epoch": source, "target_epoch": target}]}]),
+        )
+    };
+    assert_eq!(
+        import_into(&mut protection, history("100", "10", "11")),
+        Ok(HistoryOutcome::Imported)
+    );
+    assert_eq!(
+        protection
+            .activate_imported(&a, chain(GVR), ACKNOWLEDGED, (3, 3), 5)
+            .0,
+        ActivationOutcome::Activated
+    );
+    let activated = *protection.imported(0).unwrap();
+
+    // A far-future history would stop the key for good; an older or identical one, or one for
+    // another chain, would change nothing. Each is refused, by the import and by the dry run.
+    let far = (1u64 << 62).to_string();
+    let mut other_chain = history("100", "10", "11");
+    other_chain["metadata"]["genesis_validators_root"] = hex0x(&[1; 32]).into();
+    for json in [
+        history(&far, &far, &far),
+        history("50", "3", "4"),
+        history("100", "10", "11"),
+        other_chain,
+    ] {
+        let parsed = interchange(json).unwrap();
+        let import = parsed.import(None).unwrap();
+        assert_eq!(
+            protection.check_history(&import, &parsed.validators),
+            Err(HistoryRefusal::Activated { key: a })
+        );
+        let (outcome, records) = protection.import_history(&import);
+        assert_eq!(
+            outcome,
+            HistoryOutcome::Refused(HistoryRefusal::Activated { key: a })
+        );
+        assert!(records.is_empty());
+    }
+    assert_eq!(*protection.imported(0).unwrap(), activated);
+    assert_eq!(
+        activated.floors,
+        Floors {
+            block: Some(100),
+            attestation: Some((10, 11))
+        }
+    );
+    // It signs above the floors it was activated with, not above a refused import's.
+    assert!(sign_block(&mut protection, 0, 101, root(1)));
+    assert!(sign_attestation(&mut protection, 0, 11, 12, root(2)));
+}
+
+#[test]
 fn a_missing_signing_root_is_conservative() {
     let a = key(KEY_A);
     let mut protection = protection(&[a], chain(GVR));
@@ -845,12 +916,13 @@ fn random_history(rng: &mut Rng) -> serde_json::Value {
     })
 }
 
-/// Random imports and duties on an imported key. At every duty, this network refuses whatever the
-/// specification's conditions refuse, except the exact repeat of a message the network itself
-/// signed (re-signed below a later import's source minimum, which condition (4) would refuse:
-/// the same message gives the same signature, so nothing new can be slashed; documented in
-/// docs/slashing-protection.md). At the end, a specification signer that imports the export
-/// refuses whatever this network refuses. `INTERCHANGE_SEEDS=<n>` runs more seeds.
+/// Random imports and duties on an imported key, interleaved (see [protection]: the state machine
+/// imports only before the activation, and signs only after it). At every duty, this network
+/// refuses whatever the specification's conditions refuse, except the exact repeat of a message
+/// the network itself signed (re-signed below a later import's source minimum, which condition
+/// (4) would refuse; the same message gives the same signature; unreachable in the state machine,
+/// where no import follows a signature). At the end, a specification signer that imports the
+/// export refuses whatever this network refuses. `INTERCHANGE_SEEDS=<n>` runs more seeds.
 #[test]
 fn imports_and_exports_are_at_least_as_strict_as_the_specification() {
     let seeds: u64 = std::env::var("INTERCHANGE_SEEDS")

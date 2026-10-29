@@ -54,6 +54,7 @@
 //!   "validators": ["0x.."]}`: validates the interchange, checks every record against this
 //!   network's records, and (unless `dry_run`) imports it through consensus. `validators` limits
 //!   the import to those keys; without it, every key of the interchange must be an imported key.
+//!   An activated key takes no import (`409`, `activated`).
 //! - `GET /slashing-protection/export/{public_key}`: the validator's history as an EIP-3076
 //!   interchange.
 //!

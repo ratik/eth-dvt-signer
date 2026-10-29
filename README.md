@@ -613,8 +613,8 @@ Signing an existing authorization costs one p2p round trip and four pairings.
 - Ethereum: mainnet preset only. No validator registrations, Phase 0 and Altair blocks or Gloas
   types. Deposits only on a node started with `--enable-deposit-signing`, one deposit message per
   key. The client's fork versions are trusted for the domain (the chain is the explicit
-  activation). EIP-3076 import is accepted for imported keys only, and cannot be undone (audit
-  L-17); the export's compatibility with other signers is modeled, not tested. Only Lighthouse
+  activation). EIP-3076 import is accepted for imported keys only, before their activation, and
+  cannot be undone (audit L-17); the export's compatibility with other signers is modeled, not tested. Only Lighthouse
   v8.3.2 has been run against the API, on a local devnet
   ([docs/ethereum-signing.md](docs/ethereum-signing.md#compatibility-evidence)).
 - `POST /sign` (`dev-api` builds only) is generic authorization, not slashing protection: the

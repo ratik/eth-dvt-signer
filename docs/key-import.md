@@ -57,7 +57,7 @@ moment consensus decides it:
 | --- | --- | --- |
 | `RegisterImportedKey {manifest}` | the manifest is well formed: version, protocol, the committee in order, threshold, `n` commitments, distinct share-encryption keys, a valid G1 point at every position, the constant commitment equal to the validator key | the ceremony id is in use with another manifest (`409`), the key is already known as any validator, DKG or imported (`409`: a key is registered once), the manifest is invalid (`400`) |
 | `ImportedShareReady {round, manifest digest, participant, signature}` | the participant's ed25519 signature, with its consensus key, over the round and the manifest digest (own namespace) | unknown import, another manifest digest, not a participant, bad signature: ignored |
-| `ImportSlashingProtection {chain, digest, validators}` | every named key is an imported key, of that chain (its activation's or its earlier imports'), and its summary is not slashable against what this network signed for it | another chain, unknown or DKG key, conflict with local records (nothing imported) |
+| `ImportSlashingProtection {chain, digest, validators}` | every named key is an imported key, not activated, of that chain (its earlier imports'), and its summary is not slashable against what this network signed for it | the key is activated (`activated`: its floors are fixed while it signs), another chain, unknown or DKG key, conflict with local records (nothing imported) |
 | `ActivateImportedValidator {key, chain, acknowledgment}` | history imported for `chain`; acknowledged shares `≥` threshold; all four acknowledgment flags set | `no_imported_history`, `history_for_another_chain`, `shares_not_ready`, `not_acknowledged`, `other_chain` (already active for another chain) |
 
 `ActivateValidator` (the DKG activation) refuses an imported key (`imported_key`), and the imported
@@ -66,7 +66,8 @@ activation refuses a DKG key (`not_imported`), so neither path skips the other's
 **No reset.** There is no unregister, delete or reset command. The same manifest again is
 idempotent; the same key under another manifest or ceremony id is refused, so a key's records,
 floors and activation are never replaced by starting over. Imports only raise floors: an older or repeated interchange changes nothing
-(`outcome: unchanged`).
+(`outcome: unchanged`). Once the key is activated, every import is refused (`activated`), by the
+state machine itself: nothing changes its floors while it signs.
 
 **The ready set is not the coordinator's word.** Each keyholder acknowledges its own share with its
 consensus identity, after it decrypted it and checked it against the registered commitments. A
@@ -226,7 +227,7 @@ the time the operator takes.
 | History refused as slashable in itself, or conflicting with the network's records | Nothing imported | Investigate: two signers may have used the key |
 | History for another chain | Refused (`409`) | Use the interchange of the chain the key validates on |
 | Activation refused | The `refusal.reason` names the missing step | Complete it; activation is idempotent once decided |
-| A newer interchange appears after activation (the previous signer was not stopped) | It can still be imported: floors only rise | Treat it as an incident: the key had two signers |
+| A newer interchange appears after activation (the previous signer was not stopped) | Refused (`409 activated`): the floors are fixed once the key signs | Treat it as an incident: the key had two signers. Stop its validator client, and investigate |
 
 ## Assumptions
 
@@ -260,10 +261,11 @@ elsewhere.
   attestation per validator ([slashing-protection.md](slashing-protection.md#imported-history-eip-3076)).
   That is what makes import safe for histories of any size, and why the network refuses even the
   exact repetition of the previous signer's latest messages.
-- **Imports cannot be undone.** Floors only rise. An interchange with a wrong far-future slot or
-  epoch stops the key for good, and the key cannot be registered again. Any client of the node API
-  can submit one (no authentication). Check the dry run's latest block and attestation before
-  importing (audit L-17).
+- **Imports cannot be undone.** Floors only rise. Before the activation, an interchange with a
+  wrong far-future slot or epoch stops the key for good, and the key cannot be registered again;
+  any client of the node API can submit one (no authentication). Check the import state
+  (`GET /keys/import/{ceremony_id}`) before activating (audit L-17). After the activation, no
+  import is accepted.
 - **Interoperability of the export is modeled, not tested.** It is checked against a reference
   implementation of EIP-3076's conditions and by reading Lighthouse's import; no other client has
   imported one ([slashing-protection.md](slashing-protection.md#compared-with-eip-3076)).
@@ -297,6 +299,7 @@ elsewhere.
 | The CLI: permissions, no overwrite, no secret in its output | `keytool_splits_a_keystore_into_four_encrypted_shares` |
 | Lifecycle in the state machine: activation only after history, shares and acknowledgment; restart | `storage::tests::validator::imported::imported_keys_activate_only_after_history_shares_and_acknowledgement` |
 | Altered import state on disk: the node refuses to start | `storage::tests::validator::imported::altered_import_state_fails_closed` |
+| An activated key takes no history (far in the future, older, the same, another chain), and no command of any kind changes its floors; the same after a restart | `eth::interchange::tests::no_history_is_imported_once_the_key_is_activated`, `storage::tests::validator::imported::an_activated_imported_key_keeps_its_floors_whatever_the_command`, E2E-IMP-1 |
 | EIP-3076 parsing, the official interchange tests, floors, export | [slashing-protection.md](slashing-protection.md#imported-history-eip-3076) |
 | The whole flow on 4 real processes: registration, install, every refusal, dry run, import, activation, signatures equal to the original key's, one keyholder offline, restart, re-registration, export | `tests/e2e/import.rs`: E2E-IMP-1 |
 | A node without a share-encryption key; a DKG key takes no imported history and no acknowledgment | E2E-IMP-2 |
