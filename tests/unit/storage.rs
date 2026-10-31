@@ -2139,3 +2139,120 @@ mod validator {
         }
     }
 }
+
+fn epoch_key(seed: u64) -> PublicKey {
+    use commonware_cryptography::Signer as _;
+    commonware_cryptography::ed25519::PrivateKey::from_seed(seed).public_key()
+}
+
+fn epoch_committee(seeds: [u64; 4]) -> Set<PublicKey> {
+    use commonware_utils::TryCollect as _;
+    seeds.map(epoch_key).into_iter().try_collect().unwrap()
+}
+
+fn reconfigure(epoch: u64, remove: u64, add: u64) -> Transaction {
+    tx(Command::Reconfigure(Box::new(
+        crate::types::Reconfiguration {
+            epoch,
+            remove: epoch_key(remove),
+            add: epoch_key(add),
+        },
+    )))
+}
+
+/// A reconfiguration is committed with its block as the next consensus epoch, which the state
+/// restores on restart; the original committee must lead to it.
+#[test]
+fn a_reconfiguration_commits_the_next_epoch() {
+    deterministic::Runner::default().start(|mut context| async move {
+        let committee = epoch_committee([0, 1, 2, 3]);
+        let mut store = Store::init(context.child("first"), "node", committee.clone())
+            .await
+            .unwrap();
+        assert_eq!(store.epochs().current().epoch, 0);
+        store
+            .apply_block(1, &Sha256::hash(&[b"one"]), &[sign(1, 1)], &mut context)
+            .await
+            .unwrap();
+        let boundary = Sha256::hash(&[b"two"]);
+        let applied = store
+            .apply_block(2, &boundary, &[reconfigure(1, 3, 4)], &mut context)
+            .await
+            .unwrap();
+        let record = applied.reconfigured.clone().unwrap();
+        assert_eq!(
+            applied.effects,
+            vec![Effect::Reconfigure(Box::new(record.clone()))]
+        );
+        assert_eq!(
+            (record.epoch, record.boundary, record.boundary_digest),
+            (1, 2, boundary)
+        );
+        assert_eq!(record.committee, epoch_committee([0, 1, 2, 4]));
+        assert_eq!(store.epochs().current(), &record);
+        drop(store);
+
+        let store = Store::init(context.child("second"), "node", committee.clone())
+            .await
+            .unwrap();
+        assert_eq!(store.height(), 2);
+        assert_eq!(store.epochs().current(), &record);
+        assert_eq!(store.epochs().get(0).unwrap().committee, committee);
+        drop(store);
+
+        // Another original committee (a wrong --participants) does not lead to epoch 1.
+        let refused = Store::init(
+            context.child("third"),
+            "node",
+            epoch_committee([0, 1, 2, 5]),
+        )
+        .await;
+        assert!(matches!(refused, Err(Error::Epochs(_))));
+    });
+}
+
+/// The committee finalizes only a reconfiguration that follows the rules (`application`): one
+/// that does not means this node's state is not the committee's, and it stops.
+#[test]
+#[should_panic(expected = "invalid reconfiguration")]
+fn a_finalized_invalid_reconfiguration_stops_the_node() {
+    deterministic::Runner::default().start(|mut context| async move {
+        let mut store = Store::init(
+            context.child("store"),
+            "node",
+            epoch_committee([0, 1, 2, 3]),
+        )
+        .await
+        .unwrap();
+        let _ = store
+            .apply_block(
+                1,
+                &Sha256::hash(&[b"one"]),
+                &[reconfigure(2, 3, 4)],
+                &mut context,
+            )
+            .await;
+    });
+}
+
+#[test]
+#[should_panic(expected = "with other transactions")]
+fn a_finalized_reconfiguration_with_company_stops_the_node() {
+    deterministic::Runner::default().start(|mut context| async move {
+        let mut store = Store::init(
+            context.child("store"),
+            "node",
+            epoch_committee([0, 1, 2, 3]),
+        )
+        .await
+        .unwrap();
+        let _ = store
+            .apply_block(
+                1,
+                &Sha256::hash(&[b"one"]),
+                &[sign(1, 1), reconfigure(1, 3, 4)],
+                &mut context,
+            )
+            .await;
+    });
+}

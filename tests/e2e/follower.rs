@@ -34,7 +34,7 @@ pub fn voters() -> Vec<usize> {
 }
 
 /// Highest height of the given nodes that answer.
-fn max_height(network: &TestNetwork, nodes: &[usize]) -> u64 {
+pub(crate) fn max_height(network: &TestNetwork, nodes: &[usize]) -> u64 {
     nodes
         .iter()
         .filter_map(|id| network.height(*id))

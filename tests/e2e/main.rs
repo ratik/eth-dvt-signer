@@ -19,6 +19,7 @@ mod lag;
 mod lifecycle;
 mod limits;
 mod readiness;
+mod reconfigure;
 mod recovery;
 mod replace;
 mod reshare;

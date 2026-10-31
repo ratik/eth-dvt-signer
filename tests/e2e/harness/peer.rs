@@ -93,15 +93,13 @@ impl FakePeer {
                 // Real nodes send on every channel; a message on an unregistered one makes
                 // commonware-p2p drop the connection. Accept and discard the others.
                 let mut others = std::collections::BTreeMap::new();
-                for channel in [
-                    engine::VOTES_CHANNEL,
-                    engine::CERTIFICATES_CHANNEL,
-                    engine::RESOLVER_CHANNEL,
+                // The consensus channels of the first epochs too (`engine::consensus_channels`).
+                for channel in (0..3).flat_map(engine::consensus_channels).chain([
                     engine::BACKFILL_CHANNEL,
                     engine::BLOCKS_CHANNEL,
                     engine::MEMPOOL_CHANNEL,
                     engine::DKG_CHANNEL,
-                ] {
+                ]) {
                     let (other_sender, mut other_receiver) = network.register(channel, quota);
                     others.insert(channel, other_sender);
                     context.child("drain").spawn(move |_| async move {

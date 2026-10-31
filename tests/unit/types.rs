@@ -95,3 +95,24 @@ fn reshare_start_encodings() {
     };
     assert!(Command::decode(empty.encode()).is_err());
 }
+
+/// A reconfiguration (R3) is tag 14 and round trips inside a block.
+#[test]
+fn reconfigure_encoding() {
+    use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
+    let command = Command::Reconfigure(Box::new(Reconfiguration {
+        epoch: 1,
+        remove: PrivateKey::from_seed(3).public_key(),
+        add: PrivateKey::from_seed(4).public_key(),
+    }));
+    assert_eq!(command.encode()[0], 14);
+    assert_eq!(command.encode().len(), command.encode_size());
+    assert_eq!(Command::decode(command.encode()).unwrap(), command);
+    let block = Block::new(
+        Block::genesis().digest(),
+        Height::new(1),
+        1,
+        vec![Transaction { id: 9, command }],
+    );
+    assert_eq!(Block::decode(block.encode()).unwrap(), block);
+}

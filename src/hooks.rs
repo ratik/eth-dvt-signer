@@ -21,6 +21,8 @@
 //! - `ETH_MPC_SIGNER_NO_PARTIALS_FILE=<path>`: while `<path>` exists, the keyholder answers no
 //!   peer's partial-signature request (they go unanswered); the node keeps voting and applying
 //!   blocks.
+//! - `ETH_MPC_SIGNER_PROPOSE_PAST_TERMINAL=1`: as a leader, the node builds on a block that ends
+//!   its consensus epoch, as a faulty leader would (the others refuse such a block).
 //!
 //! Points:
 //!
@@ -50,6 +52,14 @@
 //! - `after-apply-activation`: that block is durably applied, before the keyholder learns of it.
 //! - `new-generation-partial`: a participant computed a partial with a share generation it
 //!   activated, before sending it.
+//!
+//! Consensus epochs (`epochs`, R3):
+//!
+//! - `before-apply-reconfiguration`: the executor got the finalized block ending the epoch, before
+//!   applying it.
+//! - `after-apply-reconfiguration`: that block and the next epoch are durably committed, before the
+//!   node stops.
+//! - `epoch-started`: at startup in an epoch after the first, consensus is about to start.
 
 #[cfg(feature = "test-hooks")]
 mod enabled {
@@ -133,6 +143,11 @@ mod enabled {
         std::env::var("ETH_MPC_SIGNER_NO_PARTIALS_FILE").is_ok_and(|path| Path::new(&path).exists())
     }
 
+    /// Whether a leader must build on a block that ends the epoch.
+    pub fn propose_past_terminal() -> bool {
+        std::env::var("ETH_MPC_SIGNER_PROPOSE_PAST_TERMINAL").is_ok()
+    }
+
     pub fn exit_on_stdin_eof() {
         if std::env::var("ETH_MPC_SIGNER_EXIT_ON_STDIN_EOF").is_ok() {
             std::thread::spawn(|| {
@@ -171,6 +186,10 @@ mod enabled {
     }
 
     pub const fn no_partials() -> bool {
+        false
+    }
+
+    pub const fn propose_past_terminal() -> bool {
         false
     }
 

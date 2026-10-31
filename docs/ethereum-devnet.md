@@ -123,6 +123,11 @@ keyholder (R2) after the onboarding and a baseline: no other fault scenario and 
 ([below](#replacing-a-lost-keyholder-run-g)). Every run starts the signers with `--followers 1`
 (node 4's slot, used only by the replacement), the voters with `--approved-reshares`.
 
+`IT_RUN=run-r3 ./integration/ethereum/scripts/run.sh` runs the same, then replaces the lost voter
+too (R3, [reconfiguration.md](reconfiguration.md)): `mpc-admin replace-node` ends consensus epoch
+0, the script restarts each signer that stops with status 75 (as a supervisor would), and
+Lighthouse keeps signing ([below](#replacing-a-lost-consensus-voter-run-h)).
+
 The repository's own checks run on the same host, in the same pinned Rust image, with their own
 target directory: fmt, clippy (all features and default), `cargo test`, the E2E suite three times,
 and the L-1 reproducer, expected to fail. Logs go to `$IT_HOME/validation/<time>/`, with a
@@ -151,6 +156,7 @@ signing requests the proxy forwarded (`requests/`, duty data only).
 | Migration | a genesis validator moves from Lighthouse's local keystore to the MPC network ([below](#migration-of-a-genesis-validator)), then node 2 is stopped for 2 epochs | the key's duties before, during and after; the same public key; the imported history refuses the previous signer's messages; 3 keyholders keep signing |
 | Resharing | both MPC validator keys (the DKG key, then the migrated imported key) get a new share generation while Lighthouse signs ([resharing.md](resharing.md)), then node 2 is stopped for an epoch | the same keys; every verification share and the generation ids changed; every node switched and the old shares retired; signatures with the old generation while the new one is prepared and with the new one after; duties in the beacon state; interruptions, retries, latency before and after; node 2 back with the new generation |
 | Replacing a lost keyholder (`run-r2`) | node 3 (D) stopped for good; node 4 (E) started as a non-voting follower; the DKG key reshared by nodes 0, 1, 2 to nodes 0, 1, 2, 4 ([resharing.md](resharing.md#r2-replacing-a-lost-keyholder)) while Lighthouse signs; then node 2's partial signatures switched off for an epoch | duties with D lost; E's catching up; the same key, new verification shares and generation; every keyholder switched; with node 2's partials off, every signature combines E's share (coordinator logs); duties in the beacon state, latency, failures and retries throughout; the security checks with D still offline |
+| Replacing a lost consensus voter (`run-r3`, after `run-r2`'s scenario) | `mpc-admin replace-node --old 3 --new 4`: the committee A, B, C finalizes the block ending epoch 0; nodes 0, 1, 2, 4 stop (status 75) and are restarted in epoch 1 (A, B, C, E); then node 2 stopped for an epoch; then node 3 (D) started with its old data, and caught up with `mpc-admin resume` | every node's epoch, committee and boundary; the signing pause around the switch (Lighthouse requests, failures, retries, latency); with node 2 stopped, A, B and E finalize and sign (signer sets in the coordinators' logs); D stays in epoch 0 without disturbing epoch 1, then follows it as a non-voter; duties in the beacon state throughout; the security checks |
 
 The proxy retries only on a connection failure, `502`, `503` or `504`, never on `4xx`. That is
 safe because the state machine decides each duty once: an identical retry is `AlreadyAccepted`
@@ -424,6 +430,42 @@ whole replacement, finalization needed every one of A, B and C.
 from its `scenarios.json` and logs: the run's own `report.md` lacks it because the scenario's
 details overwrote its name (an `it.py` bug, fixed after the run; the scenario is recorded as
 `validator-devnet-r2` in `scenarios.json` and its window table).
+
+### Replacing a lost consensus voter (run H)
+
+Run H (`20261031T105527Z`, `IT_RUN=run-r3`) is the R3 demonstration
+([reconfiguration.md](reconfiguration.md)): a new devnet, the DKG key onboarded as before
+(validator 32, active from epoch 11), a 2-epoch baseline, R2 as in run G (D lost, E caught up in
+13.6 s, the key reshared to A, B, C, E), then the reconfiguration while Lighthouse signs. No other
+fault scenario ran.
+
+| Step | Result |
+| --- | --- |
+| `mpc-admin replace-node --old 3 --new 4` | submitted through node 0 (D not answering, as expected); the committee A, B, C finalized the block ending epoch 0, **height 2 046**, 1.1 s after the submission |
+| The switch | nodes 0, 1, 2 and 4 stopped with status 75 within 1.4 s and were restarted by the script; every one reported epoch 1, committee A, B, C, E, the same boundary, and voting; epoch 1 finalized its first block **8.1 s** after the first stop; `mpc-admin` followed it to the end |
+| Epoch 1 (A, B, C, E) | epochs 26 and 27 attested (target and head), proposal 840 canonical |
+| C (node 2) stopped for an epoch | A, B and E finalized and signed: every signature in that window combined shares {0, 1, 3} (A, B and **E**; C is index 2), 17 signatures; epoch 30 attested, proposals 962 and 975 canonical |
+| D (node 3) back with its old data | it started in epoch 0 at height 1 225 and changed nothing for the others (epoch 33 attested, proposal 1 059 canonical); after `mpc-admin resume` it fetched block 2 046, stopped with status 75 7 s later, restarted in epoch 1 as a non-voter and followed: every node at height 2 893 at the end |
+| Whole active period | epochs 11 to 33: every attestation with a correct target and head; 24 of 24 proposals canonical; 24 blocks signed for Lighthouse, all canonical |
+| Security checks, after the switch | 7 of 7: identical retry, double vote refused through the proxy and on node 2, double proposal refused, `/sign` refuses the key, the chain identity fixed, no keystore in the validator client |
+
+Signing around the reconfiguration (Lighthouse's requests through the proxy; none failed, none was
+retried):
+
+| Window | Voters, keyholders signing | End-to-end p50 / p95 ms (n) |
+| --- | --- | --- |
+| Baseline | A, B, C, D | 213 / 329 (21) |
+| D lost (R2) | A, B, C | 244 / 363 (13) |
+| Epoch 1 | A, B, C, E | 218 / 438 (20) |
+| C stopped | A, B, E | 252 / 453 (17) |
+| D back in epoch 0 | A, B, C, E | 236 / 404 (11) |
+
+The signing pause is the switch itself: about 8 s from the first stop to epoch 1's first block. One
+validator has about one duty every few seconds of a 128 s epoch, and none of Lighthouse's requests
+fell into that window, so this run shows no request waiting on it (the E2E tests cover requests
+across the switch: R3-2/R3-3). Consensus authorization stayed at p50 178 ms, p95 391 ms during the
+reconfiguration scenario (175 / 412 ms with D lost): D's 2 s leader turns are gone with D from
+the committee.
 
 ## Troubleshooting
 

@@ -29,6 +29,7 @@ use commonware_utils::{
 };
 use eth_mpc_signer::{
     engine::{self, Channels},
+    executor::Stop,
     rpc,
     signer::coordinator,
 };
@@ -40,7 +41,7 @@ use std::{
     path::PathBuf,
     time::Duration,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -50,15 +51,24 @@ struct Args {
     #[arg(long)]
     id: u64,
 
-    /// Number of consensus voters (the committee): nodes `0..participants`.
+    /// Number of consensus voters of epoch 0 (the original committee): nodes `0..participants`.
+    /// A later epoch's committee is in the replicated state (R3, `docs/reconfiguration.md`).
     #[arg(long, default_value_t = 4)]
     participants: u64,
 
     /// Number of non-voting keyholder nodes after the committee (nodes `participants..`). They
     /// follow consensus without voting and hold a validator's key share only once a reshare names
-    /// them as players. Every node of the network must use the same value.
+    /// them as players; a reconfiguration may make one of them a voter. Every node of the network
+    /// must use the same value.
     #[arg(long, default_value_t = 0)]
     followers: u64,
+
+    /// End the current consensus epoch at this height: no block above it is built or voted for,
+    /// the block at it is re-proposed until it is finalized, and the node exits once it applied it
+    /// (`docs/reconfiguration.md`, closing an epoch). Only to finalize the block that ends the
+    /// epoch when consensus stalled before finalizing it.
+    #[arg(long)]
+    close_epoch_at: Option<u64>,
 
     /// p2p port of node 0; node `i` uses `p2p-port + i`.
     #[arg(long, default_value_t = 3000)]
@@ -151,11 +161,9 @@ fn main() {
             .try_collect()
             .expect("unique keys")
     };
-    // Voters are primary peers (dialed); followers are secondary peers: accepted when they dial in
-    // and sent `Recipients::All` traffic, never dialed.
-    let committee = peers(0..args.participants);
-    let followers = peers(args.participants..nodes);
-    let participants: Set<PublicKey> = committee.keys().clone();
+    let everyone = peers(0..nodes);
+    let participants: Set<PublicKey> = peers(0..args.participants).keys().clone();
+    let followers: Set<PublicKey> = peers(args.participants..nodes).keys().clone();
     let listen = address(args.id);
     let http = SocketAddr::from((
         Ipv4Addr::LOCALHOST,
@@ -192,28 +200,17 @@ fn main() {
             engine::MAX_MESSAGE_SIZE,
         );
         let (mut network, mut oracle) = lookup::Network::new(context.child("network"), p2p);
-        oracle.track(0, AddressableTrackedPeers::new(committee, followers));
 
-        let quota = Quota::per_second(NZU32!(1_000));
-        let channels = Channels {
-            votes: network.register(engine::VOTES_CHANNEL, quota),
-            certificates: network.register(engine::CERTIFICATES_CHANNEL, quota),
-            resolver: network.register(engine::RESOLVER_CHANNEL, quota),
-            backfill: network.register(engine::BACKFILL_CHANNEL, quota),
-            blocks: network.register(engine::BLOCKS_CHANNEL, quota),
-            mempool: network.register(engine::MEMPOOL_CHANNEL, quota),
-            dkg: network.register(engine::DKG_CHANNEL, quota),
-            signing: network.register(engine::SIGNING_CHANNEL, quota),
-        };
-        let network_handle = network.start();
-
-        let node = engine::start(
+        // The replicated state decides the consensus epoch, hence the committee and channels.
+        let opened = engine::open(
             context.child("node"),
             engine::Config {
                 signer,
                 participants,
+                followers,
+                close_epoch_at: args.close_epoch_at,
                 blocker: oracle.clone(),
-                peer_provider: oracle,
+                peer_provider: oracle.clone(),
                 partition_prefix: "registry".to_string(),
                 retention: engine::Retention {
                     section: engine::ARCHIVE_SECTION,
@@ -228,10 +225,50 @@ fn main() {
                 share_key,
                 approved_reshares: args.approved_reshares.clone(),
             },
-            channels,
         )
         .await;
         // Inconsistent durable state: fail closed, storage kept for investigation (`StartError`).
+        let opened = match opened {
+            Ok(opened) => opened,
+            Err(err) => {
+                error!(%err, "refusing to start");
+                std::process::exit(1);
+            }
+        };
+        let epoch = opened.epoch().clone();
+        info!(epoch = epoch.epoch, committee = ?epoch.committee, "consensus epoch");
+
+        // The epoch's voters are primary peers (dialed); every other node is a secondary peer:
+        // accepted when it dials in and sent `Recipients::All` traffic, never dialed.
+        let (voters, others): (Vec<_>, Vec<_>) = everyone
+            .iter_pairs()
+            .map(|(key, address)| (key.clone(), address.clone()))
+            .partition(|(key, _)| epoch.committee.position(key).is_some());
+        let voters: Map<PublicKey, Address> = voters.into_iter().try_collect().expect("unique keys");
+        let others: Map<PublicKey, Address> = others.into_iter().try_collect().expect("unique keys");
+        oracle.track(epoch.epoch, AddressableTrackedPeers::new(voters, others));
+
+        let quota = Quota::per_second(NZU32!(1_000));
+        let [votes, certificates, resolver] = engine::consensus_channels(epoch.epoch);
+        let channels = Channels {
+            votes: network.register(votes, quota),
+            certificates: network.register(certificates, quota),
+            resolver: network.register(resolver, quota),
+            backfill: network.register(engine::BACKFILL_CHANNEL, quota),
+            blocks: network.register(engine::BLOCKS_CHANNEL, quota),
+            mempool: network.register(engine::MEMPOOL_CHANNEL, quota),
+            dkg: network.register(engine::DKG_CHANNEL, quota),
+            signing: network.register(engine::SIGNING_CHANNEL, quota),
+        };
+        for neighbor in engine::neighbor_epochs(epoch.epoch) {
+            for channel in engine::consensus_channels(neighbor) {
+                let (_, receiver) = network.register(channel, quota);
+                context.child("drain").spawn(move |_| engine::drain(receiver));
+            }
+        }
+        let network_handle = network.start();
+
+        let node = opened.start(channels).await;
         let node = match node {
             Ok(node) => node,
             Err(err) => {
@@ -248,6 +285,7 @@ fn main() {
             node.dkg,
             node.signer,
             node.recovery,
+            node.consensus,
             rpc::Options {
                 deposit_signing: args.enable_deposit_signing,
                 share_key: share_key_public,
@@ -259,9 +297,23 @@ fn main() {
             }
         });
 
-        // A node never stops on its own: whatever ended, it is a failure.
+        // A node stops on its own only when its consensus epoch ended: whatever else ended, it is a
+        // failure.
+        let stopped = node.stopped.clone();
         let result = Handle::select([network_handle, node.handle, rpc_handle]).await;
-        error!(?result, "node stopped");
-        std::process::exit(1);
+        match stopped.get() {
+            Some(Stop::Reconfigured { epoch, height }) => {
+                info!(epoch, height, "the consensus epoch ended: exiting to restart in the next one");
+                std::process::exit(engine::EXIT_RECONFIGURED);
+            }
+            Some(Stop::Closed { height }) => {
+                warn!(height, "the consensus epoch was closed: exiting");
+                std::process::exit(engine::EXIT_CLOSED);
+            }
+            None => {
+                error!(?result, "node stopped");
+                std::process::exit(1);
+            }
+        }
     });
 }

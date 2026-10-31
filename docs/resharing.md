@@ -237,7 +237,7 @@ D stays offline throughout. A, B and C deal their shares of the active generatio
 ### What R2 restores and what it does not
 
 - **Restored: the key's redundancy.** Before R2, only A, B and C hold usable shares: losing one more of them loses the key. After R2, four keyholders hold shares of the new generation, and any three sign.
-- **Not restored: consensus availability.** The committee is still A, B, C, D, and finalization needs 3 of its 4 votes. With D offline, **every one of A, B and C must be up**: losing another voter stops finalization, so no duty is authorized and nothing is signed until it is back. E does not vote and cannot replace a voter. Replacing D in consensus needs committee reconfiguration (epochs), which is out of scope.
+- **Not restored: consensus availability.** The committee is still A, B, C, D, and finalization needs 3 of its 4 votes. With D offline, **every one of A, B and C must be up**: losing another voter stops finalization, so no duty is authorized and nothing is signed until it is back. E does not vote and cannot replace a voter. Replacing D in consensus is R3, a reconfiguration of the committee by consensus epochs ([reconfiguration.md](reconfiguration.md)).
 - **Not restored: latency.** D is still a leader every fourth view, and each of its turns costs the leader timeout (2 s, L-16) before the next leader proposes. Duties whose authorization falls in such a view wait about 2 s longer, as they did since D was lost.
 
 ### Consensus voters and MPC keyholders

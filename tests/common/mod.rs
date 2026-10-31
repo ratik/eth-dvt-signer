@@ -177,6 +177,26 @@ pub async fn start_network_with(
     let mut handles = Vec::new();
     for (index, signer) in signers.into_iter().enumerate() {
         let control = oracle.control(signer.public_key());
+        let opened = engine::open(
+            context.child("node").with_attribute("index", index),
+            engine::Config {
+                signer,
+                participants: participants.clone(),
+                followers: Set::default(),
+                close_epoch_at: None,
+                blocker: control.clone(),
+                peer_provider: oracle.manager(),
+                partition_prefix: format!("node-{index}"),
+                retention,
+                signing: coordinator::Config::default(),
+                allow_missing_consensus_journal: false,
+                share_key: None,
+                approved_reshares: None,
+            },
+        )
+        .await
+        .expect("node refused to start");
+        let [votes, certificates, resolver] = engine::consensus_channels(opened.epoch().epoch);
         let (dkg_sender, dkg_receiver) =
             control.register(engine::DKG_CHANNEL, quota).await.unwrap();
         let (signing_sender, signing_receiver) = control
@@ -184,18 +204,9 @@ pub async fn start_network_with(
             .await
             .unwrap();
         let channels = Channels {
-            votes: control
-                .register(engine::VOTES_CHANNEL, quota)
-                .await
-                .unwrap(),
-            certificates: control
-                .register(engine::CERTIFICATES_CHANNEL, quota)
-                .await
-                .unwrap(),
-            resolver: control
-                .register(engine::RESOLVER_CHANNEL, quota)
-                .await
-                .unwrap(),
+            votes: control.register(votes, quota).await.unwrap(),
+            certificates: control.register(certificates, quota).await.unwrap(),
+            resolver: control.register(resolver, quota).await.unwrap(),
             backfill: control
                 .register(engine::BACKFILL_CHANNEL, quota)
                 .await
@@ -225,24 +236,7 @@ pub async fn start_network_with(
                 },
             ),
         };
-        let node = engine::start(
-            context.child("node").with_attribute("index", index),
-            engine::Config {
-                signer,
-                participants: participants.clone(),
-                blocker: control,
-                peer_provider: oracle.manager(),
-                partition_prefix: format!("node-{index}"),
-                retention,
-                signing: coordinator::Config::default(),
-                allow_missing_consensus_journal: false,
-                share_key: None,
-                approved_reshares: None,
-            },
-            channels,
-        )
-        .await
-        .expect("node refused to start");
+        let node = opened.start(channels).await.expect("node refused to start");
         clients.push(node.client);
         dkg.push(node.dkg);
         coordinators.push(node.signer);

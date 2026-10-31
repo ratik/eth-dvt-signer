@@ -68,6 +68,18 @@
 //! - `GET /validators/reshare/{ceremony_id}`: its state, dealers, players, dealer logs and
 //!   acknowledged shares.
 //!
+//! Consensus epochs (docs/reconfiguration.md):
+//!
+//! - `GET /consensus`: the epoch this node runs, its committee, every earlier epoch, the keys a
+//!   reconfiguration may add, and the epoch's last block once this node saw it.
+//! - `POST /consensus/reconfigure` `{"remove": "0x..", "add": "0x.."}` (consensus identities):
+//!   end the epoch with the block that carries it; the next epoch's committee is the current one
+//!   with `remove` replaced by `add`, a configured follower. `202` once submitted (every node stops
+//!   after that block, so none answers with its outcome), `400` refused, `409` the epoch already
+//!   ended. Use `mpc-admin replace-node`, which also checks the network and follows the switch.
+//! - `POST /consensus/sync` `{"height": H}`: ask the peers for the finalization at `H`, as a node
+//!   left in an earlier epoch must to learn the block that ended it. `202`.
+//!
 //! A follower (not a committee member) serves no signing: the Web3Signer and development signing
 //! endpoints answer `403`.
 //!
@@ -83,7 +95,8 @@ use crate::{
         },
         format_key,
     },
-    engine::Recovery,
+    engine::{Consensus, Recovery},
+    epochs::EpochRecord,
     eth::{
         duty::{Duty, DutyRequest, ValidatorKey, format_root, format_validator},
         web3signer::{parse_identifier, parse_request},
@@ -123,6 +136,7 @@ use commonware_utils::{
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "dev-api")]
 use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
 /// How long `POST /dkg/start` waits for finalization.
@@ -241,6 +255,8 @@ struct ConsensusResponse {
     floor_view: Option<u64>,
     /// The journal was missing at startup and the operator allowed starting anyway.
     journal_missing_at_start: bool,
+    /// The consensus epoch this node runs.
+    epoch: u64,
 }
 
 #[derive(Deserialize)]
@@ -313,6 +329,7 @@ struct Api {
     dkg: dkg::Client,
     signer: coordinator::Client,
     recovery: Recovery,
+    consensus: Consensus,
     options: Options,
 }
 
@@ -334,6 +351,7 @@ pub fn router(
     dkg: dkg::Client,
     signer: coordinator::Client,
     recovery: Recovery,
+    consensus: Consensus,
     options: Options,
 ) -> Router {
     // A follower holds shares and answers partial-signature requests from the committee's
@@ -375,7 +393,10 @@ pub fn router(
         .route(
             "/slashing-protection/export/{public_key}",
             get(export_history),
-        );
+        )
+        .route("/consensus", get(consensus_status))
+        .route("/consensus/reconfigure", post(reconfigure))
+        .route("/consensus/sync", post(sync_consensus));
     #[cfg(feature = "dev-api")]
     let router = router
         .route("/sign", coordinates(post(sign)))
@@ -385,6 +406,7 @@ pub fn router(
         dkg,
         signer,
         recovery,
+        consensus,
         options,
     })
 }
@@ -857,6 +879,7 @@ async fn observe(api: &Api) -> Result<(Status, Health, ReadinessResponse), ApiEr
             floor_height: api.recovery.floor.map(|(height, _)| height),
             floor_view: api.recovery.floor.map(|(_, view)| view),
             journal_missing_at_start: api.recovery.journal_missing,
+            epoch: api.recovery.epoch,
         },
     };
     Ok((status, health, readiness))
@@ -1377,6 +1400,154 @@ async fn not_coordinator() -> ApiError {
 
 fn unavailable(err: Stopped) -> ApiError {
     (StatusCode::SERVICE_UNAVAILABLE, err.to_string())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Consensus epochs (docs/reconfiguration.md)
+
+#[derive(Serialize)]
+struct EpochResponse {
+    epoch: u64,
+    committee: Vec<String>,
+    /// The member this epoch replaced and its replacement (absent for epoch 0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    removed: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    added: Option<String>,
+    /// The previous epoch's last block, this epoch's consensus genesis (0: the genesis block).
+    boundary: u64,
+    boundary_digest: String,
+}
+
+fn describe_epoch(record: &EpochRecord) -> EpochResponse {
+    EpochResponse {
+        epoch: record.epoch,
+        committee: record.committee.iter().map(format_identity).collect(),
+        removed: record
+            .change
+            .as_ref()
+            .map(|(removed, _)| format_identity(removed)),
+        added: record
+            .change
+            .as_ref()
+            .map(|(_, added)| format_identity(added)),
+        boundary: record.boundary,
+        boundary_digest: format!("0x{}", hex::encode(record.boundary_digest)),
+    }
+}
+
+#[derive(Serialize)]
+struct ConsensusStatus {
+    /// The epoch this node runs.
+    epoch: EpochResponse,
+    /// Every epoch up to this one.
+    epochs: Vec<EpochResponse>,
+    /// This node votes in it.
+    voting: bool,
+    /// Keys a reconfiguration may add (configured followers).
+    candidates: Vec<String>,
+    /// The height of this epoch's last block, once this node saw it as a proposal's parent
+    /// (finalized or not yet).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ended_at: Option<u64>,
+    /// `--close-epoch-at`, if set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    close_epoch_at: Option<u64>,
+}
+
+async fn consensus_status(State(api): State<Api>) -> Json<ConsensusStatus> {
+    let epochs = &api.consensus.epochs;
+    let ended = api.consensus.terminal.load(Ordering::Acquire);
+    Json(ConsensusStatus {
+        epoch: describe_epoch(epochs.current()),
+        epochs: epochs.iter().map(describe_epoch).collect(),
+        voting: api.recovery.voting,
+        candidates: api
+            .consensus
+            .candidates
+            .iter()
+            .map(format_identity)
+            .collect(),
+        ended_at: (ended > 0).then_some(ended),
+        close_epoch_at: api.consensus.close,
+    })
+}
+
+#[derive(Deserialize)]
+struct ReconfigureBody {
+    remove: String,
+    add: String,
+}
+
+fn parse_identity(field: &str, value: &str) -> Result<PublicKey, ApiError> {
+    hex::decode(value.strip_prefix("0x").unwrap_or(value))
+        .ok()
+        .and_then(|bytes| PublicKey::decode(bytes.as_slice()).ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("{field}: {value} is not an ed25519 public key"),
+            )
+        })
+}
+
+async fn reconfigure(
+    State(api): State<Api>,
+    Json(body): Json<ReconfigureBody>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let remove = parse_identity("remove", &body.remove)?;
+    let add = parse_identity("add", &body.add)?;
+    let epochs = &api.consensus.epochs;
+    let ended = api.consensus.terminal.load(Ordering::Acquire);
+    if ended > 0 {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "epoch {} already ended with block {ended}",
+                epochs.current().epoch
+            ),
+        ));
+    }
+    // The same rules consensus applies, first, for a clear answer.
+    let epoch = epochs.current().epoch + 1;
+    epochs
+        .check(epoch, &remove, &add, Some(&api.consensus.candidates))
+        .map_err(|refusal| (StatusCode::BAD_REQUEST, refusal.to_string()))?;
+    let id = api
+        .client
+        .reconfigure(crate::types::Reconfiguration {
+            epoch,
+            remove: remove.clone(),
+            add: add.clone(),
+        })
+        .await
+        .map_err(unavailable)?;
+    let committee: Vec<String> = epochs
+        .current()
+        .committee
+        .iter()
+        .filter(|member| **member != remove)
+        .chain(std::iter::once(&add))
+        .map(format_identity)
+        .collect();
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "transaction_id": id,
+            "epoch": epoch,
+            "committee": committee,
+        })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct SyncBody {
+    height: u64,
+}
+
+async fn sync_consensus(State(api): State<Api>, Json(body): Json<SyncBody>) -> StatusCode {
+    api.consensus.sync(body.height);
+    StatusCode::ACCEPTED
 }
 
 // ---------------------------------------------------------------------------------------------

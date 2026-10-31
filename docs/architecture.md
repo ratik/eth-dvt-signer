@@ -106,8 +106,15 @@ failover proxy (development)  ──>  4 eth-mpc-signer nodes (this repository)
    A node outside the committee runs as a non-voting follower (commonware secondary peer, a
    verifier-only consensus scheme) with its own replicated state; the remaining keyholders reshare
    the key to it with an explicit dealer and player set, which their operators approved locally.
-   The consensus committee is not reconfigured: with one voter lost, consensus has no fault
-   tolerance left. Not done: committee reconfiguration.
+   The consensus committee is not reconfigured by R2: with one voter lost, consensus has no fault
+   tolerance left until R3.
+8. Done: replacing a lost consensus voter (R3) ([reconfiguration.md](reconfiguration.md)). The
+   committee finalizes a block carrying a reconfiguration, which ends its consensus epoch: no
+   honest node builds or votes for a child of it, every node commits the next epoch (one member
+   replaced by a configured follower) with that block and exits (status 75), and restarted, runs
+   the next epoch from it, on its own journal and consensus channels. Marshal verifies every
+   height with its own epoch's committee. A maintenance operation (`mpc-admin replace-node`), not
+   online reconfiguration.
 
 ## Anvil
 

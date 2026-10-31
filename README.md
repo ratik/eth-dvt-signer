@@ -23,6 +23,11 @@ A 4-node threshold signer built on [commonware](https://github.com/commonwarexyz
   non-voting follower of consensus, the remaining keyholders dealing (A, B, C, D → A, B, C, E);
   the key and its history unchanged, the consensus committee deliberately unchanged
   ([docs/resharing.md](docs/resharing.md#r2-replacing-a-lost-keyholder));
+- replacing a lost consensus voter (R3): the committee finalizes a block that ends its consensus
+  epoch, every node stops after it and restarts in the next epoch, with the follower voting
+  instead of the lost node (A, B, C, D → A, B, C, E), from one operator command (`mpc-admin
+  replace-node`); the key, its shares and its history unchanged
+  ([docs/reconfiguration.md](docs/reconfiguration.md));
 - for development builds only (`dev-api` feature): `POST /sign` authorizes
   `(ceremony_id, nonce) -> payload_hash` once, through consensus, and returns the threshold
   signature of any 32-byte payload (see [Signing](#signing)).
@@ -553,6 +558,14 @@ Replacing a lost keyholder (R2, [docs/resharing.md](docs/resharing.md#tests)):
 - `tests/e2e/replace.rs` (R2-E2E-1 to R2-E2E-6, E restarted at four points): D stopped for good, E
   signing with A and B while C's partials are switched off.
 
+Replacing a lost voter (R3, [docs/reconfiguration.md](docs/reconfiguration.md#tests)):
+- `epochs::tests`, `storage::tests::a_reconfiguration_commits_the_next_epoch` and the two
+  fail-closed tests, `types::tests::reconfigure_encoding`: the rules, the records, the guard's
+  condition, heights and schemes per epoch;
+- `tests/e2e/reconfigure.rs` (R3-1 to R3-9): the switch with `mpc-admin`, E voting and signing
+  without C, D back, a node left in epoch 0, crashes around the switch, refusals, a faulty leader
+  past the end of the epoch, closing an epoch.
+
 `tests/signing.rs`: signing through the coordinator, verified with blst (combinations of signers,
 another root, another ceremony's key); concurrent identical and conflicting requests; a
 coordinator dying after the authorization or holding partials; one node offline and a lagging
@@ -653,9 +666,9 @@ Signing an existing authorization costs one p2p round trip and four pairings.
   nonce is caller-chosen, and the caller computes the signing root.
 - Authorizations and slashing history are kept forever, and every new one rewrites the state
   partition (O(n) per block). Pruning slashing history needs low watermarks (EIP-3076).
-- DKG: the committee is the 4 configured nodes and the threshold is fixed (`n - f`). There is no
-  consensus committee change; a reshare can move a key's shares to other keyholders of the same
-  number (R2).
+- DKG: the committee is the 4 configured nodes and the threshold is fixed (`n - f`). A
+  reconfiguration replaces one voter at a time, by a stop and restart of every node (R3); a
+  reshare can move a key's shares to other keyholders of the same number (R2).
 - Key import is a trusted-dealer split: whoever keeps the original keystore can still sign outside
   the network, and that the previous signer is stopped is the operator's statement, not a check
   ([docs/key-import.md](docs/key-import.md#assumptions)).
@@ -664,11 +677,16 @@ Signing an existing authorization costs one p2p round trip and four pairings.
   backed-up share ([docs/resharing.md](docs/resharing.md)).
 - Replacing a lost keyholder (R2) restores the key's redundancy, not consensus: the committee
   stays A, B, C, D, so with D offline **losing another voter stops finalization** (and signing).
-  The lost node's leader turns keep costing a 2 s timeout. Committee reconfiguration is not
-  implemented. The approval of new keyholders is a local file, a prototype safeguard behind an
+  The lost node's leader turns keep costing a 2 s timeout, until a reconfiguration (R3) replaces
+  it as a voter. The approval of new keyholders is a local file, a prototype safeguard behind an
   unauthenticated admin API, not an authorization system. A new follower builds its state from the
   retained history, or from a restored copy it cannot check (no state root)
   ([docs/resharing.md](docs/resharing.md#security-properties-and-limitations)).
+- Replacing a lost voter (R3) stops and restarts every node, with a signing pause of a few
+  seconds; anyone who reaches a node's API (or a faulty voter) can submit one, and only a configured
+  follower can be added, so an honest voter can be evicted (L-22). If the epoch's last block is
+  notarized but never finalized, an operator must restart the voters with `--close-epoch-at` (L-21)
+  ([docs/reconfiguration.md](docs/reconfiguration.md#security-properties-and-limitations)).
   - Liveness: every participant must be online, and a single non-cooperating player can make a
     ceremony fail; safety is not affected. Like every Feldman-Desmedt DKG, the key is not
     guaranteed to be uniformly random (bias of a few bits), and timing assumes synchrony.

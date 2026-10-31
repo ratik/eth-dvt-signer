@@ -20,8 +20,8 @@ enforces it. Passing tests are evidence, not proof (tests are listed in the last
 
 ## 2. Startup checks (fail closed)
 
-`engine::start` opens the durable stores first and checks them against each other before any
-actor runs (`engine::check_recovery`). On failure the node logs `refusing to start` with the
+`engine::open` and `Opened::start` open the durable stores first and check them against each
+other before any actor runs (`engine::check_recovery`, `engine::check_boundary`). On failure the node logs `refusing to start` with the
 reason and exits with status 1. Nothing is reset or deleted, no file is removed and no key share is
 regenerated.
 
@@ -44,7 +44,10 @@ repaired.
 | State not behind marshal | state height < marshal's processed height | marshal resumes after the last block it saw acknowledged, and the executor acknowledges only after the state commit: the state can be ahead by one block (crash before the acknowledgement, replayed and skipped), never behind. Behind means applied blocks were lost; running would skip them silently (BUG-2) |
 | Share has its ceremony | a stored share's round has no completed ceremony in the state | a share is stored only after its ceremony's completion is durably applied; otherwise the state (and its authorization history) was lost or rolled back while the share stayed |
 | Slashing history consistent | a record of an unknown validator, a validator whose record count differs from its stored records, a validator ceremony without its validator (or the reverse), a key that is not its ceremony's, records without an activation (or a chain pinned by the previous version), attestations that surround each other, an entry of an unknown kind | the history of a validator key must be complete before it signs again: a lost proposal or attestation would let a conflicting one through ([slashing-protection.md](slashing-protection.md#startup-checks-fail-closed)) |
-| Consensus journal present | the journal partition is empty while the node has finalized history (state or marshal height > 0) | the node may have voted in views it no longer remembers; voting again could equivocate. Overridable by the operator only (`--allow-missing-consensus-journal`, see §6) |
+| Consensus journal present | the current epoch's journal partition is empty while the node has finalized history in that epoch (state or marshal height above the epoch's start) | the node may have voted in views it no longer remembers; voting again could equivocate. Overridable by the operator only (`--allow-missing-consensus-journal`, see §6). A node at the very start of an epoch has no journal of it yet ([reconfiguration.md](reconfiguration.md)) |
+| Consensus epochs follow from the committee | the state's epoch records do not follow, one by one, from `--participants` | the command line names another original committee than the one this state's epochs come from |
+| Epoch boundary matches the history | in an epoch after the first: the stored block at the epoch's start differs from the recorded one, or a finalization of an earlier epoch is stored above it | the previous epoch would have finalized past its last block; marshal could hand such a block to the executor as this epoch's |
+| Closing height reachable | `--close-epoch-at` at or below the state's height | the node would never reach it, so never stop |
 
 The executor keeps the run-time check of BUG-2: a finalized block delivered at a height other than
 the next one stops the node.
@@ -80,7 +83,15 @@ rolled back together with the journal (a whole-directory restore: the floor is r
 `rollback::a1_full_restore_*` asserts it). Those are §6's unsupported cases. The floor detects no
 rollback; it only bounds what a node with a lost or older journal can repeat.
 
-`/status` reports the floor (`readiness.consensus.floor_height`, `floor_view`).
+`/status` reports the floor (`readiness.consensus.floor_height`, `floor_view`) and the consensus
+epoch (`readiness.consensus.epoch`). In an epoch after the first, the floor is the epoch's genesis
+(the block that ended the previous epoch) until the node processed a finalization of its own
+epoch: a finalization of another epoch is never a floor (simplex refuses one).
+
+A node stops on its own only at the end of its consensus epoch, after committing the block that
+ended it: status **75** (restart it: it runs the next epoch) or, closed with `--close-epoch-at`
+without a reconfiguration, **76** (restart it without the flag). Any other exit is a failure, as
+before ([reconfiguration.md](reconfiguration.md)).
 
 ## 4. Readiness is not a safety mechanism
 

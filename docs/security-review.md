@@ -129,8 +129,8 @@ moved to a new keyholder, a non-voting follower (R2) ([resharing.md](resharing.m
 - Detection of a second signer of an imported key outside the network.
 - Revocation of old key shares by resharing (erasure is operational), and an R1 refresh with a node
   offline (R2 replaces it instead).
-- Consensus committee reconfiguration: after a keyholder is replaced, the lost node is still a
-  voter (L-19).
+- Online consensus reconfiguration: replacing a voter (R3) stops and restarts every node, one
+  member at a time, with no governance or operator approval of the new committee (L-21 to L-23).
 - Slashing protection for the development API (`dev-api` builds; nonces are caller-chosen).
 - Client authentication, authorization policy, rate limiting.
 - Encryption of shares at rest, HSM or TEE isolation.

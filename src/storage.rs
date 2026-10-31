@@ -14,7 +14,9 @@
 //! durable together or not at all. A state without such records (written before they existed)
 //! reads as one without validator keys; an older binary refuses a state that has them. The same
 //! holds for imported keys: their ceremonies and import state are entries of their own, and a
-//! state without them reads as before.
+//! state without them reads as before. Consensus epochs after the first (`epochs`, R3) are entries
+//! too, each committed with the block that ended the previous epoch; a state without one is in
+//! epoch 0, whose committee is the command line's.
 
 use crate::{
     dkg::{
@@ -24,6 +26,7 @@ use crate::{
             ImportOutcome, Origin, ReadyIgnored, ReshareOutcome, StartOutcome,
         },
     },
+    epochs::{EpochRecord, Epochs},
     eth::{
         duty::{DutyKind, ValidatorKey},
         types::Root,
@@ -85,6 +88,8 @@ const PROPOSAL_PREFIX: u8 = 5;
 const ATTESTATION_PREFIX: u8 = 6;
 /// `(validator, 0)`: the import state of an imported key.
 const IMPORTED_PREFIX: u8 = 7;
+/// `(epoch, 0)`: consensus epochs after the first (`epochs`).
+const EPOCH_PREFIX: u8 = 8;
 /// `16 + duty kind`, `(validator, period)`: authorized roots of non-slashable duties.
 const BOUNDED_PREFIX: u8 = 16;
 
@@ -113,6 +118,8 @@ enum Value {
     ImportedValidator(ImportedValidator),
     /// A reshare ceremony: a share generation of a validator key (stored under its round).
     ReshareCeremony(Box<Ceremony>),
+    /// A consensus epoch after the first (stored under its number).
+    Epoch(Box<EpochRecord>),
 }
 
 fn write_optional_u64(value: Option<u64>, buf: &mut impl BufMut) {
@@ -309,6 +316,10 @@ impl Write for Value {
                 11u8.write(buf);
                 ceremony.write_reshare(buf);
             }
+            Self::Epoch(record) => {
+                12u8.write(buf);
+                record.write(buf);
+            }
         }
     }
 }
@@ -372,6 +383,7 @@ impl Read for Value {
             11 => Ok(Self::ReshareCeremony(Box::new(Ceremony::read_reshare(
                 buf, true,
             )?))),
+            12 => Ok(Self::Epoch(Box::new(EpochRecord::read(buf)?))),
             tag => Err(CodecError::InvalidEnum(tag)),
         }
     }
@@ -399,6 +411,7 @@ impl EncodeSize for Value {
             Self::ImportedCeremony(ceremony) => ceremony.imported_encode_size(),
             Self::ImportedValidator(imported) => imported_size(imported),
             Self::ReshareCeremony(ceremony) => ceremony.reshare_encode_size(),
+            Self::Epoch(record) => record.encode_size(),
         }
     }
 }
@@ -418,6 +431,8 @@ pub enum Error {
     Corrupt(String),
     #[error("inconsistent slashing protection: {0}")]
     Slashing(String),
+    #[error("inconsistent consensus epochs: {0}")]
+    Epochs(String),
 }
 
 /// A signing authorization that is part of this node's durably committed state.
@@ -474,6 +489,8 @@ pub enum Effect {
     Generation(GenerationOutcome),
     /// The outcome of a reshare's abort.
     Abort(AbortOutcome),
+    /// The consensus epoch the block starts once it is committed (it ends the current one).
+    Reconfigure(Box<EpochRecord>),
 }
 
 /// Result of applying a block, once it is durably committed.
@@ -490,6 +507,8 @@ pub struct Applied {
     pub designated: Vec<u64>,
     /// Share generations the block activated: `(validator key, its new round)`.
     pub generations: Vec<(ValidatorKey, u64)>,
+    /// The consensus epoch the block starts: it was the current epoch's last block.
+    pub reconfigured: Option<EpochRecord>,
 }
 
 /// In-memory replicated state mirrored to disk.
@@ -503,6 +522,7 @@ pub struct Store<E: Context> {
     state: State,
     ceremonies: Ceremonies,
     protection: Protection,
+    epochs: Epochs,
     height: u64,
 }
 
@@ -553,8 +573,8 @@ fn persist<E: Context>(
 
 impl<E: Context> Store<E> {
     /// Open (or create) the replicated state of the node with storage `prefix` and rebuild it.
-    /// `committee` is the set of participants every ceremony must use.
-    pub async fn init(context: E, prefix: &str, committee: Set<PublicKey>) -> Result<Self, Error> {
+    /// `genesis` is epoch 0's committee; ceremonies started from now on use the current epoch's.
+    pub async fn init(context: E, prefix: &str, genesis: Set<PublicKey>) -> Result<Self, Error> {
         let legacy = format!("{prefix}-registry");
         if matches!(context.scan(&legacy).await, Ok(blobs) if !blobs.is_empty()) {
             return Err(Error::Legacy(legacy));
@@ -577,8 +597,24 @@ impl<E: Context> Store<E> {
             _ => return Err(Error::Format(None)),
         }
 
+        let mut stored = Vec::new();
+        for key in metadata.keys() {
+            if let ((EPOCH_PREFIX, epoch, 0), Some(Value::Epoch(record))) =
+                (parse(key), metadata.get(key))
+            {
+                if record.epoch != epoch {
+                    return Err(Error::Corrupt(format!(
+                        "epoch {epoch} holds epoch {}",
+                        record.epoch
+                    )));
+                }
+                stored.push(record.as_ref().clone());
+            }
+        }
+        let epochs = Epochs::restore(genesis, stored).map_err(Error::Epochs)?;
+
         let mut state = State::default();
-        let mut ceremonies = Ceremonies::new(committee);
+        let mut ceremonies = Ceremonies::new(epochs.current().committee.clone());
         let mut protection = Protection::default();
         let mut height = 0;
         for stored in metadata.keys() {
@@ -618,6 +654,8 @@ impl<E: Context> Store<E> {
                     let kind = DutyKind::from_u8(prefix - BOUNDED_PREFIX).expect("checked");
                     protection.restore_bounded(id, kind, period, roots.clone());
                 }
+                // Read above.
+                ((EPOCH_PREFIX, _, 0), Some(Value::Epoch(_))) => {}
                 (parsed, _) => return Err(Error::Corrupt(format!("{parsed:?}"))),
             }
         }
@@ -628,6 +666,7 @@ impl<E: Context> Store<E> {
             state,
             ceremonies,
             protection,
+            epochs,
             height,
         })
     }
@@ -747,6 +786,11 @@ impl<E: Context> Store<E> {
         &self.ceremonies
     }
 
+    /// Consensus epochs up to the current one.
+    pub const fn epochs(&self) -> &Epochs {
+        &self.epochs
+    }
+
     /// Height of the last block applied to the state.
     pub const fn height(&self) -> u64 {
         self.height
@@ -801,6 +845,7 @@ impl<E: Context> Store<E> {
         let mut duties = Vec::new();
         let mut designated = Vec::new();
         let mut generations = Vec::new();
+        let mut reconfigured = None;
         let effects = transactions
             .iter()
             .map(|transaction| match &transaction.command {
@@ -984,6 +1029,31 @@ impl<E: Context> Store<E> {
                 Command::AbortResharing { validator, round } => {
                     Effect::Abort(self.abort_resharing(validator, *round))
                 }
+                Command::Reconfigure(change) => {
+                    // The committee verified it before finalizing this block, against the epoch
+                    // this process runs (the current one): a finalized block that breaks the rules
+                    // means this node's state is not the committee's, so it stops.
+                    assert!(
+                        transactions.len() == 1,
+                        "finalized block {height} carries a reconfiguration with other \
+                         transactions: refusing to continue"
+                    );
+                    let next = self
+                        .epochs
+                        .next(change.epoch, &change.remove, &change.add, height, *digest)
+                        .unwrap_or_else(|refusal| {
+                            panic!(
+                                "finalized block {height} carries an invalid reconfiguration \
+                                 ({refusal}): refusing to continue"
+                            )
+                        });
+                    metadata.put(
+                        key(EPOCH_PREFIX, next.epoch, 0),
+                        Value::Epoch(Box::new(next.clone())),
+                    );
+                    reconfigured = Some(next.clone());
+                    Effect::Reconfigure(Box::new(next))
+                }
             })
             .collect();
         self.ceremonies.advance(height, rng);
@@ -1016,6 +1086,9 @@ impl<E: Context> Store<E> {
 
         self.metadata = Some(metadata.sync().await?);
         self.height = height;
+        if let Some(record) = &reconfigured {
+            self.epochs.push(record.clone());
+        }
         Ok(Applied {
             effects,
             changed,
@@ -1023,6 +1096,7 @@ impl<E: Context> Store<E> {
             duties,
             designated,
             generations,
+            reconfigured,
         })
     }
 

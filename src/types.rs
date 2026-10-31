@@ -15,7 +15,7 @@ use crate::{
 use bytes::{Buf, BufMut};
 use commonware_codec::{Encode, EncodeSize, Error, Read, ReadExt, Write, varint::UInt};
 use commonware_consensus::{Heightable, types::Height};
-use commonware_cryptography::{Digestible, Hasher, Sha256, sha256::Digest};
+use commonware_cryptography::{Digestible, Hasher, Sha256, ed25519::PublicKey, sha256::Digest};
 use serde::Serialize;
 
 /// What a client wants signed: a 32-byte Ethereum signing root.
@@ -118,6 +118,19 @@ pub enum Command {
     ActivateGeneration { validator: ValidatorKey, round: u64 },
     /// Abort the reshare `round` (in progress or not activated): the active generation stays.
     AbortResharing { validator: ValidatorKey, round: u64 },
+    /// End the current consensus epoch with this block and start the next one ([Reconfiguration],
+    /// R3, `epochs`). The block carrying it carries nothing else, and no block follows it in the
+    /// epoch.
+    Reconfigure(Box<Reconfiguration>),
+}
+
+/// The next consensus epoch: `epoch`, whose committee is the current one with `remove` replaced by
+/// `add`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reconfiguration {
+    pub epoch: u64,
+    pub remove: PublicKey,
+    pub add: PublicKey,
 }
 
 /// Most validators one history import may name.
@@ -311,6 +324,13 @@ impl Write for Command {
                 buf.put_slice(validator);
                 UInt(*round).write(buf);
             }
+            // Tag 13 is a reshare start with membership (above).
+            Self::Reconfigure(change) => {
+                14u8.write(buf);
+                UInt(change.epoch).write(buf);
+                change.remove.write(buf);
+                change.add.write(buf);
+            }
         }
     }
 }
@@ -379,6 +399,11 @@ impl Read for Command {
                 validator: <[u8; 48]>::read(buf)?,
                 round: UInt::read(buf)?.into(),
             }),
+            14 => Ok(Self::Reconfigure(Box::new(Reconfiguration {
+                epoch: UInt::read(buf)?.into(),
+                remove: PublicKey::read(buf)?,
+                add: PublicKey::read(buf)?,
+            }))),
             tag => Err(Error::InvalidEnum(tag)),
         }
     }
@@ -409,6 +434,11 @@ impl EncodeSize for Command {
             }
             Self::ActivateGeneration { round, .. } | Self::AbortResharing { round, .. } => {
                 48 + UInt(*round).encode_size()
+            }
+            Self::Reconfigure(change) => {
+                UInt(change.epoch).encode_size()
+                    + change.remove.encode_size()
+                    + change.add.encode_size()
             }
         }
     }

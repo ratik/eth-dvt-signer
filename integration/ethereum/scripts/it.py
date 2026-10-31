@@ -38,6 +38,7 @@ WORK = os.environ.get("IT_WORK", f"{IT}/work")
 KURTOSIS = f"{IT}/bin/kurtosis"
 SIGNER = f"{IT}/target/release/eth-mpc-signer"
 KEYTOOL = f"{IT}/target/release/mpc-keytool"
+ADMIN = f"{IT}/target/release/mpc-admin"
 HERE = f"{SRC}/integration/ethereum"
 NETWORK_ARGS = f"{HERE}/kurtosis/network.yaml"
 
@@ -276,6 +277,25 @@ def keytool(*args, network="none"):
                 "-v", f"{IT}:{IT}", VERSIONS["RUNTIME_IMAGE"], KEYTOOL, *args])
 
 
+def admin(*args):
+    """`mpc-admin` (consensus reconfiguration, R3) in the runtime image on the host network, in
+    the background: it only talks to the signers' HTTP APIs, and returns once it is done."""
+    nodes = ",".join(f"127.0.0.1:{HTTP_BASE + node}" for node in range(NODES + FOLLOWERS))
+    return subprocess.Popen(
+        ["docker", "run", "--rm", "--network", "host", "--user", f"{UID}:{GID}", "-v", f"{IT}:{IT}",
+         VERSIONS["RUNTIME_IMAGE"], ADMIN, "--nodes", nodes, *args],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+
+def admin_done(process, stage, timeout=900):
+    output, _ = process.communicate(timeout=timeout)
+    for line in output.strip().splitlines():
+        log(f"mpc-admin: {line}")
+    if process.returncode != 0:
+        raise Failure(stage, f"mpc-admin exited with {process.returncode}: {output.strip()[-2000:]}")
+    return output
+
+
 def share_key(node):
     """Node `node`'s share-encryption key file, created once (`mpc-keytool share-key`)."""
     path = f"{WORK}/signers/share-key-{node}.json"
@@ -323,6 +343,13 @@ def signer_stop(node, crash=False):
     else:
         run(["docker", "stop", "-t", "5", name], check=False)
     run(["docker", "rm", "-f", name], check=False)
+
+
+def signer_exit_code(node):
+    """Node `node`'s exit status once its container stopped; `None` while it runs."""
+    out = run(["docker", "inspect", "-f", "{{.State.Running}} {{.State.ExitCode}}",
+               f"it-signer-{node}"], check=False).split()
+    return int(out[1]) if len(out) == 2 and out[0] == "false" else None
 
 
 def signer_running(node):
@@ -802,7 +829,7 @@ def duty_log(signing_root):
     of an accepted duty is `AlreadyAccepted`, not a second acceptance), the nodes that submitted it
     to consensus (with the time) and the nodes that coordinated its signature."""
     heights, submitted, signed_by = set(), [], set()
-    for node in range(NODES):
+    for node in range(NODES + FOLLOWERS):
         for line in read(f"{WORK}/logs/signer-{node}.log").splitlines():
             line = re.sub(r"\x1b\[[0-9;]*m", "", line)
             if f"signing_root={signing_root}" not in line:
@@ -1241,6 +1268,94 @@ def replacement(chain, key, index, observed=2):
     return body
 
 
+def consensus_of(node):
+    status, body = http("GET", f"{node_url(node)}/consensus", timeout=3)
+    if status != 200:
+        raise Failure("reconfiguration", f"node {node} consensus: {status} {body}")
+    return body
+
+
+def supervise(nodes, stage, timeout=600):
+    """What each signer's supervisor does: once its container stopped, check that it ended its
+    epoch (status 75) and start it again. Returns when every one of `nodes` was restarted."""
+    exits, pending = {}, set(nodes)
+    deadline = time.monotonic() + timeout
+    while pending:
+        for node in sorted(pending):
+            code = signer_exit_code(node)
+            if code is None:
+                continue
+            if code != 75:
+                raise Failure(stage, f"node {node} exited with status {code}, not 75")
+            exits[node] = time.time()
+            log(f"{stage}: node {node} stopped at the end of its epoch (status 75): restarting it")
+            signer_start(node)
+            pending.discard(node)
+        if time.monotonic() > deadline:
+            raise Failure(stage, f"nodes {sorted(pending)} did not stop")
+        time.sleep(0.2)
+    return exits
+
+
+def reconfiguration(chain, key, index, observed=2):
+    """After R2 (A, B, C, E hold the key; D lost): A, B and C finalize a reconfiguration replacing
+    D by E as a voter (`mpc-admin replace-node`). Each signer stops after the block that ends epoch
+    0 (status 75) and is restarted here, as its supervisor would; Lighthouse keeps signing through
+    the switch. Then C stops for an epoch: A, B and E finalize and sign. Last, D comes back with its
+    old data: it stays in epoch 0 until `mpc-admin resume` asks it to catch up, then follows."""
+    def body():
+        voters = [0, 1, WITHHELD, REPLACEMENT]
+        process = admin("replace-node", "--old", str(REPLACED), "--new", str(REPLACEMENT))
+        submitted = time.time()
+        exits = supervise(voters, "reconfiguration")
+        admin_done(process, "reconfiguration")
+        views = {node: consensus_of(node) for node in voters}
+        boundary = views[0]["epoch"]["boundary"]
+        for node, view in views.items():
+            if view["epoch"]["epoch"] != 1 or view["epoch"]["boundary"] != boundary or not view["voting"]:
+                raise Failure("reconfiguration", f"node {node} after the switch: {view}")
+        first = wait("epoch 1's first finalized block", "reconfiguration", 120, 0.1,
+                     lambda: any((height(node) or 0) > boundary for node in voters) and time.time())
+        committee = views[0]["epoch"]["committee"]
+        log(f"reconfiguration: epoch 0 ended with block {boundary}; every voter stopped within "
+            f"{max(exits.values()) - min(exits.values()):.1f} s; epoch 1 ({committee}) finalized its "
+            f"first block {first - min(exits.values()):.1f} s after the first stop")
+        observe("reconfiguration", index, observed, chain)
+        heights = {node: height(node) for node in voters}
+
+        signer_stop(WITHHELD)
+        without_c = time.time()
+        log("reconfiguration: C stopped: A, B and E are epoch 1's quorum")
+        observe("reconfiguration-without-c", index, 1, chain)
+        signer_start(WITHHELD)
+        wait("C back", "reconfiguration", 180, 0.5, lambda: ready(WITHHELD))
+        c_back = time.time()
+
+        signer_start(REPLACED)
+        wait("D answering", "reconfiguration", 120, 0.5, lambda: consensus_of(REPLACED))
+        d_back = time.time()
+        stale = consensus_of(REPLACED)["epoch"]["epoch"]
+        log(f"reconfiguration: D back with its old data, in epoch {stale} at height {height(REPLACED)}")
+        observe("reconfiguration-d-back", index, 1, chain)
+        admin_done(admin("resume"), "reconfiguration")
+        supervise([REPLACED], "reconfiguration")
+        wait("D in epoch 1", "reconfiguration", 120, 0.5,
+             lambda: consensus_of(REPLACED)["epoch"]["epoch"] == 1)
+        target = max(height(node) or 0 for node in voters)
+        wait("D to follow epoch 1", "reconfiguration", 300, 0.5,
+             lambda: (height(REPLACED) or 0) >= target)
+        follows = time.time()
+        d_view = consensus_of(REPLACED)
+        if d_view["voting"]:
+            raise Failure("reconfiguration", f"D votes in epoch 1: {d_view}")
+        return {"boundary": boundary, "committee": committee, "submitted": submitted,
+                "exits": {str(node): at for node, at in exits.items()}, "first_epoch_1_block": first,
+                "without_c": without_c, "c_back": c_back, "d_back": d_back, "d_stale_epoch": stale,
+                "d_follows": follows, "heights_after_switch": heights,
+                "heights_at_end": {node: height(node) for node in voters + [REPLACED]}}
+    return body
+
+
 # ---------------------------------------------------------------------------------------------
 # Security checks on the live devnet
 
@@ -1331,7 +1446,7 @@ SIGNERS = re.compile(r"signers=\[([^\]]*)\]")
 def signer_records():
     """`signed validator duty` and `validator duty not signed` lines of every node."""
     records = []
-    for node in range(NODES):
+    for node in range(NODES + FOLLOWERS):
         for line in read(f"{WORK}/logs/signer-{node}.log").splitlines():
             line = re.sub(r"\x1b\[[0-9;]*m", "", line)
             if "signed validator duty" not in line and "validator duty not signed" not in line:
@@ -1484,6 +1599,7 @@ def report(chain=None):
         "migration": migration,
         "resharing": resharing_report(scenarios, proxy, signed, index, migration),
         "replacement": replacement_report(scenarios, proxy, signed, index),
+        "reconfiguration": reconfiguration_report(scenarios, proxy, signed, index),
         "finalized_epoch": finalized,
     }
     save("report.json", result)
@@ -1541,6 +1657,7 @@ def report(chain=None):
     lines.extend(migration_lines(migration))
     lines.extend(resharing_lines(result["resharing"]))
     lines.extend(replacement_lines(result["replacement"]))
+    lines.extend(reconfiguration_lines(result["reconfiguration"]))
     lines.append("")
     for item in result["security"]:
         lines.append(f"- security: {'ok' if item['passed'] else 'FAILED'}: {item['check']} ({item['detail']})")
@@ -1732,6 +1849,77 @@ def replacement_report(scenarios, proxy, signed, dkg_index):
     }
 
 
+def reconfiguration_report(scenarios, proxy, signed, dkg_index):
+    """The replacement of D by E as a voter: the signing pause, latency around it, without C,
+    with D back; whose shares signed; missed duties."""
+    details = next((s for s in scenarios if s["name"] == "reconfiguration"), None)
+    if not details or "boundary" not in details:
+        return None
+    replacement = next((s for s in scenarios if s["name"] == "replacement"), {})
+    key = (replacement.get("public_key") or "").lower()
+    lighthouse = [r for r in proxy if r.get("type") and r.get("client") != PROBE_AGENT
+                  and key_of(r) == key]
+    ok = [r for r in lighthouse if r["status"] == 200]
+
+    def latency(start, end):
+        return percentiles([r["ms"] for r in ok if start <= r["ts"] <= end])
+    exits = details["exits"]
+    stopped, restarted = min(exits.values()), max(exits.values())
+    during = [r for r in lighthouse if details["submitted"] <= r["ts"] <= details["first_epoch_1_block"] + 10]
+    sets = {}
+    for record in signed:
+        if record["ok"] and details["without_c"] <= record["ts"] <= details["c_back"]:
+            sets[record.get("signers")] = sets.get(record.get("signers"), 0) + 1
+    epochs = [json.loads(l) for l in read(f"{WORK}/epochs.jsonl").splitlines() if l.strip()]
+    observed = [e for e in epochs if e["scenario"].startswith("reconfiguration")]
+    window = [r for r in lighthouse if details["start"] <= r["ts"] <= details["end"]]
+    return {
+        "boundary": details["boundary"],
+        "committee": details["committee"],
+        "pause_s": {"submit_to_first_stop": round(stopped - details["submitted"], 1),
+                    "stops_spread": round(restarted - stopped, 1),
+                    "first_stop_to_first_epoch_1_block": round(details["first_epoch_1_block"] - stopped, 1)},
+        "lighthouse_during_switch": {"requests": len(during),
+                                     "failed": len([r for r in during if r["status"] != 200]),
+                                     "retried": len([r for r in during if len(r["attempts"]) > 1]),
+                                     "max_ms": max((r["ms"] for r in during), default=None)},
+        "latency_ms": {"epoch 1 (A, B, C, E)": latency(details["first_epoch_1_block"], details["without_c"]),
+                       "without C (A, B, E)": latency(details["without_c"], details["c_back"]),
+                       "D back in epoch 0": latency(details["d_back"], details["d_follows"])},
+        "signer_sets_without_c": sets,
+        "d_stale_epoch": details["d_stale_epoch"],
+        "lighthouse_requests_failed": len([r for r in window if r["status"] != 200]),
+        "lighthouse_requests_retried_by_proxy": len([r for r in window if len(r["attempts"]) > 1]),
+        "observed_epochs": len(observed),
+        "missed_attestations": [x["epoch"] for x in observed if not x["target_attester"]],
+        "proposals": [(p["slot"], proposed(p, dkg_index)) for x in observed for p in x["proposals"]],
+        "heights_at_end": details["heights_at_end"],
+    }
+
+
+def reconfiguration_lines(r):
+    if not r:
+        return []
+
+    def ms(p):
+        return "n/a" if not p else f"{p.get('p50')}/{p.get('p95')} ({p['n']})"
+    p, d = r["pause_s"], r["lighthouse_during_switch"]
+    lines = ["", "## Replacing a lost consensus voter (R3) on the live devnet", "",
+             f"- epoch 0 (A, B, C, D) ended with block {r['boundary']}; epoch 1 committee {r['committee']}",
+             f"- submit to the first stop {p['submit_to_first_stop']} s; every voter stopped within "
+             f"{p['stops_spread']} s; first stop to epoch 1's first block {p['first_stop_to_first_epoch_1_block']} s",
+             f"- Lighthouse during the switch: {d['requests']} requests, {d['failed']} failed, "
+             f"{d['retried']} retried by the proxy, slowest {d['max_ms']} ms",
+             f"- without C, signer sets {r['signer_sets_without_c']}; D came back in epoch {r['d_stale_epoch']} "
+             f"and followed epoch 1 after `mpc-admin resume`",
+             f"- Lighthouse requests failed: {r['lighthouse_requests_failed']}, retried by the proxy: "
+             f"{r['lighthouse_requests_retried_by_proxy']}"]
+    lines += [f"- latency end to end p50/p95 ms (n), {label}: {ms(q)}" for label, q in r["latency_ms"].items()]
+    lines.append(f"- observed epochs: {r['observed_epochs']}, missed attestations {r['missed_attestations']}, "
+                 f"proposals (slot, canonical) {r['proposals']}; heights at the end {r['heights_at_end']}")
+    return lines
+
+
 def replacement_lines(r):
     if not r:
         return []
@@ -1912,11 +2100,45 @@ def run_r2(observed=2):
     return report(chain)
 
 
+def run_r3(observed=2):
+    """Replacing a lost consensus voter (R3) after R2: the R2 run (D lost, E a keyholder), then the
+    reconfiguration making E a voter, C lost for an epoch, D back, the security checks, a report."""
+    os.makedirs(f"{WORK}/logs", exist_ok=True)
+    pull_images()
+    devnet_up()
+    chain = Chain()
+    log(f"devnet: {chain.seconds_per_slot} s slots, {chain.slots_per_epoch} slots per epoch, "
+        f"genesis fork version {chain.genesis_fork_version}")
+    signers_start()
+    key = dkg()
+    activation = activate(key, chain)
+    deposit(key, chain)
+    proxy_start()
+    vc_start(key)
+    index, activation_epoch = wait_active(key, chain)
+    recorder = Recorder(index, activation_epoch, chain)
+    recorder.start()
+    save("validator.json", {"public_key": key, "index": index, "activation_epoch": activation_epoch,
+                            "mpc_activation_height": activation["activated_at"],
+                            "genesis_validators_root": chain.genesis_validators_root})
+    chain.wait_epoch(activation_epoch)
+
+    def baseline():
+        observe("baseline", index, observed, chain)
+    scenario("baseline", baseline)
+    scenario("replacement", replacement(chain, key, index, observed))
+    scenario("reconfiguration", reconfiguration(chain, key, index, observed))
+    security_checks(key, chain, direct=WITHHELD, other=1)
+    recorder.stop()
+    return report(chain)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("run")
     sub.add_parser("run-r2")
+    sub.add_parser("run-r3")
     devnet = sub.add_parser("devnet")
     devnet.add_argument("action", choices=["up", "down"])
     signers = sub.add_parser("signers")
@@ -1931,6 +2153,8 @@ def main():
             run_all()
         elif args.command == "run-r2":
             run_r2()
+        elif args.command == "run-r3":
+            run_r3()
         elif args.command == "devnet":
             devnet_up() if args.action == "up" else devnet_down()
         elif args.command == "signers":

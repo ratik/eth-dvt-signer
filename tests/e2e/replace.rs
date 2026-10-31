@@ -74,10 +74,10 @@ fn identity(network: &TestNetwork, node: usize) -> String {
 /// A network about to replace D: the activated validator `key` signed some history with the
 /// original committee; D is stopped for good; E runs as a follower and has applied everything.
 /// The operators of A, B and C approved giving `key`'s shares to A, B, C, E.
-struct Replacement {
-    network: TestNetwork,
+pub(crate) struct Replacement {
+    pub(crate) network: TestNetwork,
     dir: PathBuf,
-    key: String,
+    pub(crate) key: String,
     /// The generation replaced: its ceremony id and round.
     from: (String, u64),
 }
@@ -164,7 +164,7 @@ fn replacement_with(env: impl Fn(usize) -> Vec<(String, String)>) -> Replacement
     )
 }
 
-fn replacement() -> Replacement {
+pub(crate) fn replacement() -> Replacement {
     replacement_with(|_| Vec::new())
 }
 
@@ -263,7 +263,7 @@ impl Replacement {
         wait_generation(&self.network, &KEYHOLDERS, &self.key, (generation, name));
     }
 
-    fn replace_and_activate(&self, name: &str) {
+    pub(crate) fn replace_and_activate(&self, name: &str) {
         self.start(0, name);
         self.activate(name, 1);
     }
@@ -280,7 +280,7 @@ impl Replacement {
 
     /// The share indices whose partials produced the signature of `body` through `via`, from the
     /// coordinator's log.
-    fn signers(&self, via: usize, body: &Value) -> Vec<u64> {
+    pub(crate) fn signers(&self, via: usize, body: &Value) -> Vec<u64> {
         let root = format!("0x{}", hex::encode(signing_root(body)));
         let log = self.network.log(via);
         let line = log
@@ -300,7 +300,7 @@ impl Replacement {
     }
 
     /// Node `node`'s share index in the generation `name`.
-    fn index(&self, node: usize, name: &str) -> u64 {
+    pub(crate) fn index(&self, node: usize, name: &str) -> u64 {
         dkg_status(&self.network, node, name)["participant_index"]
             .as_u64()
             .unwrap()

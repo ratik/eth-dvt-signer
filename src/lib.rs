@@ -4,6 +4,7 @@
 pub mod application;
 pub mod dkg;
 pub mod engine;
+pub mod epochs;
 pub mod eth;
 pub mod executor;
 pub mod hooks;

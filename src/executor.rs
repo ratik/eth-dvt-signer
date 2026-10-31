@@ -1,4 +1,8 @@
 //! The executor applies finalized blocks to the state machine and answers clients.
+//!
+//! It stops on its own after the last block of the node's consensus epoch (`epochs`, R3): once the
+//! block carrying a reconfiguration is committed, with the next epoch's record, it records why
+//! ([Stop]) and applies nothing more, and the process exits to restart in the next epoch.
 
 use crate::{
     application::{Mempool, Scheme},
@@ -24,7 +28,7 @@ use crate::{
     },
     state::Authorization,
     storage::{Effect, Store},
-    types::{Block, Command, Outcome, SignRequest, Transaction, format_hash},
+    types::{Block, Command, Outcome, Reconfiguration, SignRequest, Transaction, format_hash},
 };
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_consensus::{
@@ -45,7 +49,7 @@ use rand_core::CryptoRng;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
@@ -319,6 +323,12 @@ pub enum Message {
         round: u64,
         response: oneshot::Sender<AbortReceipt>,
     },
+    /// End the consensus epoch, starting the next one (through consensus). Answered with the
+    /// transaction id once submitted: no node answers after the epoch ends.
+    Reconfigure {
+        change: Box<Reconfiguration>,
+        response: oneshot::Sender<u64>,
+    },
 }
 
 /// The node has shut down.
@@ -504,6 +514,18 @@ impl Client {
         receiver.await.map_err(|_| Stopped)
     }
 
+    /// Submit a reconfiguration ending the consensus epoch; returns its transaction id at once.
+    pub async fn reconfigure(&self, change: Reconfiguration) -> Result<u64, Stopped> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(Message::Reconfigure {
+                change: Box::new(change),
+                response,
+            })
+            .map_err(|_| Stopped)?;
+        receiver.await.map_err(|_| Stopped)
+    }
+
     /// Activate the reshare `round` as `validator`'s share generation; wait until decided.
     pub async fn activate_generation(
         &self,
@@ -560,6 +582,16 @@ impl Client {
     }
 }
 
+/// Why a node stops on its own: its consensus epoch ended with the last block it applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stop {
+    /// The block at `height` ended the epoch with a reconfiguration: the node restarts in `epoch`.
+    Reconfigured { epoch: u64, height: u64 },
+    /// The epoch was closed at `height` (`--close-epoch-at`) by a block without a
+    /// reconfiguration: the node restarts in the same epoch without the closing height.
+    Closed { height: u64 },
+}
+
 /// A client waiting for its transaction.
 enum Waiter {
     Sign(oneshot::Sender<Receipt>),
@@ -595,6 +627,10 @@ pub struct Executor<E: CryptoRng + Spawner + Context, S: Sender> {
     /// Transactions this node submitted that no finalized block contains yet, if it is a follower
     /// (gossiped again until one does, [REGOSSIP_BLOCKS]); `None` on a voter.
     unfinalized: Option<HashMap<Digest, Transaction>>,
+    /// The height the epoch was closed at (`--close-epoch-at`), if any.
+    close: Option<u64>,
+    /// Set, once, when the epoch ended with the last block applied; the executor then stops.
+    stopped: Arc<OnceLock<Stop>>,
 }
 
 impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
@@ -610,6 +646,8 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
         retention: Retention,
         dkg: mpsc::UnboundedSender<dkg::actor::Message>,
         follower: bool,
+        close: Option<u64>,
+        stopped: Arc<OnceLock<Stop>>,
     ) -> (Self, mpsc::UnboundedSender<Message>, Client) {
         executed.store(store.height(), Ordering::Release);
         let (sender, mailbox) = mpsc::unbounded_channel();
@@ -627,6 +665,8 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
             retention,
             dkg,
             unfinalized: follower.then(HashMap::new),
+            close,
+            stopped,
         };
         let client = Client {
             sender: sender.clone(),
@@ -646,6 +686,9 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                 let (block, ack) = held.pop_front().expect("not empty");
                 self.execute(&block).await;
                 ack.acknowledge();
+                if self.stopped.get().is_some() {
+                    return;
+                }
             }
             let next = if held.is_empty() {
                 Some(self.mailbox.recv().await)
@@ -740,6 +783,16 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                     let id = self.submit(Command::AbortResharing { validator, round });
                     info!(id, round, validator = %format_validator(&validator), "submitted reshare abort");
                     self.waiters.insert(id, Waiter::Abort(response));
+                }
+                Message::Reconfigure { change, response } => {
+                    let (epoch, remove, add) = (
+                        change.epoch,
+                        hex::encode(change.remove.encode()),
+                        hex::encode(change.add.encode()),
+                    );
+                    let id = self.submit(Command::Reconfigure(change));
+                    info!(id, epoch, remove, add, "submitted reconfiguration");
+                    let _ = response.send(id);
                 }
                 Message::ImportHistory { import, response } => {
                     let validators = import.validators.len();
@@ -883,6 +936,10 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                     }
                     self.execute(&block).await;
                     ack.acknowledge();
+                    // The epoch ended with this block: nothing more is applied.
+                    if self.stopped.get().is_some() {
+                        return;
+                    }
                 }
             }
         }
@@ -967,6 +1024,10 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
         if activates {
             hooks::crash_point("before-apply-activation");
         }
+        let reconfigures = crate::epochs::is_terminal(block);
+        if reconfigures {
+            hooks::crash_point("before-apply-reconfiguration");
+        }
         let applied = self
             .store
             .apply_block(
@@ -984,6 +1045,28 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
         }
         if activates {
             hooks::crash_point("after-apply-activation");
+        }
+        if reconfigures {
+            hooks::crash_point("after-apply-reconfiguration");
+        }
+        if let Some(record) = &applied.reconfigured {
+            info!(
+                height,
+                epoch = record.epoch,
+                committee = ?record.committee,
+                "the consensus epoch ended with this block: stopping to restart in the next one"
+            );
+            let _ = self.stopped.set(Stop::Reconfigured {
+                epoch: record.epoch,
+                height,
+            });
+        } else if self.close == Some(height) {
+            warn!(
+                height,
+                "the consensus epoch was closed here without a reconfiguration: stopping \
+                 (restart without --close-epoch-at)"
+            );
+            let _ = self.stopped.set(Stop::Closed { height });
         }
         self.executed.store(height, Ordering::Release);
         self.last_applied = Some(applied_at);
@@ -1251,6 +1334,13 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                         let _ = waiter.send(ActivationReceipt { outcome, height });
                     }
                 }
+                // Nobody waits: the node stops right after this block (`Stop`).
+                (Command::Reconfigure { .. }, Effect::Reconfigure(record)) => info!(
+                    height,
+                    id = transaction.id,
+                    epoch = record.epoch,
+                    "applied reconfiguration"
+                ),
                 _ => unreachable!("one effect per command"),
             }
         }
