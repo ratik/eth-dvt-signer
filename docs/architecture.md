@@ -24,6 +24,10 @@ Crypto                  src/dkg/signing         Ethereum ciphersuite over raw 32
 Ethereum types          src/eth                 containers, SSZ hash_tree_root, domains, roots.
 ```
 
+Two roles are kept apart: **voters** (the consensus committee, which also runs the coordinators)
+and **keyholders** (the players of a key's active generation). They coincide until a keyholder is
+replaced (R2): then a follower, which votes on nothing and coordinates nothing, holds a share.
+
 The core never sees HTTP types, and the HTTP layer never sees shares or partial signatures. For
 validator keys, the state machine computes what is signed from the typed duty, so the signing
 root and the slashing decision cannot disagree. The client's `signingRoot` is only compared with
@@ -97,7 +101,13 @@ failover proxy (development)  ──>  4 eth-mpc-signer nodes (this repository)
 6. Done: resharing (R1) ([resharing.md](resharing.md)). A validator key (DKG or imported) gets new
    shares within the committee through commonware's Feldman-Desmedt reshare; the key, history
    and activation stay; the new share generation is activated by consensus, and signing requests
-   name the generation they use. Not done: replacing a keyholder (R2).
+   name the generation they use.
+7. Done: replacing a lost keyholder (R2) ([resharing.md](resharing.md#r2-replacing-a-lost-keyholder)).
+   A node outside the committee runs as a non-voting follower (commonware secondary peer, a
+   verifier-only consensus scheme) with its own replicated state; the remaining keyholders reshare
+   the key to it with an explicit dealer and player set, which their operators approved locally.
+   The consensus committee is not reconfigured: with one voter lost, consensus has no fault
+   tolerance left. Not done: committee reconfiguration.
 
 ## Anvil
 

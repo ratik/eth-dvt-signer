@@ -418,7 +418,7 @@ pub(crate) mod reshare {
         let key = key_of(from);
         let block = Sha256::hash(&[&height.to_be_bytes()]);
         let ReshareOutcome::Started(round) =
-            ceremonies.reshare(id(name), key, from.round, height, &block)
+            ceremonies.reshare(id(name), key, from.round, None, height, &block)
         else {
             panic!("reshare not started");
         };
@@ -543,7 +543,7 @@ pub(crate) mod reshare {
             let (g0, shares0) = dkg(&mut context, &mut ceremonies, &signers);
             let block = Sha256::hash(&[b"b10"]);
             let ReshareOutcome::Started(round) =
-                ceremonies.reshare(id("g1"), key_of(&g0), g0.round, 10, &block)
+                ceremonies.reshare(id("g1"), key_of(&g0), g0.round, None, 10, &block)
             else {
                 panic!()
             };
@@ -570,7 +570,7 @@ pub(crate) mod reshare {
             let (g0, shares0) = dkg(&mut context, &mut ceremonies, &signers);
             let block = Sha256::hash(&[b"b10"]);
             let ReshareOutcome::Started(round) =
-                ceremonies.reshare(id("g1"), key_of(&g0), g0.round, 10, &block)
+                ceremonies.reshare(id("g1"), key_of(&g0), g0.round, None, 10, &block)
             else {
                 panic!()
             };
@@ -625,7 +625,7 @@ pub(crate) mod reshare {
             let (g0, shares0) = dkg(&mut context, &mut ceremonies, &signers);
             let block = Sha256::hash(&[b"b10"]);
             let ReshareOutcome::Started(round) =
-                ceremonies.reshare(id("g1"), key_of(&g0), g0.round, 10, &block)
+                ceremonies.reshare(id("g1"), key_of(&g0), g0.round, None, 10, &block)
             else {
                 panic!()
             };
@@ -674,29 +674,29 @@ pub(crate) mod reshare {
             let key = key_of(&g0);
             let block = Sha256::hash(&[b"b10"]);
             assert_eq!(
-                ceremonies.reshare(id("g1"), key, g0.round, 10, &block),
+                ceremonies.reshare(id("g1"), key, g0.round, None, 10, &block),
                 ReshareOutcome::Started(1)
             );
             // The same again: idempotent, whatever the height; a second reshare: pending.
             assert_eq!(
-                ceremonies.reshare(id("g1"), key, g0.round, 11, &block),
+                ceremonies.reshare(id("g1"), key, g0.round, None, 11, &block),
                 ReshareOutcome::Exists(1)
             );
             assert_eq!(
-                ceremonies.reshare(id("g1b"), key, g0.round, 11, &block),
+                ceremonies.reshare(id("g1b"), key, g0.round, None, 11, &block),
                 ReshareOutcome::Pending(1)
             );
             // The id of another ceremony; another key; a generation that is not the key's.
             assert_eq!(
-                ceremonies.reshare(id("key"), key, g0.round, 11, &block),
+                ceremonies.reshare(id("key"), key, g0.round, None, 11, &block),
                 ReshareOutcome::Conflict(0)
             );
             assert_eq!(
-                ceremonies.reshare(id("g1c"), [9; 48], g0.round, 11, &block),
+                ceremonies.reshare(id("g1c"), [9; 48], g0.round, None, 11, &block),
                 ReshareOutcome::NoGeneration
             );
             assert_eq!(
-                ceremonies.reshare(id("g1d"), key, 7, 11, &block),
+                ceremonies.reshare(id("g1d"), key, 7, None, 11, &block),
                 ReshareOutcome::NoGeneration
             );
 
@@ -742,7 +742,7 @@ pub(crate) mod reshare {
             assert!(ceremonies.abort(1));
             assert!(!ceremonies.abort(1));
             assert_eq!(
-                ceremonies.reshare(id("g2"), key, g0.round, 13, &block),
+                ceremonies.reshare(id("g2"), key, g0.round, None, 13, &block),
                 ReshareOutcome::Started(2)
             );
 
@@ -751,12 +751,15 @@ pub(crate) mod reshare {
             let g2 = ceremonies.by_round(2).unwrap();
             g2.write_reshare(&mut bytes);
             assert_eq!(bytes.len(), g2.reshare_encode_size());
-            assert_eq!(&Ceremony::read_reshare(&mut bytes.as_slice()).unwrap(), g2);
+            assert_eq!(
+                &Ceremony::read_reshare(&mut bytes.as_slice(), true).unwrap(),
+                g2
+            );
             let completed = ceremonies.by_round(1).unwrap();
             let mut bytes = Vec::new();
             completed.write_reshare(&mut bytes);
             assert_eq!(
-                &Ceremony::read_reshare(&mut bytes.as_slice()).unwrap(),
+                &Ceremony::read_reshare(&mut bytes.as_slice(), true).unwrap(),
                 completed
             );
         });
@@ -827,5 +830,441 @@ pub(crate) mod reshare {
                 .verify(g1.public_key().unwrap(), &signature)
                 .unwrap();
         });
+    }
+
+    // R2: replacing a lost keyholder (A, B, C, D -> A, B, C, E): dealers and players differ.
+
+    pub(crate) mod replace {
+        use super::*;
+
+        /// A, B, C, D (the committee, seeds 0 to 3) and E (seed 4, not a committee member).
+        pub(crate) fn replacement() -> PrivateKey {
+            PrivateKey::from_seed(4)
+        }
+
+        /// The new keyholders: A, B, C and E.
+        pub(crate) fn new_keyholders(signers: &[PrivateKey]) -> Vec<PrivateKey> {
+            let mut players = signers[..3].to_vec();
+            players.push(replacement());
+            players
+        }
+
+        /// The reshare of `from` dealt by A, B, C to A, B, C, E.
+        pub(crate) fn membership(signers: &[PrivateKey], from: u64) -> Membership {
+            Membership {
+                from,
+                dealers: committee(&signers[..3]),
+                players: committee(&new_keyholders(signers)),
+            }
+        }
+
+        /// Run `dealers` (each with its share of the generation refreshed) in memory, every
+        /// player of `ceremony` (the `players` keys) acknowledging every dealing.
+        pub(crate) fn deal_replacement(
+            rng: &mut impl CryptoRng,
+            ceremony: &Ceremony,
+            dealers: &[(PrivateKey, Share)],
+            players: &[PrivateKey],
+        ) -> (Vec<Player<Variant, PrivateKey>>, Vec<SignedLog>) {
+            let info = ceremony.info();
+            let mut states: Vec<_> = players
+                .iter()
+                .map(|signer| Player::new(info.clone(), signer.clone()).unwrap())
+                .collect();
+            let mut logs = Vec::new();
+            for (signer, share) in dealers {
+                let (mut dealer, commitment, dealings) = Dealer::start::<Faults>(
+                    &mut *rng,
+                    info.clone(),
+                    signer.clone(),
+                    Some(share.clone()),
+                )
+                .unwrap();
+                for (player_key, dealing) in dealings {
+                    let p = players
+                        .iter()
+                        .position(|player| player.public_key() == player_key)
+                        .unwrap();
+                    let ack = states[p]
+                        .dealer_message::<Faults>(signer.public_key(), commitment.clone(), dealing)
+                        .unwrap()
+                        .unwrap();
+                    dealer.receive_player_ack(player_key, ack).unwrap();
+                }
+                logs.push(dealer.finalize::<Faults>());
+            }
+            (states, logs)
+        }
+
+        /// R2-CRYPTO-1 to 5 and 8, over several seeds: the generation of A, B, C, D is reshared
+        /// by A, B, C to A, B, C, E. D takes no part; all three dealers are needed; the public key
+        /// is the same bytes; any three new shares sign as the key (A, B, E without C included),
+        /// two cannot; old-generation partials never combine with new ones.
+        #[test]
+        fn replacing_a_lost_keyholder_keeps_the_key() {
+            for seed in 0..8 {
+                deterministic::Runner::seeded(seed).start(|mut context| async move {
+                    let signers = signers();
+                    let mut ceremonies = Ceremonies::new(committee(&signers));
+                    let (g0, shares0) = dkg(&mut context, &mut ceremonies, &signers);
+                    let membership = membership(&signers, g0.round);
+                    let block = Sha256::hash(&[b"b10"]);
+                    let ReshareOutcome::Started(round) = ceremonies.reshare(
+                        id("g1"),
+                        key_of(&g0),
+                        g0.round,
+                        Some(&membership),
+                        10,
+                        &block,
+                    ) else {
+                        panic!("reshare not started");
+                    };
+                    let started = ceremonies.by_round(round).unwrap().clone();
+                    assert_eq!(started.dealers(), &membership.dealers);
+                    assert_eq!(started.config.participants, membership.players);
+                    assert_eq!(started.config.threshold, 3);
+                    // commonware's required commitments: max(dealers' quorum, previous quorum).
+                    assert_eq!(started.required_logs(), 3);
+
+                    // R2-CRYPTO-5: D is neither a dealer nor a player of the round.
+                    let info = started.info();
+                    assert!(
+                        Dealer::start::<Faults>(
+                            &mut context,
+                            info.clone(),
+                            signers[3].clone(),
+                            Some(shares0[3].clone()),
+                        )
+                        .is_err()
+                    );
+                    assert!(Player::new(info.clone(), signers[3].clone()).is_err());
+                    // E has no old share and is not a dealer: it only plays.
+                    assert!(
+                        Dealer::start::<Faults>(&mut context, info, replacement(), None).is_err()
+                    );
+
+                    let players = new_keyholders(&signers);
+                    let dealers: Vec<(PrivateKey, Share)> = (0..3)
+                        .map(|node| (signers[node].clone(), shares0[node].clone()))
+                        .collect();
+                    let (states, logs) =
+                        deal_replacement(&mut context, &started, &dealers, &players);
+                    // Two dealers do not complete the round: the third is required.
+                    ceremonies.record(round, logs[0].clone()).unwrap();
+                    ceremonies.record(round, logs[1].clone()).unwrap();
+                    ceremonies.advance(11, &mut context);
+                    assert_eq!(
+                        ceremonies.by_round(round).unwrap().status,
+                        DkgStatus::InProgress
+                    );
+                    ceremonies.record(round, logs[2].clone()).unwrap();
+                    ceremonies.advance(12, &mut context);
+                    let g1 = ceremonies.by_round(round).unwrap().clone();
+                    assert_eq!(g1.status, DkgStatus::Completed);
+                    let output = g1.output.as_ref().unwrap();
+                    assert_eq!(output.dealers(), &membership.dealers);
+                    assert_eq!(output.players(), &membership.players);
+
+                    // R2-CRYPTO-2: the same public key, byte for byte.
+                    let key = g0.public_key().unwrap();
+                    assert_eq!(
+                        g1.public_key().unwrap().encode().as_ref(),
+                        key.encode().as_ref()
+                    );
+                    assert_ne!(g1.generation_id(), g0.generation_id());
+
+                    // Every new keyholder, E included, derives a share that verifies.
+                    let shares1: Vec<Share> = states
+                        .into_iter()
+                        .zip(&players)
+                        .map(|(state, signer)| {
+                            let (derived, share) = state
+                                .finalize::<Faults, ed25519::Batch>(
+                                    &mut context,
+                                    g1.logs(),
+                                    &Sequential,
+                                )
+                                .unwrap();
+                            assert_eq!(&derived, output);
+                            KeyShare::new(&g1, share.clone())
+                                .verify(&signer.public_key(), &g1)
+                                .unwrap();
+                            share
+                        })
+                        .collect();
+
+                    // R2-CRYPTO-3 and 4: any three sign as the key, two cannot.
+                    let sharing = g1.sharing().unwrap();
+                    for skip in 0..4 {
+                        let three: Vec<&Share> = shares1
+                            .iter()
+                            .enumerate()
+                            .filter(|(node, _)| *node != skip)
+                            .map(|(_, share)| share)
+                            .collect();
+                        let signature = signing::recover(sharing, &sign(&three)).unwrap();
+                        Message::Ethereum([7; 32]).verify(key, &signature).unwrap();
+                    }
+                    // A, B and E, without C (players are A, B, C, E in that order here).
+                    let without_c = sign(&[&shares1[0], &shares1[1], &shares1[3]]);
+                    for partial in &without_c {
+                        Message::Ethereum([7; 32])
+                            .verify_partial(sharing, partial)
+                            .unwrap();
+                    }
+                    let signature = signing::recover(sharing, &without_c).unwrap();
+                    Message::Ethereum([7; 32]).verify(key, &signature).unwrap();
+                    assert!(signing::recover(sharing, &sign(&[&shares1[0], &shares1[3]])).is_err());
+
+                    // R2-CRYPTO-8: an old-generation partial (D's, or C's old share) is not a
+                    // partial of the new sharing, and a new one is not of the old sharing.
+                    for old in [&shares0[3], &shares0[2]] {
+                        let partial = &sign(&[old])[0];
+                        assert!(
+                            Message::Ethereum([7; 32])
+                                .verify_partial(sharing, partial)
+                                .is_err()
+                        );
+                        // Combined anyway (unless its index repeats a new one's): not the key's.
+                        let mixed = sign(&[&shares1[0], &shares1[1], old]);
+                        if let Ok(signature) = signing::recover(sharing, &mixed) {
+                            assert!(Message::Ethereum([7; 32]).verify(key, &signature).is_err());
+                        }
+                    }
+                    let e_partial = &sign(&[&shares1[3]])[0];
+                    assert!(
+                        Message::Ethereum([7; 32])
+                            .verify_partial(g0.sharing().unwrap(), e_partial)
+                            .is_err()
+                    );
+                });
+            }
+        }
+
+        /// Membership rules, all deterministic: dealers must be keyholders of the generation
+        /// refreshed and at least its threshold, the new generation has exactly the committee's
+        /// size, the generation named must be the active one; a start is idempotent only for the
+        /// same key, dealers and players; a log from a non-dealer (D) or for another round is
+        /// refused.
+        #[test]
+        fn replacement_membership_rules() {
+            deterministic::Runner::default().start(|mut context| async move {
+                let signers = signers();
+                let mut ceremonies = Ceremonies::new(committee(&signers));
+                let (g0, shares0) = dkg(&mut context, &mut ceremonies, &signers);
+                let key = key_of(&g0);
+                let block = Sha256::hash(&[b"b10"]);
+                let valid = membership(&signers, g0.round);
+                let e = replacement();
+                let f = PrivateKey::from_seed(5);
+                let with = |dealers: Vec<PrivateKey>, players: Vec<PrivateKey>| Membership {
+                    from: g0.round,
+                    dealers: committee(&dealers),
+                    players: committee(&players),
+                };
+                let abc = signers[..3].to_vec();
+                let mut start = |name: &str, membership: &Membership| {
+                    ceremonies.reshare(id(name), key, g0.round, Some(membership), 10, &block)
+                };
+                // E is not a keyholder of generation 0: it cannot deal.
+                assert_eq!(
+                    start(
+                        "bad",
+                        &with(
+                            vec![signers[0].clone(), signers[1].clone(), e.clone()],
+                            new_keyholders(&signers)
+                        )
+                    ),
+                    ReshareOutcome::Membership(MembershipRefusal::DealerNotKeyholder)
+                );
+                assert_eq!(
+                    start(
+                        "bad",
+                        &with(signers[..2].to_vec(), new_keyholders(&signers))
+                    ),
+                    ReshareOutcome::Membership(MembershipRefusal::TooFewDealers {
+                        dealers: 2,
+                        required: 3
+                    })
+                );
+                let mut five = new_keyholders(&signers);
+                five.push(f.clone());
+                for players in [
+                    vec![signers[0].clone(), signers[1].clone(), e.clone()],
+                    five,
+                ] {
+                    let count = players.len();
+                    assert_eq!(
+                        start("bad", &with(abc.clone(), players)),
+                        ReshareOutcome::Membership(MembershipRefusal::PlayerCount {
+                            players: count,
+                            required: 4
+                        })
+                    );
+                }
+                // A generation that is not the active one.
+                let stale = Membership {
+                    from: 7,
+                    ..valid.clone()
+                };
+                assert_eq!(
+                    start("bad", &stale),
+                    ReshareOutcome::Stale {
+                        from: 7,
+                        active: g0.round
+                    }
+                );
+                // Nothing was started by the refused commands, and their id is still free.
+                assert_eq!(start("g1", &valid), ReshareOutcome::Started(1));
+                assert_eq!(start("g1", &valid), ReshareOutcome::Exists(1));
+                // The same id with other players, or other (valid) dealers: a conflict.
+                let mut other_players = abc.clone();
+                other_players.push(f.clone());
+                assert_eq!(
+                    start("g1", &with(abc.clone(), other_players)),
+                    ReshareOutcome::Conflict(1)
+                );
+                assert_eq!(
+                    start(
+                        "g1",
+                        &with(
+                            vec![signers[0].clone(), signers[1].clone(), signers[3].clone()],
+                            new_keyholders(&signers)
+                        )
+                    ),
+                    ReshareOutcome::Conflict(1)
+                );
+                // The R1 form of the same id: a conflict too (other players).
+                assert_eq!(
+                    ceremonies.reshare(id("g1"), key, g0.round, None, 10, &block),
+                    ReshareOutcome::Conflict(1)
+                );
+                assert_eq!(
+                    ceremonies.reshare(id("g1b"), key, g0.round, Some(&valid), 10, &block),
+                    ReshareOutcome::Pending(1)
+                );
+
+                // D's log, dealt for the same session with D as a dealer (another dealer set):
+                // signed for another round, refused.
+                let g1 = ceremonies.by_round(1).unwrap().clone();
+                let mut with_d = g1.clone();
+                if let Origin::Reshare(reshare) = &mut with_d.origin {
+                    reshare.dealers =
+                        committee(&[signers[0].clone(), signers[1].clone(), signers[3].clone()]);
+                }
+                let (_, d_logs) = deal_replacement(
+                    &mut context,
+                    &with_d,
+                    &[(signers[3].clone(), shares0[3].clone())],
+                    &new_keyholders(&signers),
+                );
+                assert_eq!(
+                    ceremonies.record(1, d_logs[0].clone()),
+                    Err(Ignored::BadSignature)
+                );
+                // An R1 log of the key (dealt to the committee) is not a log of this round either.
+                let (_, r1_logs) = deal_reshare(&mut context, &g0, &signers, &shares0, &[]);
+                assert_eq!(
+                    ceremonies.record(1, r1_logs[0].clone()),
+                    Err(Ignored::BadSignature)
+                );
+
+                // The ceremony round trips with its dealers; the R1 encoding (no dealers) still
+                // reads, its dealers being the previous generation's keyholders.
+                let mut bytes = Vec::new();
+                g1.write_reshare(&mut bytes);
+                assert_eq!(bytes.len(), g1.reshare_encode_size());
+                assert_eq!(
+                    Ceremony::read_reshare(&mut bytes.as_slice(), true).unwrap(),
+                    g1
+                );
+                let mut r1_ceremonies = Ceremonies::new(committee(&signers));
+                r1_ceremonies.restore(g0.clone());
+                let (r1, _) = super::reshare(
+                    &mut context,
+                    &mut r1_ceremonies,
+                    &signers,
+                    &g0,
+                    &shares0,
+                    "r1",
+                    10,
+                );
+                let mut bytes = Vec::new();
+                r1.write_reshare(&mut bytes);
+                let dealers = r1.reshare().unwrap().dealers.encode_size();
+                bytes.truncate(bytes.len() - dealers);
+                assert_eq!(
+                    Ceremony::read_reshare(&mut bytes.as_slice(), false).unwrap(),
+                    r1
+                );
+            });
+        }
+
+        /// R2-CRYPTO-6: invalid dealer contributions are refused by the new keyholder E: a dealing
+        /// of another dealer's share (it would change the key), a private value meant for another
+        /// player, or a DKG dealing (no previous share).
+        #[test]
+        fn invalid_replacement_dealings_are_refused() {
+            deterministic::Runner::default().start(|mut context| async move {
+                let signers = signers();
+                let mut ceremonies = Ceremonies::new(committee(&signers));
+                let (g0, shares0) = dkg(&mut context, &mut ceremonies, &signers);
+                let block = Sha256::hash(&[b"b10"]);
+                let membership = membership(&signers, g0.round);
+                let ReshareOutcome::Started(round) = ceremonies.reshare(
+                    id("g1"),
+                    key_of(&g0),
+                    g0.round,
+                    Some(&membership),
+                    10,
+                    &block,
+                ) else {
+                    panic!()
+                };
+                let info = ceremonies.by_round(round).unwrap().info();
+                let e = replacement();
+                let refused = |commitment, dealing| {
+                    let mut player = Player::new(info.clone(), e.clone()).unwrap();
+                    player
+                        .dealer_message::<Faults>(signers[0].public_key(), commitment, dealing)
+                        .is_err()
+                };
+                // A deals B's old share (under A's index).
+                let wrong = Share::new(shares0[0].index, shares0[1].private.clone());
+                if let Ok((_, commitment, dealings)) = Dealer::start::<Faults>(
+                    &mut context,
+                    info.clone(),
+                    signers[0].clone(),
+                    Some(wrong),
+                ) {
+                    let dealing = dealings
+                        .into_iter()
+                        .find(|(key, _)| *key == e.public_key())
+                        .unwrap()
+                        .1;
+                    assert!(refused(commitment, dealing));
+                }
+                // A's honest commitment with the value meant for B.
+                let (_, commitment, dealings) = Dealer::start::<Faults>(
+                    &mut context,
+                    info.clone(),
+                    signers[0].clone(),
+                    Some(shares0[0].clone()),
+                )
+                .unwrap();
+                let for_b = dealings
+                    .into_iter()
+                    .find(|(key, _)| *key == signers[1].public_key())
+                    .unwrap()
+                    .1;
+                assert!(refused(commitment, for_b));
+                // A DKG dealing of the old round.
+                let (_, commitment, dealings) =
+                    Dealer::start::<Faults>(&mut context, g0.info(), signers[0].clone(), None)
+                        .unwrap();
+                let dealing = dealings.into_iter().next().unwrap().1;
+                assert!(refused(commitment, dealing));
+            });
+        }
     }
 }

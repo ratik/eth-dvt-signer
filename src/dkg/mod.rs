@@ -1,7 +1,8 @@
 //! Distributed key generation (DKG) of a BLS12-381 threshold key, using commonware's
 //! Feldman-Desmedt (Joint-Feldman) construction.
 //!
-//! Every committee member is both a dealer and a player:
+//! Every committee member is both a dealer and a player (a reshare's dealers and players are its
+//! own, see [ceremony]):
 //!
 //! ```text
 //! POST /dkg/start ──> StartCeremony tx ──consensus──> ceremony InProgress (same round on every node)
@@ -20,9 +21,11 @@
 //! - [wire]: private dealer/player messages exchanged over the dedicated p2p channel.
 //! - [secrets]: this node's secret material (dealer seed, received dealings, final share).
 //! - [actor]: runs this node's dealer and player and serves threshold partial signatures.
+//! - [approval]: the operator's local approval of a reshare that gives shares to a new keyholder.
 //! - [signing]: threshold signing with shares (Ethereum ciphersuite or internal domain).
 
 pub mod actor;
+pub mod approval;
 pub mod ceremony;
 pub mod parked;
 pub mod secrets;
@@ -148,7 +151,7 @@ pub struct CeremonyConfig {
 pub enum Unsupported {
     #[error("unsupported protocol version {0} (supported: {PROTOCOL_VERSION})")]
     Version(u8),
-    #[error("participants must be the configured committee")]
+    #[error("participants must be the configured committee (a reshare: as many keyholders)")]
     Participants,
     #[error("threshold must be {expected} for {participants} participants")]
     Threshold { expected: u32, participants: usize },
@@ -167,12 +170,24 @@ impl CeremonyConfig {
         }
     }
 
-    /// Check that `committee` can run this configuration.
+    /// Check that `committee` can run this configuration: the whole committee deals and plays.
     pub fn check(&self, committee: &Set<PublicKey>) -> Result<(), Unsupported> {
         if self.version != PROTOCOL_VERSION {
             return Err(Unsupported::Version(self.version));
         }
         if &self.participants != committee {
+            return Err(Unsupported::Participants);
+        }
+        self.check_players(committee)
+    }
+
+    /// Check a reshare's configuration: its participants (the new generation's keyholders) need
+    /// not be committee members, but are as many, with the committee's threshold (`n - f`).
+    pub fn check_players(&self, committee: &Set<PublicKey>) -> Result<(), Unsupported> {
+        if self.version != PROTOCOL_VERSION {
+            return Err(Unsupported::Version(self.version));
+        }
+        if self.participants.len() != committee.len() {
             return Err(Unsupported::Participants);
         }
         let expected = committee.quorum::<Faults>();

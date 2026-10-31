@@ -22,13 +22,19 @@
 //! the active generation (commonware refuses a dealing whose constant commitment is not that
 //! share's public commitment), and each player interpolates the selected dealings at its own
 //! index. The key does not change; every share does. The previous generation's public [Output] is
-//! part of the ceremony ([Reshare::previous]): it fixes the dealers (that generation's players) and
-//! enters the round's transcript. Today dealers and players are the same committee; the round
-//! format already keeps them apart.
+//! part of the ceremony ([Reshare::previous]) and enters the round's transcript, with the round's
+//! dealers and players.
+//!
+//! Dealers and players are the round's own ([Membership]): R1 refreshes the shares within the
+//! committee (the generation's keyholders deal to themselves); R2 replaces a lost keyholder, its
+//! remaining keyholders (at least the threshold) dealing to a new set of the same size that need not
+//! be committee members (A, B, C deal to A, B, C, E). Consensus checks the membership
+//! deterministically; whether a dealer gives its share's dealing to new keyholders is its
+//! operator's local decision (`approval`).
 
 use super::{
     CeremonyConfig, CeremonyId, DEADLINE_BLOCKS, DkgStatus, Faults, GroupKey, MAX_ACTIVE,
-    MAX_PARTICIPANTS, NAMESPACE, Unsupported, Variant,
+    MAX_PARTICIPANTS, NAMESPACE, PROTOCOL_VERSION, Unsupported, Variant,
 };
 use crate::{
     eth::duty::ValidatorKey,
@@ -102,9 +108,12 @@ pub struct Reshare {
     /// The generation refreshed: the round of the ceremony the key signed with when this one
     /// started.
     pub from: u64,
-    /// That generation's public output. Its players are this round's dealers, each dealing its
-    /// share of it.
+    /// That generation's public output: its players hold the shares dealt again.
     pub previous: Output<Variant, PublicKey>,
+    /// This round's dealers, each dealing its share of `previous`: keyholders of that generation,
+    /// at least its threshold of them (R1: all of them; R2: those left after one was lost). The
+    /// new generation's players are the configuration's participants.
+    pub dealers: Set<PublicKey>,
     /// Share indices whose keyholder acknowledged (signed) that it derived, verified and stored its
     /// new share.
     pub ready: BTreeSet<u32>,
@@ -218,6 +227,91 @@ pub enum ImportOutcome {
     Invalid(Invalid),
 }
 
+/// Who deals a reshare and who holds the new generation (`StartResharing`, R2). Without it, the
+/// active generation's keyholders deal to the committee (R1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Membership {
+    /// The generation refreshed (its ceremony round): it must be the key's active generation when
+    /// the command is applied, so a delayed command never applies to a later generation.
+    pub from: u64,
+    /// Keyholders of that generation, at least its threshold.
+    pub dealers: Set<PublicKey>,
+    /// The new generation's keyholders (as many as the committee has members, threshold
+    /// unchanged). They need not be committee members.
+    pub players: Set<PublicKey>,
+}
+
+impl Write for Membership {
+    fn write(&self, buf: &mut impl BufMut) {
+        UInt(self.from).write(buf);
+        self.dealers.write(buf);
+        self.players.write(buf);
+    }
+}
+
+impl Read for Membership {
+    type Cfg = ();
+
+    fn read_cfg(buf: &mut impl Buf, _: &()) -> Result<Self, CodecError> {
+        let range = || (1..=MAX_PARTICIPANTS.get() as usize).into();
+        Ok(Self {
+            from: UInt::read(buf)?.into(),
+            dealers: Set::read_cfg(buf, &(range(), ()))?,
+            players: Set::read_cfg(buf, &(range(), ()))?,
+        })
+    }
+}
+
+impl EncodeSize for Membership {
+    fn encode_size(&self) -> usize {
+        UInt(self.from).encode_size() + self.dealers.encode_size() + self.players.encode_size()
+    }
+}
+
+impl Membership {
+    /// Check the dealers against the generation they refresh (`previous`) and the player count
+    /// against the committee's size (the threshold is the committee's).
+    pub fn check(
+        &self,
+        previous: &Output<Variant, PublicKey>,
+        committee: &Set<PublicKey>,
+    ) -> Result<(), MembershipRefusal> {
+        if self
+            .dealers
+            .iter()
+            .any(|dealer| previous.players().position(dealer).is_none())
+        {
+            return Err(MembershipRefusal::DealerNotKeyholder);
+        }
+        let required = previous.quorum::<Faults>();
+        if self.dealers.len() < required as usize {
+            return Err(MembershipRefusal::TooFewDealers {
+                dealers: self.dealers.len(),
+                required,
+            });
+        }
+        if self.players.len() != committee.len() {
+            return Err(MembershipRefusal::PlayerCount {
+                players: self.players.len(),
+                required: committee.len(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Why a reshare's dealers or players are refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, thiserror::Error)]
+#[serde(rename_all = "snake_case", tag = "reason")]
+pub enum MembershipRefusal {
+    #[error("a dealer is not a keyholder of the generation refreshed")]
+    DealerNotKeyholder,
+    #[error("{dealers} dealers: the generation refreshed needs at least {required}")]
+    TooFewDealers { dealers: usize, required: u32 },
+    #[error("{players} new keyholders: the new generation needs exactly {required}")]
+    PlayerCount { players: usize, required: usize },
+}
+
 /// Result of a `StartResharing` command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReshareOutcome {
@@ -234,6 +328,13 @@ pub enum ReshareOutcome {
     NotActivated,
     /// The key's active ceremony has no public output to reshare.
     NoGeneration,
+    /// The command names generation `from`, but `active` is the key's active generation.
+    Stale {
+        from: u64,
+        active: u64,
+    },
+    /// The dealers or players cannot run this reshare.
+    Membership(MembershipRefusal),
     /// The configuration cannot be run.
     Unsupported(Unsupported),
 }
@@ -337,7 +438,9 @@ impl Ceremony {
     }
 
     /// The reshare ceremony started in the block at `started`: a new generation of `validator`'s
-    /// key, dealt by the players of the generation `from` (its public output `previous`).
+    /// key, dealt by `dealers`, keyholders of the generation `from` (its public output `previous`),
+    /// to the configuration's participants.
+    #[allow(clippy::too_many_arguments)]
     fn new_reshare(
         config: CeremonyConfig,
         round: u64,
@@ -346,15 +449,35 @@ impl Ceremony {
         validator: ValidatorKey,
         from: u64,
         previous: Output<Variant, PublicKey>,
+        dealers: Set<PublicKey>,
     ) -> Self {
         let mut ceremony = Self::new(config, round, started, block);
         ceremony.origin = Origin::Reshare(Box::new(Reshare {
             validator,
             from,
             previous,
+            dealers,
             ready: BTreeSet::new(),
         }));
         ceremony
+    }
+
+    /// This round's dealers: a reshare's own, otherwise every participant.
+    pub fn dealers(&self) -> &Set<PublicKey> {
+        match &self.origin {
+            Origin::Reshare(reshare) => &reshare.dealers,
+            _ => &self.config.participants,
+        }
+    }
+
+    /// Valid dealer logs this round needs: the dealers' quorum, and for a reshare at least the
+    /// refreshed generation's threshold (commonware's required commitments).
+    pub fn required_logs(&self) -> usize {
+        let dealers = self.dealers().quorum::<Faults>();
+        let previous = self
+            .reshare()
+            .map_or(0, |reshare| reshare.previous.quorum::<Faults>());
+        dealers.max(previous) as usize
     }
 
     /// The public sharing of the key (commitments and every participant's public share), once
@@ -430,15 +553,10 @@ impl Ceremony {
     }
 
     /// Feldman-Desmedt round information shared by every dealer, player and observer. A reshare's
-    /// dealers are the previous generation's players.
+    /// dealers are its own (keyholders of the previous generation), its players the participants.
     pub fn info(&self) -> Info<Variant, PublicKey> {
-        let (previous, dealers) = match &self.origin {
-            Origin::Reshare(reshare) => (
-                Some(reshare.previous.clone()),
-                reshare.previous.players().clone(),
-            ),
-            _ => (None, self.config.participants.clone()),
-        };
+        let previous = self.reshare().map(|reshare| reshare.previous.clone());
+        let dealers = self.dealers().clone();
         Info::new::<Faults>(
             &union(NAMESPACE, self.session.as_ref()),
             self.round,
@@ -487,7 +605,7 @@ pub enum Ignored {
     Closed,
     #[error("signature does not match this ceremony")]
     BadSignature,
-    #[error("dealer is not a participant")]
+    #[error("not a dealer of this ceremony")]
     NotParticipant,
     #[error("dealer already has a log")]
     Duplicate,
@@ -601,27 +719,48 @@ impl Ceremonies {
         ImportOutcome::Registered(round)
     }
 
-    /// Start a reshare of `validator`'s key, whose active generation is the ceremony `from`, as
-    /// ceremony `id` in the block at `height`. One reshare of a key at a time: a later round of
-    /// the same key that has not failed is either in progress, awaiting activation, or already the
-    /// active generation (then `from` is it, and nothing later exists).
+    /// Start a reshare of `validator`'s key, whose active generation is the ceremony `active`, as
+    /// ceremony `id` in the block at `height`. With `membership`, its dealers and players as given
+    /// (R2; checked here, deterministically); without it, the active generation's keyholders deal
+    /// to the committee (R1). One reshare of a key at a time: a later round of the same key that
+    /// has not failed is either in progress, awaiting activation, or already the active generation
+    /// (then `active` is it, and nothing later exists).
     pub fn reshare(
         &mut self,
         id: CeremonyId,
         validator: ValidatorKey,
-        from: u64,
+        active: u64,
+        membership: Option<&Membership>,
         height: u64,
         block: &Digest,
     ) -> ReshareOutcome {
-        let config = CeremonyConfig::new(id, self.committee.clone());
+        let config = match membership {
+            Some(membership) => CeremonyConfig {
+                id,
+                version: PROTOCOL_VERSION,
+                threshold: self.committee.quorum::<Faults>(),
+                participants: membership.players.clone(),
+            },
+            None => CeremonyConfig::new(id, self.committee.clone()),
+        };
+        let from = membership.map_or(active, |membership| membership.from);
         if let Some(&round) = self.ids.get(&config.id) {
             let existing = &self.ceremonies[&round];
             return match existing.reshare() {
-                Some(reshare) if reshare.validator == validator && existing.config == config => {
+                Some(reshare)
+                    if reshare.validator == validator
+                        && existing.config == config
+                        && membership.is_none_or(|membership| {
+                            reshare.from == membership.from && reshare.dealers == membership.dealers
+                        }) =>
+                {
                     ReshareOutcome::Exists(round)
                 }
                 _ => ReshareOutcome::Conflict(round),
             };
+        }
+        if from != active {
+            return ReshareOutcome::Stale { from, active };
         }
         if let Some(pending) = self.ceremonies.values().find(|ceremony| {
             ceremony.round > from
@@ -644,7 +783,16 @@ impl Ceremonies {
         else {
             return ReshareOutcome::NoGeneration;
         };
-        if let Err(reason) = config.check(&self.committee) {
+        let dealers = match membership {
+            Some(membership) => {
+                if let Err(refusal) = membership.check(&previous, &self.committee) {
+                    return ReshareOutcome::Membership(refusal);
+                }
+                membership.dealers.clone()
+            }
+            None => previous.players().clone(),
+        };
+        if let Err(reason) = config.check_players(&self.committee) {
             return ReshareOutcome::Unsupported(reason);
         }
         // The round must accept the previous output (consistent, enough dealers among its players).
@@ -654,7 +802,7 @@ impl Ceremonies {
             Some(previous.clone()),
             Mode::NonZeroCounter,
             Reveal::V1,
-            previous.players().clone(),
+            dealers.clone(),
             config.participants.clone(),
         )
         .is_err()
@@ -673,7 +821,9 @@ impl Ceremonies {
         self.ids.insert(config.id.clone(), round);
         self.ceremonies.insert(
             round,
-            Ceremony::new_reshare(config, round, height, block, validator, from, previous),
+            Ceremony::new_reshare(
+                config, round, height, block, validator, from, previous, dealers,
+            ),
         );
         self.changed.insert(round);
         ReshareOutcome::Started(round)
@@ -734,8 +884,8 @@ impl Ceremonies {
 
     /// Record a dealer log for the ceremony `round`. The first valid log of each dealer wins.
     ///
-    /// A log is only accepted if it is signed by a participant for this very ceremony and every
-    /// player acknowledged the dealing (no reveals). The acknowledgement signatures and the
+    /// A log is only accepted if it is signed by a dealer of this very ceremony and every player
+    /// acknowledged the dealing (no reveals). The acknowledgement signatures and the
     /// commitment are verified later, by [observe], before any log is used.
     pub fn record(&mut self, round: u64, log: SignedLog) -> Result<PublicKey, Ignored> {
         let ceremony = self
@@ -746,7 +896,7 @@ impl Ceremonies {
             return Err(Ignored::Closed);
         }
         let (dealer, log) = log.check(&ceremony.info()).ok_or(Ignored::BadSignature)?;
-        if ceremony.config.participants.position(&dealer).is_none() {
+        if ceremony.dealers().position(&dealer).is_none() {
             return Err(Ignored::NotParticipant);
         }
         if ceremony.logs.contains_key(&dealer) {
@@ -768,8 +918,7 @@ impl Ceremonies {
             if ceremony.status != DkgStatus::InProgress {
                 continue;
             }
-            let required = ceremony.config.participants.quorum::<Faults>() as usize;
-            if ceremony.logs.len() >= required {
+            if ceremony.logs.len() >= ceremony.required_logs() {
                 match observe::<Variant, PublicKey, Faults, ed25519::Batch>(
                     rng,
                     ceremony.logs(),
@@ -928,7 +1077,9 @@ impl Ceremony {
 
 impl Ceremony {
     /// Encoding of a reshare ceremony: the DKG encoding ([Write]), then the key, the generation it
-    /// refreshes, that generation's output and the acknowledged shares.
+    /// refreshes, that generation's output, the acknowledged shares and the dealers (the R1
+    /// encoding, [Ceremony::read_reshare] with `dealers: false`, has no dealers: they were the
+    /// previous generation's keyholders).
     pub fn write_reshare(&self, buf: &mut impl BufMut) {
         let reshare = self.reshare().expect("a reshare ceremony");
         self.write(buf);
@@ -939,6 +1090,7 @@ impl Ceremony {
         for index in &reshare.ready {
             UInt(*index).write(buf);
         }
+        reshare.dealers.write(buf);
     }
 
     pub fn reshare_encode_size(&self) -> usize {
@@ -953,9 +1105,10 @@ impl Ceremony {
                 .iter()
                 .map(|index| UInt(*index).encode_size())
                 .sum::<usize>()
+            + reshare.dealers.encode_size()
     }
 
-    pub fn read_reshare(buf: &mut impl Buf) -> Result<Self, CodecError> {
+    pub fn read_reshare(buf: &mut impl Buf, dealers: bool) -> Result<Self, CodecError> {
         let mut ceremony = Self::read(buf)?;
         if buf.remaining() < 48 {
             return Err(CodecError::EndOfBuffer);
@@ -971,10 +1124,16 @@ impl Ceremony {
         let ready = (0..count)
             .map(|_| UInt::read(buf).map(u32::from))
             .collect::<Result<BTreeSet<_>, _>>()?;
+        let dealers = if dealers {
+            Set::read_cfg(buf, &((1..=MAX_PARTICIPANTS.get() as usize).into(), ()))?
+        } else {
+            previous.players().clone()
+        };
         ceremony.origin = Origin::Reshare(Box::new(Reshare {
             validator,
             from,
             previous,
+            dealers,
             ready,
         }));
         Ok(ceremony)

@@ -305,7 +305,8 @@ impl Write for Value {
                 write_imported(imported, buf);
             }
             Self::ReshareCeremony(ceremony) => {
-                10u8.write(buf);
+                // Tag 10 is R1's encoding (no dealers): read, never written.
+                11u8.write(buf);
                 ceremony.write_reshare(buf);
             }
         }
@@ -366,7 +367,10 @@ impl Read for Value {
             )?))),
             9 => Ok(Self::ImportedValidator(read_imported(buf)?)),
             10 => Ok(Self::ReshareCeremony(Box::new(Ceremony::read_reshare(
-                buf,
+                buf, false,
+            )?))),
+            11 => Ok(Self::ReshareCeremony(Box::new(Ceremony::read_reshare(
+                buf, true,
             )?))),
             tag => Err(CodecError::InvalidEnum(tag)),
         }
@@ -717,6 +721,19 @@ impl<E: Context> Store<E> {
                     ));
                 }
             }
+            // A reshare's dealers hold the generation it refreshes (its players need not be
+            // committee members: a replaced keyholder's successor is not).
+            if let Some(reshare) = ceremony.reshare()
+                && reshare
+                    .dealers
+                    .iter()
+                    .any(|dealer| reshare.previous.players().position(dealer).is_none())
+            {
+                return Err(format!(
+                    "reshare round {} has a dealer that is not a keyholder of round {}",
+                    ceremony.round, reshare.from
+                ));
+            }
         }
         Ok(())
     }
@@ -930,6 +947,7 @@ impl<E: Context> Store<E> {
                 Command::StartResharing {
                     validator,
                     ceremony,
+                    membership,
                 } => {
                     let outcome = match self.protection.validator_of(validator) {
                         None => ReshareOutcome::UnknownValidator,
@@ -937,11 +955,12 @@ impl<E: Context> Store<E> {
                             ReshareOutcome::NotActivated
                         }
                         Some((_, entry)) => {
-                            let from = entry.round;
+                            let active = entry.round;
                             self.ceremonies.reshare(
                                 ceremony.clone(),
                                 *validator,
-                                from,
+                                active,
+                                membership.as_deref(),
                                 height,
                                 digest,
                             )

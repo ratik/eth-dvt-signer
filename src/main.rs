@@ -18,7 +18,9 @@ use commonware_cryptography::{
     Signer as _,
     ed25519::{PrivateKey, PublicKey},
 };
-use commonware_p2p::{Address, AddressableManager as _, authenticated::lookup};
+use commonware_p2p::{
+    Address, AddressableManager as _, AddressableTrackedPeers, authenticated::lookup,
+};
 use commonware_runtime::{Handle, Quota, Runner as _, Spawner as _, Supervisor as _, tokio};
 use commonware_utils::{
     NZU32, TryCollect as _,
@@ -48,9 +50,15 @@ struct Args {
     #[arg(long)]
     id: u64,
 
-    /// Number of nodes in the network.
+    /// Number of consensus voters (the committee): nodes `0..participants`.
     #[arg(long, default_value_t = 4)]
     participants: u64,
+
+    /// Number of non-voting keyholder nodes after the committee (nodes `participants..`). They
+    /// follow consensus without voting and hold a validator's key share only once a reshare names
+    /// them as players. Every node of the network must use the same value.
+    #[arg(long, default_value_t = 0)]
+    followers: u64,
 
     /// p2p port of node 0; node `i` uses `p2p-port + i`.
     #[arg(long, default_value_t = 3000)]
@@ -92,6 +100,12 @@ struct Args {
     /// of imported keys. It must be readable by its owner only.
     #[arg(long)]
     share_encryption_key: Option<PathBuf>,
+
+    /// File of reshares to new keyholders this node's operator approves, one per line:
+    /// `<validator public key> <identity>,<identity>,...` (the exact new keyholder set). Read when
+    /// the node is about to deal: without a matching line it deals nothing to new keyholders.
+    #[arg(long)]
+    approved_reshares: Option<PathBuf>,
 }
 
 /// Load the share-encryption key: owner-only permissions, or the node refuses to start.
@@ -113,7 +127,10 @@ fn load_share_key(
 fn main() {
     let args = Args::parse();
     eth_mpc_signer::hooks::exit_on_stdin_eof();
-    assert!(args.id < args.participants, "id must be below participants");
+    assert!(
+        args.id < args.participants + args.followers,
+        "id must be below participants + followers"
+    );
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .with_ansi(std::io::stdout().is_terminal())
@@ -124,16 +141,21 @@ fn main() {
         SocketAddr::from((Ipv4Addr::LOCALHOST, port))
     };
     let signer = PrivateKey::from_seed(args.id);
-    let keys: Vec<PublicKey> = (0..args.participants)
-        .map(|index| PrivateKey::from_seed(index).public_key())
-        .collect();
-    let participants: Set<PublicKey> = keys.iter().cloned().try_collect().expect("unique keys");
-    let peers: Map<PublicKey, Address> = keys
-        .iter()
-        .enumerate()
-        .map(|(index, key)| (key.clone(), address(index as u64).into()))
-        .try_collect()
-        .expect("unique keys");
+    let nodes = args.participants + args.followers;
+    let peers = |indices: std::ops::Range<u64>| -> Map<PublicKey, Address> {
+        indices
+            .map(|index| {
+                let key = PrivateKey::from_seed(index).public_key();
+                (key, address(index).into())
+            })
+            .try_collect()
+            .expect("unique keys")
+    };
+    // Voters are primary peers (dialed); followers are secondary peers: accepted when they dial in
+    // and sent `Recipients::All` traffic, never dialed.
+    let committee = peers(0..args.participants);
+    let followers = peers(args.participants..nodes);
+    let participants: Set<PublicKey> = committee.keys().clone();
     let listen = address(args.id);
     let http = SocketAddr::from((
         Ipv4Addr::LOCALHOST,
@@ -166,11 +188,11 @@ fn main() {
             signer.clone(),
             &union(engine::NAMESPACE, b"_P2P"),
             listen,
-            NonZeroUsize::new(keys.len()).expect("participants"),
+            NonZeroUsize::new(nodes as usize).expect("participants"),
             engine::MAX_MESSAGE_SIZE,
         );
         let (mut network, mut oracle) = lookup::Network::new(context.child("network"), p2p);
-        oracle.track(0, peers);
+        oracle.track(0, AddressableTrackedPeers::new(committee, followers));
 
         let quota = Quota::per_second(NZU32!(1_000));
         let channels = Channels {
@@ -204,6 +226,7 @@ fn main() {
                 },
                 allow_missing_consensus_journal: args.allow_missing_consensus_journal,
                 share_key,
+                approved_reshares: args.approved_reshares.clone(),
             },
             channels,
         )

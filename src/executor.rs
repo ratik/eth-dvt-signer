@@ -5,8 +5,8 @@ use crate::{
     dkg::{
         self, CeremonyConfig, CeremonyId, DkgStatus,
         ceremony::{
-            AbortOutcome, Ceremony, GenerationOutcome, ImportOutcome, ReadyAck, ReshareOutcome,
-            SignedLog, StartOutcome,
+            AbortOutcome, Ceremony, GenerationOutcome, ImportOutcome, Membership, ReadyAck,
+            ReshareOutcome, SignedLog, StartOutcome,
         },
         format_key,
     },
@@ -31,7 +31,7 @@ use commonware_consensus::{
     marshal::{core::Mailbox as Marshal, standard::Standard},
     types::Height,
 };
-use commonware_cryptography::Digestible as _;
+use commonware_cryptography::{Digestible as _, sha256::Digest};
 use commonware_macros::select;
 use commonware_p2p::{Receiver, Recipients, Sender};
 use commonware_runtime::{ContextCell, Handle, Spawner, spawn_cell};
@@ -54,6 +54,10 @@ use tracing::{debug, info, warn};
 
 /// How often a held-back block is checked again (test hook only).
 const HOLD_POLL: Duration = Duration::from_millis(50);
+
+/// A follower never proposes, so a transaction it submitted reaches a block only through its
+/// gossip: it gossips each one again every this many applied blocks until a block contains it.
+const REGOSSIP_BLOCKS: u64 = 4;
 
 /// Final answer for a submitted signing authorization, sent once its block is durably applied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -300,6 +304,7 @@ pub enum Message {
     StartResharing {
         validator: ValidatorKey,
         ceremony: CeremonyId,
+        membership: Option<Box<Membership>>,
         response: oneshot::Sender<ReshareReceipt>,
     },
     /// Activate a reshare as the key's share generation (through consensus).
@@ -479,17 +484,20 @@ impl Client {
         receiver.await.map_err(|_| Stopped)
     }
 
-    /// Start a reshare of `validator`'s key as ceremony `ceremony`; wait until consensus decided.
+    /// Start a reshare of `validator`'s key as ceremony `ceremony` (dealt and held as `membership`
+    /// says, or within the committee); wait until consensus decided.
     pub async fn start_resharing(
         &self,
         validator: ValidatorKey,
         ceremony: CeremonyId,
+        membership: Option<Membership>,
     ) -> Result<ReshareReceipt, Stopped> {
         let (response, receiver) = oneshot::channel();
         self.sender
             .send(Message::StartResharing {
                 validator,
                 ceremony,
+                membership: membership.map(Box::new),
                 response,
             })
             .map_err(|_| Stopped)?;
@@ -584,6 +592,9 @@ pub struct Executor<E: CryptoRng + Spawner + Context, S: Sender> {
     retention: Retention,
     /// This node's DKG actor, told about every finalized block and ceremony change.
     dkg: mpsc::UnboundedSender<dkg::actor::Message>,
+    /// Transactions this node submitted that no finalized block contains yet, if it is a follower
+    /// (gossiped again until one does, [REGOSSIP_BLOCKS]); `None` on a voter.
+    unfinalized: Option<HashMap<Digest, Transaction>>,
 }
 
 impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
@@ -598,6 +609,7 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
         marshal: Marshal<Scheme, Standard<Block>>,
         retention: Retention,
         dkg: mpsc::UnboundedSender<dkg::actor::Message>,
+        follower: bool,
     ) -> (Self, mpsc::UnboundedSender<Message>, Client) {
         executed.store(store.height(), Ordering::Release);
         let (sender, mailbox) = mpsc::unbounded_channel();
@@ -614,6 +626,7 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
             marshal,
             retention,
             dkg,
+            unfinalized: follower.then(HashMap::new),
         };
         let client = Client {
             sender: sender.clone(),
@@ -699,11 +712,13 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                 Message::StartResharing {
                     validator,
                     ceremony,
+                    membership,
                     response,
                 } => {
                     let id = self.submit(Command::StartResharing {
                         validator,
                         ceremony: ceremony.clone(),
+                        membership,
                     });
                     info!(id, %ceremony, validator = %format_validator(&validator), "submitted reshare start");
                     self.waiters.insert(id, Waiter::Reshare(response));
@@ -907,8 +922,13 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
             command,
         };
         let id = transaction.id;
-        self.gossip
-            .send(Recipients::All, transaction.encode(), false);
+        if !hooks::drop_first_gossip() {
+            self.gossip
+                .send(Recipients::All, transaction.encode(), false);
+        }
+        if let Some(unfinalized) = &mut self.unfinalized {
+            unfinalized.insert(transaction.digest(), transaction.clone());
+        }
         self.mempool.insert(transaction);
         id
     }
@@ -968,6 +988,21 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
         self.executed.store(height, Ordering::Release);
         self.last_applied = Some(applied_at);
         self.mempool.remove_all(&block.transactions);
+        if let Some(unfinalized) = &mut self.unfinalized {
+            for transaction in &block.transactions {
+                unfinalized.remove(&transaction.digest());
+            }
+            if height.is_multiple_of(REGOSSIP_BLOCKS) {
+                for transaction in unfinalized.values() {
+                    debug!(
+                        id = transaction.id,
+                        "gossiping an unfinalized transaction again"
+                    );
+                    self.gossip
+                        .send(Recipients::All, transaction.encode(), false);
+                }
+            }
+        }
 
         // The DKG actor (which holds the shares) learns about committed changes before any client
         // is answered, so a coordinator that just got its receipt finds them there. The purpose of
@@ -1143,6 +1178,7 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                     Command::StartResharing {
                         validator,
                         ceremony,
+                        ..
                     },
                     Effect::Reshare(outcome),
                 ) => {

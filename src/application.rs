@@ -32,6 +32,7 @@ use std::{
     },
     time::Duration,
 };
+use tracing::debug;
 
 /// Consensus signing scheme.
 pub type Scheme = commonware_consensus::simplex::scheme::ed25519::Scheme;
@@ -165,12 +166,19 @@ where
             context.sleep(IDLE_POLL).await;
         }
 
-        Some(Block::new(
+        let block = Block::new(
             parent.digest(),
             parent.height().next(),
             consensus.round.view().get(),
             self.mempool.select(&in_flight),
-        ))
+        );
+        debug!(
+            height = block.height.get(),
+            view = block.view,
+            transactions = block.transactions.len(),
+            "proposing a block"
+        );
+        Some(block)
     }
 
     async fn verify(&mut self, _: (E, Self::Context), _: impl Ancestry<Self::Block>) -> bool {

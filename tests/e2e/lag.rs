@@ -64,9 +64,17 @@ fn authorization(network: &TestNetwork, node: usize, nonce: u64) -> Option<(Vec<
 /// next hold starts at the next transaction.
 fn wait_caught_up(network: &TestNetwork) {
     network.wait_for_ready(&[0, 2, 3]);
-    network.wait_until("node 3 to apply everything it knows of", || {
-        let readiness = network.readiness(3);
-        readiness["applied_height"] == readiness["known_finalized_height"]
+    // No transaction is pending anywhere (each is in a block its node applied: a request rejected
+    // by consensus in a later block than the winner's cannot still be finalized, and held, once
+    // the hold is armed again), and node 3 applied everything it knows of.
+    network.wait_until("no pending transaction, node 3 caught up", || {
+        [0, 2, 3]
+            .iter()
+            .all(|node| network.status(*node)["mempool"] == 0)
+            && {
+                let readiness = network.readiness(3);
+                readiness["applied_height"] == readiness["known_finalized_height"]
+            }
     });
 }
 

@@ -15,6 +15,12 @@
 //!   which blocks are finalized.
 //! - `ETH_MPC_SIGNER_EXIT_ON_STDIN_EOF=1`: the process exits when its stdin closes, so nodes never
 //!   outlive the test process that spawned them.
+//! - `ETH_MPC_SIGNER_DROP_FIRST_GOSSIP=1`: the executor does not gossip a locally submitted
+//!   transaction when it is submitted (a follower's later gossip still goes out), as if every
+//!   first gossip were lost.
+//! - `ETH_MPC_SIGNER_NO_PARTIALS_FILE=<path>`: while `<path>` exists, the keyholder answers no
+//!   peer's partial-signature request (they go unanswered); the node keeps voting and applying
+//!   blocks.
 //!
 //! Points:
 //!
@@ -117,6 +123,16 @@ mod enabled {
         holding() && (has_transactions || !at("ETH_MPC_SIGNER_HOLD_FROM", "transactions"))
     }
 
+    /// Whether the first gossip of a locally submitted transaction must be dropped.
+    pub fn drop_first_gossip() -> bool {
+        std::env::var("ETH_MPC_SIGNER_DROP_FIRST_GOSSIP").is_ok()
+    }
+
+    /// Whether the keyholder must not compute partial signatures right now.
+    pub fn no_partials() -> bool {
+        std::env::var("ETH_MPC_SIGNER_NO_PARTIALS_FILE").is_ok_and(|path| Path::new(&path).exists())
+    }
+
     pub fn exit_on_stdin_eof() {
         if std::env::var("ETH_MPC_SIGNER_EXIT_ON_STDIN_EOF").is_ok() {
             std::thread::spawn(|| {
@@ -147,6 +163,14 @@ mod enabled {
     }
 
     pub const fn empty_blocks_paused() -> bool {
+        false
+    }
+
+    pub const fn drop_first_gossip() -> bool {
+        false
+    }
+
+    pub const fn no_partials() -> bool {
         false
     }
 

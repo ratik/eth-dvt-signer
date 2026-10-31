@@ -237,6 +237,7 @@ pub async fn start_network_with(
                 signing: coordinator::Config::default(),
                 allow_missing_consensus_journal: false,
                 share_key: None,
+                approved_reshares: None,
             },
             channels,
         )

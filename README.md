@@ -19,6 +19,10 @@ A 4-node threshold signer built on [commonware](https://github.com/commonwarexyz
   the same committee, with commonware's Feldman-Desmedt reshare; the key, its identity and its
   slashing history unchanged, the new share generation activated through consensus
   ([docs/resharing.md](docs/resharing.md));
+- replacing a lost keyholder (R2): a permanently lost node's share moves to a new node, a
+  non-voting follower of consensus, the remaining keyholders dealing (A, B, C, D → A, B, C, E);
+  the key and its history unchanged, the consensus committee deliberately unchanged
+  ([docs/resharing.md](docs/resharing.md#r2-replacing-a-lost-keyholder));
 - for development builds only (`dev-api` feature): `POST /sign` authorizes
   `(ceremony_id, nonce) -> payload_hash` once, through consensus, and returns the threshold
   signature of any 32-byte payload (see [Signing](#signing)).
@@ -332,6 +336,12 @@ Node `i` serves p2p on `127.0.0.1:300i` and HTTP on `127.0.0.1:808i`. Data is in
 Development keys come from the node index (`ed25519::PrivateKey::from_seed(i)`). Do not use them
 outside a local network.
 
+A follower (a keyholder that does not vote, R2) is node `participants + j`, run with the same
+`--participants` and `--followers` as every other node: `cargo run --release -- --id 4
+--followers 1`, the voters also with `--followers 1`. A voter deals to new keyholders only with
+`--approved-reshares <file>` naming the key and the exact new keyholder set
+([docs/resharing.md](docs/resharing.md#local-approval-of-new-keyholders)).
+
 Logs are in `data/node-i.log`. For a duty, the coordinator logs `submitted validator duty` and,
 once done, `signed validator duty` with the phase timings. Every node logs `applied validator duty`
 with the validator, duty type, computed signing root and decision. Development requests log
@@ -533,6 +543,16 @@ Resharing ([docs/resharing.md](docs/resharing.md)):
   history and refusals before and after, aborts, restarts, an imported key's floors;
 - `tests/e2e/reshare.rs` (E2E-RSH-1 to RSH-5, and 10 crash points): real processes.
 
+Replacing a lost keyholder (R2, [docs/resharing.md](docs/resharing.md#tests)):
+- `tests/e2e/follower.rs` (FOL-1 to FOL-5): a non-voting follower joins, applies the same state,
+  restarts, submits a transaction and cannot vote, propose or count toward a quorum;
+- `dkg::ceremony::tests::reshare::replace`, `dkg::approval::tests`,
+  `storage::tests::validator::reshare::a_replaced_keyholder_holds_the_new_generation_through_consensus`:
+  dealers A, B, C to players A, B, C, E, the key unchanged, membership rules, invalid dealings,
+  local approvals, the lifecycle through consensus;
+- `tests/e2e/replace.rs` (R2-E2E-1 to R2-E2E-6, E restarted at four points): D stopped for good, E
+  signing with A and B while C's partials are switched off.
+
 `tests/signing.rs`: signing through the coordinator, verified with blst (combinations of signers,
 another root, another ceremony's key); concurrent identical and conflicting requests; a
 coordinator dying after the authorization or holding partials; one node offline and a lagging
@@ -634,14 +654,21 @@ Signing an existing authorization costs one p2p round trip and four pairings.
 - Authorizations and slashing history are kept forever, and every new one rewrites the state
   partition (O(n) per block). Pruning slashing history needs low watermarks (EIP-3076).
 - DKG: the committee is the 4 configured nodes and the threshold is fixed (`n - f`). There is no
-  committee change.
+  consensus committee change; a reshare can move a key's shares to other keyholders of the same
+  number (R2).
 - Key import is a trusted-dealer split: whoever keeps the original keystore can still sign outside
   the network, and that the previous signer is stopped is the operator's statement, not a check
   ([docs/key-import.md](docs/key-import.md#assumptions)).
-- Resharing needs all four keyholders online, and does not restore fault tolerance after a node
-  is lost. Old shares still sign for the same key until they are erased, which is operational. It
-  keeps the committee (no replacement of a keyholder, R2)
-  ([docs/resharing.md](docs/resharing.md)).
+- Resharing needs every dealer and player online (R1: all four nodes). Old shares still sign for
+  the same key until they are erased, which is operational: a reshare does not revoke a copied or
+  backed-up share ([docs/resharing.md](docs/resharing.md)).
+- Replacing a lost keyholder (R2) restores the key's redundancy, not consensus: the committee
+  stays A, B, C, D, so with D offline **losing another voter stops finalization** (and signing).
+  The lost node's leader turns keep costing a 2 s timeout. Committee reconfiguration is not
+  implemented. The approval of new keyholders is a local file, a prototype safeguard behind an
+  unauthenticated admin API, not an authorization system. A new follower builds its state from the
+  retained history, or from a restored copy it cannot check (no state root)
+  ([docs/resharing.md](docs/resharing.md#security-properties-and-limitations)).
   - Liveness: every participant must be online, and a single non-cooperating player can make a
     ceremony fail; safety is not affected. Like every Feldman-Desmedt DKG, the key is not
     guaranteed to be uniformly random (bias of a few bits), and timing assumes synchrony.

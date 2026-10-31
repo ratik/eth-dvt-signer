@@ -1492,6 +1492,7 @@ mod validator {
             tx(Command::StartResharing {
                 validator: key,
                 ceremony: id(name),
+                membership: None,
             })
         }
 
@@ -1836,6 +1837,186 @@ mod validator {
                 assert_eq!(
                     store.ceremonies().iter().cloned().collect::<Vec<_>>(),
                     before.1
+                );
+                assert_eq!(store.protection().validator_of(&key).unwrap().1.round, 1);
+            });
+        }
+
+        /// R2 through consensus: the key of A, B, C, D is reshared by A, B, C to A, B, C, E. D's
+        /// acknowledgement does not count (it holds no share of the new generation), E's is
+        /// required; the key activates the new generation with its whole history and activation;
+        /// a start naming the retired generation is stale; the state restarts verified, with the
+        /// reshare's dealers.
+        #[test]
+        fn a_replaced_keyholder_holds_the_new_generation_through_consensus() {
+            use crate::dkg::ceremony::{ReadyIgnored, tests::reshare::replace};
+            deterministic::Runner::default().start(|mut context| async move {
+                let signers = signers();
+                let committee = committee(&signers);
+                let block = Sha256::hash(&[b"block"]);
+                let mut store = Store::init(context.child("first"), "node", committee.clone())
+                    .await
+                    .unwrap();
+                let (key, shares0) = active_dkg_validator(&mut context, &mut store, &signers).await;
+                let (validator_id, before) = store.protection().validator_of(&key).unwrap();
+                let activation = before.activation;
+                store
+                    .apply_block(
+                        4,
+                        &block,
+                        &[
+                            submit(&propose(key, 10, 1)),
+                            submit(&attestation(key, 2, 5)),
+                        ],
+                        &mut context,
+                    )
+                    .await
+                    .unwrap();
+
+                let membership = replace::membership(&signers, 0);
+                let start = |name: &str, membership: &crate::dkg::ceremony::Membership| {
+                    tx(Command::StartResharing {
+                        validator: key,
+                        ceremony: id(name),
+                        membership: Some(Box::new(membership.clone())),
+                    })
+                };
+                let applied = store
+                    .apply_block(
+                        5,
+                        &block,
+                        &[start("v-r2", &membership), start("v-r2", &membership)],
+                        &mut context,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    applied.effects,
+                    vec![
+                        Effect::Reshare(ReshareOutcome::Started(1)),
+                        Effect::Reshare(ReshareOutcome::Exists(1)),
+                    ]
+                );
+                let started = store.ceremonies().by_round(1).unwrap().clone();
+                let players = replace::new_keyholders(&signers);
+                let dealers: Vec<(PrivateKey, Share)> = (0..3)
+                    .map(|node| (signers[node].clone(), shares0[node].clone()))
+                    .collect();
+                let (_, logs) =
+                    replace::deal_replacement(&mut context, &started, &dealers, &players);
+                let logs: Vec<_> = logs
+                    .into_iter()
+                    .map(|log| {
+                        tx(Command::DealerLog {
+                            round: 1,
+                            log: Box::new(log),
+                        })
+                    })
+                    .collect();
+                let applied = store
+                    .apply_block(6, &block, &logs, &mut context)
+                    .await
+                    .unwrap();
+                let g1 = applied
+                    .changed
+                    .iter()
+                    .find(|ceremony| ceremony.round == 1)
+                    .unwrap()
+                    .clone();
+                assert_eq!(g1.status, DkgStatus::Completed);
+                assert_eq!(
+                    g1.public_key(),
+                    store.ceremonies().by_round(0).unwrap().public_key()
+                );
+
+                // D's acknowledgement is ignored; A, B and C are not enough.
+                let applied = store
+                    .apply_block(
+                        7,
+                        &block,
+                        &[
+                            ready(&signers[3], &g1),
+                            ready(&signers[0], &g1),
+                            ready(&signers[1], &g1),
+                            ready(&signers[2], &g1),
+                            activate_generation(key, 1),
+                        ],
+                        &mut context,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    applied.effects[0],
+                    Effect::Ready(Err(ReadyIgnored::NotParticipant))
+                );
+                assert_eq!(
+                    applied.effects[4],
+                    Effect::Generation(GenerationOutcome::Refused(GenerationRefusal::NotReady {
+                        ready: 3,
+                        required: 4
+                    }))
+                );
+                let applied = store
+                    .apply_block(
+                        8,
+                        &block,
+                        &[
+                            ready(&replace::replacement(), &g1),
+                            activate_generation(key, 1),
+                        ],
+                        &mut context,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    applied.effects[1],
+                    Effect::Generation(GenerationOutcome::Activated { from: 0 })
+                );
+                let (id_after, after) = store.protection().validator_of(&key).unwrap();
+                assert_eq!(
+                    (id_after, after.round, after.activation),
+                    (validator_id, 1, activation)
+                );
+
+                // The same history; a start naming the retired generation is stale.
+                let applied = store
+                    .apply_block(
+                        9,
+                        &block,
+                        &[
+                            submit(&propose(key, 10, 2)),
+                            submit(&attestation(key, 1, 6)),
+                            start("v-r2b", &membership),
+                        ],
+                        &mut context,
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    applied.effects[0],
+                    Effect::Duty(Decision::Refused(Refusal::DoubleProposal { slot: 10 }), _)
+                ));
+                assert!(matches!(
+                    applied.effects[1],
+                    Effect::Duty(Decision::Refused(Refusal::SurroundsSigned { .. }), _)
+                ));
+                assert_eq!(
+                    applied.effects[2],
+                    Effect::Reshare(ReshareOutcome::Stale { from: 0, active: 1 })
+                );
+
+                let before = store.ceremonies().iter().cloned().collect::<Vec<_>>();
+                drop(store);
+                let store = Store::init(context.child("second"), "node", committee.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    store.ceremonies().iter().cloned().collect::<Vec<_>>(),
+                    before
+                );
+                assert_eq!(
+                    store.ceremonies().by_round(1).unwrap().dealers(),
+                    &membership.dealers
                 );
                 assert_eq!(store.protection().validator_of(&key).unwrap().1.round, 1);
             });

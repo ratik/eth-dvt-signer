@@ -70,12 +70,12 @@ node's own coordinator; tests: `tests/eth_duties.rs::byzantine_coordinators_cann
 | -------- | ------------------- | ---------------- |
 | 1. Reuse another validator's authorization | Rejected by an explicit check: duty roots were scoped to the ceremony round | Rejected by explicit checks: the validator key in the request must be held by that round, and the root must be among that key's records (`not_authorized`) |
 | 2. Reuse another ceremony's authorization | Rejected (round scope) | Rejected: round and key checks; a development ceremony refuses any duty request (`wrong_purpose`) |
-| 3. Reuse one from a previous ceremony round of the validator | Impossible by construction (no resharing; a new ceremony has a new key), but an old round's in-memory roots were not invalidated if a key's round changed | Rejected by an explicit check: the key's current round only; still unreachable (no resharing) |
+| 3. Reuse one from a previous ceremony round of the validator | Impossible by construction (no resharing; a new ceremony has a new key), but an old round's in-memory roots were not invalidated if a key's round changed | Rejected by an explicit check: the key's current round only. Reachable since resharing (R1, R2): a request for a retired generation is refused (`stale_generation`; E2E-RSH-3, crash tests, R2-E2E-4) |
 | 4. Ask a keyholder that has not applied the authorization | Rejected (`not_authorized`, request parked until applied) | Same |
 | 5. Ask for an unauthorized root | Rejected | Rejected |
 | 6. Use `nonce = 0` to mix development and duty authorizations | **Possible, harmless:** the duty check ignored the nonce, so a "development" request with any nonce for an authorized duty root got a partial; purpose separation rested on the state machine never creating development authorizations for validator rounds | Rejected by an explicit check: the request names its kind; a development request to a validator ceremony is `wrong_purpose`, whatever the nonce and root |
 | 7. Use a development ceremony to sign with a validator key | Impossible by construction (each ceremony has its own key and shares); `Sign` on a validator ceremony refused by the state machine | Same, plus `wrong_purpose` at the keyholder |
-| 8. Reuse a root after the validator's active ceremony changed | Unreachable (no resharing); after a restart only the current round was rebuilt, before it the old round kept its roots | Rejected by an explicit check (current round only); unreachable |
+| 8. Reuse a root after the validator's active ceremony changed | Unreachable (no resharing); after a restart only the current round was rebuilt, before it the old round kept its roots | Rejected by an explicit check (current round only), now reachable through resharing and exercised by its tests; a key's records belong to the key, so a root authorized before a reshare is signed with the new generation |
 
 None of the "before" cases could produce a signature that was not already authorized for that
 validator key. The change makes every binding an explicit check at the keyholder instead of a
@@ -102,7 +102,8 @@ checks, and what it cannot:
 
 ## Resharing
 
-A validator key's shares are refreshed within the committee ([resharing.md](resharing.md)).
+A validator key's shares are refreshed within the committee (R1), or a lost keyholder's share is
+moved to a new keyholder, a non-voting follower (R2) ([resharing.md](resharing.md)).
 
 | Question | Answer | Status |
 | -------- | ------ | ------ |
@@ -114,7 +115,11 @@ A validator key's shares are refreshed within the committee ([resharing.md](resh
 | Is the history preserved? | Yes: only the validator's round changes; records, activation and import state stay. | Implemented, tested |
 | Does it revoke old shares? | No. Old shares remain a valid sharing of the same key; erasing them is best effort and operational. | Documented |
 | A keyholder acknowledging readiness without a share | Counted (consensus checks only its signature): the new generation then works with 3 shares. Availability, not safety. | Documented, E2E-RSH-4 |
-| Liveness | All four keyholders are needed (no reveals); a reshare does not restore fault tolerance after a node is lost. | Documented (audit L-18) |
+| Liveness | Every dealer and player is needed (no reveals): R1 needs all four nodes, R2 the three remaining keyholders and the new one. | Documented (audit L-18) |
+| R2: can a single API request hand a key's shares to other identities? | No dealer deals to new keyholders without its operator's local approval of that exact key and recipient set; a reshare needs at least 3 dealers. Not an authorization system: the admin API is unauthenticated and the approval is a local file. | Implemented, tested (`dkg::approval::tests`, R2-E2E-4); audit L-20 |
+| R2: can the lost node, or an old share, take part? | No. D is neither a dealer nor a player of the new round: commonware refuses its dealing, its acknowledgement does not count, and old-generation partials do not verify against the new shares. Its old share is still a share of the old generation (not revoked). | Implemented, tested (`replace::*`, R2-E2E-4); audit L-18 |
+| R2: can the follower vote, lead or sign on its own? | No. Its consensus scheme cannot sign; leaders are committee members; it serves no signing API and signs only duties its own replicated state authorized. | Implemented, tested (FOL-5, R2-E2E-1, R2-E2E-2) |
+| R2: is consensus fault tolerance restored? | No. The committee is unchanged: with D lost, every one of A, B, C must be up. | Documented (audit L-19) |
 
 ## Not provided
 
@@ -122,8 +127,10 @@ A validator key's shares are refreshed within the committee ([resharing.md](resh
   [slashing-protection.md](slashing-protection.md), not implemented). It applies to imported keys
   unchanged (L-1).
 - Detection of a second signer of an imported key outside the network.
-- Revocation of old key shares by resharing (erasure is operational), resharing with a node
-  offline, and replacing a keyholder (R2).
+- Revocation of old key shares by resharing (erasure is operational), and an R1 refresh with a node
+  offline (R2 replaces it instead).
+- Consensus committee reconfiguration: after a keyholder is replaced, the lost node is still a
+  voter (L-19).
 - Slashing protection for the development API (`dev-api` builds; nonces are caller-chosen).
 - Client authentication, authorization policy, rate limiting.
 - Encryption of shares at rest, HSM or TEE isolation.

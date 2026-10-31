@@ -58,6 +58,19 @@
 //! - `GET /slashing-protection/export/{public_key}`: the validator's history as an EIP-3076
 //!   interchange.
 //!
+//! Share generations (docs/resharing.md):
+//!
+//! - `POST /validators/reshare` `{"public_key": "0x..", "ceremony_id": ".."}`: refresh the active
+//!   generation's shares within the committee (R1). With `"from_round"` (the active generation),
+//!   `"dealers"` and `"players"` (consensus identities, `GET /identity`), replace keyholders (R2):
+//!   the given keyholders of that generation deal to the given new set.
+//! - `POST /validators/reshare/activate` and `/abort` `{"public_key", "ceremony_id"}`.
+//! - `GET /validators/reshare/{ceremony_id}`: its state, dealers, players, dealer logs and
+//!   acknowledged shares.
+//!
+//! A follower (not a committee member) serves no signing: the Web3Signer and development signing
+//! endpoints answer `403`.
+//!
 //! There is no authentication: the node binds this API to loopback only.
 
 use crate::{
@@ -65,8 +78,8 @@ use crate::{
         CeremonyId, DkgStatus,
         actor::{self as dkg, Health, ShareStatus},
         ceremony::{
-            AbortOutcome, Ceremony, GenerationOutcome, GenerationRefusal, ReshareOutcome,
-            StartOutcome,
+            AbortOutcome, Ceremony, GenerationOutcome, GenerationRefusal, Membership,
+            ReshareOutcome, StartOutcome,
         },
         format_key,
     },
@@ -99,10 +112,14 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{MethodRouter, get, post},
 };
-use commonware_codec::Encode as _;
-use commonware_utils::{Participant, ordered::Quorum as _};
+use commonware_codec::{DecodeExt as _, Encode as _};
+use commonware_cryptography::ed25519::PublicKey;
+use commonware_utils::{
+    Participant, TryCollect as _,
+    ordered::{Quorum as _, Set},
+};
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "dev-api")]
 use std::collections::BTreeMap;
@@ -213,7 +230,8 @@ struct ReadinessResponse {
 
 #[derive(Serialize)]
 struct ConsensusResponse {
-    /// This node votes. Decided at startup (consensus journal checks); never disabled at run time.
+    /// This node votes: a committee member, after its startup checks (consensus journal); never
+    /// disabled at run time. A follower never votes.
     voting: bool,
     /// Finalized height and view consensus resumed above: it never votes at or below that view.
     /// Absent: it resumed from genesis.
@@ -318,9 +336,22 @@ pub fn router(
     recovery: Recovery,
     options: Options,
 ) -> Router {
+    // A follower holds shares and answers partial-signature requests from the committee's
+    // coordinators, but coordinates none: it serves no signing API (its coordinator is not even
+    // started, see `engine`).
+    let coordinates = |handler: MethodRouter<Api>| {
+        if recovery.voting {
+            handler
+        } else {
+            post(not_coordinator)
+        }
+    };
     let router = Router::new()
         .route("/api/v1/eth2/publicKeys", get(eth2_public_keys))
-        .route("/api/v1/eth2/sign/{identifier}", post(eth2_sign))
+        .route(
+            "/api/v1/eth2/sign/{identifier}",
+            coordinates(post(eth2_sign)),
+        )
         .route("/upcheck", get(|| async { "OK" }))
         .route("/status", get(status))
         .route("/ready", get(ready))
@@ -347,7 +378,7 @@ pub fn router(
         );
     #[cfg(feature = "dev-api")]
     let router = router
-        .route("/sign", post(sign))
+        .route("/sign", coordinates(post(sign)))
         .route("/authorizations/{ceremony_id}/{nonce}", get(authorization));
     router.with_state(Api {
         client,
@@ -822,7 +853,7 @@ async fn observe(api: &Api) -> Result<(Status, Health, ReadinessResponse), ApiEr
         state_height_at_start: api.recovery.state_height,
         unavailable_shares: health.unavailable.iter().map(ToString::to_string).collect(),
         consensus: ConsensusResponse {
-            voting: true,
+            voting: api.recovery.voting,
             floor_height: api.recovery.floor.map(|(height, _)| height),
             floor_view: api.recovery.floor.map(|(_, view)| view),
             journal_missing_at_start: api.recovery.journal_missing,
@@ -998,6 +1029,49 @@ async fn describe(api: &Api, ceremony: Ceremony) -> Result<Json<CeremonyResponse
 struct ReshareBody {
     public_key: String,
     ceremony_id: String,
+    /// R2 (replacing a keyholder), all three or none: the generation refreshed (its ceremony
+    /// round, the key's active one), its keyholders that deal, and the new generation's keyholders
+    /// (consensus identities, `0x`-hex ed25519 keys as `GET /identity` shows them). Without them,
+    /// the active generation's keyholders deal to the committee (R1).
+    from_round: Option<u64>,
+    dealers: Option<Vec<String>>,
+    players: Option<Vec<String>>,
+}
+
+/// A set of consensus identities (`0x`-hex ed25519 public keys), each once, as many as a command
+/// can carry (a command its peers could not decode would make every block carrying it invalid).
+fn parse_identities(field: &str, values: &[String]) -> Result<Set<PublicKey>, String> {
+    let limit = crate::dkg::MAX_PARTICIPANTS.get() as usize;
+    if values.is_empty() || values.len() > limit {
+        return Err(format!("{field}: 1 to {limit} identities"));
+    }
+    let keys = values
+        .iter()
+        .map(|value| {
+            hex::decode(value.strip_prefix("0x").unwrap_or(value))
+                .ok()
+                .and_then(|bytes| PublicKey::decode(bytes.as_slice()).ok())
+                .ok_or_else(|| format!("{field}: {value} is not an ed25519 public key"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let count = keys.len();
+    keys.into_iter()
+        .try_collect::<Set<_>>()
+        .ok()
+        .filter(|set| set.len() == count)
+        .ok_or_else(|| format!("{field}: an identity is listed twice"))
+}
+
+fn reshare_membership(body: &ReshareBody) -> Result<Option<Membership>, String> {
+    match (&body.from_round, &body.dealers, &body.players) {
+        (None, None, None) => Ok(None),
+        (Some(from), Some(dealers), Some(players)) => Ok(Some(Membership {
+            from: *from,
+            dealers: parse_identities("dealers", dealers)?,
+            players: parse_identities("players", players)?,
+        })),
+        _ => Err("from_round, dealers and players go together: all three or none".into()),
+    }
 }
 
 #[derive(Serialize)]
@@ -1033,28 +1107,35 @@ fn reshare_body(body: &ReshareBody) -> Result<(ValidatorKey, CeremonyId), Box<Re
     Ok((key, id))
 }
 
-/// `POST /validators/reshare`: start a new share generation of an activated validator key.
+/// `POST /validators/reshare`: start a new share generation of an activated validator key, within
+/// the committee or, with an explicit membership, replacing keyholders.
 async fn start_resharing(State(api): State<Api>, Json(body): Json<ReshareBody>) -> Response {
     let (key, id) = match reshare_body(&body) {
         Ok(parsed) => parsed,
         Err(response) => return *response,
     };
-    let receipt =
-        match tokio::time::timeout(SUBMIT_TIMEOUT, api.client.start_resharing(key, id.clone()))
-            .await
-        {
-            Ok(Ok(receipt)) => receipt,
-            Ok(Err(err)) => {
-                return generation_error(StatusCode::SERVICE_UNAVAILABLE, err.to_string(), None);
-            }
-            Err(_) => {
-                return generation_error(
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "reshare start not finalized in time (it may still be)".into(),
-                    None,
-                );
-            }
-        };
+    let membership = match reshare_membership(&body) {
+        Ok(membership) => membership,
+        Err(error) => return generation_error(StatusCode::BAD_REQUEST, error, None),
+    };
+    let receipt = match tokio::time::timeout(
+        SUBMIT_TIMEOUT,
+        api.client.start_resharing(key, id.clone(), membership),
+    )
+    .await
+    {
+        Ok(Ok(receipt)) => receipt,
+        Ok(Err(err)) => {
+            return generation_error(StatusCode::SERVICE_UNAVAILABLE, err.to_string(), None);
+        }
+        Err(_) => {
+            return generation_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "reshare start not finalized in time (it may still be)".into(),
+                None,
+            );
+        }
+    };
     let (status, error) = match receipt.outcome {
         ReshareOutcome::Started(_) | ReshareOutcome::Exists(_) => {
             return describe_reshare(&api, id).await;
@@ -1081,6 +1162,11 @@ async fn start_resharing(State(api): State<Api>, Json(body): Json<ReshareBody>) 
             StatusCode::CONFLICT,
             "the key's active generation has no public output to reshare".into(),
         ),
+        ReshareOutcome::Stale { from, active } => (
+            StatusCode::CONFLICT,
+            format!("from_round {from} is not the key's active generation (round {active})"),
+        ),
+        ReshareOutcome::Membership(refusal) => (StatusCode::BAD_REQUEST, refusal.to_string()),
         ReshareOutcome::Unsupported(reason) => (StatusCode::BAD_REQUEST, reason.to_string()),
     };
     generation_error(status, error, None)
@@ -1242,6 +1328,9 @@ async fn describe_reshare(api: &Api, id: CeremonyId) -> Response {
         "status": state,
         "started_at": ceremony.started,
         "participants": ceremony.config.participants.len(),
+        "dealers": reshare.dealers.iter().map(format_identity).collect::<Vec<_>>(),
+        "players": ceremony.config.participants.iter().map(format_identity).collect::<Vec<_>>(),
+        "dealer_logs": ceremony.logs.keys().map(format_identity).collect::<Vec<_>>(),
         "ready_shares": reshare.ready.iter().collect::<Vec<_>>(),
         "share": share,
         "public_key": sharing.map(|sharing| format!("0x{}", hex::encode(sharing.public().encode()))),
@@ -1276,6 +1365,16 @@ fn parse_hash(value: &str) -> Result<PayloadHash, ApiError> {
     })
 }
 
+/// Signing endpoints on a follower.
+async fn not_coordinator() -> ApiError {
+    (
+        StatusCode::FORBIDDEN,
+        "this node follows consensus without voting: it holds key shares but does not coordinate \
+         signing; send signing requests to a committee member"
+            .to_string(),
+    )
+}
+
 fn unavailable(err: Stopped) -> ApiError {
     (StatusCode::SERVICE_UNAVAILABLE, err.to_string())
 }
@@ -1291,10 +1390,15 @@ struct IdentityResponse {
     share_encryption_key: Option<String>,
 }
 
+/// A consensus identity as the API shows it: `0x`-hex ed25519 public key.
+fn format_identity(key: &PublicKey) -> String {
+    format!("0x{}", hex::encode(key.encode()))
+}
+
 async fn identity(State(api): State<Api>) -> Json<IdentityResponse> {
     let me = api.dkg.me();
     Json(IdentityResponse {
-        identity: format!("0x{}", hex::encode(me.encode())),
+        identity: format_identity(me),
         participant_index: api.dkg.committee().index(me).map(|index| index.get()),
         share_encryption_key: api
             .options

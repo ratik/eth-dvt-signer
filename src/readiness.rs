@@ -18,7 +18,7 @@
 //!   consensus: a block applied since start, none known but unapplied, and a recent one. Without
 //!   it the node would wait for an outcome it cannot see (or that consensus cannot reach).
 //! - **Voting** is not gated at run time: it is decided at startup (consensus journal checks and the
-//!   durable floor, see `engine`).
+//!   durable floor, see `engine`). A follower never votes; its readiness says whether it follows.
 
 use crate::engine::LEADER_TIMEOUT;
 use serde::Serialize;

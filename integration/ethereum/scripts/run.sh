@@ -7,6 +7,7 @@
 #   IT_HOME=~/eth-mpc-it ./integration/ethereum/scripts/run.sh
 #
 # Each run writes to $IT_HOME/runs/<UTC time>/ (report.md, report.json, logs/), kept after the run.
+# IT_RUN=run-r2 runs only the replacement of a lost keyholder (R2) after the baseline.
 # Everything the run started is removed at the end; KEEP=1 keeps the environment for debugging
 # (remove it later with `env.sh exec python3 /it/src/integration/ethereum/scripts/it.py stop`
 # and `env.sh down`).
@@ -23,7 +24,7 @@ mkdir -p "$IT_HOME/runs/$run"
 "$here/env.sh" up
 
 status=0
-"$here/env.sh" exec python3 /it/src/integration/ethereum/scripts/it.py run || status=$?
+"$here/env.sh" exec python3 /it/src/integration/ethereum/scripts/it.py "${IT_RUN:-run}" || status=$?
 
 if [ "${KEEP:-0}" != 1 ]; then
 	"$here/env.sh" exec python3 /it/src/integration/ethereum/scripts/it.py stop || true

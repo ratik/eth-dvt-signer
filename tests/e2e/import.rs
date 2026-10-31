@@ -50,6 +50,19 @@ fn keytool(args: &[&str]) -> std::process::Output {
 /// A network whose nodes each have a share-encryption key, and the directory of the import
 /// (keys, committee, keystore, password).
 pub(crate) fn import_network() -> (TestNetwork, PathBuf) {
+    let (network, dir) = import_network_with(0, |_, _| Vec::new(), |_, _| Vec::new());
+    network.wait_for_ready(&network.all());
+    (network, dir)
+}
+
+/// Like [import_network], with `followers` non-voting nodes after the committee (not started, no
+/// share-encryption key), node `i` with the extra arguments `args(dir, i)` and environment
+/// `env(dir, i)`, `dir` being the import's directory. Does not wait for readiness.
+pub(crate) fn import_network_with(
+    followers: usize,
+    args: impl Fn(&Path, usize) -> Vec<String>,
+    env: impl Fn(&Path, usize) -> Vec<(String, String)>,
+) -> (TestNetwork, PathBuf) {
     let dir = std::env::temp_dir().join(format!(
         "eth-mpc-signer-import-{}-{}",
         std::process::id(),
@@ -63,18 +76,22 @@ pub(crate) fn import_network() -> (TestNetwork, PathBuf) {
         );
     }
     let keys = dir.clone();
-    let network = TestNetwork::start_with_node_args(
+    let env_dir = dir.clone();
+    let network = TestNetwork::start_with_followers(
         NODES,
+        followers,
         Vec::new(),
         move |node| {
-            vec![
-                "--share-encryption-key".into(),
-                keys.join(format!("node-{node}.key")).display().to_string(),
-            ]
+            let mut extra = args(&keys, node);
+            if node < NODES {
+                extra.push("--share-encryption-key".into());
+                extra.push(keys.join(format!("node-{node}.key")).display().to_string());
+            }
+            extra
         },
-        |_| Vec::new(),
+        move |node| env(&env_dir, node),
+        |node| node < NODES,
     );
-    network.wait_for_ready(&network.all());
     (network, dir)
 }
 
@@ -86,6 +103,7 @@ fn rand_suffix() -> u128 {
 }
 
 /// Split the vector keystore for the network's committee (as `GET /identity` gives it) into `out`.
+/// Envelopes by committee node.
 pub(crate) fn split(
     network: &TestNetwork,
     dir: &Path,
@@ -93,7 +111,7 @@ pub(crate) fn split(
     out: &str,
 ) -> (Value, Vec<Value>) {
     let participants: Vec<Value> = network
-        .all()
+        .voters()
         .into_iter()
         .map(|node| {
             let (status, identity) = network.get(node, "/identity");
@@ -137,7 +155,7 @@ pub(crate) fn split(
     let manifest = read("manifest.json");
     // Node `n` gets the envelope addressed to its identity.
     let envelopes = network
-        .all()
+        .voters()
         .into_iter()
         .map(|node| {
             let (_, identity) = network.get(node, "/identity");

@@ -11,6 +11,7 @@ inferred from an HTTP 200: attestations and proposals are checked in the beacon 
 
 Usage (inside the environment):
     it.py run                     everything, then a report (WORK/report.md, WORK/report.json)
+    it.py run-r2                  replacing a lost keyholder only (R2), then a report
     it.py devnet up|down          the Kurtosis enclave
     it.py signers start|stop      the four signer nodes
     it.py report                  the report from the logs of a run
@@ -47,6 +48,13 @@ EL_SERVICE = "el-1-geth-lighthouse"
 ORIGINAL_VC = "vc-1-geth-lighthouse"
 MIGRATED_CEREMONY = "migrated-validator"
 NODES = 4
+# One non-voting slot after the committee (node 4, E): the replacement scenario starts it.
+FOLLOWERS = 1
+# Replacing a lost keyholder (R2): D is lost, E takes its share; C's partial signatures are
+# switched off for a while to show that E's count.
+REPLACED = 3
+REPLACEMENT = NODES
+WITHHELD = 2
 P2P_BASE = 47000
 HTTP_BASE = 47100
 PROXY_PORT = 47200
@@ -276,17 +284,30 @@ def share_key(node):
     return path
 
 
+def approvals(node):
+    """Node `node`'s file of approved reshares to new keyholders (`--approved-reshares`)."""
+    return f"{WORK}/signers/approved-reshares-{node}"
+
+
+def no_partials(node):
+    """While this file exists, node `node` answers no partial-signature request (a test hook of
+    the `test-hooks` build; it keeps voting)."""
+    return f"{WORK}/signers/no-partials-{node}"
+
+
 def signer_start(node, env=None):
     name = f"it-signer-{node}"
     run(["docker", "rm", "-f", name], check=False)
-    args = [SIGNER, "--id", str(node), "--participants", str(NODES),
+    args = [SIGNER, "--id", str(node), "--participants", str(NODES), "--followers", str(FOLLOWERS),
             "--p2p-port", str(P2P_BASE), "--http-port", str(HTTP_BASE),
             "--data-dir", f"{WORK}/signers", "--signing-timeout", "2",
-            "--authorization-timeout", "4", "--share-encryption-key", share_key(node)]
+            "--authorization-timeout", "4"]
+    if node < NODES:
+        args += ["--share-encryption-key", share_key(node), "--approved-reshares", approvals(node)]
     if node == 0:
         # Validator onboarding: node 0 alone accepts the one DEPOSIT signing request.
         args.append("--enable-deposit-signing")
-    environment = ["-e", "RUST_LOG=info"]
+    environment = ["-e", "RUST_LOG=info", "-e", f"ETH_MPC_SIGNER_NO_PARTIALS_FILE={no_partials(node)}"]
     for key, value in (env or {}).items():
         environment += ["-e", f"{key}={value}"]
     command = " ".join(args) + f" >> {WORK}/logs/signer-{node}.log 2>&1"
@@ -332,7 +353,7 @@ def signers_start():
 
 
 def signers_stop():
-    for node in range(NODES):
+    for node in range(NODES + FOLLOWERS):
         signer_stop(node)
 
 
@@ -1133,6 +1154,94 @@ def resharing(chain, key, index, migrated_key, observed=2, offline=1):
 
 
 # ---------------------------------------------------------------------------------------------
+# Replacing a lost keyholder (R2, docs/resharing.md)
+
+
+def identity(node):
+    status, body = http("GET", f"{node_url(node)}/identity")
+    if status != 200:
+        raise Failure("replacement", f"node {node} identity: {status} {body}")
+    return body["identity"]
+
+
+def replacement(chain, key, index, observed=2):
+    """D (node 3) stops for good; E (node 4) joins as a non-voting follower and catches up; A, B, C
+    reshare the key to A, B, C, E (their operators approved exactly that set) while Lighthouse
+    signs; then C's partial signatures are switched off for an epoch: every signature needs E's
+    share. The consensus committee stays A, B, C, D throughout."""
+    def body():
+        before = http("GET", f"{node_url(0)}/dkg/status/{CEREMONY}")[1]
+        signer_stop(REPLACED)
+        lost = time.time()
+        log(f"replacement: node {REPLACED} (D) stopped for good")
+        observe("replacement-d-offline", index, 1, chain)
+        signer_start(REPLACEMENT)
+        joined = time.time()
+        wait("E to catch up (ready)", "replacement", 900, 0.5, lambda: ready(REPLACEMENT))
+        synced = time.time()
+        voters = [node for node in range(NODES) if node != REPLACED]
+        log(f"replacement: E ready {synced - joined:.1f} s after its start, at height "
+            f"{height(REPLACEMENT)} (voters {[height(node) for node in voters]})")
+        keyholders = voters + [REPLACEMENT]
+        identities = {node: identity(node) for node in keyholders}
+        players = [identities[node] for node in keyholders]
+        for node in voters:
+            with open(approvals(node), "a") as file:
+                file.write(f"{key} {','.join(players)}\n")
+        name = f"{CEREMONY}-r2"
+        started = time.time()
+        status, answer = http("POST", f"{node_url(0)}/validators/reshare", {
+            "public_key": key, "ceremony_id": name, "from_round": before["round"],
+            "dealers": [identities[node] for node in voters], "players": players}, timeout=40)
+        if status != 200:
+            raise Failure("replacement", f"start {name}: {status} {answer}")
+        for node in keyholders:
+            wait(f"the replacement ready on node {node}", "replacement", 180, 0.2,
+                 lambda node=node: http("GET", f"{node_url(node)}/validators/reshare/{name}")[1]
+                 .get("status") == "ready")
+        ready_at = time.time()
+        status, active = http("POST", f"{node_url(1)}/validators/reshare/activate",
+                              {"public_key": key, "ceremony_id": name}, timeout=40)
+        if status != 200 or active.get("status") != "active":
+            raise Failure("replacement", f"activate {name}: {status} {active}")
+        activated = time.time()
+        for node in keyholders:
+            wait(f"generation {name} on node {node}", "replacement", 60, 0.1,
+                 lambda node=node: generation_of(node, key)[1] == name)
+        switched = time.time()
+        after = http("GET", f"{node_url(REPLACEMENT)}/dkg/status/{name}")[1]
+        if after["public_key"] != key or before["public_key"] != key:
+            raise Failure("replacement", f"the key changed: {before['public_key']} -> {after['public_key']}")
+        if after["generation_id"] == before["generation_id"] or any(
+                old == new for old, new in zip(before["verification_shares"], after["verification_shares"])):
+            raise Failure("replacement", "a verification share or the generation id did not change")
+        if after["share"] != "stored":
+            raise Failure("replacement", f"E holds no share: {after}")
+        e_index = after["participant_index"]
+        c_index = http("GET", f"{node_url(WITHHELD)}/dkg/status/{name}")[1]["participant_index"]
+        log(f"replacement: {name} ready {ready_at - started:.1f} s after its start, activated "
+            f"{activated - ready_at:.1f} s later, every keyholder switched {switched - activated:.1f} s "
+            f"later; E holds share index {e_index}")
+        observe("replacement", index, observed, chain)
+        with open(no_partials(WITHHELD), "w"):
+            pass
+        withheld = time.time()
+        log(f"replacement: C's partial signatures switched off (index {c_index}): A, B and E sign")
+        observe("replacement-without-c", index, 1, chain)
+        os.remove(no_partials(WITHHELD))
+        restored = time.time()
+        # Not "name": that key is the scenario's own (`scenario`).
+        return {"ceremony": name, "round": active["round"], "from_round": before["round"],
+                "public_key": active["public_key"], "generation_id": active["generation_id"],
+                "before_generation_id": before["generation_id"], "players": players,
+                "e_index": e_index, "c_index": c_index, "lost": lost, "joined": joined,
+                "synced": synced, "started": started, "ready": ready_at, "activated": activated,
+                "switched": switched, "withheld": withheld, "restored": restored,
+                "heights_at_end": {node: height(node) for node in keyholders}}
+    return body
+
+
+# ---------------------------------------------------------------------------------------------
 # Security checks on the live devnet
 
 
@@ -1154,7 +1263,9 @@ def sign_via(url, path, body):
                 timeout=30, headers={"Accept": "application/json", "User-Agent": PROBE_AGENT})
 
 
-def security_checks(key, chain):
+def security_checks(key, chain, direct=2, other=3):
+    """`direct`: the node asked directly for a conflicting attestation; `other`: the node asked to
+    change the chain identity (both must be running)."""
     proxy = f"http://127.0.0.1:{PROXY_PORT}"
     roots = ssz()
     checks = []
@@ -1171,7 +1282,7 @@ def security_checks(key, chain):
         conflicting = json.loads(attestation["body"])
         conflicting["attestation"]["beacon_block_root"] = "0x" + "ee" * 32
         conflicting["signingRoot"] = "0x" + roots.signing_root(conflicting, roots.preset(False)).hex()
-        for node in (None, 2):
+        for node in (None, direct):
             url = proxy if node is None else node_url(node)
             status, body = sign_via(url, attestation["path"], json.dumps(conflicting))
             check(f"a conflicting attestation is refused ({'proxy' if node is None else f'node {node}'})",
@@ -1197,7 +1308,7 @@ def security_checks(key, chain):
     check("the development /sign refuses the validator key",
           status == 403 and isinstance(body, dict) and body.get("result") == "VALIDATOR_KEY",
           f"HTTP {status}")
-    status, body = http("POST", f"{node_url(3)}/validators/activate",
+    status, body = http("POST", f"{node_url(other)}/validators/activate",
                         {"public_key": key, "genesis_validators_root": "0x" + "42" * 32}, timeout=40)
     check("the chain identity cannot be changed", status == 409, f"HTTP {status} {body}")
     vc_files = sorted(os.path.relpath(os.path.join(root, f), f"{WORK}/vc")
@@ -1214,6 +1325,7 @@ def security_checks(key, chain):
 
 SIGNED = re.compile(r"^(\S+) .*signed validator duty")
 FIELD = re.compile(r"(\w+)=(\"[^\"]*\"|\S+)")
+SIGNERS = re.compile(r"signers=\[([^\]]*)\]")
 
 
 def signer_records():
@@ -1228,6 +1340,9 @@ def signer_records():
             if ts is None:
                 continue
             fields = {k: v.strip('"') for k, v in FIELD.findall(line)}
+            # The share indices combined (`signers=[0, 1, 3]`: spaces, not one FIELD).
+            signers = SIGNERS.search(line)
+            fields["signers"] = signers.group(1) if signers else None
             fields["ts"] = ts
             fields["node"] = node
             fields["ok"] = "validator duty not signed" not in line
@@ -1368,6 +1483,7 @@ def report(chain=None):
         "security": load("security.json", []),
         "migration": migration,
         "resharing": resharing_report(scenarios, proxy, signed, index, migration),
+        "replacement": replacement_report(scenarios, proxy, signed, index),
         "finalized_epoch": finalized,
     }
     save("report.json", result)
@@ -1424,6 +1540,7 @@ def report(chain=None):
                              f"heights {evidence['authorized_at']}, signed by nodes {evidence['signed_by']}")
     lines.extend(migration_lines(migration))
     lines.extend(resharing_lines(result["resharing"]))
+    lines.extend(replacement_lines(result["replacement"]))
     lines.append("")
     for item in result["security"]:
         lines.append(f"- security: {'ok' if item['passed'] else 'FAILED'}: {item['check']} ({item['detail']})")
@@ -1540,6 +1657,108 @@ def resharing_report(scenarios, proxy, signed, dkg_index, migration):
         "missed_attestations": [e["epoch"] for e in observed if not e["target_attester"]],
         "proposals": [(p["slot"], proposed(p, dkg_index)) for e in observed for p in e["proposals"]],
     }
+
+
+def replacement_report(scenarios, proxy, signed, dkg_index):
+    """The replacement of D by E: timings, E's catching up, the signing around it (latency with
+    D present, with D lost, after the replacement, without C), whose shares signed, missed duties."""
+    details = next((s for s in scenarios if s["name"] == "replacement"), None)
+    if not details or "ceremony" not in details:
+        return None
+    name, key = details["ceremony"], details["public_key"]
+    lighthouse = [r for r in proxy if r.get("type") and r.get("client") != PROBE_AGENT
+                  and key_of(r) == key.lower()]
+    ok = [r for r in lighthouse if r["status"] == 200]
+    baseline = next((s for s in scenarios if s["name"] == "baseline"), None)
+
+    def latency(start, end):
+        return percentiles([r["ms"] for r in ok if start <= r["ts"] <= end])
+
+    def authorization(start, end):
+        return percentiles([float(s["authorization_ms"]) for s in signed
+                            if s["ok"] and s.get("authorization_ms") and start <= s["ts"] <= end])
+
+    def sets(start, end):
+        found = {}
+        for record in signed:
+            if record["ok"] and record.get("generation") == name and start <= record["ts"] <= end:
+                found[record.get("signers")] = found.get(record.get("signers"), 0) + 1
+        return found
+    e, c = str(details["e_index"]), str(details["c_index"])
+
+    def indices(signers):
+        return [index.strip() for index in (signers or "").strip("[]").split(",") if index.strip()]
+    without_c = sets(details["withheld"], details["restored"])
+    after = sets(details["switched"], details["end"])
+    epochs = [json.loads(l) for l in read(f"{WORK}/epochs.jsonl").splitlines() if l.strip()]
+    observed = [e_ for e_ in epochs if e_["scenario"].startswith("replacement")]
+    failed = [r for r in lighthouse if details["start"] <= r["ts"] <= details["end"] and r["status"] != 200]
+    retried = [r for r in lighthouse if details["start"] <= r["ts"] <= details["end"] and len(r["attempts"]) > 1]
+    by_generation = {}
+    for record in signed:
+        if record["ok"] and record.get("generation") and record["ts"] >= details["start"]:
+            by_generation[record["generation"]] = by_generation.get(record["generation"], 0) + 1
+    heights = details["heights_at_end"]
+    return {
+        "ceremony": {k: details[k] for k in ("ceremony", "round", "from_round", "public_key",
+                                             "generation_id", "before_generation_id", "players",
+                                             "e_index", "c_index")},
+        "timings_s": {"e_catch_up": round(details["synced"] - details["joined"], 1),
+                      "ceremony": round(details["ready"] - details["started"], 1),
+                      "ready_to_activation": round(details["activated"] - details["ready"], 1),
+                      "activation_to_all_keyholders": round(details["switched"] - details["activated"], 1)},
+        "latency_ms": {
+            "baseline (A, B, C, D)": latency(baseline["start"], baseline["end"]) if baseline else None,
+            "D lost (A, B, C)": latency(details["lost"], details["started"]),
+            "after the replacement": latency(details["switched"], details["withheld"]),
+            "without C (A, B, E)": latency(details["withheld"], details["restored"]),
+        },
+        "authorization_ms": {
+            "baseline": authorization(baseline["start"], baseline["end"]) if baseline else None,
+            "D lost": authorization(details["lost"], details["end"]),
+        },
+        "signer_sets_without_c": without_c,
+        "without_c_all_include_e": bool(without_c) and all(
+            e in indices(s) and c not in indices(s) for s in without_c),
+        "signatures_with_e_after_activation": sum(n for s, n in after.items() if e in indices(s)),
+        "signatures_after_activation": sum(after.values()),
+        "signatures_by_generation": by_generation,
+        "lighthouse_requests_failed": len(failed),
+        "lighthouse_requests_retried_by_proxy": len(retried),
+        "observed_epochs": len(observed),
+        "missed_attestations": [x["epoch"] for x in observed if not x["target_attester"]],
+        "proposals": [(p["slot"], proposed(p, dkg_index)) for x in observed for p in x["proposals"]],
+        "heights_at_end": heights,
+    }
+
+
+def replacement_lines(r):
+    if not r:
+        return []
+
+    def ms(p):
+        return "n/a" if not p else f"{p.get('p50')}/{p.get('p95')} ({p['n']})"
+    c, t = r["ceremony"], r["timings_s"]
+    lines = ["", "## Replacing a lost keyholder (R2) on the live devnet", "",
+             f"- key `{c['public_key']}` unchanged; generation round {c['from_round']} -> {c['round']} "
+             f"(`{c['ceremony']}`), generation id {c['before_generation_id']} -> {c['generation_id']}; "
+             f"consensus committee unchanged (A, B, C, D; D offline)",
+             f"- E caught up in {t['e_catch_up']} s; ceremony {t['ceremony']} s, ready to activation "
+             f"{t['ready_to_activation']} s, activation to every keyholder {t['activation_to_all_keyholders']} s; "
+             f"heights at the end {r['heights_at_end']}",
+             f"- E's share index {c['e_index']}, C's {c['c_index']}: without C, signer sets "
+             f"{r['signer_sets_without_c']} (all with E, none with C: {r['without_c_all_include_e']}); "
+             f"after the activation {r['signatures_with_e_after_activation']} of "
+             f"{r['signatures_after_activation']} signatures include E's share",
+             f"- signatures by generation since D was lost: {r['signatures_by_generation']}",
+             f"- Lighthouse requests failed: {r['lighthouse_requests_failed']}, retried by the proxy: "
+             f"{r['lighthouse_requests_retried_by_proxy']}"]
+    lines += [f"- latency end to end p50/p95 ms (n), {label}: {ms(p)}" for label, p in r["latency_ms"].items()]
+    lines += [f"- consensus authorization p50/p95 ms (n), {label}: {ms(p)}"
+              for label, p in r["authorization_ms"].items()]
+    lines.append(f"- observed epochs: {r['observed_epochs']}, missed attestations {r['missed_attestations']}, "
+                 f"proposals (slot, canonical) {r['proposals']}")
+    return lines
 
 
 def resharing_lines(r):
@@ -1660,10 +1879,44 @@ def run_all(observed=3, proposal_epochs=12):
     return report(chain)
 
 
+def run_r2(observed=2):
+    """Replacing a lost keyholder (R2) alone: the devnet, the signers (E not started), DKG,
+    activation, deposit, Lighthouse, a baseline, the replacement, the security checks, a report."""
+    os.makedirs(f"{WORK}/logs", exist_ok=True)
+    pull_images()
+    devnet_up()
+    chain = Chain()
+    log(f"devnet: {chain.seconds_per_slot} s slots, {chain.slots_per_epoch} slots per epoch, "
+        f"genesis fork version {chain.genesis_fork_version}")
+    signers_start()
+    key = dkg()
+    activation = activate(key, chain)
+    deposit(key, chain)
+    proxy_start()
+    vc_start(key)
+    index, activation_epoch = wait_active(key, chain)
+    recorder = Recorder(index, activation_epoch, chain)
+    recorder.start()
+    save("validator.json", {"public_key": key, "index": index, "activation_epoch": activation_epoch,
+                            "mpc_activation_height": activation["activated_at"],
+                            "genesis_validators_root": chain.genesis_validators_root})
+    chain.wait_epoch(activation_epoch)
+
+    def baseline():
+        observe("baseline", index, observed, chain)
+    scenario("baseline", baseline)
+    scenario("replacement", replacement(chain, key, index, observed))
+    # D is gone: node 1 is asked to change the chain identity, node 2 (C, signing again) directly.
+    security_checks(key, chain, direct=WITHHELD, other=1)
+    recorder.stop()
+    return report(chain)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("run")
+    sub.add_parser("run-r2")
     devnet = sub.add_parser("devnet")
     devnet.add_argument("action", choices=["up", "down"])
     signers = sub.add_parser("signers")
@@ -1676,6 +1929,8 @@ def main():
     try:
         if args.command == "run":
             run_all()
+        elif args.command == "run-r2":
+            run_r2()
         elif args.command == "devnet":
             devnet_up() if args.action == "up" else devnet_down()
         elif args.command == "signers":

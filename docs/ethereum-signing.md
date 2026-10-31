@@ -78,6 +78,18 @@ new shares within the committee, through consensus ([resharing.md](resharing.md)
 | `POST /validators/reshare/activate` | Make a `ready` reshare the active generation (`ActivateGeneration`, every new share acknowledged); refusals: `not_reshare`, `not_completed`, `aborted`, `stale`, `not_ready` |
 | `POST /validators/reshare/abort` | Abort a reshare that is not and never was active |
 
+A lost keyholder is replaced (R2) by the same request with the generation it refreshes, its
+dealers and the new keyholders, each a consensus identity from `GET /identity`
+([resharing.md](resharing.md#r2-replacing-a-lost-keyholder)):
+
+```json
+{"public_key": "0x..", "ceremony_id": "validator-eth-r2", "from_round": 0,
+ "dealers": ["0x<A>", "0x<B>", "0x<C>"], "players": ["0x<A>", "0x<B>", "0x<C>", "0x<E>"]}
+```
+
+The new keyholder E is a follower: it holds a share but serves no signing API (`403`); clients keep
+sending duties to committee members.
+
 Nothing else changes for a client: the same key, the same `fork_info`, the same slashing history.
 Signing requests between nodes name the generation, and a keyholder signs only with the one it has
 committed as active: an older one is refused (`stale_generation`, and the coordinator asks again with

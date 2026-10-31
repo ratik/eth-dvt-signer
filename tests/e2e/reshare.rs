@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 
 const VALIDATOR: &str = "validator-eth";
 
-fn crash_at(point: &str) -> Vec<(String, String)> {
+pub(crate) fn crash_at(point: &str) -> Vec<(String, String)> {
     vec![("ETH_MPC_SIGNER_CRASH_AT".into(), point.into())]
 }
 
@@ -63,7 +63,7 @@ fn start_reshare(network: &TestNetwork, via: usize, key: &str, name: &str) -> Va
 }
 
 /// `POST /validators/reshare/{action}` (`activate` or `abort`) on node `via`.
-fn generation_call(
+pub(crate) fn generation_call(
     network: &TestNetwork,
     via: usize,
     action: &str,
@@ -77,7 +77,7 @@ fn generation_call(
     )
 }
 
-fn reshare_status(network: &TestNetwork, node: usize, name: &str) -> Value {
+pub(crate) fn reshare_status(network: &TestNetwork, node: usize, name: &str) -> Value {
     let (status, body) = network.get(node, &format!("/validators/reshare/{name}"));
     assert_eq!(status, 200, "{body}");
     body
@@ -93,7 +93,7 @@ fn wait_reshare(network: &TestNetwork, name: &str, state: &str) {
 }
 
 /// `(generation, active ceremony)` of `key` on node `node`.
-fn generation(network: &TestNetwork, node: usize, key: &str) -> (u64, String) {
+pub(crate) fn generation(network: &TestNetwork, node: usize, key: &str) -> (u64, String) {
     let validator = activation(network, node, key).expect("an active validator");
     (
         validator["generation"].as_u64().unwrap(),
@@ -101,7 +101,12 @@ fn generation(network: &TestNetwork, node: usize, key: &str) -> (u64, String) {
     )
 }
 
-fn wait_generation(network: &TestNetwork, nodes: &[usize], key: &str, expected: (u64, &str)) {
+pub(crate) fn wait_generation(
+    network: &TestNetwork,
+    nodes: &[usize],
+    key: &str,
+    expected: (u64, &str),
+) {
     for &node in nodes {
         network.wait_until(&format!("generation {expected:?} on node {node}"), || {
             let (generation, ceremony) = generation(network, node, key);
@@ -110,7 +115,7 @@ fn wait_generation(network: &TestNetwork, nodes: &[usize], key: &str, expected: 
     }
 }
 
-fn dkg_status(network: &TestNetwork, node: usize, name: &str) -> Value {
+pub(crate) fn dkg_status(network: &TestNetwork, node: usize, name: &str) -> Value {
     let (status, body) = network.get(node, &format!("/dkg/status/{name}"));
     assert_eq!(status, 200, "{body}");
     body
@@ -329,14 +334,14 @@ fn e2e_rsh_3_crash_around_activation() {
 }
 
 /// The session digest of a reshare, as its status gives it.
-fn session(status: &Value) -> Digest {
+pub(crate) fn session(status: &Value) -> Digest {
     let bytes = hex::decode(status["session"].as_str().unwrap().trim_start_matches("0x")).unwrap();
     Digest::decode(bytes.as_slice()).unwrap()
 }
 
 /// A share acknowledgement of reshare `round`, signed with node `node`'s identity, as a
 /// transaction for the mempool.
-fn acknowledgement(node: u64, round: u64, session: Digest, id: u64) -> Vec<u8> {
+pub(crate) fn acknowledgement(node: u64, round: u64, session: Digest, id: u64) -> Vec<u8> {
     let ack = ReadyAck::sign(&PrivateKey::from_seed(node), round, session);
     Transaction {
         id,

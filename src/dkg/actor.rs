@@ -27,7 +27,8 @@
 
 use super::{
     CeremonyConfig, CeremonyId, DkgStatus, Faults, Variant,
-    ceremony::{Ceremony, ReadyAck, SignedLog},
+    approval::{Approvals, NotApproved},
+    ceremony::{Ceremony, ReadyAck, Reshare, SignedLog},
     format_key,
     parked::Parked,
     secrets::{KeyShare, Secrets},
@@ -367,8 +368,13 @@ pub struct Actor<
     shares: BTreeMap<u64, Share>,
     /// Completed ceremonies without a usable share on this node.
     unavailable: BTreeSet<u64>,
-    /// Participants of each ceremony, by round.
-    participants: BTreeMap<u64, Set<PublicKey>>,
+    /// Number of dealers of each ceremony, by round.
+    dealers: BTreeMap<u64, usize>,
+    /// The consensus committee: the only nodes whose coordinators may ask for partial signatures
+    /// (a follower holds shares but coordinates nothing).
+    committee: Set<PublicKey>,
+    /// The operator's approvals of reshares to new keyholders (R2).
+    approvals: Approvals,
     /// Signing authorizations committed on this node, by `(round, nonce)`.
     authorizations: HashMap<(u64, u64), Committed>,
     /// Ceremony rounds started as validator keys: they sign only duty authorizations.
@@ -413,6 +419,8 @@ impl<
         duties: Vec<DutyAuthorization>,
         generations: Vec<(ValidatorKey, u64)>,
         share_key: Option<ShareKey>,
+        committee: Set<PublicKey>,
+        approvals: Approvals,
     ) -> Self {
         let mut validators = HashMap::new();
         for (key, round) in duties
@@ -436,7 +444,9 @@ impl<
             sessions: BTreeMap::new(),
             shares: BTreeMap::new(),
             unavailable: BTreeSet::new(),
-            participants: BTreeMap::new(),
+            dealers: BTreeMap::new(),
+            committee,
+            approvals,
             authorizations: authorizations
                 .into_iter()
                 .map(|committed| ((committed.round(), committed.nonce()), committed))
@@ -535,12 +545,14 @@ impl<
     async fn update(&mut self, ceremony: Ceremony) {
         let round = ceremony.round;
         self.ids.insert(ceremony.config.id.clone(), round);
-        self.participants
-            .insert(round, ceremony.config.participants.clone());
+        self.dealers.insert(round, ceremony.dealers().len());
         if let Some(reshare) = ceremony.reshare() {
             self.reshares.insert(round, reshare.validator);
         }
-        if ceremony.config.participants.position(&self.me).is_none() {
+        // A reshare's dealers and players may differ (R2): a node takes part as either or both.
+        if ceremony.config.participants.position(&self.me).is_none()
+            && ceremony.dealers().position(&self.me).is_none()
+        {
             return;
         }
         match ceremony.status {
@@ -610,43 +622,67 @@ impl<
     }
 
     /// Join a ceremony in progress as dealer and player (again, after a restart). A reshare's
-    /// dealer deals its share of the generation refreshed; without one, this node only plays.
+    /// dealer deals its share of the generation refreshed; without one, this node only plays. A
+    /// reshare's dealers and players are its own (R2): a new keyholder only plays, and a reshare
+    /// to new keyholders is dealt only with the operator's approval ([Approvals]).
     async fn open(&mut self, ceremony: &Ceremony) {
         let round = ceremony.round;
         let info = ceremony.info();
         let reshare = ceremony.reshare().is_some();
-        info!(ceremony = %ceremony.config.id, round, reshare, "joining dkg ceremony");
+        let playing = ceremony.config.participants.position(&self.me).is_some();
+        let deals = ceremony.dealers().position(&self.me).is_some();
+        info!(ceremony = %ceremony.config.id, round, reshare, deals, playing, "joining dkg ceremony");
         if reshare {
             crate::hooks::crash_point("reshare-before-dealing");
         }
-        let previous = match ceremony.reshare() {
-            None => Some(None),
-            Some(reshare) => self.shares.get(&reshare.from).cloned().map(Some),
+        // What this node deals: nothing (a player only, or its log is already finalized), a fresh
+        // secret (DKG), or its share of the generation a reshare refreshes.
+        let previous = if !deals || ceremony.logs.contains_key(&self.me) {
+            if !deals {
+                info!(ceremony = %ceremony.config.id, round, "not a dealer of this round: playing only");
+            }
+            None
+        } else {
+            match ceremony.reshare() {
+                None => Some(None),
+                Some(reshare) => match self.approve(ceremony, reshare) {
+                    Err(err) => {
+                        warn!(ceremony = %ceremony.config.id, round, %err, "reshare to new keyholders not approved here: not dealing");
+                        None
+                    }
+                    Ok(()) => match self.shares.get(&reshare.from) {
+                        Some(share) => Some(Some(share.clone())),
+                        None => {
+                            warn!(ceremony = %ceremony.config.id, round, "no share of the generation being refreshed: playing only");
+                            None
+                        }
+                    },
+                },
+            }
         };
 
         // The player replays the dealings it acknowledged before a restart.
-        let (player, acks) = match Player::resume::<Faults>(
-            info.clone(),
-            self.signer.clone(),
-            &ceremony.logs,
-            self.secrets.dealings(round),
-        ) {
-            Ok((player, acks)) => (Some(player), acks),
-            Err(err) => {
-                error!(round, %err, "cannot restore dkg player: no share for this node");
-                (None, BTreeMap::new())
+        let (player, acks) = if !playing {
+            (None, BTreeMap::new())
+        } else {
+            match Player::resume::<Faults>(
+                info.clone(),
+                self.signer.clone(),
+                &ceremony.logs,
+                self.secrets.dealings(round),
+            ) {
+                Ok((player, acks)) => (Some(player), acks),
+                Err(err) => {
+                    error!(round, %err, "cannot restore dkg player: no share for this node");
+                    (None, BTreeMap::new())
+                }
             }
         };
 
         // The dealer's randomness comes from a fresh random seed persisted before anything is
-        // sent, so a restart replays the same dealing instead of equivocating. A dealer whose log
-        // is already finalized has nothing left to do.
+        // sent, so a restart replays the same dealing instead of equivocating.
         let dealing = match previous {
-            _ if ceremony.logs.contains_key(&self.me) => None,
-            None => {
-                warn!(ceremony = %ceremony.config.id, round, "no share of the generation being refreshed: playing only");
-                None
-            }
+            None => None,
             Some(previous) => {
                 let seed = match self.secrets.seed(round) {
                     Some(seed) => seed,
@@ -677,11 +713,11 @@ impl<
             }
         };
 
-        let own = dealing.as_ref().map(|dealing| {
-            (
-                dealing.commitment.clone(),
-                dealing.pending[&self.me].clone(),
-            )
+        let own = dealing.as_ref().and_then(|dealing| {
+            dealing
+                .pending
+                .get(&self.me)
+                .map(|share| (dealing.commitment.clone(), share.clone()))
         });
         self.sessions.insert(
             round,
@@ -703,6 +739,17 @@ impl<
         if reshare {
             crate::hooks::crash_point("reshare-after-dealings-sent");
         }
+    }
+
+    /// Whether this node may deal `ceremony`, a reshare: always if its players are the
+    /// keyholders of the generation it refreshes (R1), otherwise only with the operator's
+    /// approval of exactly these players for this key ([Approvals], R2).
+    fn approve(&self, ceremony: &Ceremony, reshare: &Reshare) -> Result<(), NotApproved> {
+        if reshare.previous.players() == &ceremony.config.participants {
+            return Ok(());
+        }
+        self.approvals
+            .check(&reshare.validator, &ceremony.config.participants)
     }
 
     fn send_dealings(&mut self, round: u64) {
@@ -757,16 +804,13 @@ impl<
                     .await
                     .expect("failed to persist dealing");
                 session.acks.insert(dealer.clone(), ack.clone());
+                debug!(round, ?dealer, "acknowledged a dealing");
                 if self.reshares.contains_key(&round) {
                     let held = self.secrets.dealings(round).len();
                     if held == 1 {
                         crate::hooks::crash_point("reshare-after-first-dealing");
                     }
-                    if self
-                        .participants
-                        .get(&round)
-                        .is_some_and(|participants| held == participants.len())
-                    {
+                    if self.dealers.get(&round) == Some(&held) {
                         crate::hooks::crash_point("reshare-after-all-dealings");
                     }
                 }
@@ -852,6 +896,10 @@ impl<
         }
         let round = ceremony.round;
         let session = self.sessions.remove(&round);
+        // A dealer that is not a player of the new generation gets no share of it.
+        if ceremony.config.participants.position(&self.me).is_none() {
+            return;
+        }
         if self.shares.contains_key(&round) || self.unavailable.contains(&round) {
             if self.shares.contains_key(&round) {
                 self.acknowledge(ceremony);
@@ -1106,15 +1154,18 @@ impl<
     /// Answer a peer's signing request: a partial signature or a refusal. A request whose
     /// authorization is not applied here yet is parked and answered once it is.
     fn on_sign_request(&mut self, from: PublicKey, request: sign_wire::Request) {
+        if crate::hooks::no_partials() {
+            debug!(peer = ?from, "test hook: not answering a signing request");
+            return;
+        }
         if !request.is_consistent() {
             warn!(peer = ?from, "signing request with an inconsistent id");
             return;
         }
-        let member = self.ids.get(&request.ceremony).is_none_or(|round| {
-            self.participants
-                .get(round)
-                .is_some_and(|participants| participants.position(&from).is_some())
-        });
+        // Coordinators are committee members; whether this node signs is decided by the request's
+        // committed authorization and this node's active generation ([Self::partial]), never by
+        // who asks. A follower coordinates nothing.
+        let member = self.committee.position(&from).is_some();
         let result = if member {
             self.partial(
                 &request.ceremony,

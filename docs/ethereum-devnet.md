@@ -118,6 +118,11 @@ IT_HOME=~/eth-mpc-it ./integration/ethereum/scripts/run.sh
 Steps one at a time (inside the environment, `env.sh exec python3 /it/src/integration/ethereum/scripts/it.py ...`):
 `devnet up|down`, `signers start|stop`, `report`, `stop`.
 
+`IT_RUN=run-r2 ./integration/ethereum/scripts/run.sh` runs only the replacement of a lost
+keyholder (R2) after the onboarding and a baseline: no other fault scenario and no migration
+([below](#replacing-a-lost-keyholder-run-g)). Every run starts the signers with `--followers 1`
+(node 4's slot, used only by the replacement), the voters with `--approved-reshares`.
+
 The repository's own checks run on the same host, in the same pinned Rust image, with their own
 target directory: fmt, clippy (all features and default), `cargo test`, the E2E suite three times,
 and the L-1 reproducer, expected to fail. Logs go to `$IT_HOME/validation/<time>/`, with a
@@ -145,6 +150,7 @@ signing requests the proxy forwarded (`requests/`, duty data only).
 | In-flight failure | node 0 restarted with the `authorized` crash point, re-armed (up to 3 crashes) until a crash follows a new authorization: one node 0 itself submitted, which consensus then accepted | node 0 dies after the authorization, before answering; the proxy retries on another node, which returns the signature of the same authorization; the duty is accepted at exactly one height |
 | Migration | a genesis validator moves from Lighthouse's local keystore to the MPC network ([below](#migration-of-a-genesis-validator)), then node 2 is stopped for 2 epochs | the key's duties before, during and after; the same public key; the imported history refuses the previous signer's messages; 3 keyholders keep signing |
 | Resharing | both MPC validator keys (the DKG key, then the migrated imported key) get a new share generation while Lighthouse signs ([resharing.md](resharing.md)), then node 2 is stopped for an epoch | the same keys; every verification share and the generation ids changed; every node switched and the old shares retired; signatures with the old generation while the new one is prepared and with the new one after; duties in the beacon state; interruptions, retries, latency before and after; node 2 back with the new generation |
+| Replacing a lost keyholder (`run-r2`) | node 3 (D) stopped for good; node 4 (E) started as a non-voting follower; the DKG key reshared by nodes 0, 1, 2 to nodes 0, 1, 2, 4 ([resharing.md](resharing.md#r2-replacing-a-lost-keyholder)) while Lighthouse signs; then node 2's partial signatures switched off for an epoch | duties with D lost; E's catching up; the same key, new verification shares and generation; every keyholder switched; with node 2's partials off, every signature combines E's share (coordinator logs); duties in the beacon state, latency, failures and retries throughout; the security checks with D still offline |
 
 The proxy retries only on a connection failure, `502`, `503` or `504`, never on `4xx`. That is
 safe because the state machine decides each duty once: an identical retry is `AlreadyAccepted`
@@ -233,8 +239,9 @@ DKG key, its deposit, activation, the scenarios, the security checks. Logs are o
 in `~/eth-mpc-it/runs/<directory>/`. Runs B and C used the 10 s nullify retry; run D used the
 3 s retry and the final scripts (whole-period recorder, every signed block checked, in-flight
 re-arming); run E added the migration of a genesis validator
-([below](#migration-run-e)), run F resharing ([below](#resharing-run-f)). The rows below are the
-DKG validator's.
+([below](#migration-run-e)), run F resharing ([below](#resharing-run-f)). Run G is the replacement of
+a lost keyholder alone ([below](#replacing-a-lost-keyholder-run-g)), not in the table. The rows
+below are the DKG validator's.
 
 | | Run B | Run C | Run D | Run E | Run F |
 | --- | --- | --- | --- | --- | --- |
@@ -377,6 +384,46 @@ Signing around the reshares:
 The migration in run F missed one proposal, slot 929, in the 5.0 s between the original signer's
 stop and Lighthouse signing through the network: the switch-over cost of the migration, not of
 resharing. Run E had no proposal in its gap.
+
+### Replacing a lost keyholder (run G)
+
+Run G (`20261030T152504Z`, `IT_RUN=run-r2`) is the R2 demonstration alone
+([resharing.md](resharing.md#r2-replacing-a-lost-keyholder)): a new devnet, the DKG key onboarded
+as before (validator 32, active from epoch 11), a 2-epoch baseline with nodes 0 to 3 (A, B, C, D),
+then the replacement while Lighthouse signs. No other fault scenario ran.
+
+| Step | Result |
+| --- | --- |
+| Baseline (A, B, C, D) | epochs 12 and 13 attested (target and head), proposals 399 and 404 canonical |
+| D (node 3) stopped for good | epoch 16 attested by A, B, C; proposals 533 and 541 canonical |
+| E (node 4) started as a follower | ready (caught up from genesis by backfill) 15.6 s after its start, at height 1 475, the voters' height |
+| Replacement `validator-devnet-r2`: dealers A, B, C; players A, B, C, E | ceremony 1.7 s (start to all four new shares acknowledged), ready to activation 0.2 s, every keyholder switched within 0.1 s; E holds share index 0 |
+| Key | `0x8ee0b83c…5e01`, unchanged; generation round 0 → 1, generation id `0xf390f0d3…062a` → `0x0f9da003…a573`; every verification share changed |
+| After the replacement | epochs 19 and 20 attested; proposals 615, 622 and 626 canonical |
+| C's partials switched off for an epoch | every signature in that window combined shares {0, 1, 3}: A, B and **E** (C is index 2), 17 signatures; epoch 23 attested, proposal 762 canonical |
+| Whole active period | epochs 11 to 22: every attestation with a correct target and head; 16 of 16 proposals canonical; 18 blocks signed for Lighthouse, all canonical |
+| Security checks, D still offline | 7 of 7: identical retry, double vote refused through the proxy and on node 2 (C), double proposal refused, `/sign` refuses the key, the chain identity fixed, no keystore in the validator client |
+
+Signing around the replacement (Lighthouse's requests through the proxy; no request failed and
+none was retried):
+
+| Window | Keyholders signing | End-to-end p50 / p95 ms (n) | Slowest |
+| --- | --- | --- | --- |
+| Baseline | A, B, C, D | 220 / 392 (20) | 500 ms |
+| D lost | A, B, C | 284 / 402 (17) | 421 ms |
+| After the replacement | A, B, C, E | 233 / 513 (24) | 525 ms |
+| C's partials off | A, B, E | 268 / 579 (17) | 583 ms |
+
+Consensus authorization stayed at p50 179 ms (p95 350 ms before, 427 ms after D's loss); no
+authorization took over 1.5 s, so no duty of this run fell into one of D's leader turns, which cost
+the 2 s leader timeout (L-16, L-19; the E2E runs show one). E followed the chain within the voters'
+height throughout (2 053 for all at the end). The consensus committee stayed A, B, C, D: during the
+whole replacement, finalization needed every one of A, B and C.
+
+`report-r2.md` and `report-r2.json` in the run directory hold this section, computed after the run
+from its `scenarios.json` and logs: the run's own `report.md` lacks it because the scenario's
+details overwrote its name (an `it.py` bug, fixed after the run; the scenario is recorded as
+`validator-devnet-r2` in `scenarios.json` and its window table).
 
 ## Troubleshooting
 

@@ -4,6 +4,12 @@
 //!
 //! The engine is generic over the runtime and the p2p network so the same code runs on the real
 //! `tokio` runtime with authenticated p2p and in deterministic simulation (see `tests/`).
+//!
+//! A node outside the committee (`participants`) is a follower: the same engine with a consensus
+//! scheme that verifies the committee's votes and certificates but cannot sign, so it never votes
+//! or leads. It applies every finalized block to its own replicated state, submits transactions
+//! through the committee's mempools, holds key shares once a reshare names it (R2), and runs no
+//! signing coordinator.
 
 use crate::{
     application::{Application, MAX_IDLE, Mempool, Scheme},
@@ -108,6 +114,8 @@ pub struct Config<B, P> {
     pub allow_missing_consensus_journal: bool,
     /// This node's share-encryption key, to install shares of imported keys (`import`).
     pub share_key: Option<crate::import::envelope::ShareKey>,
+    /// The operator's approvals of reshares to new keyholders (`dkg::approval`), if any.
+    pub approved_reshares: Option<std::path::PathBuf>,
 }
 
 /// Registered p2p channels, one `(sender, receiver)` pair per purpose.
@@ -144,6 +152,8 @@ pub struct Recovery {
     pub floor: Option<(u64, u64)>,
     /// The consensus journal was missing and the operator allowed starting anyway.
     pub journal_missing: bool,
+    /// This node is a committee member (votes); otherwise it follows consensus without voting.
+    pub voting: bool,
 }
 
 /// Why a node refuses to start. Nothing is reset or deleted and no key share is regenerated.
@@ -331,8 +341,16 @@ where
     let prefix = config.partition_prefix;
     let retention = config.retention;
     let page_cache = CacheRef::from_pooler(&context, NZU16!(16_384), NZUsize!(10_000));
-    let scheme = Scheme::signer(NAMESPACE, config.participants, config.signer)
-        .expect("signer must be a participant");
+    // A node outside the committee follows consensus without voting: its scheme verifies the
+    // committee's votes and certificates but cannot sign (simplex then never votes or leads).
+    let voting = committee.position(&public_key).is_some();
+    let scheme = if voting {
+        Scheme::signer(NAMESPACE, config.participants, config.signer)
+            .expect("signer is a participant")
+    } else {
+        info!("not a committee member: following consensus without voting");
+        Scheme::verifier(NAMESPACE, config.participants)
+    };
 
     // Durable state first, checked against itself before anything runs. Damaged copies of the
     // metadata stores opened before the checks are saved first (opening truncates them).
@@ -463,6 +481,7 @@ where
         marshal.clone(),
         retention,
         dkg_sender.clone(),
+        !voting,
     );
     let executor_handle = executor.start();
     let gossip_handle = context.child("gossip").spawn({
@@ -475,7 +494,7 @@ where
     let (signing_sender, signing_receiver) = channels.signing;
     let dkg_client = dkg::actor::Client::new(
         public_key.clone(),
-        committee,
+        committee.clone(),
         executor_mailbox.clone(),
         dkg_sender.clone(),
     );
@@ -493,6 +512,8 @@ where
         duties,
         generations,
         config.share_key,
+        committee,
+        dkg::approval::Approvals::new(config.approved_reshares),
     )
     .start();
     let dkg_receiver_handle = context.child("dkg_receiver").spawn({
@@ -511,7 +532,9 @@ where
         signing_sender,
         pending.clone(),
     );
-    let coordinator_handle = coordinator.start();
+    // A follower answers partial-signature requests but never coordinates one (its HTTP API does
+    // not offer signing, see `rpc`): its coordinator is not started.
+    let coordinator_handle = voting.then(|| coordinator.start());
     let signing_receiver_handle = context
         .child("signing_receiver")
         .spawn(move |_| coordinator::receive(signing_receiver, dkg_sender, pending));
@@ -589,17 +612,20 @@ where
     let consensus_handle =
         consensus.start(channels.votes, channels.certificates, channels.resolver);
 
-    let handle = Handle::from_future(Handle::select([
-        broadcast_handle,
-        marshal_handle,
-        executor_handle,
-        gossip_handle,
-        dkg_handle,
-        dkg_receiver_handle,
-        coordinator_handle,
-        signing_receiver_handle,
-        consensus_handle,
-    ]));
+    let handle = Handle::from_future(Handle::select(
+        [
+            broadcast_handle,
+            marshal_handle,
+            executor_handle,
+            gossip_handle,
+            dkg_handle,
+            dkg_receiver_handle,
+            signing_receiver_handle,
+            consensus_handle,
+        ]
+        .into_iter()
+        .chain(coordinator_handle),
+    ));
     Ok(Node {
         client,
         dkg: dkg_client,
@@ -608,6 +634,7 @@ where
             state_height,
             floor: floor_at,
             journal_missing,
+            voting,
         },
         handle,
     })

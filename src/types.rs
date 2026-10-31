@@ -3,7 +3,7 @@
 use crate::{
     dkg::{
         CeremonyConfig, CeremonyId, MAX_PARTICIPANTS,
-        ceremony::{ReadyAck, SignedLog},
+        ceremony::{Membership, ReadyAck, SignedLog},
     },
     eth::duty::{DutyRequest, ValidatorKey},
     import::manifest::Manifest,
@@ -105,10 +105,13 @@ pub enum Command {
         acknowledgment: Acknowledgment,
     },
     /// Start a reshare of an activated validator key: a new share generation of the same key, as
-    /// the ceremony `ceremony` (`dkg::ceremony`, resharing).
+    /// the ceremony `ceremony` (`dkg::ceremony`, resharing). With `membership`, the generation it
+    /// refreshes, its dealers and the new keyholders (R2, replacing a lost keyholder); without, the
+    /// active generation's keyholders deal to the committee (R1).
     StartResharing {
         validator: ValidatorKey,
         ceremony: CeremonyId,
+        membership: Option<Box<Membership>>,
     },
     /// Make the completed reshare `round` the key's active share generation (every new share
     /// acknowledged). The previous generation is retired.
@@ -288,10 +291,15 @@ impl Write for Command {
             Self::StartResharing {
                 validator,
                 ceremony,
+                membership,
             } => {
-                10u8.write(buf);
+                // Tag 10 is R1's encoding, kept as is so its history still decodes.
+                (if membership.is_some() { 13u8 } else { 10u8 }).write(buf);
                 buf.put_slice(validator);
                 ceremony.write(buf);
+                if let Some(membership) = membership {
+                    membership.write(buf);
+                }
             }
             Self::ActivateGeneration { validator, round } => {
                 11u8.write(buf);
@@ -356,6 +364,12 @@ impl Read for Command {
             10 => Ok(Self::StartResharing {
                 validator: <[u8; 48]>::read(buf)?,
                 ceremony: CeremonyId::read(buf)?,
+                membership: None,
+            }),
+            13 => Ok(Self::StartResharing {
+                validator: <[u8; 48]>::read(buf)?,
+                ceremony: CeremonyId::read(buf)?,
+                membership: Some(Box::new(Membership::read(buf)?)),
             }),
             11 => Ok(Self::ActivateGeneration {
                 validator: <[u8; 48]>::read(buf)?,
@@ -383,7 +397,16 @@ impl EncodeSize for Command {
             Self::ShareReady(ack) => ack.encode_size(),
             Self::ImportSlashingProtection(import) => import.encode_size(),
             Self::ActivateImportedValidator { .. } => 48 + 32 + 1,
-            Self::StartResharing { ceremony, .. } => 48 + ceremony.encode_size(),
+            Self::StartResharing {
+                ceremony,
+                membership,
+                ..
+            } => {
+                48 + ceremony.encode_size()
+                    + membership
+                        .as_ref()
+                        .map_or(0, |membership| membership.encode_size())
+            }
             Self::ActivateGeneration { round, .. } | Self::AbortResharing { round, .. } => {
                 48 + UInt(*round).encode_size()
             }

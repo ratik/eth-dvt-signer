@@ -1,5 +1,10 @@
 # Resharing: new share generations of a validator key
 
+Two operations produce a new share generation of a validator key, with the same protocol:
+
+- **R1** refreshes the shares within the committee (A, B, C, D deal to A, B, C, D).
+- **R2** replaces a permanently lost keyholder (A, B, C deal to A, B, C, E): [below](#r2-replacing-a-lost-keyholder).
+
 R1 rotates the secret shares of an existing validator key inside the fixed 3-of-4 committee:
 
 - The key's four shares are replaced by four new, independently random ones.
@@ -21,7 +26,7 @@ Both DKG keys and imported keys are reshared by the same protocol.
 | L-16, a leader timeout after a node failure | Consensus is unchanged. |
 | L-17, poisoning an import before activation | Unchanged. |
 
-Resharing does not revoke a compromised share by itself ([below](#old-shares)). It is not a change of committee ([R2](#r2-replacing-a-keyholder)).
+Resharing does not revoke a compromised share by itself ([below](#old-shares)). Neither R1 nor R2 changes the consensus committee ([R2](#r2-replacing-a-lost-keyholder)).
 
 ## Cryptography
 
@@ -48,7 +53,7 @@ The network uses commonware's Feldman-Desmedt **reshare** mode, the construction
 1. **Player.** A player acknowledges a dealing only if its private value matches the dealer's commitments, the constant commitment is the dealer's previous public share, and it is the dealer's first dealing (a second, different one is not acknowledged).
 2. **Log.** A dealer log counts only if:
    - it is signed for this round and session (a replayed log of another round fails);
-   - its dealer is a keyholder of the generation refreshed;
+   - its dealer is one of the round's dealers (keyholders of the generation refreshed);
    - every player acknowledged its dealing: no reveals, as for the DKG, so no share material ever enters a block.
 3. **Selection.** Consensus selects the logs (`observe`), checking the acknowledgement signatures and the commitments; invalid logs are dropped.
 4. **Share use.** A player uses its new share only after verifying it against the selected logs' interpolated commitments, and persists it before announcing it.
@@ -73,7 +78,7 @@ A reshare does **not** revoke the old generation.
 
 ## Share generations
 
-A **share generation** of a validator key is the ceremony that holds it: its round, configuration, session, commitments and the participants' share indices (sorted committee order, `x = i + 1`). The validator's `round` (`slashing::Validator`) names the **active** generation, the only one that signs.
+A **share generation** of a validator key is the ceremony that holds it: its round, configuration, session, commitments and its keyholders' share indices (the sorted order of its players, `x = i + 1`; the committee for DKG keys and R1, A, B, C, E after R2). The validator's `round` (`slashing::Validator`) names the **active** generation, the only one that signs.
 
 Validator entry and status fields:
 
@@ -109,8 +114,8 @@ ACTIVE(g) ── POST /validators/reshare ──> StartResharing ──consensus
 
 | Command | Decided against the committed state | Refused when |
 | --- | --- | --- |
-| `StartResharing {validator, ceremony}` | The key is an activated validator; no other reshare of it is in progress or awaiting activation; the active generation has a public output (an imported key's registered sharing serves as one) | `unknown_validator`, not activated, pending (`409`, one at a time), id taken (`409`); the same id and key again is idempotent |
-| `DealerLog` | As for a DKG | Not signed for this round, dealer not a keyholder of `g`, reveals, closed |
+| `StartResharing {validator, ceremony, membership}` | The key is an activated validator; no other reshare of it is in progress or awaiting activation; the active generation has a public output (an imported key's registered sharing serves as one). With a membership (R2), [its rules](#membership) | `unknown_validator`, not activated, pending (`409`, one at a time), id taken (`409`), stale or invalid membership; the same id, key and membership again is idempotent |
+| `DealerLog` | As for a DKG | Not signed for this round, dealer not one of the round's dealers, reveals, closed |
 | `ShareReady {round, session, participant, signature}` | A signed statement by a keyholder that it derived, verified and persisted its new share; counted only once the reshare is completed | Before completion, wrong session, not a participant, bad signature: ignored |
 | `ActivateGeneration {validator, round}` | The round is a reshare of this key, completed, refreshing the active generation, with all 4 acknowledged | `not_reshare`, `not_completed`, `aborted`, `stale` (it refreshes a generation that is no longer active), `not_ready`; repeating it is idempotent |
 | `AbortResharing {validator, round}` | The round is a reshare of this key that is not, and never was, active | `not_reshare`, `active`; repeating it is idempotent |
@@ -185,7 +190,8 @@ A reshare that cannot complete is aborted explicitly or fails at its deadline. T
 ## Storage
 
 **Replicated state.**
-- A reshare is a ceremony entry (value tag 10): its DKG fields plus the key, the generation it refreshes, that generation's public output and the acknowledged shares.
+- A reshare is a ceremony entry (value tag 11): its DKG fields plus the key, the generation it refreshes, that generation's public output, the acknowledged shares and its dealers. Tag 10, R1's encoding without dealers (they were the previous generation's keyholders), is still read and never written.
+- `StartResharing` keeps R1's encoding (command tag 10) without a membership; with one it is tag 13. An R1 history replays unchanged.
 - An activation rewrites only the validator entry's `round`.
 - Slashing records, the activation and the import state are not written.
 - The startup checks accept a validator whose ceremony is an active, retired or pending generation of its key, and an imported key's import state at its original round. They still refuse inconsistent states.
@@ -194,13 +200,13 @@ A reshare that cannot complete is aborted explicitly or fails at its deadline. T
 - The new share is stored under the new round, written once.
 - The retired round's seed, dealings and share are erased with two writes (`Secrets::erase`), and the same happens for an aborted reshare.
 
-Older binaries cannot read a state with reshares (an unknown value tag): they refuse to start, and nothing is misread. `PROTOCOL_VERSION` is unchanged; mixed-version clusters are unsupported.
+Older binaries cannot read a state with reshares (an unknown value tag): they refuse to start, and nothing is misread. `PROTOCOL_VERSION` is unchanged; mixed-version clusters are unsupported: an R1 binary cannot decode a block with an R2 start.
 
 ## Liveness and Byzantine behavior
 
-**All four keyholders are needed.** A dealing counts only if every player acknowledged it (no reveals), and activation waits for every new share to be acknowledged. With one node offline, a reshare cannot complete: it is aborted or fails at its deadline, and the active generation keeps signing with 3 nodes.
+**Every player and every selected dealer is needed.** A dealing counts only if every player acknowledged it (no reveals), and activation waits for every new share to be acknowledged. With one of them offline, a reshare cannot complete: it is aborted or fails at its deadline, and the active generation keeps signing. For R1 that means all four nodes; for R2, A, B, C (dealers and players) and E.
 
-**Resharing does not restore fault tolerance after losing a node.** Its share cannot be rebuilt without that node; that is what R2 is for.
+**R1 does not restore fault tolerance after losing a node.** It needs that node. R2 does without it, and restores the redundancy of the key's shares, not of consensus ([below](#what-r2-restores-and-what-it-does-not)).
 
 | Behavior | Effect | Test |
 | --- | --- | --- |
@@ -215,17 +221,144 @@ Older binaries cannot read a state with reshares (an unknown value tag): they re
 | Repeated or concurrent starts and activations | Idempotent (same id and key), or refused (another pending reshare, a stale or completed one) | `a_reshared_key_keeps_its_history_and_activates_only_when_ready` |
 | A signing request during the activation | Bound to one generation; refused or parked, retried once | E2E-RSH-3, `e2e_rsh_crash_at_first_new_partial` |
 
-## R2: replacing a keyholder
+## R2: replacing a lost keyholder
 
-R1 keeps old keyholders = new keyholders = the consensus committee. Replacing D with E (A, B, C, D → A, B, C, E) needs the following. The cryptography already supports it (`Info::new(previous, dealers, players)`, dealers taken from the previous output's players), and this format keeps dealers, players, share indices and consensus identities apart.
+D, one of the four nodes, is permanently lost. E replaces it as a keyholder; the consensus committee is deliberately not reconfigured:
 
-1. A ceremony configuration with separate players. Today `CeremonyConfig::check` requires the participants to be the committee. Dealers would be ≥ 3 of {A, B, C, D}, players {A, B, C, E}, and share indices follow the new player set.
-2. Keyholder membership separate from consensus. E must reach the DKG and signing p2p channels, whose peer set is the consensus committee today, possibly without voting.
-3. Coordinators route partial-signature requests to the active generation's players, not to the committee.
-4. Readiness, the startup checks and the acknowledgements per generation's player set.
-5. D's share retired and erased: as with L-15, that D erased it is the operator's statement.
+| | Before | After |
+| --- | --- | --- |
+| Consensus voters (committee, quorum 3 of 4) | A, B, C, D | A, B, C, D, unchanged (D offline) |
+| Keyholders of the active generation (threshold 3 of 4) | A, B, C, D | A, B, C, E |
+| Validator public key | `K` | `K`, the same bytes |
+| Slashing history, activation, imported floors | | unchanged |
 
-A committee change of consensus itself (dynamic membership) is separate again.
+D stays offline throughout. A, B and C deal their shares of the active generation; A, B, C and E receive fresh shares of the new one. E then signs where C's or D's share would: A, B and E produce valid signatures without C.
+
+### What R2 restores and what it does not
+
+- **Restored: the key's redundancy.** Before R2, only A, B and C hold usable shares: losing one more of them loses the key. After R2, four keyholders hold shares of the new generation, and any three sign.
+- **Not restored: consensus availability.** The committee is still A, B, C, D, and finalization needs 3 of its 4 votes. With D offline, **every one of A, B and C must be up**: losing another voter stops finalization, so no duty is authorized and nothing is signed until it is back. E does not vote and cannot replace a voter. Replacing D in consensus needs committee reconfiguration (epochs), which is out of scope.
+- **Not restored: latency.** D is still a leader every fourth view, and each of its turns costs the leader timeout (2 s, L-16) before the next leader proposes. Duties whose authorization falls in such a view wait about 2 s longer, as they did since D was lost.
+
+### Consensus voters and MPC keyholders
+
+The two roles are separate:
+
+- **Voters** are the committee (`--participants`, nodes `0..participants`). They vote, lead, and run signing coordinators (the Web3Signer API).
+- **Keyholders** are the players of a key's active generation. They answer partial-signature requests for duties committed in their own replicated state. A keyholder need not be a voter.
+- **Coordinators** are committee members: a keyholder answers signing requests only from committee members (`dkg::actor`), and a follower runs no coordinator. Whether it signs is decided, as for every keyholder, by the duty's committed authorization and its active generation, never by who asks.
+
+### Follower nodes
+
+E runs the same binary as a **follower**: a node outside the committee, started with `--followers 1` (node `participants + j`). Every node of the network uses the same `--participants` and `--followers`. Verified against the pinned commonware 2026.9.0 sources:
+
+| Need | How (commonware) |
+| --- | --- |
+| Connectivity without joining the committee | p2p `lookup` tracks the committee as **primary** peers and followers as **secondary** peers (`AddressableTrackedPeers`). Secondary peers are accepted when they dial in and receive `Recipients::All` traffic on their connections; nobody dials them. E dials the voters. |
+| Every channel registered | A message on an unregistered channel makes `lookup` drop the connection, so E runs the full engine and registers every channel. |
+| Finalized blocks, verified against A, B, C, D | E's simplex engine uses `ed25519::Scheme::verifier(committee)`: it verifies votes and certificates but cannot sign. `sign` returns nothing without a key, simplex skips voting when `me()` is `None`, and the round-robin leaders are committee members only. Voters broadcast votes and certificates with `Recipients::All`, so E receives them. |
+| Blocks and backfill | Blocks are broadcast to all peers (`Recipients::All`) and cached from primary peers. Resolvers fetch from primary peers only and serve any connected peer, so E backfills from A, B, C. |
+| Applying blocks | Marshal (with the verifier scheme) delivers finalized blocks to E's executor, which applies them to E's own replicated state: the same state machine as the voters'. |
+| Restart | E's journals and archives recover as a voter's do; it resumes above its durable finalized floor and catches up by backfill. |
+| Submitting transactions | E gossips its transactions (`ShareReady`) to the voters' mempools. It never proposes, so it gossips each one again every 4 applied blocks until a block contains it. |
+
+E's HTTP API serves status, readiness (`consensus.voting: false`), ceremonies and validators, but no signing: the Web3Signer and development signing endpoints answer `403`.
+
+**Bootstrap.** Blocks carry no state root, so E builds its state by applying the finalized history from genesis, fetched from the voters. That works while the voters still keep the whole history (`--retain-blocks`, 100 000 blocks by default). Beyond it, E's state and marshal partitions are restored from a stopped healthy node's copy, as for a node behind the retained history ([recovery.md](recovery.md)). E's secret store is its own and is never copied: E has no share of anything before the replacement.
+
+### Membership
+
+`POST /validators/reshare` with an explicit membership:
+
+```json
+{
+  "public_key": "0x<validator key>",
+  "ceremony_id": "validator-eth-r2",
+  "from_round": 0,
+  "dealers": ["0x<A>", "0x<B>", "0x<C>"],
+  "players": ["0x<A>", "0x<B>", "0x<C>", "0x<E>"]
+}
+```
+
+The identities are consensus identities (`GET /identity` of each node). Consensus checks the membership deterministically, from committed state only:
+
+| Rule | Refusal |
+| --- | --- |
+| `from_round` is the key's active generation (a delayed command never applies to a later one) | `stale` (`409`) |
+| Every dealer is a keyholder of that generation | `dealer_not_keyholder` (`400`) |
+| At least that generation's threshold of dealers (3) | `too_few_dealers` (`400`) |
+| Exactly as many players as the committee has members (4), each once; the threshold stays the committee's (3) | `player_count` (`400`); a repeated or malformed identity is refused by the API |
+| The same id again: the same key, generation, dealers and players | otherwise `conflict` (`409`) |
+
+Players need not be committee members, and consensus membership is never derived from them. The cryptography is commonware's, unchanged: `Info::new(previous, dealers = {A, B, C}, players = {A, B, C, E})` requires dealers among the previous players and at least its quorum; the round needs `max(quorum(dealers), quorum(previous)) = 3` valid logs, so all three dealers must deal; the new polynomial has degree `quorum(players) − 1 = 2`; the public key is asserted unchanged. The round's dealers and players enter its transcript, so its dealings, acknowledgements and logs cannot be replayed into another round. D is neither a dealer nor a player: commonware refuses its dealing, and players refuse its messages.
+
+### Local approval of new keyholders
+
+The admin API is unauthenticated (a prototype limitation). Without a further check, one request could hand a key's shares to identities an attacker controls. Each dealer therefore deals to **new** keyholders only if its operator approved that exact recipient set for that key, in a local file (`--approved-reshares <file>`):
+
+```text
+# <validator public key> <identity>,<identity>,<identity>,<identity>
+0xb84e...10ef 0x5925...428c,0x478b...5266,0xedd0...7033,0x1c0c...f880
+```
+
+- The file is read when the node joins the ceremony, before its dealer seed is created: an approval must be in place before the reshare starts (or the node restarted).
+- Without a matching line, the node deals nothing: no seed, no commitment, no private dealing. It still verifies and acknowledges dealings as a player (that reveals nothing of its own share). A malformed file approves nothing.
+- R1 (players are the generation's keyholders) needs no approval.
+- The approval is local configuration, not replicated state: consensus accepts any well-formed membership, and nodes may disagree about approvals without diverging. An unapproved reshare stays `in_progress` without a single dealer log and is aborted (or fails at its deadline).
+
+A reshare completes only with at least the threshold of dealers (3), so a recipient set that fewer than three operators approved never receives a usable sharing. Each approving dealer does give each recipient one evaluation of its dealing polynomial, so approve only identities you operate. This is a prototype safeguard, not an authorization system: there are no operator signatures, no governance and no authenticated admin API.
+
+### Lifecycle and activation
+
+The R1 lifecycle, unchanged: `ACTIVE(g)` → `StartResharing` (with membership) → dealing by A, B, C to A, B, C, E → completed → each new keyholder derives, verifies and persists its share, then submits `ShareReady` → `READY` once all four acknowledged → `ActivateGeneration` → `ACTIVE(g + 1)`.
+
+- E takes part as a player only (it holds no share of `g`). It receives the dealings over the DKG channel, verifies them, persists them before acknowledging, derives and persists its share, then gossips its acknowledgement.
+- D's acknowledgement does not count: it is not a player of `g + 1`.
+- Activation requires the completed reshare, all four new keyholders' acknowledgements and the committed command; an aborted or stale reshare never activates, and a generation is never partly activated.
+- After activation, A, B, C and E serve `g + 1`. Requests naming `g` are refused for good (`stale_generation`), in-flight ones retried once, as in R1. A, B and C erase their shares of `g`. D's copy of its old share stays on D (see the limitations).
+
+### Signing routing
+
+The coordinator already sends partial-signature requests to the active generation's players (`ceremony.config.participants` of the active generation) and verifies each partial against that generation's verification shares: after the replacement it asks A, B, C and E, with E's index in the new generation. A committee member that is not a keyholder of the active generation (D, were it back) would coordinate with three of the four keyholders' partials; no test exercises it, since the coordinators here are A, B and C. The rest is unchanged: the validator, the signing root, the committed authorization, the active generation and slashing protection are checked by every keyholder against its own state; E signs only duties its own executor applied, and parks requests it has not applied yet (by about 0.1 s, its follower lag).
+
+### Persistence and recovery
+
+- A node needs a share of a generation only if it is one of its players. E has none of `g`; D has none of `g + 1`; neither is reported as a missing share.
+- The R1 order holds for E: received dealings persisted before acknowledged, the share persisted before `ShareReady`, the activation applied atomically, the keyholder told after the block is durable.
+- E restarted before receiving its share, after persisting it, after its acknowledgement, and while applying the activation: in each case it resumes, the replacement completes and activates, and E signs (`tests/e2e/replace.rs`, `r2_e2e_restart_e_*`). E restarted after the activation loads its share and signs (R2-E2E-3).
+
+### Replacement procedure
+
+1. All nodes run with `--participants 4 --followers 1`, voters with `--approved-reshares <file>` (a rolling restart if they were not: each restart pauses finalization while D is offline).
+2. Start E (node 4). Wait until `GET /ready` on E is `200` (it applied the finalized history) and `GET /validators` on E lists the key.
+3. On A, B and C, append the approval line for the key and A, B, C, E (identities from `GET /identity`).
+4. `POST /validators/reshare` with the membership above, on a voter. Wait until `GET /validators/reshare/<id>` is `ready` on A, B, C and E.
+5. `POST /validators/reshare/activate` on a voter. Wait until `GET /validators` on every keyholder shows the new `ceremony_id`.
+6. Keep D off. Never restart it with its old data: its old share is useless only as long as the old shares of A, B and C are really erased.
+
+### Security properties and limitations
+
+- The public key and the slashing history are unchanged; no new deposit.
+- The new generation's shares are fresh: D's old share does not combine with them, and a partial signature from any old share fails against the new verification shares.
+- **Resharing does not revoke copied shares.** D's old share (lost or stolen with D), and any backup of an old share of A, B or C, remain shares of `g`. Three shares of `g` still sign as the key. R2 protects against an attacker who holds D's share only if the old shares of A, B and C are erased and no backups of them exist (erasure is operational, L-15).
+- **Consensus: no fault tolerance left while D is offline.** See [above](#what-r2-restores-and-what-it-does-not).
+- **Unauthenticated admin API.** Anyone with access to a node's loopback API can start or abort reshares; the local approval only limits who receives shares.
+- **The approval is a prototype safeguard**, local and unauthenticated, not an authorization system (no operator signatures or governance).
+- **Follower bootstrap needs the retained history** or a restored state copy, whose correctness E cannot check (no state root).
+- L-1, L-15, L-16, L-17 and every other documented limitation are unchanged ([audit.md](audit.md)).
+
+### Tests
+
+| What | Tests |
+| --- | --- |
+| A follower joins without voting, applies the same state, restarts and catches up, submits a transaction (its first gossip dropped), cannot vote, propose or count toward a quorum | `tests/e2e/follower.rs`, FOL-1 to FOL-5 |
+| R2-CRYPTO-1 to 5 and 8 over 8 seeds: dealers A, B, C, players A, B, C, E; all three dealers required; D neither a dealer nor a player; the key byte for byte unchanged; any 3 new shares sign, 2 cannot, A, B, E without C; old and new partials never combine | `dkg::ceremony::tests::reshare::replace::replacing_a_lost_keyholder_keeps_the_key` |
+| Membership rules: dealers outside the generation, too few dealers, wrong player counts, a stale generation, idempotent and conflicting starts; D's log and an R1 log refused; the codec, R1's encoding still read | `replace::replacement_membership_rules`, `types::tests::reshare_start_encodings` |
+| R2-CRYPTO-6: a dealing of another share, a value meant for another player, a DKG dealing: refused by E | `replace::invalid_replacement_dealings_are_refused` |
+| R2-CRYPTO-7: no approval, no dealing (the file's rules) | `dkg::approval::tests::*`, R2-E2E-4 |
+| The lifecycle through consensus: D's acknowledgement ignored, E's required, the same history and refusals after activation, a stale start, a restart | `storage::tests::validator::reshare::a_replaced_keyholder_holds_the_new_generation_through_consensus` |
+| Real processes: R2-E2E-1 (loss of D, replacement, the same key), R2-E2E-2 (A, B, E sign with C's partials off; A and B alone cannot), R2-E2E-3 (E restarts), R2-E2E-4 (invalid, stale, unapproved, replayed), R2-E2E-5 (aborted replacement, the old generation with A, B, C), R2-E2E-6 (slashing protection of a DKG key and an imported key's floors), E restarted at four points | `tests/e2e/replace.rs` |
+| A live Lighthouse validator: D lost, E joins, the key reshared to A, B, C, E, E's share signing with C's switched off | [ethereum-devnet.md](ethereum-devnet.md#replacing-a-lost-keyholder-run-g) |
 
 ## Performance
 
@@ -250,6 +383,24 @@ End-to-end latency through the proxy was unchanged: p50 / p95 279 / 524 ms befor
 282 / 520 ms after (n ≈ 1 300 each). With one keyholder offline after the reshare, signing
 continued with 3 keyholders. The only slow requests were the leader-timeout delays of L-16 right
 after the node stopped, unrelated to resharing.
+
+### R2 on the devnet (run G)
+
+Measured with a live Lighthouse validator ([ethereum-devnet.md](ethereum-devnet.md#replacing-a-lost-keyholder-run-g)), 4 voters and the follower on one host, 4 s slots:
+
+| | |
+| --- | --- |
+| E catching up from genesis (1 475 blocks) | 15.6 s |
+| Ceremony: start to every new share acknowledged | 1.7 s |
+| Ready to activation decided | 0.2 s |
+| Activation to every keyholder switched | under 0.1 s |
+| Consensus transactions | 9: start, 3 dealer logs, 4 acknowledgements, activation |
+| End-to-end latency p50 / p95 | 220 / 392 ms with A, B, C, D; 284 / 402 ms with D lost; 233 / 513 ms after the replacement; 268 / 579 ms with A, B, E (C's partials off) |
+| Lighthouse requests failed or retried | 0 |
+| Missed attestations or proposals | none (epochs 11 to 22; 16 of 16 proposals canonical) |
+| With C's partials off | all 17 signatures combined A's, B's and E's shares |
+
+E's partial adds no round: a keyholder answers once it applied the duty's block, and E applies it about 0.1 s after the voters (E2E logs). D's leader turns still cost the leader timeout when a duty falls in one (none did in run G).
 
 ## Tests
 

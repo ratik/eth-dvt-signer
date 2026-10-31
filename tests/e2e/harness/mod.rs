@@ -110,6 +110,8 @@ pub struct TestNetwork {
     http_base: u16,
     /// Extra command-line arguments of every node.
     args: Vec<String>,
+    /// The last `followers` nodes follow consensus without voting.
+    followers: usize,
     nodes: Mutex<Vec<Node>>,
     _slot: Slot,
 }
@@ -219,6 +221,21 @@ impl TestNetwork {
         node_args: impl Fn(usize) -> Vec<String>,
         env: impl Fn(usize) -> Vec<(String, String)>,
     ) -> Self {
+        Self::start_with_followers(n, 0, args, node_args, env, |_| true)
+    }
+
+    /// `voters` committee members and `followers` non-voting nodes after them (node `voters + j`).
+    /// Only the nodes for which `started(i)` holds are started now (the others with
+    /// [TestNetwork::start_node]).
+    pub fn start_with_followers(
+        voters: usize,
+        followers: usize,
+        args: Vec<String>,
+        node_args: impl Fn(usize) -> Vec<String>,
+        env: impl Fn(usize) -> Vec<(String, String)>,
+        started: impl Fn(usize) -> bool,
+    ) -> Self {
+        let n = voters + followers;
         let slot = Slot::acquire();
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -238,6 +255,7 @@ impl TestNetwork {
             p2p_base,
             http_base,
             args,
+            followers,
             _slot: slot,
             nodes: Mutex::new(
                 (0..n)
@@ -250,10 +268,16 @@ impl TestNetwork {
                     .collect(),
             ),
         };
-        for id in 0..n {
+        for id in (0..n).filter(|id| started(*id)) {
             network.spawn(id);
         }
         network
+    }
+
+    /// Start node `id` (never started, or stopped) on its storage; returns once it serves HTTP.
+    pub fn start_node(&self, id: usize) {
+        self.spawn(id);
+        self.wait_until(&format!("node {id} to serve HTTP"), || self.serves(id));
     }
 
     fn len(&self) -> usize {
@@ -262,6 +286,7 @@ impl TestNetwork {
 
     fn spawn(&self, id: usize) {
         let mut nodes = self.nodes.lock().unwrap();
+        let voters = nodes.len() - self.followers;
         let log = OpenOptions::new()
             .create(true)
             .append(true)
@@ -272,7 +297,9 @@ impl TestNetwork {
                 "--id",
                 &id.to_string(),
                 "--participants",
-                &nodes.len().to_string(),
+                &voters.to_string(),
+                "--followers",
+                &self.followers.to_string(),
                 "--p2p-port",
                 &self.p2p_base.to_string(),
                 "--http-port",
@@ -569,6 +596,11 @@ impl TestNetwork {
 
     pub fn all(&self) -> Vec<usize> {
         (0..self.len()).collect()
+    }
+
+    /// The consensus committee's nodes (every node, unless the network has followers).
+    pub fn voters(&self) -> Vec<usize> {
+        (0..self.len() - self.followers).collect()
     }
 
     pub fn start_dkg(&self, via: usize, name: &str) -> Value {
