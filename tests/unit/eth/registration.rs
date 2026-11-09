@@ -71,7 +71,7 @@ fn the_fee_recipient_and_the_gas_limit_must_be_the_policys() {
     let policy = policy();
     let terms = |fee_recipient, gas_limit| Terms {
         fee_recipient: address(fee_recipient),
-        gas_limit,
+        gas_limit: Some(gas_limit),
     };
     assert_eq!(policy.allows(&terms(1, 30_000_000)), Ok(()));
     assert_eq!(policy.allows(&terms(2, 60_000_000)), Ok(()));
@@ -96,6 +96,31 @@ fn the_fee_recipient_and_the_gas_limit_must_be_the_policys() {
         closed.allows(&terms(1, 1)),
         Err(Refusal::FeeRecipient { .. })
     ));
+    // An envelope's terms name no gas limit: only the fee recipient is decided on.
+    let fee_only = |fee_recipient| Terms {
+        fee_recipient: address(fee_recipient),
+        gas_limit: None,
+    };
+    assert_eq!(policy.allows(&fee_only(1)), Ok(()));
+    assert_eq!(
+        policy.allows(&fee_only(3)),
+        Err(Refusal::FeeRecipient {
+            fee_recipient: address(3)
+        })
+    );
+}
+
+#[test]
+fn terms_encoding_round_trips() {
+    for gas_limit in [Some(30_000_000), Some(0), None] {
+        let terms = Terms {
+            fee_recipient: address(7),
+            gas_limit,
+        };
+        let encoded = terms.encode();
+        assert_eq!(encoded.len(), terms.encode_size());
+        assert_eq!(Terms::decode(encoded).unwrap(), terms);
+    }
 }
 
 #[test]

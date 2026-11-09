@@ -30,8 +30,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const VALIDATOR: &str = "validator-registration";
 
-const A: &str = "0x1111111111111111111111111111111111111111";
-const B: &str = "0x2222222222222222222222222222222222222222";
+pub(crate) const A: &str = "0x1111111111111111111111111111111111111111";
+pub(crate) const B: &str = "0x2222222222222222222222222222222222222222";
 
 fn now() -> u64 {
     SystemTime::now()
@@ -101,7 +101,7 @@ fn refused(network: &TestNetwork, via: usize, key: &str, body: &Value, status: u
     assert!(answer.get("signature").is_none(), "{answer}");
 }
 
-fn policy(fee_recipients: &[&str]) -> Value {
+pub(crate) fn policy(fee_recipients: &[&str]) -> Value {
     json!({
         "fee_recipients": fee_recipients,
         "gas_limit_min": 30_000_000u64,
@@ -112,7 +112,7 @@ fn policy(fee_recipients: &[&str]) -> Value {
 }
 
 /// Set `policy` with two approvers' authorization and wait until `nodes` apply it.
-fn set_policy(network: &TestNetwork, via: usize, policy: Value, nodes: &[usize]) {
+pub(crate) fn set_policy(network: &TestNetwork, via: usize, policy: Value, nodes: &[usize]) {
     let (status, answer) = network.approved(via, "set-registration-policy", policy);
     assert_eq!(status, 202, "{answer}");
     let digest = answer["digest"].as_str().unwrap().to_string();
@@ -147,7 +147,7 @@ fn start(inject: Option<&std::path::Path>) -> (TestNetwork, String) {
 }
 
 /// Each B block's refusal by an honest voter, for `why`.
-fn refused_by_voters(
+pub(crate) fn refused_by_voters(
     network: &TestNetwork,
     inject: &std::path::Path,
     commands: Vec<Command>,
@@ -291,7 +291,7 @@ fn reg_1_registrations_follow_the_approved_policy() {
         &network,
         &inject,
         vec![bare(&registration(&key, B, 30_000_000, t))],
-        "refusing a block with a builder registration the policy in force refuses",
+        "refusing a block with a duty the registration policy in force refuses",
     );
     refused_by_voters(
         &network,

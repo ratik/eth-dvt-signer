@@ -295,11 +295,14 @@ consensus and atomic `Metadata` writes. Guarantees from this application:
   duties of the Web3Signer API ([docs/ethereum-signing.md](docs/ethereum-signing.md)). They are
   checked against consensus-spec-tests vectors, the roots Web3Signer publishes, and an independent
   Python SSZ implementation.
-- **Not covered:** full Phase 0 and Altair blocks, `BUILDER_REQUEST_AUTH`, Gloas types. Voluntary
-  exits and deposits are signed only with the approvers' authorization (P0.2), every duty's
-  `fork_info` must follow the node's pinned fork schedule (P0.3), and builder registrations are
+- **Not covered:** full Phase 0 and Altair blocks, `BUILDER_REQUEST_AUTH`, builder bids, Heze.
+  Voluntary exits and deposits are signed only with the approvers' authorization (P0.2), every
+  duty's `fork_info` must follow the node's pinned fork schedule (P0.3), builder registrations are
   signed only under the approvers' registration policy (fee recipients, gas limit range, timestamp
-  window; [docs/ethereum-signing.md](docs/ethereum-signing.md#builder-registrations)). `POST /sign` (`dev-api`) signs
+  window; [docs/ethereum-signing.md](docs/ethereum-signing.md#builder-registrations)), and Gloas's
+  PTC votes, envelopes of self-built payloads and proposer preferences under its rules (one vote
+  and one envelope per slot, an envelope only for the validator's own block, preferences and
+  envelopes under the policy; [docs/ethereum-signing.md](docs/ethereum-signing.md#gloas)). `POST /sign` (`dev-api`) signs
   whatever root it is given, with no slashing protection: its nonce is not a slot or an epoch.
 
 ## Signing
@@ -685,10 +688,12 @@ Signing an existing authorization costs one p2p round trip and four pairings.
   signs a conflicting duty (a double proposal is reproduced). It cannot be detected without state
   outside the nodes. An anchor design is proposed, not implemented
   ([docs/slashing-protection.md](docs/slashing-protection.md)).
-- Ethereum: mainnet preset only. No Phase 0 and Altair blocks, `BUILDER_REQUEST_AUTH` or Gloas
-  types. Builder registrations only under the approved registration policy; it does not cover the
-  fee recipient of a block the beacon node builds itself, and within the policy any API client can
-  choose among its fee recipients (audit L-27). Deposits only on a node started with `--enable-deposit-signing`, one deposit message per
+- Ethereum: mainnet preset only. No Phase 0 and Altair blocks, `BUILDER_REQUEST_AUTH`, builder
+  bids or Heze. Builder registrations only under the approved registration policy; before Gloas it
+  does not cover the fee recipient of a block the beacon node builds itself, and within the policy
+  any API client can choose among its fee recipients (audit L-27). Gloas is signed on a schedule
+  that has it (a devnet's today; a release adds mainnet's epoch once announced); a refused or late
+  envelope or PTC vote is lost, as Lighthouse does not retry them (audit L-28). Deposits only on a node started with `--enable-deposit-signing`, one deposit message per
   key; exits and deposits only with the approvers' authorization. Only the fork versions of the
   pinned schedule are signed (mainnet, Hoodi, or a devnet's `--eth-fork-schedule`), in the fork
   forms Lighthouse sends. EIP-3076 import is accepted for imported keys only, before their activation, and

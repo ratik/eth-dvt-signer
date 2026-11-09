@@ -1,0 +1,56 @@
+{
+ "source": "consensus-specs v1.7.0-beta.4 mainnet.tar.gz (sha256 67762986572372a08d3b182535aa760433c86e174e14e0bbd756f350dd19398c), tests/mainnet/gloas/ssz_static",
+ "type": "PayloadAttestationData",
+ "cases": [
+  {
+   "case": "ssz_random/case_0",
+   "value": {
+    "beacon_block_root": "0xf331c5d5b48f4d644077ce99eb7fc8c0f8112900343af2c5eca9891bb3773ccb",
+    "slot": "14925080484703391178",
+    "payload_present": true,
+    "blob_data_available": false
+   },
+   "root": "0xc61864e2d30219f219bf7353024ec37f31b46ea4f5c7468bc1fd886a4c6ab046"
+  },
+  {
+   "case": "ssz_random/case_1",
+   "value": {
+    "beacon_block_root": "0x964978041e0a6f45187e6fb9ba0e5bdd8d0a46ee2e6ad4c9f0bdef7dfd8f3537",
+    "slot": "15903536710468736461",
+    "payload_present": true,
+    "blob_data_available": false
+   },
+   "root": "0xfccfa1cb182e686b324da8992e2ec7d2d87dbfbddbddb5b7b7d6f1bf681dfff4"
+  },
+  {
+   "case": "ssz_random/case_2",
+   "value": {
+    "beacon_block_root": "0x0beef6c85c7f6e714af189816b99eef3fad86f8fb10b4ff5fed6f8a0ee9a4391",
+    "slot": "6715636891179374112",
+    "payload_present": true,
+    "blob_data_available": false
+   },
+   "root": "0xfbdb1ddc30a0fcb1dfca43308391d5a9a7aec47cc04cfcbf3d954d3d622b491e"
+  },
+  {
+   "case": "ssz_random/case_3",
+   "value": {
+    "beacon_block_root": "0x4bba5660b3dbaaf91ca778e512ee2ada745b93e3581223ad0373f5421f47fb97",
+    "slot": "2668281717004321476",
+    "payload_present": true,
+    "blob_data_available": false
+   },
+   "root": "0xf381b3346ee81d32e23c08e127fabb27e629a21fe497b1a72e1bc92f1aec0789"
+  },
+  {
+   "case": "ssz_random/case_4",
+   "value": {
+    "beacon_block_root": "0x6e4f46ca4564c1742dc9b39474995cfedf49c8ef8626d8d0bd9c5f3d71eadc8e",
+    "slot": "1177888537381006997",
+    "payload_present": true,
+    "blob_data_available": false
+   },
+   "root": "0xf3e11c377f8cd92e0f0b7545d705369742568f3858b55d4606287f1b4ca419dc"
+  }
+ ]
+}

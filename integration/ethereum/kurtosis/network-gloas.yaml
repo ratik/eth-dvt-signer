@@ -1,0 +1,37 @@
+# `it.py run-gloas`: the devnet of network.yaml with Gloas (EIP-7732, Glamsterdam) at epoch 16,
+# a few epochs after the MPC validator is active (its deposit made it active at epoch 11 in
+# earlier runs), so it signs on both sides of the fork (docs/ethereum-devnet.md, Gloas).
+#
+# - ethereum-package is pinned to a main commit (it.py GLOAS_PACKAGE): 6.1.0's genesis generator
+#   predates the Amsterdam EIPs that Lighthouse v8.3 and geth v1.17.10 implement.
+# - Lighthouse v8.3.3 (remote-signing-api v1.4.0's Gloas types from v8.3.0 on); geth v1.17.10
+#   (Amsterdam). The execution layer's Amsterdam time follows from the Gloas epoch.
+# - `gas_limit: 0` and `genesis_gaslimit`: with Gloas scheduled, main otherwise sets both to 200M
+#   and gives the genesis validators' client `--builder-proposals`. Its default gas limit
+#   schedule (200M from the Gloas epoch) stays: the network's, as Sepolia has one.
+# - No builder: every block is self-built, so the validator's proposals need its envelopes.
+participants:
+  - el_type: geth
+    el_image: ethereum/client-go:v1.17.10
+    cl_type: lighthouse
+    cl_image: sigp/lighthouse:v8.3.3
+    vc_type: lighthouse
+    vc_image: sigp/lighthouse:v8.3.3
+    # Fulu (PeerDAS): the only beacon node must custody every data column.
+    supernode: true
+    keymanager_enabled: true
+    count: 1
+network_params:
+  preset: mainnet
+  seconds_per_slot: 4
+  slot_duration_ms: 4000
+  num_validator_keys_per_node: 32
+  genesis_delay: 30
+  genesis_gaslimit: 60000000
+  gas_limit: 0
+  deneb_fork_epoch: 0
+  electra_fork_epoch: 0
+  fulu_fork_epoch: 0
+  gloas_fork_epoch: 16
+additional_services: []
+persistent: false

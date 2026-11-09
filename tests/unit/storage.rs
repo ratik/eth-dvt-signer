@@ -331,7 +331,7 @@ mod validator {
             signing_root: request.signing_root(),
             kind: request.duty.kind(),
             period: request.duty.protection().period(),
-            terms: request.duty.registration().map(Into::into),
+            terms: request.duty.terms(),
         }
     }
 
@@ -836,7 +836,7 @@ mod validator {
                 applied.duties[0].terms,
                 Some(Terms {
                     fee_recipient: [1; 20],
-                    gas_limit: 30_000_000
+                    gas_limit: Some(30_000_000)
                 })
             );
             assert_eq!(store.registration_policy(), Some(&policy(&[1])));
@@ -955,6 +955,193 @@ mod validator {
                     .map(|_| ()),
                 Err(Error::Slashing(_))
             ));
+        });
+    }
+
+    /// Gloas envelopes and proposer preferences follow the registration policy in force at
+    /// their transaction, as registrations do; an envelope needs the validator's own block; the
+    /// terms a keyholder checks survive a restart.
+    #[test]
+    fn gloas_duties_follow_the_policy_in_force() {
+        use crate::eth::{
+            duty::DutyKind,
+            gloas::{BUILDER_INDEX_SELF_BUILD, EnvelopeSummary, ProposerPreferences},
+            registration::Policy,
+        };
+        use tree_hash::TreeHash as _;
+        deterministic::Runner::default().start(|mut context| async move {
+            let signers = signers();
+            let committee = committee(&signers);
+            let admin = super::administration::administration(&committee);
+            let mut store = Store::init(context.child("first"), "node", committee.clone())
+                .await
+                .unwrap();
+            store.administer(Some(admin.clone()));
+            let key = complete_validator(&mut context, &mut store, &signers).await;
+            let block = Sha256::hash(&[b"block"]);
+            let policy = |fee_recipients: &[u8]| {
+                Policy::new(
+                    fee_recipients.iter().map(|byte| [*byte; 20]).collect(),
+                    30_000_000,
+                    60_000_000,
+                    30,
+                    3600,
+                )
+                .unwrap()
+            };
+            let set = |nonce, policy: Policy| {
+                super::administration::approved(
+                    &admin,
+                    nonce,
+                    Command::SetRegistrationPolicy(Box::new(policy)),
+                    &[100, 101],
+                )
+            };
+            let proposal = propose(key, 64, 1);
+            let Duty::BlockProposal(header) = &proposal.duty else {
+                unreachable!()
+            };
+            let envelope = |fee: u8, block_root: [u8; 32]| {
+                duty(
+                    key,
+                    Duty::ExecutionPayloadEnvelope(Box::new(EnvelopeSummary {
+                        parent_hash: [1; 32],
+                        fee_recipient: [fee; 20],
+                        state_root: [2; 32],
+                        receipts_root: [3; 32],
+                        logs_bloom_root: [4; 32],
+                        prev_randao: [5; 32],
+                        block_number: 1,
+                        gas_limit: 60_000_000,
+                        gas_used: 0,
+                        timestamp: 1,
+                        extra_data_root: [6; 32],
+                        base_fee_per_gas: [7; 32],
+                        block_hash: [8; 32],
+                        transactions_root: [9; 32],
+                        withdrawals_root: [10; 32],
+                        blob_gas_used: 0,
+                        excess_blob_gas: 0,
+                        block_access_list_root: [11; 32],
+                        slot_number: 64,
+                        execution_requests_root: [12; 32],
+                        builder_index: BUILDER_INDEX_SELF_BUILD,
+                        beacon_block_root: block_root,
+                        parent_beacon_block_root: [13; 32],
+                    })),
+                )
+            };
+            let preferences = |fee: u8, gas: u64| {
+                duty(
+                    key,
+                    Duty::ProposerPreferences(ProposerPreferences {
+                        dependent_root: [fee; 32],
+                        proposal_slot: 96,
+                        validator_index: 5,
+                        fee_recipient: [fee; 20],
+                        target_gas_limit: gas,
+                    }),
+                )
+            };
+            let refused = |request: &DutyRequest, refusal| {
+                Effect::Duty(Decision::Refused(refusal), request.signing_root())
+            };
+            let accepted =
+                |request: &DutyRequest| Effect::Duty(Decision::Accepted, request.signing_root());
+            let own = header.tree_hash_root().0;
+            let (envelope_a, envelope_b) = (envelope(1, own), envelope(2, own));
+            let foreign = envelope(1, [0xee; 32]);
+            let (preferences_a, preferences_high) =
+                (preferences(1, 60_000_000), preferences(1, 90_000_000));
+
+            // No policy: the envelope is refused. A policy of A: B's envelope refused, A's
+            // accepted only for the own block; preferences within the range only.
+            let applied = store
+                .apply_block(
+                    3,
+                    &block,
+                    &[
+                        activate(key, 9),
+                        submit(&proposal),
+                        submit(&envelope_a),
+                        set(1, policy(&[1])),
+                        submit(&envelope_b),
+                        submit(&foreign),
+                        submit(&envelope_a),
+                        submit(&preferences_high),
+                        submit(&preferences_a),
+                    ],
+                    &mut context,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                applied.effects[1..],
+                [
+                    accepted(&proposal),
+                    refused(&envelope_a, Refusal::RegistrationPolicy),
+                    Effect::RegistrationPolicy(policy(&[1]).digest()),
+                    refused(&envelope_b, Refusal::RegistrationPolicy),
+                    refused(&foreign, Refusal::EnvelopeWithoutOwnBlock { slot: 64 }),
+                    accepted(&envelope_a),
+                    refused(&preferences_high, Refusal::RegistrationPolicy),
+                    accepted(&preferences_a),
+                ]
+            );
+            assert_eq!(
+                applied.duties,
+                vec![
+                    authorized(key, &proposal),
+                    authorized(key, &envelope_a),
+                    authorized(key, &preferences_a)
+                ]
+            );
+            // After a change to B's policy, the retry of A's envelope is refused.
+            let applied = store
+                .apply_block(
+                    4,
+                    &block,
+                    &[set(2, policy(&[2])), submit(&envelope_a)],
+                    &mut context,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                applied.effects[1..],
+                [refused(&envelope_a, Refusal::RegistrationPolicy)]
+            );
+            let protection = store.protection().clone();
+            drop(store);
+
+            // Restarted: the terms a keyholder checks are back.
+            let store = Store::init(context.child("second"), "node", committee)
+                .await
+                .unwrap();
+            assert_eq!(store.protection(), &protection);
+            let gloas: Vec<_> = store
+                .protection()
+                .authorized_duties()
+                .into_iter()
+                .filter(|duty| duty.kind.is_gloas())
+                .collect();
+            assert_eq!(
+                gloas,
+                vec![
+                    authorized(key, &envelope_a),
+                    authorized(key, &preferences_a)
+                ]
+            );
+            assert!(gloas.iter().all(|duty| duty.terms.is_some()));
+            assert_eq!(
+                gloas
+                    .iter()
+                    .map(|duty| duty.kind)
+                    .collect::<Vec<DutyKind>>(),
+                [
+                    DutyKind::ExecutionPayloadEnvelope,
+                    DutyKind::ProposerPreferences
+                ]
+            );
         });
     }
 

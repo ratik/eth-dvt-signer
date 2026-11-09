@@ -743,6 +743,21 @@ where
             executor_mailbox.clone(),
             dkg_sender.clone(),
         );
+        // From Gloas on, a self-built block's payload is revealed only with an envelope the
+        // registration policy allows (`eth::registration`): say so where it would be missed.
+        if let Some(gloas) = config
+            .horizon
+            .network()
+            .and_then(|network| network.gloas_epoch())
+            && registration_policy.is_none()
+        {
+            warn!(
+                gloas,
+                "Gloas is scheduled and no registration policy is set: no proposer preferences \
+                 or payload envelope is signed, so self-built Gloas blocks lose their payloads \
+                 (mpc-admin draft set-registration-policy)"
+            );
+        }
         let dkg_handle = dkg::actor::Actor::new(
             context.child("dkg"),
             signer,

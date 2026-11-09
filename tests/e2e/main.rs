@@ -16,6 +16,7 @@ mod exits;
 mod failures;
 mod follower;
 mod forks;
+mod gloas;
 mod harness;
 mod horizon;
 mod import;

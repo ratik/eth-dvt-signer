@@ -107,7 +107,7 @@ fn unsupported_requests_are_refused() {
             parse(&value)
         );
     };
-    for version in ["PHASE0", "ALTAIR", "GLOAS", "HEZE", "FUTURE"] {
+    for version in ["PHASE0", "ALTAIR", "HEZE", "FUTURE"] {
         let mut value = fixture("block_v2_electra.json");
         value["beacon_block"]["version"] = json!(version);
         unsupported(value);
@@ -120,8 +120,7 @@ fn unsupported_requests_are_refused() {
         "BLOCK",
         "BUILDER_REQUEST_AUTH",
         "SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF_V9",
-        "EXECUTION_PAYLOAD_ENVELOPE",
-        "PAYLOAD_ATTESTATION_MESSAGE",
+        "EXECUTION_PAYLOAD_BID",
     ] {
         let mut value = fixture("randao_reveal.json");
         value["type"] = json!(kind);
@@ -130,7 +129,7 @@ fn unsupported_requests_are_refused() {
     let mut value = fixture("aggregate_and_proof_phase0.json");
     let data = value["aggregate_and_proof"].take();
     value["type"] = json!("AGGREGATE_AND_PROOF_V2");
-    value["aggregate_and_proof"] = json!({ "version": "GLOAS", "data": data });
+    value["aggregate_and_proof"] = json!({ "version": "HEZE", "data": data });
     unsupported(value);
 }
 
@@ -376,4 +375,119 @@ fn registrations_parse_without_fork_info() {
         .unwrap()
         .remove("timestamp");
     assert!(matches!(parse(&missing), Err(ParseError::Invalid(_))));
+}
+
+fn gloas_fixture(name: &str) -> Value {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/gloas")
+        .join(name);
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+/// The Gloas request types of remote-signing-api v1.4.0, on Web3Signer's examples: each object
+/// under `{"version": "GLOAS", "data": ...}`; an envelope reaches consensus as its summary, with
+/// the full envelope's root.
+#[test]
+fn gloas_requests_parse() {
+    let ptc = parse(&gloas_fixture(
+        "web3signer_payload_attestation_message.json",
+    ))
+    .unwrap();
+    let Duty::PayloadAttestation(data) = &ptc.duty else {
+        panic!("a PTC vote: {:?}", ptc.duty)
+    };
+    assert_eq!((data.slot, data.payload_present), (1, true));
+    assert_eq!(ptc.duty.kind(), DutyKind::PayloadAttestation);
+
+    let preferences = parse(&gloas_fixture("web3signer_proposer_preferences.json")).unwrap();
+    let Duty::ProposerPreferences(data) = &preferences.duty else {
+        panic!("preferences: {:?}", preferences.duty)
+    };
+    assert_eq!(
+        (data.proposal_slot, data.target_gas_limit),
+        (32, 60_000_000)
+    );
+    // The domain epoch is the proposal's.
+    assert_eq!(preferences.duty.epoch(), 1);
+
+    let value = gloas_fixture("web3signer_execution_payload_envelope.json");
+    let envelope = parse(&value).unwrap();
+    let Duty::ExecutionPayloadEnvelope(summary) = &envelope.duty else {
+        panic!("an envelope: {:?}", envelope.duty)
+    };
+    let full: eth_mpc_signer::eth::gloas::ExecutionPayloadEnvelope =
+        serde_json::from_value(value["execution_payload_envelope"]["data"].clone()).unwrap();
+    assert_eq!(**summary, full.summary().unwrap());
+    assert_eq!(summary.slot_number, 1);
+    assert_eq!(
+        format!("0x{}", hex::encode(summary.fee_recipient)),
+        "0x6fdfab408c56b6105a76eff5c0435d09fc6ed7a9"
+    );
+    // Web3Signer's example is a builder's payload: parsed, but never a validator's to sign.
+    assert!(!summary.self_built());
+    assert!(envelope.duty.validate().is_err());
+
+    // Blocks of Gloas come as their header, as before.
+    let mut block = fixture("block_v2_electra.json");
+    block["beacon_block"]["version"] = json!("GLOAS");
+    assert_eq!(parse(&block).unwrap().duty.kind(), DutyKind::BlockProposal);
+    // An AGGREGATE_AND_PROOF_V2 of Gloas: Electra's shape, the Gloas form.
+    let mut aggregate = fixture("aggregate_and_proof_electra.json");
+    let data = aggregate["aggregate_and_proof"].take();
+    aggregate["type"] = json!("AGGREGATE_AND_PROOF_V2");
+    aggregate["aggregate_and_proof"] = json!({ "version": "GLOAS", "data": data });
+    assert!(matches!(
+        parse(&aggregate).unwrap().duty,
+        Duty::AggregateAndProof(AggregateAndProof::Gloas(_))
+    ));
+}
+
+/// A Gloas object must be exactly `{"version": "GLOAS", "data": ...}`, its data exactly the
+/// specification's.
+#[test]
+fn malformed_gloas_requests_are_refused() {
+    let base = gloas_fixture("web3signer_payload_attestation_message.json");
+    let with = |change: &dyn Fn(&mut Value)| {
+        let mut value = base.clone();
+        change(&mut value);
+        parse(&value)
+    };
+    assert!(matches!(
+        with(&|value| value["payload_attestation_message"]["version"] = json!("FULU")),
+        Err(ParseError::Unsupported(_))
+    ));
+    for change in [
+        &(|value: &mut Value| {
+            value["payload_attestation_message"]
+                .as_object_mut()
+                .unwrap()
+                .remove("version");
+        }) as &dyn Fn(&mut Value),
+        &|value| value["payload_attestation_message"]["extra"] = json!(1),
+        &|value| value["payload_attestation_message"]["data"]["extra"] = json!(1),
+        &|value| value["payload_attestation_message"]["data"]["slot"] = json!("x"),
+        &|value| {
+            value["payload_attestation_message"]["data"]
+                .as_object_mut()
+                .unwrap()
+                .remove("blob_data_available");
+        },
+        &|value| {
+            value.as_object_mut().unwrap().remove("fork_info");
+        },
+    ] {
+        assert!(
+            matches!(with(change), Err(ParseError::Invalid(_))),
+            "{:?}",
+            with(change)
+        );
+    }
+    // An envelope whose extra data is beyond `ByteList[32]`, or whose base fee is no uint256.
+    let mut envelope = gloas_fixture("web3signer_execution_payload_envelope.json");
+    let payload = &mut envelope["execution_payload_envelope"]["data"]["payload"];
+    payload["extra_data"] = json!(format!("0x{}", "ab".repeat(33)));
+    assert!(matches!(parse(&envelope), Err(ParseError::Invalid(_))));
+    let mut envelope = gloas_fixture("web3signer_execution_payload_envelope.json");
+    envelope["execution_payload_envelope"]["data"]["payload"]["base_fee_per_gas"] = json!("0x1");
+    assert!(matches!(parse(&envelope), Err(ParseError::Invalid(_))));
 }

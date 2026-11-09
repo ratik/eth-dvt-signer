@@ -699,3 +699,183 @@ fn long_histories_match_the_exhaustive_reference() {
         );
     }
 }
+
+fn ptc_vote(slot: u64, present: bool) -> DutyRequest {
+    request(Duty::PayloadAttestation(
+        crate::eth::gloas::PayloadAttestationData {
+            beacon_block_root: [4; 32],
+            slot,
+            payload_present: present,
+            blob_data_available: true,
+        },
+    ))
+}
+
+/// The envelope of a self-built payload of `slot` naming block root `block_root`; `fee` is its
+/// fee recipient's byte, `variant` changes its payload (and its root).
+fn envelope(slot: u64, block_root: Root, fee: u8, variant: u8) -> DutyRequest {
+    request(Duty::ExecutionPayloadEnvelope(Box::new(
+        crate::eth::gloas::EnvelopeSummary {
+            parent_hash: [1; 32],
+            fee_recipient: [fee; 20],
+            state_root: [variant; 32],
+            receipts_root: [3; 32],
+            logs_bloom_root: [4; 32],
+            prev_randao: [5; 32],
+            block_number: 7,
+            gas_limit: 60_000_000,
+            gas_used: 21_000,
+            timestamp: 1_700_000_000,
+            extra_data_root: [6; 32],
+            base_fee_per_gas: [7; 32],
+            block_hash: [8; 32],
+            transactions_root: [9; 32],
+            withdrawals_root: [10; 32],
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+            block_access_list_root: [11; 32],
+            slot_number: slot,
+            execution_requests_root: [12; 32],
+            builder_index: crate::eth::gloas::BUILDER_INDEX_SELF_BUILD,
+            beacon_block_root: block_root,
+            parent_beacon_block_root: [13; 32],
+        },
+    )))
+}
+
+/// The root of `block(slot, body)`'s block (what an envelope names).
+fn block_root(slot: u64, body: u8) -> Root {
+    use tree_hash::TreeHash as _;
+    let Duty::BlockProposal(header) = block(slot, body).duty else {
+        unreachable!()
+    };
+    header.tree_hash_root().0
+}
+
+/// One PTC vote per slot (an exact repeat is free), slots independent.
+#[test]
+fn one_ptc_vote_per_slot() {
+    let mut p = protection();
+    assert_eq!(decide(&mut p, &ptc_vote(64, true)), Decision::Accepted);
+    assert_eq!(
+        decide(&mut p, &ptc_vote(64, true)),
+        Decision::AlreadyAccepted
+    );
+    assert_eq!(
+        decide(&mut p, &ptc_vote(64, false)),
+        Decision::Refused(Refusal::TooManyRoots {
+            kind: DutyKind::PayloadAttestation,
+            period: 64,
+            max: 1
+        })
+    );
+    assert_eq!(decide(&mut p, &ptc_vote(65, false)), Decision::Accepted);
+    assert_eq!(p.verify(), Ok(()));
+}
+
+/// An envelope only for the validator's own authorized block of its slot, one per slot, only a
+/// self-built one; its policy terms are kept with it.
+#[test]
+fn an_envelope_reveals_only_the_validators_own_block() {
+    let mut p = protection();
+    // No block of slot 70 yet.
+    assert_eq!(
+        decide(&mut p, &envelope(70, block_root(70, 1), 1, 0)),
+        Decision::Refused(Refusal::EnvelopeWithoutOwnBlock { slot: 70 })
+    );
+    assert_eq!(decide(&mut p, &block(70, 1)), Decision::Accepted);
+    // Another block's root (of this slot, or this block's of another slot): refused.
+    assert_eq!(
+        decide(&mut p, &envelope(70, block_root(70, 2), 1, 0)),
+        Decision::Refused(Refusal::EnvelopeWithoutOwnBlock { slot: 70 })
+    );
+    assert_eq!(
+        decide(&mut p, &envelope(71, block_root(70, 1), 1, 0)),
+        Decision::Refused(Refusal::EnvelopeWithoutOwnBlock { slot: 71 })
+    );
+    // The block's own root under another fork (another domain): not the block signed.
+    let mut other_fork = envelope(70, block_root(70, 1), 1, 0);
+    other_fork.fork.fork.current_version = [0, 0, 0, 9];
+    other_fork.fork.fork.epoch = 0;
+    assert_eq!(
+        decide(&mut p, &other_fork),
+        Decision::Refused(Refusal::EnvelopeWithoutOwnBlock { slot: 70 })
+    );
+    // Its own block: signed once; a repeat is free, another payload refused.
+    let own = envelope(70, block_root(70, 1), 1, 0);
+    let (root, decision, records) = p.authorize(&own, 2);
+    assert_eq!(decision, Decision::Accepted);
+    assert!(records.contains(&Record::Bound { id: 0, root }));
+    assert_eq!(decide(&mut p, &own), Decision::AlreadyAccepted);
+    assert_eq!(
+        decide(&mut p, &envelope(70, block_root(70, 1), 1, 1)),
+        Decision::Refused(Refusal::TooManyRoots {
+            kind: DutyKind::ExecutionPayloadEnvelope,
+            period: 70,
+            max: 1
+        })
+    );
+    // The terms a keyholder checks: the payload's fee recipient, no gas limit.
+    let authorization = p.duty_authorization(0, DutyKind::ExecutionPayloadEnvelope, 70, root);
+    assert_eq!(
+        authorization.terms,
+        Some(Terms {
+            fee_recipient: [1; 20],
+            gas_limit: None
+        })
+    );
+    assert!(p.duties_of(0).contains(&authorization));
+    assert_eq!(p.verify(), Ok(()));
+    // A builder's envelope is never a validator's to sign.
+    let mut built = envelope(70, block_root(70, 1), 1, 0);
+    if let Duty::ExecutionPayloadEnvelope(summary) = &mut built.duty {
+        summary.builder_index = 3;
+    }
+    assert_eq!(
+        decide(&mut p, &built),
+        Decision::Refused(Refusal::NotSelfBuilt { builder_index: 3 })
+    );
+}
+
+/// Gloas proposer preferences: per proposal slot, bounded as other non-slashable duties, with
+/// their terms kept.
+#[test]
+fn proposer_preferences_keep_their_terms() {
+    let mut p = protection();
+    let preferences = |dependent: u8, gas| {
+        request(Duty::ProposerPreferences(
+            crate::eth::gloas::ProposerPreferences {
+                dependent_root: [dependent; 32],
+                proposal_slot: 96,
+                validator_index: 5,
+                fee_recipient: [2; 20],
+                target_gas_limit: gas,
+            },
+        ))
+    };
+    let (first, decision, _) = p.authorize(&preferences(1, 60_000_000), 1);
+    assert_eq!(decision, Decision::Accepted);
+    // Signed again after a reorg (another dependent root): another root of the same slot.
+    assert_eq!(
+        decide(&mut p, &preferences(2, 60_000_000)),
+        Decision::Accepted
+    );
+    assert_eq!(
+        p.bound(0, &first)
+            .map(|bound| (bound.kind, bound.period, bound.terms)),
+        Some((
+            DutyKind::ProposerPreferences,
+            96,
+            Terms {
+                fee_recipient: [2; 20],
+                gas_limit: Some(60_000_000)
+            }
+        ))
+    );
+    assert_eq!(p.verify(), Ok(()));
+    // Terms of a root never authorized, or under a reused sequence number, are detected.
+    let mut foreign = p.clone();
+    let bound = *p.bound(0, &first).unwrap();
+    foreign.restore_bound(0, [0xee; 32], bound);
+    assert!(foreign.verify().unwrap_err().contains("never authorized"));
+}

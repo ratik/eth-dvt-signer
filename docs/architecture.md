@@ -133,6 +133,12 @@ failover proxy (development)  ──>  4 eth-mpc-signer nodes (this repository)
    application and every keyholder, a retry included. Registrations go after every other
    transaction, at most 16 per block, from a bounded queue
    ([ethereum-signing.md](ethereum-signing.md#builder-registrations)).
+12. Done: Gloas (EIP-7732). PTC votes, envelopes of self-built payloads and proposer preferences,
+   aggregates rooted progressively, Gloas block headers, as Lighthouse v8.3 sends them. One vote
+   and one envelope per slot, an envelope only for the validator's own block of that slot (both
+   rules of the replicated state); preferences and envelopes under the registration policy. An
+   envelope enters consensus as a summary with its root; the pinned schedule gates Gloas
+   ([ethereum-signing.md](ethereum-signing.md#gloas)).
 
 ## Anvil
 

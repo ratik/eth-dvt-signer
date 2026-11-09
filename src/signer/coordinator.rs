@@ -709,17 +709,16 @@ async fn sign_duty<E: Clock, S: Sender<PublicKey = PublicKey>>(
         return Err(SignError::RootMismatch(check.signing_root));
     }
     // A builder registration only while the policy in force allows it and its timestamp is in
-    // the window, checked before any answer: a retry of one authorized before a policy change
-    // gets no signature from this node either (`eth::registration`).
-    if let Some(registration) = request.duty.registration() {
-        registration::check(
-            check.policy.as_ref(),
-            registration,
-            hooks::clock(context.current()),
-            Horizon::ADMISSION,
-        )
-        .map_err(SignError::Registration)?;
-    }
+    // the window, Gloas preferences and envelopes only while it allows their fee recipient (and
+    // the preferences' gas limit), checked before any answer: a retry of one authorized before a
+    // policy change gets no signature from this node either (`eth::registration`).
+    registration::check_duty(
+        check.policy.as_ref(),
+        &request.duty,
+        hooks::clock(context.current()),
+        Horizon::ADMISSION,
+    )
+    .map_err(SignError::Registration)?;
     // An exit or a deposit is signed only once approved: an approved one again (a retry), any
     // other only with the approvers' authorization, which approves it.
     let approval = request.duty.kind().needs_approval();

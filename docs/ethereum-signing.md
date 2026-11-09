@@ -157,10 +157,11 @@ Lighthouse v8.3.2 always sends `signingRoot`, `Content-Type: application/json` a
 
 ## Duties
 
-Signing roots follow the consensus specifications v1.6.1, mainnet preset:
-`compute_signing_root(hash_tree_root(object), compute_domain(domain_type, fork_version,
+Signing roots follow the consensus specifications v1.6.1 (v1.7.0-beta.4 for Gloas), mainnet
+preset: `compute_signing_root(hash_tree_root(object), compute_domain(domain_type, fork_version,
 genesis_validators_root))`. SSZ and `hash_tree_root` come from sigp's `ethereum_ssz` and `tree_hash`,
-the implementation Lighthouse uses (`src/eth/types.rs`, `src/eth/duty.rs`).
+the implementation Lighthouse uses (`src/eth/types.rs`, `src/eth/duty.rs`); Gloas's progressive
+merkleization is written out in `src/eth/progressive.rs` ([Gloas](#gloas)).
 
 | `type` | Signed object | Domain | Epoch for the fork version | Slashing rule |
 | ------ | ------------- | ------ | -------------------------- | ------------- |
@@ -168,13 +169,16 @@ the implementation Lighthouse uses (`src/eth/types.rs`, `src/eth/duty.rs`).
 | `ATTESTATION` | `AttestationData` | `BEACON_ATTESTER` | `target.epoch` | no double vote, no surround vote |
 | `RANDAO_REVEAL` | epoch (`uint64`) | `RANDAO` | `epoch` | bounded |
 | `AGGREGATION_SLOT` | slot (`uint64`) | `SELECTION_PROOF` | `slot / 32` | bounded |
-| `AGGREGATE_AND_PROOF`, `AGGREGATE_AND_PROOF_V2` | `AggregateAndProof` (phase 0 or Electra) | `AGGREGATE_AND_PROOF` | `aggregate.data.slot / 32` | bounded |
+| `AGGREGATE_AND_PROOF`, `AGGREGATE_AND_PROOF_V2` | `AggregateAndProof` (phase 0, Electra, or Gloas: Electra's fields rooted progressively) | `AGGREGATE_AND_PROOF` | `aggregate.data.slot / 32` | bounded |
 | `SYNC_COMMITTEE_MESSAGE` | `beacon_block_root` | `SYNC_COMMITTEE` | `slot / 32` | bounded |
 | `SYNC_COMMITTEE_SELECTION_PROOF` | `SyncAggregatorSelectionData` | `SYNC_COMMITTEE_SELECTION_PROOF` | `slot / 32` | bounded |
 | `SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF` | `ContributionAndProof` | `CONTRIBUTION_AND_PROOF` | `contribution.slot / 32` | bounded |
 | `VOLUNTARY_EXIT` (approved, P0.2) | `VoluntaryExit` | `VOLUNTARY_EXIT` | `epoch` (Capella's version from Deneb on) | bounded |
 | `DEPOSIT` (approved, P0.2; only with `--enable-deposit-signing`) | `DepositMessage` of the validator's own key | `DEPOSIT`, with `deposit.genesis_fork_version` (the network's) and a zero genesis validators root | none (fork-agnostic) | one message per key, ever |
 | `VALIDATOR_REGISTRATION` (under the approved [registration policy](#builder-registrations)) | `ValidatorRegistrationV1` (builder-specs) of the validator's own key | `APPLICATION_BUILDER` (`0x00000001`), with the network's genesis fork version and a zero genesis validators root | none (fork-agnostic) | none; the registration policy, its timestamp window and the per-block limit |
+| `PAYLOAD_ATTESTATION_MESSAGE` (Gloas) | `PayloadAttestationData` (a PTC vote) | `PTC_ATTESTER` (`0x0C000000`) | `data.slot / 32` | one root per slot |
+| `EXECUTION_PAYLOAD_ENVELOPE` (Gloas, under the registration policy) | `ExecutionPayloadEnvelope` of a self-built payload, as its summary | `BEACON_BUILDER` (`0x0B000000`) | `payload.slot_number / 32` | one root per slot, only for the validator's own block of that slot |
+| `PROPOSER_PREFERENCES` (Gloas, under the registration policy) | `ProposerPreferences` | `PROPOSER_PREFERENCES` (`0x0D000000`) | `proposal_slot / 32` (the proposal's fork, also in the epoch before it) | bounded |
 
 An exit and a deposit are signed only with the approvers' authorization over exactly that duty
 ([administration.md](administration.md#voluntary-exits-and-deposits-p02)): without it the API
@@ -187,13 +191,15 @@ RANDAO reveals and exits.
 
 Forks:
 
-- **Blocks.** `BLOCK_V2` with `block_header` for `BELLATRIX`, `CAPELLA`, `DENEB`, `ELECTRA` and
-  `FULU`, which is what Lighthouse sends from Bellatrix on. A whole `block` (`PHASE0`, `ALTAIR`)
+- **Blocks.** `BLOCK_V2` with `block_header` for `BELLATRIX`, `CAPELLA`, `DENEB`, `ELECTRA`,
+  `FULU` and `GLOAS`, which is what Lighthouse sends from Bellatrix on. A whole `block` (`PHASE0`, `ALTAIR`)
   is refused (`400`): its body root would need every body container of those forks.
 - **Aggregates.** Lighthouse sends `AGGREGATE_AND_PROOF` for every fork, with the Electra
   attestation (`committee_bits`, `Bitlist[131072]`) from Electra on. The shape selects the
   container. `AGGREGATE_AND_PROOF_V2` is selected by its `version`: `PHASE0` to `DENEB` use the
-  phase 0 container, `ELECTRA` and `FULU` the Electra container, and any other version is refused.
+  phase 0 container, `ELECTRA` and `FULU` the Electra container, `GLOAS` the Gloas form, and any
+  other version is refused. An unversioned Electra-shaped aggregate of a Gloas epoch is rooted in
+  the Gloas form: the node's fork schedule decides ([Gloas](#gloas)).
 - **Exits.** After Deneb, exits are signed with the Capella fork version (EIP-7044). Clients
   express this through `fork_info`: Lighthouse sends `{capella, capella, exit epoch}`, the only
   form the signer accepts for an exit of an epoch at or after Deneb ([Fork schedule](#fork-schedule)).
@@ -232,9 +238,57 @@ applies from the transaction after the one that set it, in block order (`src/eth
 - **`fork_info`.** Lighthouse sends none (Web3Signer's API says it must not): the domain is the
   pinned network's genesis fork version ([Fork schedule](#fork-schedule)); a request with
   `fork_info` is refused (`400`).
-- **What it does not protect.** A block the beacon node builds itself pays its execution payload's
-  fee recipient, which the signer does not see (it signs the block header): the policy protects
-  the builder path only.
+- **What it does not protect.** Before Gloas, a block the beacon node builds itself pays its
+  execution payload's fee recipient, which the signer does not see (it signs the block header):
+  the policy protects the builder path only. From Gloas on the signer sees it: a self-built
+  payload is revealed only with an envelope, which the policy binds ([Gloas](#gloas)).
+
+### Gloas
+
+Gloas (EIP-7732, consensus-specs v1.7.0-beta.4) separates a block from its execution payload.
+Lighthouse v8.3 sends its new messages as remote-signing-api v1.4.0 defines them, each object as
+`{"version": "GLOAS", "data": ...}` with `fork_info` (`src/eth/gloas.rs`):
+
+| Message | When Lighthouse signs it | Rule |
+| --- | --- | --- |
+| PTC vote (`PAYLOAD_ATTESTATION_MESSAGE`) | a payload timeliness committee member (drawn from the slot's beacon committees: at most once per epoch), once per slot, no retry | its slot has started; one vote per validator and slot, an exact repeat free |
+| Envelope (`EXECUTION_PAYLOAD_ENVELOPE`) | after publishing a block it built itself (no retry): without it the payload is never revealed | its slot has started; self-built (`builder_index` = `2^64 - 1`, else `400`); only for the block this validator signed in that slot (`envelope_without_own_block`); one per slot; the payload's fee recipient is one of the registration policy's |
+| Preferences (`PROPOSER_PREFERENCES`) | for each upcoming proposal, again when the dependent root changes | at most two epochs ahead; the fee recipient is one of the registration policy's, the target gas limit in its range; at most 8 roots per proposal slot |
+
+- **The envelope's block.** The replicated state recorded the signing root of every block it
+  authorized. An envelope names its block's root: the state recomputes that block's signing root
+  (`DOMAIN_BEACON_PROPOSER` at the payload's slot, under the envelope's checked `fork_info`) and
+  signs the envelope only if this validator's authorized block of that slot has it. The binding is
+  in the replicated state, so it survives restarts.
+- **Megabytes, not consensus.** An envelope carries its whole execution payload. The API node
+  hashes it into a summary: the fields a rule reads as values, every other leaf of the payload as
+  its root (`EnvelopeSummary`, 532 bytes). Only the summary enters consensus; its root is the
+  envelope's, so every node signs exactly what the client sent. A signing request may be up to
+  32 MiB (EIP-7934 caps an execution block at 10 MiB of RLP, about twice that as JSON hex);
+  larger ones are refused with `413`.
+- **The policy binds the fee recipient.** Preferences and envelopes name the fee recipient the
+  validator is paid to, as registrations do: the same approved policy decides, in the same
+  places and order (API, leader, voters, block application, keyholders, a retry included). Without
+  a policy neither is signed: a self-built Gloas block then loses its payload. The node logs a
+  warning at start, and `mpc-admin status` prints one, when Gloas is scheduled and no policy is
+  set.
+- **Aggregates.** From Gloas on an `Attestation` is a progressive container (EIP-7688) with a
+  progressive bit list: the same JSON, another root. The request does not tell the two forms
+  apart; the API takes the pinned schedule's form for the aggregate's epoch, voters refuse the
+  other form (`aggregate_form`).
+- **The fork gate.** A PTC vote, an envelope or preferences are refused (`400`, `before_gloas`)
+  for an epoch before the schedule's Gloas epoch, and on a network that does not schedule Gloas.
+  Gloas is not scheduled on mainnet or Hoodi yet: a release adds its epoch once it is announced
+  ([Fork schedule](#fork-schedule)).
+- **Attestations.** `AttestationData.index` signals the payload's presence (0 or 1). Two
+  attestations of one target differing only in it are a double vote, refused as any other.
+- **Not signed.** `EXECUTION_PAYLOAD_BID` (a builder's message: a self-built bid carries the point
+  at infinity) and `BUILDER_REQUEST_AUTH` (sent only with builders in `builder_definitions.yml`)
+  are refused (`400`). No new slashing condition exists in Gloas; the one-per-slot rules keep two
+  quorums of shares from signing two different PTC votes or envelopes for one slot.
+
+Roots: the progressive merkleization and every Gloas container a validator signs reproduce the
+consensus-specs v1.7.0-beta.4 ssz_static vectors (`tests/fixtures/gloas`, `tests/unit/eth/gloas.rs`).
 
 Unsupported, refused with `400`, never signed:
 
@@ -243,7 +297,9 @@ Unsupported, refused with `400`, never signed:
 | `DEPOSIT` on a node without `--enable-deposit-signing` | Off by default (validator onboarding, [ethereum-devnet.md](ethereum-devnet.md#deposit-signing)). |
 | `BLOCK` (deprecated), `BLOCK_V2` with a whole block | Phase 0 and Altair block bodies are not implemented. |
 | `AGGREGATE_AND_PROOF_V2` with another version | Unknown container. |
-| Gloas and later types (`EXECUTION_PAYLOAD_ENVELOPE`, `PAYLOAD_ATTESTATION_MESSAGE`, ...) | Not implemented. |
+| `EXECUTION_PAYLOAD_BID` | A builder's message: validators never sign bids. |
+| `BUILDER_REQUEST_AUTH` | Not implemented (Lighthouse sends it only with external builders configured). |
+| Heze and later types, a Gloas object of another `version` | Not implemented. |
 
 Any other unknown `type` is refused as well.
 
@@ -265,7 +321,8 @@ So every node admits a duty only once its slot has started, by its own clock:
 | --- | --- |
 | `BLOCK_V2` | its slot has started by `now + leeway` |
 | `ATTESTATION` | its slot has started, and its source and target epochs have too |
-| `AGGREGATION_SLOT`, `AGGREGATE_AND_PROOF(_V2)`, `SYNC_COMMITTEE_*`, `RANDAO_REVEAL` | its epoch is at most 2 epochs ahead of `now + leeway` |
+| `PAYLOAD_ATTESTATION_MESSAGE`, `EXECUTION_PAYLOAD_ENVELOPE` (Gloas) | its slot has started |
+| `AGGREGATION_SLOT`, `AGGREGATE_AND_PROOF(_V2)`, `SYNC_COMMITTEE_*`, `RANDAO_REVEAL`, `PROPOSER_PREFERENCES` (its proposal slot's epoch) | its epoch is at most 2 epochs ahead of `now + leeway` |
 | `VOLUNTARY_EXIT`, `DEPOSIT` | always (an exit's epoch is the earliest it may be processed in, often ahead; a deposit has none) |
 | Slashing-protection import | its latest block slot, and source and target epochs, have started |
 
@@ -340,8 +397,10 @@ approved or not). Nothing is corrected: a request with another `fork_info` is wr
 So the fork is selected by the duty's own epoch, never by the clock. Just before a fork, the old
 fork and the new one both give the old version; from the new fork's first slot on, only the new
 fork passes. A version the schedule does not have (another network's, a fork this build does not
-know such as Gloas) is refused: a new fork is signed for only once a release adds it to the
-schedule. A fork object for an exit after Deneb other than Lighthouse's `{capella, capella,
+know such as Heze, Gloas where the schedule has no epoch for it) is refused: a new fork is signed
+for only once a release adds it to the schedule. Gloas is known: a devnet's `--eth-fork-schedule`
+may schedule it (`gloas=0x<version>@<epoch>`); mainnet's and Hoodi's pinned schedules do not yet
+([Gloas](#gloas)). A fork object for an exit after Deneb other than Lighthouse's `{capella, capella,
 exit epoch}` is refused.
 
 Found on the devnet (run `20261107T072938Z`): Lighthouse sends the beacon state's fork, which on
@@ -353,8 +412,8 @@ Pinned schedules:
 
 | Network | Fork versions and epochs (source) |
 | --- | --- |
-| `mainnet` | phase0 `0x00000000`@0, altair `0x01000000`@74240, bellatrix `0x02000000`@144896, capella `0x03000000`@194048, deneb `0x04000000`@269568, electra `0x05000000`@364032, fulu `0x06000000`@411392 (`consensus-specs` `configs/mainnet.yaml`) |
-| `hoodi` | phase0 `0x10000910`@0, altair `0x20000910`@0, bellatrix `0x30000910`@0, capella `0x40000910`@0, deneb `0x50000910`@0, electra `0x60000910`@2048, fulu `0x70000910`@50688 (`eth-clients/hoodi` `metadata/config.yaml`) |
+| `mainnet` | phase0 `0x00000000`@0, altair `0x01000000`@74240, bellatrix `0x02000000`@144896, capella `0x03000000`@194048, deneb `0x04000000`@269568, electra `0x05000000`@364032, fulu `0x06000000`@411392 (`consensus-specs` `configs/mainnet.yaml`); gloas (`0x07000000`) not scheduled yet |
+| `hoodi` | phase0 `0x10000910`@0, altair `0x20000910`@0, bellatrix `0x30000910`@0, capella `0x40000910`@0, deneb `0x50000910`@0, electra `0x60000910`@2048, fulu `0x70000910`@50688 (`eth-clients/hoodi` `metadata/config.yaml`); gloas withdrawn (2026-10-22), not scheduled |
 
 Another network gives its schedule explicitly, every fork it has scheduled, in order
 (`--eth-fork-schedule phase0=0x<version>@0,altair=0x<version>@<epoch>,...`); without it, or with
@@ -376,7 +435,8 @@ domain the voters checked: a coordinator asking for the same duty's root under a
 finalized before the upgrade were never checked); those authorizations stay as they were.
 
 **Answer.** `400` with `{"error": "..", "fork": {"reason": "unknown_version" | "not_a_fork" |
-"wrong_version" | "exit" | "deposit", ...}}`; another chain answers `412 other_chain` as before; a
+"wrong_version" | "exit" | "deposit" | "registration" | "before_gloas" | "aggregate_form", ...}}`
+([Gloas](#gloas)); another chain answers `412 other_chain` as before; a
 node without a network answers `503`.
 
 ## Flow
@@ -425,10 +485,11 @@ of this signer (README, Ethereum compatibility).
 | Outcome | HTTP | Body |
 | ------- | ---- | ---- |
 | Signed | 200 | `{"signature": "0x.."}` when `Accept` includes `application/json`; otherwise the signature as `text/plain` |
-| Malformed identifier, JSON, duty or `fork_info`; unsupported type or version; `signingRoot` different from the computed root; source epoch after target epoch | 400 | `{"error": ".."}` |
+| Malformed identifier, JSON, duty or `fork_info`; unsupported type or version; `signingRoot` different from the computed root; source epoch after target epoch; a builder's envelope (`not_self_built`) | 400 | `{"error": ".."}` |
+| A signing request over 32 MiB | 413 | none (refused before it is read whole) |
 | Unknown validator key, or a key that is not activated | 404 | `{"error": ".."}` |
 | Refused by slashing protection: double proposal, double vote, surround vote, at or below an imported history's floors, another chain, too many roots in a period | 412 | `{"error": "..", "refusal": {"reason": "double_proposal", "slot": 64}}` |
-| A builder registration the registration policy, or its window, refuses ([above](#builder-registrations)) | 412 | `{"error": "..", "registration": {"reason": "fee_recipient", "fee_recipient": "0x.."}}` |
+| A builder registration, Gloas preferences or an envelope the registration policy (or a registration's window) refuses ([above](#builder-registrations)) | 412 | `{"error": "..", "registration": {"reason": "fee_recipient", "fee_recipient": "0x.."}}` |
 | Beyond this node's time horizon ([above](#time-horizon)) | 412 | `{"error": "..", "beyond": {"reason": "future_slot", "slot": .., "latest": ..}}` |
 | No Ethereum network configured | 503 | `{"error": ".."}` |
 | This node is not ready to submit a new authorization, too few signers, too many requests, a full queue of builder registrations | 503 | `{"error": "..", "reasons": [..]}` when not ready |
@@ -439,8 +500,9 @@ of this signer (README, Ethereum compatibility).
 signer's transient failures. A client treats them as errors, and nothing was signed. The
 `refusal` reasons are `unknown_validator`, `not_activated`, `source_after_target`, `other_chain`,
 `deposit_for_another_key`, `double_proposal`, `double_vote`, `surrounds_signed`,
-`surrounded_by_signed`, `too_many_roots`, `registration_for_another_key`, `registration_policy`
-(the policy in force when the block applied refused it), and for imported keys
+`surrounded_by_signed`, `too_many_roots` (also a second PTC vote or envelope of a slot),
+`registration_for_another_key`, `registration_policy` (the policy in force when the block applied
+refused it), `envelope_without_own_block`, `not_self_built` (`400`), and for imported keys
 `block_at_or_below_imported`, `source_below_imported` and `target_at_or_below_imported`. The
 `registration` reasons are `no_policy`, `fee_recipient`, `gas_limit`, `too_new` and `too_old`.
 
@@ -475,7 +537,7 @@ Read from the source at tag `v8.3.2` (tag object `6b6898e6`):
 
 | Question | Lighthouse v8.3.2 | Here |
 | -------- | ----------------- | ---- |
-| Header or full block? | `Web3SignerObject::beacon_block`: `block` for `Base` (Phase 0) and `Altair`, `block_header` for `Bellatrix` to `Fulu` (and `Gloas`, `Heze`) | `block_header` for Bellatrix to Fulu; `block`, Gloas and Heze refused (`400`) |
+| Header or full block? | `Web3SignerObject::beacon_block`: `block` for `Base` (Phase 0) and `Altair`, `block_header` for `Bellatrix` to `Fulu` (and `Gloas`, `Heze`) | `block_header` for Bellatrix to Gloas; `block` and Heze refused (`400`) |
 | Blinded blocks? | The same constructor, generic over the payload (`AbstractExecPayload`): a blinded block gives the same `BLOCK_V2` header request | the same: nothing to distinguish |
 | `BLOCK_V2` envelope | `SigningRequest {type, fork_info, signingRoot, #[serde(flatten)] object}`, the object externally tagged in snake_case: `"beacon_block": {"version": "FULU", "block_header": {..}}` | parsed as such (`tests/fixtures/web3signer/block_v2_mainnet_*.json`) |
 | Signing root object | `SignableMessage::BeaconBlock(block).signing_root(domain)`: the block's root, equal to its header's | the header's root |
@@ -487,11 +549,23 @@ Read from the source at tag `v8.3.2` (tag object `6b6898e6`):
 
 `VALIDATOR_REGISTRATION` and `BUILDER_REQUEST_AUTH` are sent without `fork_info`
 (`signing_method/src/lib.rs`: they "must omit fork_info"). A registration is signed under the
-registration policy ([above](#builder-registrations)); `BUILDER_REQUEST_AUTH` is refused (`400`),
-as are the Gloas-era types Lighthouse already defines (`EXECUTION_PAYLOAD_ENVELOPE`,
-`PAYLOAD_ATTESTATION_MESSAGE`, `PROPOSER_PREFERENCES`). Lighthouse signs a registration once per
-validator and caches it (`preparation_service.rs`, `validator_registration_cache`): again after a
-restart or a change of fee recipient or gas limit, and every slot while signing fails.
+registration policy ([above](#builder-registrations)); `BUILDER_REQUEST_AUTH` is refused (`400`).
+Lighthouse signs a registration once per validator and caches it (`preparation_service.rs`,
+`validator_registration_cache`): again after a restart or a change of fee recipient or gas limit,
+and every slot while signing fails.
+
+Gloas, from v8.3.0 (remote-signing-api v1.4.0; v8.2.x sent an earlier, incompatible form), read
+in the same files and `lighthouse_validator_store/src/lib.rs` and
+`validator_services/src/{block_service,payload_attestation_service,proposer_preferences_service}.rs`:
+
+| Question | Lighthouse v8.3 | Here |
+| -------- | --------------- | ---- |
+| Object shape | `{"version": "GLOAS", "data": ..}` under `payload_attestation_message`, `execution_payload_envelope`, `proposer_preferences`; `fork_info` sent | parsed as such; another `version` refused |
+| Domain epochs | PTC vote: `data.slot`'s; envelope: `slot_number`'s; preferences: `proposal_slot`'s fork (`fork_at_epoch`) | the same ([Gloas](#gloas)) |
+| Aggregates | unversioned `AGGREGATE_AND_PROOF`, Electra's shape | rooted in the Gloas form at Gloas epochs (the schedule decides) |
+| Envelope | only for a self-built block, after publishing it, only if its block root is the block signed; one attempt, no retry | the same rules, in the replicated state |
+| PTC vote | one attempt per slot (`latest_voted_slot` set first), all validators' requests at once | one vote per slot |
+| Preferences | every slot for each own proposal of this and the next epoch; signed again when the dependent root changes; retried on failure | bounded per proposal slot, under the policy |
 
 Full blocks are therefore needed only on a chain at Phase 0 or Altair, which no maintained network
 is. A devnet whose genesis fork is earlier than Bellatrix needs them until its Bellatrix epoch; it
@@ -544,12 +618,19 @@ What still needs a running Lighthouse:
 | `VOLUNTARY_EXIT` | Yes | Lighthouse-computed root; Web3Signer example root; `VoluntaryExit` spec vectors | Bounded | Signed with approvals (P0.2) |
 | `DEPOSIT` (`--enable-deposit-signing`) | Yes | Web3Signer example root; `DepositMessage` and `DepositData` spec vectors; `ssz_roots.py`; accepted by the devnet's deposit contract and beacon chain | One message per key, its own key only | Yes: signed, retried, other credentials and another key refused (E2E-ETH-10); off by default (E2E-ETH-1); a real deposit on the devnet ([ethereum-devnet.md](ethereum-devnet.md)) |
 | `VALIDATOR_REGISTRATION` | Yes, under the registration policy | Web3Signer example root (for its examples' genesis fork version `0x00000001`); `ssz_roots.py` (mainnet and Hoodi domains too); accepted by a Flashbots relay on the devnet (`run-mev`) | No slashing rule; the policy, the window, the per-block limit | Yes: signed and retried, every policy refusal, a faulty leader's blocks, a faulty coordinator, a policy change, a restart, a burst of 100 (`registrations::reg_1`, `reg_2`) |
-| `BUILDER_REQUEST_AUTH`, Gloas types | No (400) | — | — | Refusal (E2E and unit) |
+| `BLOCK_V2` header, Gloas | Yes | the header's root as before (its body root is progressive; the header is unchanged) | Yes, one root per slot | Signed, double proposal (`gloas::gl_3`) |
+| `AGGREGATE_AND_PROOF` at a Gloas epoch (Gloas form), `_V2` `GLOAS` | Yes | Gloas `AggregateAndProof` and `Attestation` spec vectors (v1.7.0-beta.4) | Bounded | Signed; an Electra-rooted client root refused (`gloas::gl_3`) |
+| `PAYLOAD_ATTESTATION_MESSAGE` (Gloas) | Yes | `PayloadAttestationData` spec vectors; Web3Signer's request example (shape) | One root per slot | Signed, retried, a second vote refused (API and a faulty leader's block), before Gloas refused (`gloas::gl_1`) |
+| `EXECUTION_PAYLOAD_ENVELOPE` (Gloas) | Yes, self-built, under the registration policy | `ExecutionPayloadEnvelope`, `ExecutionPayload`, `ExecutionRequests` spec vectors through the summary; Web3Signer's request example (shape) | One root per slot, only for the validator's own block | Signed, retried, every refusal, a faulty leader's block, a faulty coordinator after a policy change, a 12 MB envelope, `413` (`gloas::gl_2`, `gl_4`) |
+| `PROPOSER_PREFERENCES` (Gloas) | Yes, under the registration policy | `ProposerPreferences` spec vectors; Web3Signer's request example (shape) | Bounded | Signed, re-signed for a new dependent root, policy refusals, before Gloas refused (`gloas::gl_3`) |
+| `BUILDER_REQUEST_AUTH`, `EXECUTION_PAYLOAD_BID` | No (400) | — | — | Refusal (unit) |
 
 What the evidence is:
 
 - **Specification vectors.** 39 `ssz_static` cases (`value.yaml` → `hash_tree_root`) of
-  consensus-spec-tests at commit `bc5c1a7f`, vendored in `tests/vectors` (`tests/eth_vectors.rs`).
+  consensus-spec-tests at commit `bc5c1a7f`, vendored in `tests/vectors` (`tests/eth_vectors.rs`);
+  for Gloas, 31 cases of seven containers from consensus-specs v1.7.0-beta.4's release vectors
+  (`tests/fixtures/gloas`, `tests/unit/eth/gloas.rs`).
 - **Web3Signer roots.** The signing roots that Web3Signer's API specification publishes for its
   examples are reproduced from the parsed requests (`tests/eth_vectors.rs`,
   `tests/eth_web3signer.rs`).
@@ -568,11 +649,14 @@ What the evidence is:
   local devnet. The beacon chain accepted its attestations, its blocks (with their RANDAO
   reveals) and its deposit. Aggregates, and for the migrated validator sync committee messages
   and contributions, were published (Lighthouse's log), not checked in the beacon state
-  ([ethereum-devnet.md](ethereum-devnet.md#results)).
+  ([ethereum-devnet.md](ethereum-devnet.md#results)). Across a Gloas fork (Lighthouse v8.3.3,
+  run M), every Gloas request was signed: the beacon chain built on all 11 self-built payloads
+  whose envelopes the MPC network signed, and Lighthouse published the PTC votes and preferences
+  ([ethereum-devnet.md](ethereum-devnet.md#gloas-run-m)); no builder bid on the preferences.
 
 No other validator client (Teku, Prysm, Nimbus, Lodestar) has been run against this API, and no
-public network. Compatibility is claimed for Lighthouse v8.3.2 on that devnet, and for the requests
-its code builds, as checked above.
+public network. Compatibility is claimed for Lighthouse v8.3.2 (v8.3.3 for Gloas) on that devnet,
+and for the requests its code builds, as checked above.
 
 ## Performance
 

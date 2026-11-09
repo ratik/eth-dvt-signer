@@ -13,6 +13,7 @@ Usage (inside the environment):
     it.py run                     everything, then a report (WORK/report.md, WORK/report.json)
     it.py run-r2                  replacing a lost keyholder only (R2), then a report
     it.py run-mev                 builder registrations through a Flashbots relay, then a report
+    it.py run-gloas               signing across the Gloas fork (EIP-7732), then a report
     it.py devnet up|down          the Kurtosis enclave
     it.py signers start|stop      the four signer nodes
     it.py report                  the report from the logs of a run
@@ -192,13 +193,13 @@ def port_print(service, port_id):
     return address if address.startswith("http") else f"http://{address}"
 
 
-def devnet_up(args_file=NETWORK_ARGS):
-    log(f"devnet: {VERSIONS['ETHEREUM_PACKAGE']} (enclave {ENCLAVE}, {os.path.basename(args_file)})")
+def devnet_up(args_file=NETWORK_ARGS, package=None):
+    package = package or VERSIONS["ETHEREUM_PACKAGE"]
+    log(f"devnet: {package} (enclave {ENCLAVE}, {os.path.basename(args_file)})")
     os.makedirs(f"{WORK}/logs", exist_ok=True)
     with open(f"{WORK}/logs/kurtosis-run.log", "w") as out:
         result = subprocess.run(
-            [KURTOSIS, "run", "--enclave", ENCLAVE, VERSIONS["ETHEREUM_PACKAGE"],
-             "--args-file", args_file],
+            [KURTOSIS, "run", "--enclave", ENCLAVE, package, "--args-file", args_file],
             stdout=out, stderr=subprocess.STDOUT, timeout=1800)
     if result.returncode != 0:
         raise Failure("environment", f"kurtosis run failed (logs/kurtosis-run.log)")
@@ -236,7 +237,7 @@ def beacon(path, method="GET", body=None):
 
 
 # The forks the signer knows, in order (`eth::network`); later ones are not passed to it.
-SIGNER_FORKS = ["altair", "bellatrix", "capella", "deneb", "electra", "fulu"]
+SIGNER_FORKS = ["altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas"]
 FAR_FUTURE_EPOCH = 2**64 - 1
 
 
@@ -640,7 +641,7 @@ def proxy_stop():
         pass
 
 
-def vc_start(key, *more, builder=False):
+def vc_start(key, *more, builder=False, image=None):
     """Lighthouse's validator client with remote-signer validators only: the DKG key (and, after
     the migration, the migrated key), signed by the MPC network through the proxy. Its own
     slashing database is kept across restarts. No keystore exists in it. With `builder`, it
@@ -675,7 +676,7 @@ def vc_start(key, *more, builder=False):
         + f"--debug-level info >> {WORK}/logs/vc.log 2>&1")
     run(["docker", "run", "-d", "--name", "it-vc", "--network", "host", "--user", f"{UID}:{GID}",
          "-e", f"HOME={WORK}/vc-home", "-v", f"{IT}:{IT}", "--entrypoint", "sh",
-         VERSIONS["LIGHTHOUSE_IMAGE"], "-c", command])
+         image or VERSIONS["LIGHTHOUSE_IMAGE"], "-c", command])
 
     def enabled():
         text = read(f"{WORK}/logs/vc.log")[started:].lower()
@@ -1869,6 +1870,7 @@ def report(chain=None):
     lines.extend(replacement_lines(result["replacement"]))
     lines.extend(reconfiguration_lines(result["reconfiguration"]))
     lines.extend(builder_lines(load("builder.json"), proxy))
+    lines.extend(gloas_lines(load("gloas.json"), proxy))
     lines.append("")
     for item in result["security"]:
         lines.append(f"- security: {'ok' if item['passed'] else 'FAILED'}: {item['check']} ({item['detail']})")
@@ -2396,12 +2398,12 @@ def relay(path):
     return http("GET", f"{url}{path}", timeout=10)
 
 
-def registration_policy():
+def registration_policy(gas_limit_max=GAS_LIMIT):
     """The registration policy the approvers set before the validator client starts: its fee
-    recipient only, gas limits up to its own. Every node applies it."""
+    recipient only, gas limits up to `gas_limit_max`. Every node applies it."""
     request = authorized("set-registration-policy",
                          {"fee_recipients": [FUNDER_ADDRESS.lower()], "gas_limit_min": 30_000_000,
-                          "gas_limit_max": GAS_LIMIT, "max_future_seconds": 30,
+                          "gas_limit_max": gas_limit_max, "max_future_seconds": 30,
                           "max_age_seconds": 3600},
                          "registration-policy")
     status, body = http("POST", f"{node_url(0)}/eth/registration-policy", request, timeout=40)
@@ -2413,7 +2415,7 @@ def registration_policy():
              lambda node=node: http("GET", f"{node_url(node)}/eth/registration-policy",
                                     timeout=5)[1].get("digest") == digest)
     log(f"registration: policy {digest} applied on every node (fee recipient {FUNDER_ADDRESS}, "
-        f"gas limit 30000000 to {GAS_LIMIT})")
+        f"gas limit 30000000 to {gas_limit_max})")
     return digest
 
 
@@ -2584,6 +2586,237 @@ def run_mev(observed=6):
     return report(chain)
 
 
+# ---------------------------------------------------------------------------------------------
+# Gloas (run-gloas)
+
+# `run-gloas`: the devnet with Gloas (EIP-7732) at GLOAS_EPOCH (network-gloas.yaml), after the MPC
+# validator is active (its deposit made it active at epoch 11 in earlier runs).
+NETWORK_GLOAS_ARGS = f"{HERE}/kurtosis/network-gloas.yaml"
+GLOAS_EPOCH = 16
+# ethereum-package's main branch (2026-10-27): 6.1.0's genesis generator predates the Amsterdam
+# EIPs Lighthouse v8.3 and geth v1.17.10 implement.
+GLOAS_PACKAGE = "github.com/ethpandaops/ethereum-package@5795b77e65235ad223d4d3b413b2739190bf60cc"
+# remote-signing-api v1.4.0's Gloas types from Lighthouse v8.3.0 on; v8.3.3 is the current release.
+GLOAS_LIGHTHOUSE = "sigp/lighthouse:v8.3.3"
+# The policy's gas limit range in `run-gloas`: the devnet's schedule raises the gas limit to 200M at
+# Gloas (ethereum-package's default `gas_limit_schedule`), which preferences may target.
+GLOAS_GAS_LIMIT_MAX = 300_000_000
+GLOAS_TYPES = ("PAYLOAD_ATTESTATION_MESSAGE", "EXECUTION_PAYLOAD_ENVELOPE", "PROPOSER_PREFERENCES")
+
+
+def gloas_block(slot):
+    """The canonical block of `slot` and its execution payload bid (Gloas), or None."""
+    status, value = http("GET", f"{endpoints()['beacon']}/eth/v2/beacon/blocks/{slot}", timeout=20)
+    if status != 200:
+        return None
+    message = value["data"]["message"]
+    bid = (message["body"].get("signed_execution_payload_bid") or {}).get("message")
+    return {"slot": slot, "version": value.get("version"),
+            "proposer_index": int(message["proposer_index"]), "bid": bid}
+
+
+def execution_block(block_hash):
+    """Whether the execution node has the block `block_hash` (a revealed payload)."""
+    status, value = http("POST", endpoints()["execution"],
+                         {"jsonrpc": "2.0", "id": 1, "method": "eth_getBlockByHash",
+                          "params": [block_hash, False]}, timeout=10)
+    return status == 200 and isinstance(value, dict) and bool(value.get("result"))
+
+
+def payload_revealed(slot):
+    """Whether the payload of `slot`'s block was revealed and built on: the execution node has its
+    block hash, and the next block's bid names that hash as its parent (`None`: no block yet)."""
+    block = gloas_block(slot)
+    if not block or not block["bid"]:
+        return None
+    for later in range(slot + 1, slot + 6):
+        following = gloas_block(later)
+        if following and following["bid"]:
+            return (following["bid"]["parent_block_hash"] == block["bid"]["block_hash"]
+                    and execution_block(block["bid"]["block_hash"]))
+    return None
+
+
+def stored_request(kind):
+    """The body of the latest request of `kind` Lighthouse got signed (the proxy keeps them)."""
+    directory = f"{WORK}/requests"
+    for name in sorted(os.listdir(directory), reverse=True):
+        with open(f"{directory}/{name}") as file:
+            entry = json.load(file)
+        if entry.get("status") == 200:
+            body = json.loads(entry["body"])
+            if body.get("type") == kind:
+                return body
+    return None
+
+
+def gloas_checks(key):
+    """The Gloas rules through the proxy, on requests Lighthouse got signed: a second PTC vote
+    for its slot, an envelope of a slot the validator signed no block for, an envelope and
+    preferences paying a fee recipient the policy does not allow."""
+    proxy = f"http://127.0.0.1:{PROXY_PORT}"
+    path = f"/api/v1/eth2/sign/{key}"
+    checks = load("security.json", [])
+
+    def check(name, passed, detail):
+        checks.append({"check": name, "passed": bool(passed), "detail": detail})
+        log(f"security: {'ok  ' if passed else 'FAIL'} {name}: {detail}")
+
+    def probe(name, body, change, status_wanted, field, reason):
+        if body is None:
+            check(name, False, "no signed request of that type to change")
+            return
+        body = json.loads(json.dumps(body))
+        body.pop("signingRoot", None)
+        change(body["payload_attestation_message" if "payload_attestation_message" in body else
+                    "execution_payload_envelope" if "execution_payload_envelope" in body else
+                    "proposer_preferences"]["data"])
+        status, answer = sign_via(proxy, path, json.dumps(body))
+        got = (answer.get(field) or {}).get("reason") if isinstance(answer, dict) else None
+        check(name, status == status_wanted and got == reason, f"HTTP {status} {got or answer}")
+
+    vote = stored_request("PAYLOAD_ATTESTATION_MESSAGE")
+    envelope = stored_request("EXECUTION_PAYLOAD_ENVELOPE")
+    preferences = stored_request("PROPOSER_PREFERENCES")
+    probe("a second, different PTC vote for a slot is refused", vote,
+          lambda data: data.update(payload_present=not data["payload_present"]),
+          412, "refusal", "too_many_roots")
+    probe("an envelope of a slot the validator signed no block for is refused", envelope,
+          lambda data: data["payload"].update(slot_number=str(int(data["payload"]["slot_number"]) + 1)),
+          412, "refusal", "envelope_without_own_block")
+    probe("an envelope paying a fee recipient the policy does not allow is refused", envelope,
+          lambda data: data["payload"].update(fee_recipient="0x" + "42" * 20),
+          412, "registration", "fee_recipient")
+    probe("preferences with a fee recipient the policy does not allow are refused", preferences,
+          lambda data: data.update(fee_recipient="0x" + "42" * 20),
+          412, "registration", "fee_recipient")
+    save("security.json", checks)
+
+
+def gloas_flow(chain, key, index, after):
+    """Across the fork: the validator attests and proposes before it and `after` epochs past it;
+    Lighthouse's Gloas requests (PTC votes, envelopes, preferences) and their latency; the
+    preferences for Gloas's first epoch signed before the fork, with Gloas's version; for each of
+    the validator's proposals after the fork, its envelope and whether its payload was revealed."""
+    def body():
+        fork_time = chain.genesis_time + GLOAS_EPOCH * chain.epoch_seconds()
+        observe("gloas", index, GLOAS_EPOCH + after - chain.epoch(), chain)
+        records = [r for r in proxy_records()
+                   if r.get("type") and r.get("client") != PROBE_AGENT]
+        spec = beacon("/eth/v1/config/spec")
+        gloas_version = spec.get("GLOAS_FORK_VERSION")
+        types = {}
+        for kind in GLOAS_TYPES + ("BLOCK_V2", "AGGREGATE_AND_PROOF", "ATTESTATION"):
+            after_fork = [r for r in records if r["type"] == kind
+                          and (r.get("slot") or 0) >= GLOAS_EPOCH * chain.slots_per_epoch]
+            ok = [r for r in after_fork if r["status"] == 200]
+            types[kind] = {"requested": len(after_fork), "signed": len(ok),
+                           "statuses": sorted({r["status"] for r in after_fork}),
+                           "ms": percentiles([r["ms"] for r in ok])}
+        early = [r for r in records if r["type"] == "PROPOSER_PREFERENCES" and r["ts"] < fork_time
+                 and (r.get("slot") or 0) >= GLOAS_EPOCH * chain.slots_per_epoch]
+        envelopes = {r["slot"]: r for r in records
+                     if r["type"] == "EXECUTION_PAYLOAD_ENVELOPE" and r["status"] == 200}
+        blocks = {r["slot"]: r for r in records if r["type"] == "BLOCK_V2" and r["status"] == 200}
+        proposals = []
+        for slot, block in sorted(blocks.items()):
+            if slot < GLOAS_EPOCH * chain.slots_per_epoch:
+                continue
+            onchain = gloas_block(slot)
+            envelope = envelopes.get(slot)
+            proposals.append({
+                "slot": slot,
+                "canonical": bool(onchain and onchain["proposer_index"] == index),
+                "version": onchain and onchain["version"],
+                "self_built": bool(onchain and onchain["bid"]
+                                   and int(onchain["bid"]["builder_index"]) == 2**64 - 1),
+                "envelope_signed": envelope is not None,
+                "block_to_envelope_ms": (round((envelope["ts"] - block["ts"]) * 1000 + envelope["ms"])
+                                         if envelope else None),
+                "payload_revealed": payload_revealed(slot)})
+            log(f"gloas: slot {slot}: {proposals[-1]}")
+        save("gloas.json", {"gloas_epoch": GLOAS_EPOCH, "gloas_version": gloas_version,
+                            "types": types,
+                            "preferences_before_fork": {
+                                "signed": sum(r["status"] == 200 for r in early),
+                                "versions": sorted({r.get("fork_version") for r in early} - {None})},
+                            "proposals": proposals, "images": [GLOAS_LIGHTHOUSE, GLOAS_PACKAGE]})
+        missing = [p["slot"] for p in proposals if not p["envelope_signed"] or not p["payload_revealed"]]
+        if missing:
+            log(f"gloas: proposals without a signed envelope or a revealed payload: {missing}")
+    return body
+
+
+def gloas_lines(gloas, proxy):
+    if not gloas:
+        return []
+    lines = ["", f"## Across the Gloas fork (epoch {gloas['gloas_epoch']}, version "
+                 f"{gloas['gloas_version']})", "",
+             "Lighthouse's signing requests for slots from the fork on:", "",
+             "| Duty type | Requested | Signed | Statuses | Latency p50/p95/max ms |",
+             "| --- | --- | --- | --- | --- |"]
+    for kind, entry in gloas["types"].items():
+        ms = entry["ms"]
+        lines.append(f"| {kind} | {entry['requested']} | {entry['signed']} | {entry['statuses']} | "
+                     f"{ms.get('p50')}/{ms.get('p95')}/{ms.get('max')} |")
+    early = gloas["preferences_before_fork"]
+    lines += ["", f"- preferences for Gloas's first epoch signed before the fork: {early['signed']} "
+                  f"(fork versions named: {early['versions']})",
+              f"- the validator's proposals after the fork: {len(gloas['proposals'])}, canonical "
+              f"{sum(p['canonical'] for p in gloas['proposals'])}, self-built "
+              f"{sum(p['self_built'] for p in gloas['proposals'])}, envelope signed "
+              f"{sum(p['envelope_signed'] for p in gloas['proposals'])}, payload revealed "
+              f"{sum(bool(p['payload_revealed']) for p in gloas['proposals'])}"]
+    for p in gloas["proposals"]:
+        lines.append(f"  - slot {p['slot']}: canonical {p['canonical']} ({p['version']}), self-built "
+                     f"{p['self_built']}, envelope {p['envelope_signed']} "
+                     f"(block to envelope {p['block_to_envelope_ms']} ms), payload revealed "
+                     f"{p['payload_revealed']}")
+    lines.append(f"- images: {', '.join(gloas['images'])}")
+    return lines
+
+
+def run_gloas(after=6):
+    """Signing across the Gloas fork: the devnet with Gloas at GLOAS_EPOCH (`network-gloas.yaml`,
+    ethereum-package's main branch, Lighthouse v8.3.3); the signers with a schedule that has
+    Gloas; the DKG key activated and deposited; the registration policy approved (it binds
+    preferences and envelopes); Lighthouse's validator client. The validator's duties before and
+    after the fork, its Gloas requests, its proposals' envelopes and payloads; the security
+    checks with the Gloas ones; a report."""
+    os.makedirs(f"{WORK}/logs", exist_ok=True)
+    pull_images()
+    run(["docker", "pull", "-q", GLOAS_LIGHTHOUSE], timeout=900)
+    devnet_up(NETWORK_GLOAS_ARGS, package=GLOAS_PACKAGE)
+    chain = Chain()
+    log(f"devnet: {chain.seconds_per_slot} s slots, {chain.slots_per_epoch} slots per epoch, "
+        f"schedule {chain.fork_schedule}")
+    if f"gloas=" not in chain.fork_schedule:
+        raise Failure("environment", f"the devnet schedules no Gloas: {chain.fork_schedule}")
+    signers_start()
+    key = dkg()
+    activation = activate(key, chain)
+    deposit(key, chain)
+    registration_policy(gas_limit_max=GLOAS_GAS_LIMIT_MAX)
+    proxy_start()
+    vc_start(key, image=GLOAS_LIGHTHOUSE)
+    index, activation_epoch = wait_active(key, chain)
+    if activation_epoch >= GLOAS_EPOCH - 1:
+        raise Failure("activation", f"the validator activates at epoch {activation_epoch}: too late "
+                                    f"to sign before the Gloas fork at epoch {GLOAS_EPOCH}")
+    recorder = Recorder(index, activation_epoch, chain)
+    recorder.start()
+    save("validator.json", {"public_key": key, "index": index, "activation_epoch": activation_epoch,
+                            "mpc_activation_height": activation["activated_at"],
+                            "genesis_validators_root": chain.genesis_validators_root})
+    chain.wait_epoch(activation_epoch)
+    scenario("gloas", gloas_flow(chain, key, index, after))
+    security_checks(key, chain)
+    gloas_checks(key)
+    collect_evidence()
+    recorder.stop()
+    return report(chain)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -2591,6 +2824,7 @@ def main():
     sub.add_parser("run-r2")
     sub.add_parser("run-r3")
     sub.add_parser("run-mev")
+    sub.add_parser("run-gloas")
     devnet = sub.add_parser("devnet")
     devnet.add_argument("action", choices=["up", "down"])
     signers = sub.add_parser("signers")
@@ -2609,6 +2843,8 @@ def main():
             run_r3()
         elif args.command == "run-mev":
             run_mev()
+        elif args.command == "run-gloas":
+            run_gloas()
         elif args.command == "devnet":
             devnet_up() if args.action == "up" else devnet_down()
         elif args.command == "signers":

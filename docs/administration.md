@@ -108,6 +108,14 @@ a policy, not each registration ([ethereum-signing.md](ethereum-signing.md#build
 - **Status.** `GET /eth/registration-policy` answers the policy in force, its digest and the height
   it is read at; `mpc-admin status` shows each node's digest, and `submit` waits until every
   answering node applies it.
+- **Gloas.** From Gloas on the same policy also decides on proposer preferences (their fee
+  recipient and target gas limit) and on the envelopes of self-built payloads (their fee
+  recipient), with the same order and retry rules
+  ([ethereum-signing.md](ethereum-signing.md#gloas)). Without a policy, a self-built Gloas block
+  loses its payload: set one before the fork. The node logs a warning at start, and
+  `mpc-admin status` prints one (with each node's Gloas epoch), while Gloas is scheduled and no
+  policy is set. The range must cover the target gas limit the validator client asks for in its
+  preferences.
 
 ```sh
 mpc-admin --nodes ... draft set-registration-policy --fee-recipient 0x<address> \
@@ -361,6 +369,13 @@ mpc-admin --nodes ... resume                                                # un
   state records (key prefix 10, value tags 16 and 17). Upgrade every node before setting a
   policy: until one is set, no registration enters a block, so older nodes see none of the new
   tags. Once a policy or a registration is written, older binaries cannot read the state.
+- **Gloas.** New duty kinds (11 to 13), duty encoding tags (12 to 15) and a state record (key
+  prefix 11, value tag 18: the policy terms of an authorized preference or envelope). The fork
+  schedule is not part of the cluster id, so approvals stay valid. Upgrade every node at least
+  two epochs before the fork: preferences for the first Gloas epoch are signed in the epoch
+  before it, and an older node cannot decode a block that carries one. A rolling upgrade, one
+  node at a time, works until then; a node without the release refuses the Gloas epochs' duties
+  (fail closed). Once a Gloas duty is written, older binaries cannot read the state.
 - **P0.3.** The cluster id now binds the Ethereum network's identity: approvals drafted before the
   upgrade must be drafted and signed again. The administrative record gains the network identity
   (value tag 15; tag 13 is read as "no network recorded"), and a node started for another network

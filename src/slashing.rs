@@ -106,9 +106,23 @@ pub struct DutyAuthorization {
     /// timestamp).
     pub kind: DutyKind,
     pub period: u64,
-    /// A registration's fee recipient and gas limit: a keyholder checks them against the
-    /// registration policy in force before signing (`eth::registration`).
+    /// What the fee-recipient policy decides on, for a policy-bound kind (a registration,
+    /// Gloas proposer preferences, an envelope): a keyholder checks it against the policy in
+    /// force before signing (`eth::registration`).
     pub terms: Option<Terms>,
+}
+
+/// The policy terms of an authorized Gloas duty the fee-recipient policy binds (proposer
+/// preferences, an envelope; a registration keeps its own in [Registered]): its kind and period
+/// (its record is one of the validator's `kind` roots in `period`), its terms, and the sequence
+/// number of that record among the validator's records (its storage key). Kept so a keyholder
+/// checks a retry against the policy in force after a restart too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bound {
+    pub kind: DutyKind,
+    pub period: u64,
+    pub terms: Terms,
+    pub sequence: u64,
 }
 
 /// An authorized builder registration: its timestamp, what the registration policy decides on,
@@ -347,6 +361,8 @@ pub enum Record {
     Approval { id: u64, root: Root },
     /// The builder registration of validator `id` with signing root `root`.
     Registration { id: u64, root: Root },
+    /// The policy terms of validator `id`'s Gloas duty with signing root `root`.
+    Bound { id: u64, root: Root },
 }
 
 /// The approval of an authorized signing root whose kind needs one (`DutyKind::needs_approval`,
@@ -384,8 +400,22 @@ pub enum Refusal {
     RegistrationForAnotherKey,
     /// The registration policy in force when the block applied refuses the registration (its fee
     /// recipient or gas limit, or there is none: `eth::registration`).
-    #[error("the registration policy in force refuses the builder registration")]
+    #[error(
+        "the registration policy in force refuses it (a builder registration's, or a Gloas \
+         preference's or envelope's fee recipient)"
+    )]
     RegistrationPolicy,
+    /// A Gloas envelope whose block is not this validator's authorized block of that slot.
+    #[error(
+        "no block of this validator for slot {slot} was signed with the block root the envelope \
+         names: an envelope is signed only for the validator's own block"
+    )]
+    EnvelopeWithoutOwnBlock { slot: u64 },
+    /// A Gloas envelope of a payload a builder built (only the builder signs it).
+    #[error(
+        "the envelope's builder index is {builder_index}: only a self-built payload's is signed"
+    )]
+    NotSelfBuilt { builder_index: u64 },
     #[error("another block was signed for slot {slot}")]
     DoubleProposal { slot: u64 },
     #[error("another attestation was signed for target epoch {target}")]
@@ -518,6 +548,8 @@ pub struct Protection {
     approved: BTreeMap<(u64, Root), Approved>,
     /// Authorized builder registrations, by validator id and signing root.
     registrations: BTreeMap<(u64, Root), Registered>,
+    /// The policy terms of authorized Gloas preferences and envelopes, by validator id and root.
+    bound: BTreeMap<(u64, Root), Bound>,
 }
 
 /// One validator's history as an EIP-3076 interchange holds it ([Protection::export]).
@@ -997,13 +1029,24 @@ impl Protection {
                 registration.into(),
                 height,
             ),
-            None => self.record(
-                id,
-                request.duty.protection(),
-                request.duty.kind(),
-                root,
-                height,
-            ),
+            None => {
+                let (kind, rule) = (request.duty.kind(), request.duty.protection());
+                let mut records = self.record(id, rule, kind, root, height);
+                if let Some(terms) = request.duty.terms() {
+                    let sequence = self.validators[&id].records - 1;
+                    self.bound.insert(
+                        (id, root),
+                        Bound {
+                            kind,
+                            period: rule.period(),
+                            terms,
+                            sequence,
+                        },
+                    );
+                    records.push(Record::Bound { id, root });
+                }
+                records
+            }
         };
         (root, Decision::Accepted, records)
     }
@@ -1108,15 +1151,18 @@ impl Protection {
             .validator_of(&request.validator)
             .ok_or(Refusal::UnknownValidator)?;
         let activation = validator.activation.ok_or(Refusal::NotActivated)?;
-        request.duty.validate().map_err(
-            |crate::eth::duty::Invalid::SourceAfterTarget {
-                 source_epoch,
-                 target_epoch,
-             }| Refusal::SourceAfterTarget {
+        request.duty.validate().map_err(|invalid| match invalid {
+            crate::eth::duty::Invalid::SourceAfterTarget {
+                source_epoch,
+                target_epoch,
+            } => Refusal::SourceAfterTarget {
                 source_epoch,
                 target_epoch,
             },
-        )?;
+            crate::eth::duty::Invalid::NotSelfBuilt { builder_index } => {
+                Refusal::NotSelfBuilt { builder_index }
+            }
+        })?;
         match &request.duty {
             // A deposit's domain has no genesis validators root: it is not bound to the chain,
             // only to the key, which signs one deposit message, ever.
@@ -1137,6 +1183,16 @@ impl Protection {
                     return Err(Refusal::OtherChain);
                 }
             }
+        }
+        // An envelope reveals the payload of this validator's own block of its slot: the block
+        // this state authorized, whose signing root the envelope's block root gives.
+        if let Some((slot, block_signing_root)) = request.duty.envelope_block(&request.fork)
+            && self
+                .proposals
+                .get(&(id, slot))
+                .is_none_or(|signed| signed.signing_root != block_signing_root)
+        {
+            return Err(Refusal::EnvelopeWithoutOwnBlock { slot });
         }
         self.decide_rule(id, request.duty.protection(), request.duty.kind(), root)
     }
@@ -1256,12 +1312,22 @@ impl Protection {
             signing_root,
             kind,
             period,
-            terms: self
-                .registrations
-                .get(&(id, signing_root))
-                .filter(|_| kind == DutyKind::ValidatorRegistration)
-                .map(|registered| registered.terms),
+            terms: if kind == DutyKind::ValidatorRegistration {
+                self.registrations
+                    .get(&(id, signing_root))
+                    .map(|registered| registered.terms)
+            } else {
+                self.bound
+                    .get(&(id, signing_root))
+                    .filter(|bound| bound.kind == kind)
+                    .map(|bound| bound.terms)
+            },
         }
+    }
+
+    /// The policy terms of validator `id`'s authorized Gloas duty with signing root `root`.
+    pub fn bound(&self, id: u64, root: &Root) -> Option<&Bound> {
+        self.bound.get(&(id, *root))
     }
 
     /// Every authorized signing root of every activated validator: what this node's keyholder
@@ -1375,6 +1441,10 @@ impl Protection {
 
     pub fn restore_approval(&mut self, id: u64, root: Root, approved: Approved) {
         self.approved.insert((id, root), approved);
+    }
+
+    pub fn restore_bound(&mut self, id: u64, root: Root, bound: Bound) {
+        self.bound.insert((id, root), bound);
     }
 
     pub fn restore_registration(&mut self, id: u64, root: Root, registered: Registered) {
@@ -1492,6 +1562,30 @@ impl Protection {
                     "validator {id} has a registration with sequence number {} that is not one \
                      of its records",
                     registered.sequence
+                ));
+            }
+        }
+        // Policy terms: each of an authorized root of a Gloas kind the policy binds, under the
+        // sequence number of one of its validator's records.
+        let mut sequences = BTreeSet::new();
+        for (&(id, root), bound) in &self.bound {
+            let records = self
+                .validators
+                .get(&id)
+                .map_or(0, |validator| validator.records);
+            if !bound.kind.is_policy_bound()
+                || bound.kind == DutyKind::ValidatorRegistration
+                || !self
+                    .bounded(id, bound.kind, bound.period)
+                    .iter()
+                    .any(|signed| signed.signing_root == root)
+                || bound.sequence >= records
+                || !sequences.insert((id, bound.sequence))
+            {
+                return Err(format!(
+                    "validator {id} has policy terms (sequence {}) of a {:?} root it never \
+                     authorized",
+                    bound.sequence, bound.kind
                 ));
             }
         }

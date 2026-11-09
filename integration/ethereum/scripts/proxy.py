@@ -64,6 +64,10 @@ SLOT_PATHS = {
     "SYNC_COMMITTEE_MESSAGE": ("sync_committee_message", "slot"),
     "SYNC_COMMITTEE_SELECTION_PROOF": ("sync_aggregator_selection_data", "slot"),
     "SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF": ("contribution_and_proof", "contribution", "slot"),
+    # Gloas (remote-signing-api v1.4.0): `{"version": "GLOAS", "data": ...}`.
+    "PAYLOAD_ATTESTATION_MESSAGE": ("payload_attestation_message", "data", "slot"),
+    "EXECUTION_PAYLOAD_ENVELOPE": ("execution_payload_envelope", "data", "payload", "slot_number"),
+    "PROPOSER_PREFERENCES": ("proposer_preferences", "data", "proposal_slot"),
 }
 EPOCH_PATHS = {
     "RANDAO_REVEAL": ("randao_reveal", "epoch"),
@@ -94,6 +98,7 @@ def describe(path, body):
         "epoch": dig(request, EPOCH_PATHS[kind]) if kind in EPOCH_PATHS else None,
         "validator": path.rsplit("/", 1)[-1],
         "signing_root": request.get("signingRoot"),
+        "fork_version": ((request.get("fork_info") or {}).get("fork") or {}).get("current_version"),
     }
 
 

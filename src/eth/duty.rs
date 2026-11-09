@@ -7,11 +7,18 @@
 //! where `epoch` is the epoch `get_domain` is called with for that duty. The fork and genesis
 //! validators root come from the request (`fork_info`), as validator clients send them; for
 //! voluntary exits after Deneb (EIP-7044), clients pin the fork to the Capella version there.
+//!
+//! Gloas (EIP-7732, consensus-specs v1.7.0-beta.4, `eth::gloas`) adds PTC votes, the envelopes of
+//! self-built payloads and proposer preferences, and roots aggregates progressively.
 
-use super::types::{
-    AggregateAndProofElectra, AggregateAndProofPhase0, AttestationData, BeaconBlockHeader,
-    ContributionAndProof, DepositMessage, ForkData, Root, SigningData, SyncAggregatorSelectionData,
-    ValidatorRegistration, Version, VoluntaryExit, hex_bytes,
+use super::{
+    gloas::{self, EnvelopeSummary, PayloadAttestationData, ProposerPreferences},
+    registration::Terms,
+    types::{
+        AggregateAndProofElectra, AggregateAndProofPhase0, AttestationData, BeaconBlockHeader,
+        ContributionAndProof, DepositMessage, ForkData, Root, SigningData,
+        SyncAggregatorSelectionData, ValidatorRegistration, Version, VoluntaryExit, hex_bytes,
+    },
 };
 use bytes::{Buf, BufMut};
 use commonware_codec::{EncodeSize, Error as CodecError, Read, ReadExt as _, Write, varint::UInt};
@@ -29,6 +36,12 @@ pub const MAX_ROOTS_PER_PERIOD: usize = 8;
 /// Distinct deposit messages a validator key ever signs: one, so the withdrawal credentials of
 /// its first deposit cannot be replaced by another signed deposit.
 pub const MAX_DEPOSIT_MESSAGES: usize = 1;
+
+/// Distinct PTC votes, and distinct envelopes, a validator signs for one slot: one (an exact
+/// repeat is free). Neither is slashable, but two quorums of shares must not sign two different
+/// ones (tee-signer's rule too): a second vote would contradict the first, a second envelope
+/// would reveal another payload for the same block.
+pub const MAX_SLOT_MESSAGES: usize = 1;
 
 /// Largest encoded duty accepted in a consensus command (an Electra aggregate is ~17 KB).
 pub const MAX_DUTY_BYTES: usize = 32 * 1024;
@@ -50,6 +63,12 @@ pub mod domain {
     pub const CONTRIBUTION_AND_PROOF: DomainType = [0x09, 0, 0, 0];
     /// `DOMAIN_APPLICATION_BUILDER` (builder-specs): builder registrations.
     pub const APPLICATION_BUILDER: DomainType = [0x00, 0, 0, 0x01];
+    /// Gloas: the envelope of a payload (a self-built one is signed with the proposer's key).
+    pub const BEACON_BUILDER: DomainType = [0x0B, 0, 0, 0];
+    /// Gloas: PTC votes.
+    pub const PTC_ATTESTER: DomainType = [0x0C, 0, 0, 0];
+    /// Gloas: proposer preferences.
+    pub const PROPOSER_PREFERENCES: DomainType = [0x0D, 0, 0, 0];
 }
 
 /// A compressed BLS12-381 G1 public key (an Ethereum validator public key).
@@ -132,13 +151,17 @@ pub fn compute_signing_root(object_root: Root, domain: Root) -> Root {
 pub enum AggregateAndProof {
     Phase0(Box<AggregateAndProofPhase0>),
     Electra(Box<AggregateAndProofElectra>),
+    /// Gloas: Electra's fields, rooted progressively (EIP-7688). The request does not tell the
+    /// two apart (Lighthouse sends an unversioned Electra-shaped object): the node's fork schedule
+    /// does (`Network::resolve`), and voters check it (`Network::check`).
+    Gloas(Box<AggregateAndProofElectra>),
 }
 
 impl AggregateAndProof {
     fn slot(&self) -> u64 {
         match self {
             Self::Phase0(aggregate) => aggregate.aggregate.data.slot,
-            Self::Electra(aggregate) => aggregate.aggregate.data.slot,
+            Self::Electra(aggregate) | Self::Gloas(aggregate) => aggregate.aggregate.data.slot,
         }
     }
 
@@ -146,6 +169,7 @@ impl AggregateAndProof {
         match self {
             Self::Phase0(aggregate) => aggregate.tree_hash_root().0,
             Self::Electra(aggregate) => aggregate.tree_hash_root().0,
+            Self::Gloas(aggregate) => gloas::aggregate_and_proof_root(aggregate),
         }
     }
 }
@@ -178,6 +202,13 @@ pub enum Duty {
     /// A builder registration (`eth::registration`). Its domain is a deposit's, with
     /// `DOMAIN_APPLICATION_BUILDER`: the genesis fork version and a zero genesis validators root.
     ValidatorRegistration(ValidatorRegistration),
+    /// Gloas: a PTC vote.
+    PayloadAttestation(PayloadAttestationData),
+    /// Gloas: the envelope of the payload of a block this validator proposed and built itself,
+    /// as its summary (`eth::gloas`).
+    ExecutionPayloadEnvelope(Box<EnvelopeSummary>),
+    /// Gloas: proposer preferences for one of the validator's proposal slots.
+    ProposerPreferences(ProposerPreferences),
 }
 
 /// Kind of duty (stable numbering: part of the replicated state's keys).
@@ -196,10 +227,13 @@ pub enum DutyKind {
     VoluntaryExit = 8,
     Deposit = 9,
     ValidatorRegistration = 10,
+    PayloadAttestation = 11,
+    ExecutionPayloadEnvelope = 12,
+    ProposerPreferences = 13,
 }
 
 impl DutyKind {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 14] = [
         Self::BlockProposal,
         Self::Attestation,
         Self::RandaoReveal,
@@ -211,6 +245,9 @@ impl DutyKind {
         Self::VoluntaryExit,
         Self::Deposit,
         Self::ValidatorRegistration,
+        Self::PayloadAttestation,
+        Self::ExecutionPayloadEnvelope,
+        Self::ProposerPreferences,
     ];
 
     /// Whether signing this kind needs the approvers (P0.2, `admin`): a voluntary exit cannot be
@@ -226,8 +263,29 @@ impl DutyKind {
     pub const fn max_roots(self) -> usize {
         match self {
             Self::Deposit => MAX_DEPOSIT_MESSAGES,
+            Self::PayloadAttestation | Self::ExecutionPayloadEnvelope => MAX_SLOT_MESSAGES,
             _ => MAX_ROOTS_PER_PERIOD,
         }
+    }
+
+    /// Whether the fee-recipient policy (`eth::registration`) decides on this kind: a builder
+    /// registration, Gloas proposer preferences and the envelope of a self-built payload name the
+    /// fee recipient a validator is paid to.
+    pub const fn is_policy_bound(self) -> bool {
+        matches!(
+            self,
+            Self::ValidatorRegistration
+                | Self::ProposerPreferences
+                | Self::ExecutionPayloadEnvelope
+        )
+    }
+
+    /// Whether this kind exists only from Gloas on.
+    pub const fn is_gloas(self) -> bool {
+        matches!(
+            self,
+            Self::PayloadAttestation | Self::ExecutionPayloadEnvelope | Self::ProposerPreferences
+        )
     }
 
     pub fn from_u8(value: u8) -> Option<Self> {
@@ -272,6 +330,14 @@ pub enum Invalid {
         source_epoch: u64,
         target_epoch: u64,
     },
+    /// A validator signs only the envelope of a payload it built itself; a builder's envelope
+    /// is the builder's to sign.
+    #[error(
+        "the envelope's builder index is {builder_index}: a validator signs only a self-built \
+         payload's envelope (builder index {})",
+        gloas::BUILDER_INDEX_SELF_BUILD
+    )]
+    NotSelfBuilt { builder_index: u64 },
 }
 
 impl Duty {
@@ -288,6 +354,36 @@ impl Duty {
             Self::VoluntaryExit(_) => DutyKind::VoluntaryExit,
             Self::Deposit(_) => DutyKind::Deposit,
             Self::ValidatorRegistration(_) => DutyKind::ValidatorRegistration,
+            Self::PayloadAttestation(_) => DutyKind::PayloadAttestation,
+            Self::ExecutionPayloadEnvelope(_) => DutyKind::ExecutionPayloadEnvelope,
+            Self::ProposerPreferences(_) => DutyKind::ProposerPreferences,
+        }
+    }
+
+    /// What the fee-recipient policy decides on, for a kind it binds
+    /// ([`DutyKind::is_policy_bound`]): a registration's fee recipient and gas limit, the fee
+    /// recipient and target gas limit of proposer preferences, an envelope's payload fee
+    /// recipient (its gas limit moves towards the target block by block, so it is not checked).
+    pub fn terms(&self) -> Option<Terms> {
+        match self {
+            Self::ValidatorRegistration(registration) => Some(registration.into()),
+            Self::ProposerPreferences(preferences) => Some(Terms {
+                fee_recipient: preferences.fee_recipient,
+                gas_limit: Some(preferences.target_gas_limit),
+            }),
+            Self::ExecutionPayloadEnvelope(envelope) => Some(Terms {
+                fee_recipient: envelope.fee_recipient,
+                gas_limit: None,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The envelope's summary, if the duty is one.
+    pub fn envelope(&self) -> Option<&EnvelopeSummary> {
+        match self {
+            Self::ExecutionPayloadEnvelope(envelope) => Some(envelope),
+            _ => None,
         }
     }
 
@@ -312,6 +408,9 @@ impl Duty {
             Self::VoluntaryExit(_) => domain::VOLUNTARY_EXIT,
             Self::Deposit(_) => domain::DEPOSIT,
             Self::ValidatorRegistration(_) => domain::APPLICATION_BUILDER,
+            Self::PayloadAttestation(_) => domain::PTC_ATTESTER,
+            Self::ExecutionPayloadEnvelope(_) => domain::BEACON_BUILDER,
+            Self::ProposerPreferences(_) => domain::PROPOSER_PREFERENCES,
         }
     }
 
@@ -330,6 +429,12 @@ impl Duty {
             Self::VoluntaryExit(exit) => exit.epoch,
             // Fork-agnostic: the fork info carries the genesis fork version only.
             Self::Deposit(_) | Self::ValidatorRegistration(_) => 0,
+            Self::PayloadAttestation(data) => data.slot / SLOTS_PER_EPOCH,
+            // `compute_epoch_at_slot(state.slot)`: the payload's slot is its block's.
+            Self::ExecutionPayloadEnvelope(envelope) => envelope.slot_number / SLOTS_PER_EPOCH,
+            // `compute_fork_version(proposal_epoch)`: the version of the proposal's epoch, also
+            // when signed in the epoch before (the request's `fork_info` names that fork).
+            Self::ProposerPreferences(preferences) => preferences.proposal_slot / SLOTS_PER_EPOCH,
         }
     }
 
@@ -342,6 +447,9 @@ impl Duty {
             Self::AggregateAndProof(aggregate) => Some(aggregate.slot()),
             Self::SyncSelectionProof(data) => Some(data.slot),
             Self::ContributionAndProof(proof) => Some(proof.contribution.slot),
+            Self::PayloadAttestation(data) => Some(data.slot),
+            Self::ExecutionPayloadEnvelope(envelope) => Some(envelope.slot_number),
+            Self::ProposerPreferences(preferences) => Some(preferences.proposal_slot),
             Self::RandaoReveal { .. }
             | Self::VoluntaryExit(_)
             | Self::Deposit(_)
@@ -365,6 +473,9 @@ impl Duty {
             Self::VoluntaryExit(exit) => exit.tree_hash_root().0,
             Self::Deposit(message) => message.tree_hash_root().0,
             Self::ValidatorRegistration(registration) => registration.tree_hash_root().0,
+            Self::PayloadAttestation(data) => data.tree_hash_root().0,
+            Self::ExecutionPayloadEnvelope(envelope) => envelope.root(),
+            Self::ProposerPreferences(preferences) => preferences.tree_hash_root().0,
         }
     }
 
@@ -402,7 +513,31 @@ impl Duty {
             Self::ValidatorRegistration(registration) => Protection::Registration {
                 timestamp: registration.timestamp,
             },
+            Self::PayloadAttestation(data) => Protection::Bounded { period: data.slot },
+            // One envelope per slot, and only for this validator's own block of that slot (the
+            // state machine checks the block: `Protection::envelope_block`).
+            Self::ExecutionPayloadEnvelope(envelope) => Protection::Bounded {
+                period: envelope.slot_number,
+            },
+            Self::ProposerPreferences(preferences) => Protection::Bounded {
+                period: preferences.proposal_slot,
+            },
         }
+    }
+
+    /// For an envelope, the signing root its block must have been authorized with: the block
+    /// root it names, under `DOMAIN_BEACON_PROPOSER` at the payload's slot (the epoch is the
+    /// same, so `fork` gives the same version for both).
+    pub fn envelope_block(&self, fork: &ForkInfo) -> Option<(u64, Root)> {
+        let envelope = self.envelope()?;
+        let domain = fork.domain(
+            domain::BEACON_PROPOSER,
+            envelope.slot_number / SLOTS_PER_EPOCH,
+        );
+        Some((
+            envelope.slot_number,
+            compute_signing_root(envelope.beacon_block_root, domain),
+        ))
     }
 
     /// Checks that do not depend on history.
@@ -413,6 +548,13 @@ impl Duty {
             return Err(Invalid::SourceAfterTarget {
                 source_epoch: data.source.epoch,
                 target_epoch: data.target.epoch,
+            });
+        }
+        if let Self::ExecutionPayloadEnvelope(envelope) = self
+            && !envelope.self_built()
+        {
+            return Err(Invalid::NotSelfBuilt {
+                builder_index: envelope.builder_index,
             });
         }
         Ok(())
@@ -444,6 +586,12 @@ impl Duty {
             Self::VoluntaryExit(exit) => (9, exit.as_ssz_bytes()),
             Self::Deposit(message) => (10, message.as_ssz_bytes()),
             Self::ValidatorRegistration(registration) => (11, registration.as_ssz_bytes()),
+            Self::AggregateAndProof(AggregateAndProof::Gloas(aggregate)) => {
+                (12, aggregate.as_ssz_bytes())
+            }
+            Self::PayloadAttestation(data) => (13, data.as_ssz_bytes()),
+            Self::ExecutionPayloadEnvelope(envelope) => (14, envelope.as_ssz_bytes()),
+            Self::ProposerPreferences(preferences) => (15, preferences.as_ssz_bytes()),
         }
     }
 
@@ -483,6 +631,18 @@ impl Duty {
             10 => Self::Deposit(DepositMessage::from_ssz_bytes(body).map_err(invalid)?),
             11 => Self::ValidatorRegistration(
                 ValidatorRegistration::from_ssz_bytes(body).map_err(invalid)?,
+            ),
+            12 => Self::AggregateAndProof(AggregateAndProof::Gloas(Box::new(
+                AggregateAndProofElectra::from_ssz_bytes(body).map_err(invalid)?,
+            ))),
+            13 => Self::PayloadAttestation(
+                PayloadAttestationData::from_ssz_bytes(body).map_err(invalid)?,
+            ),
+            14 => Self::ExecutionPayloadEnvelope(Box::new(
+                EnvelopeSummary::from_ssz_bytes(body).map_err(invalid)?,
+            )),
+            15 => Self::ProposerPreferences(
+                ProposerPreferences::from_ssz_bytes(body).map_err(invalid)?,
             ),
             _ => return Err(CodecError::InvalidEnum(tag)),
         })

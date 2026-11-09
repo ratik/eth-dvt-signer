@@ -173,7 +173,8 @@ pub struct DutyCheck {
     pub height: Option<u64>,
     /// Its signing root is approved (P0.2): a keyholder signs an exit or a deposit only then.
     pub approved: bool,
-    /// For a builder registration, the registration policy in force (none: none is set).
+    /// For a duty the fee-recipient policy binds (a builder registration, Gloas proposer
+    /// preferences or envelope), the registration policy in force (none: none is set).
     pub policy: Option<RegistrationPolicy>,
 }
 
@@ -1033,7 +1034,7 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                         approved: protection.is_approved(&request),
                         policy: request
                             .duty
-                            .registration()
+                            .terms()
                             .and(self.store.registration_policy().cloned()),
                     });
                 }

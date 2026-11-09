@@ -30,7 +30,8 @@
 //! | --- | --- |
 //! | Block proposal | its slot has started by `now + leeway` |
 //! | Attestation | its slot has started, and its source and target epochs have too |
-//! | Aggregation and sync committee selection proofs, aggregates, sync committee messages and contributions, RANDAO reveals | its epoch is at most [`FUTURE_EPOCHS`] ahead of `now + leeway` |
+//! | Gloas PTC vote, envelope of a self-built payload | its slot has started |
+//! | Aggregation and sync committee selection proofs, aggregates, sync committee messages and contributions, RANDAO reveals, Gloas proposer preferences (the epoch of the proposal slot) | its epoch is at most [`FUTURE_EPOCHS`] ahead of `now + leeway` |
 //! | Voluntary exit, deposit | always: an exit's epoch is the earliest one it may be processed in, which may lie ahead; a deposit has no epoch |
 //! | Builder registration | its timestamp is within the registration policy's window (`eth::registration`, checked with the policy where it is known) |
 //! | Slashing-protection import | its latest block slot and attestation epochs have started |
@@ -153,6 +154,8 @@ impl Horizon {
         };
         match &request.duty {
             Duty::BlockProposal(header) => slot(header.slot),
+            Duty::PayloadAttestation(data) => slot(data.slot),
+            Duty::ExecutionPayloadEnvelope(envelope) => slot(envelope.slot_number),
             Duty::Attestation(data) => {
                 slot(data.slot)?;
                 epoch(data.source.epoch, latest_epoch)?;
@@ -183,14 +186,21 @@ impl Horizon {
         let network = self.network.ok_or(Beyond::NotConfigured)?;
         let latest = network.slot_at(now + leeway).ok_or(Beyond::BeforeGenesis)?;
         let latest_epoch = latest / SLOTS_PER_EPOCH;
+        let slot_rule = matches!(
+            kind,
+            DutyKind::BlockProposal
+                | DutyKind::PayloadAttestation
+                | DutyKind::ExecutionPayloadEnvelope
+        );
         let (epoch, limit) = match kind {
-            DutyKind::BlockProposal if period > latest => {
+            // Protected per slot, signed only once the slot has started.
+            _ if slot_rule && period > latest => {
                 return Err(Beyond::FutureSlot {
                     slot: period,
                     latest,
                 });
             }
-            DutyKind::BlockProposal => return Ok(()),
+            _ if slot_rule => return Ok(()),
             // The protection period of an attestation is its target epoch.
             DutyKind::Attestation => (period, latest_epoch),
             DutyKind::RandaoReveal => (period, latest_epoch + FUTURE_EPOCHS),

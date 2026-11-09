@@ -1185,23 +1185,29 @@ impl<
                     warn!(?kind, period, %beyond, "not signing a duty beyond this node's horizon");
                     return Err(Refusal::BeyondHorizon);
                 }
-                // A registration only while the policy in force allows it, an authorized one
-                // asked again included (`eth::registration`).
-                if kind == DutyKind::ValidatorRegistration {
+                // A registration, Gloas preferences or an envelope only while the policy in force
+                // allows its terms (a registration also its window), an authorized one asked
+                // again included (`eth::registration`).
+                if kind.is_policy_bound() {
                     let checked = match (&self.registration_policy, terms) {
                         (Some(policy), Some(terms)) => policy
                             .allows(&terms)
                             .map_err(|refusal| (refusal, Refusal::NotAuthorized))
                             .and_then(|()| {
-                                policy
-                                    .window(period, now, Horizon::VOTE)
-                                    .map_err(|refusal| (refusal, Refusal::BeyondHorizon))
+                                if kind == DutyKind::ValidatorRegistration {
+                                    policy
+                                        .window(period, now, Horizon::VOTE)
+                                        .map_err(|refusal| (refusal, Refusal::BeyondHorizon))
+                                } else {
+                                    Ok(())
+                                }
                             }),
-                        // No policy, or (impossible) a registration recorded without terms.
+                        // No policy, or a duty recorded without its terms (written before the
+                        // terms were kept: not signed again).
                         _ => Err((RegistrationRefusal::NoPolicy, Refusal::NotAuthorized)),
                     };
                     if let Err((why, refusal)) = checked {
-                        warn!(%why, "not signing a builder registration");
+                        warn!(?kind, %why, "not signing a duty the registration policy refuses");
                         return Err(refusal);
                     }
                 }

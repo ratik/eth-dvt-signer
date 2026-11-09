@@ -30,10 +30,29 @@
 //! returned stays valid: a signature cannot be withdrawn). The window and the per-block limit are
 //! not slashing rules: they bound what a faulty node or a client can add to the replicated history
 //! and how much registrations can delay other duties.
+//!
+//! From Gloas on the same policy binds the two other duties that name a fee recipient
+//! ([`Duty::terms`], `DutyKind::is_policy_bound`), in the same places and with the same in-block
+//! order:
+//!
+//! | Duty | Rule |
+//! | --- | --- |
+//! | `PROPOSER_PREFERENCES` | its fee recipient is one of the policy's, its target gas limit in the range |
+//! | `EXECUTION_PAYLOAD_ENVELOPE` (a self-built payload) | its payload's fee recipient is one of the policy's (the gas limit is not checked: the execution layer moves it towards the target block by block) |
+//!
+//! Neither has a timestamp window or a per-block limit (both have deadlines in their slot, and
+//! slashing protection bounds them per slot). Without a policy neither is signed: a self-built
+//! Gloas block's payload is then never revealed. Before Gloas the signer sees only a block's
+//! header, never its payload's fee recipient (audit L-27).
 
-use super::types::{Address, ValidatorRegistration, hex_bytes};
+use super::{
+    duty::Duty,
+    types::{Address, ValidatorRegistration, hex_bytes},
+};
 use bytes::{Buf, BufMut};
-use commonware_codec::{EncodeSize, Error as CodecError, Read, ReadExt as _, Write, varint::UInt};
+use commonware_codec::{
+    EncodeSize, Error as CodecError, FixedSize as _, Read, ReadExt as _, Write, varint::UInt,
+};
 use commonware_cryptography::{Hasher as _, Sha256, sha256::Digest};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -67,20 +86,59 @@ pub struct Policy {
     pub max_age_seconds: u64,
 }
 
-/// What a keyholder knows of an authorized registration, beyond its signing root and timestamp:
-/// what the policy decides on.
+/// What the policy decides on for a policy-bound duty (`DutyKind::is_policy_bound`), and what a
+/// keyholder knows of one beyond its signing root: the fee recipient, and the gas limit where the
+/// duty names one the validator chooses (a registration's gas limit, the target gas limit of
+/// Gloas proposer preferences; not an envelope's payload, whose gas limit moves towards the
+/// target block by block).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Terms {
     pub fee_recipient: Address,
-    pub gas_limit: u64,
+    pub gas_limit: Option<u64>,
 }
 
 impl From<&ValidatorRegistration> for Terms {
     fn from(registration: &ValidatorRegistration) -> Self {
         Self {
             fee_recipient: registration.fee_recipient,
-            gas_limit: registration.gas_limit,
+            gas_limit: Some(registration.gas_limit),
         }
+    }
+}
+
+impl Write for Terms {
+    fn write(&self, buf: &mut impl BufMut) {
+        buf.put_slice(&self.fee_recipient);
+        self.gas_limit.is_some().write(buf);
+        if let Some(gas_limit) = self.gas_limit {
+            gas_limit.write(buf);
+        }
+    }
+}
+
+impl Read for Terms {
+    type Cfg = ();
+    fn read_cfg(buf: &mut impl Buf, _: &()) -> Result<Self, CodecError> {
+        if buf.remaining() < 20 {
+            return Err(CodecError::EndOfBuffer);
+        }
+        let mut fee_recipient = [0; 20];
+        buf.copy_to_slice(&mut fee_recipient);
+        let gas_limit = if bool::read(buf)? {
+            Some(u64::read(buf)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            fee_recipient,
+            gas_limit,
+        })
+    }
+}
+
+impl EncodeSize for Terms {
+    fn encode_size(&self) -> usize {
+        20 + 1 + self.gas_limit.map_or(0, |_| u64::SIZE)
     }
 }
 
@@ -90,7 +148,8 @@ impl From<&ValidatorRegistration> for Terms {
 pub enum Refusal {
     #[error(
         "no registration policy is set (mpc-admin draft set-registration-policy; \
-         docs/administration.md): no registration is signed"
+         docs/administration.md): no registration, proposer preferences or payload envelope is \
+         signed"
     )]
     NoPolicy,
     #[error(
@@ -186,9 +245,11 @@ impl Policy {
                 fee_recipient: terms.fee_recipient,
             });
         }
-        if !(self.gas_limit_min..=self.gas_limit_max).contains(&terms.gas_limit) {
+        if let Some(gas_limit) = terms.gas_limit
+            && !(self.gas_limit_min..=self.gas_limit_max).contains(&gas_limit)
+        {
             return Err(Refusal::GasLimit {
-                gas_limit: terms.gas_limit,
+                gas_limit,
                 min: self.gas_limit_min,
                 max: self.gas_limit_max,
             });
@@ -280,6 +341,23 @@ pub fn check(
     let policy = policy.ok_or(Refusal::NoPolicy)?;
     policy.allows(&Terms::from(registration))?;
     policy.window(registration.timestamp, now, leeway)
+}
+
+/// Whether the policy in force allows `duty`: nothing to decide for a kind it does not bind;
+/// for one it does, its terms, and a registration's timestamp window at `now`.
+pub fn check_duty(
+    policy: Option<&Policy>,
+    duty: &Duty,
+    now: SystemTime,
+    leeway: Duration,
+) -> Result<(), Refusal> {
+    if let Some(registration) = duty.registration() {
+        return check(policy, registration, now, leeway);
+    }
+    match duty.terms() {
+        Some(terms) => policy.ok_or(Refusal::NoPolicy)?.allows(&terms),
+        None => Ok(()),
+    }
 }
 
 /// A policy as the API and `mpc-admin` write it (`POST /eth/registration-policy`). The windows

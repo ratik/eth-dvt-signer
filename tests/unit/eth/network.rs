@@ -103,7 +103,9 @@ fn fork(previous: u32, current: u32, epoch: u64) -> Fork {
 fn the_pinned_schedules() {
     for network in [Network::MAINNET, Network::HOODI] {
         assert_eq!(network.validate(), Ok(()));
-        assert_eq!(network.forks.len(), ForkName::ALL.len());
+        // Every fork this build knows but Gloas, which neither schedules yet.
+        assert_eq!(network.forks.len(), ForkName::ALL.len() - 1);
+        assert_eq!(network.gloas_epoch(), None);
     }
     let schedule = |network: &Network| {
         network
@@ -473,4 +475,120 @@ fn a_custom_schedule_is_complete() {
         ..Network::MAINNET
     };
     assert!(minimal.validate().is_err());
+}
+
+/// A devnet whose Gloas starts at epoch 10.
+fn gloas_devnet() -> Network {
+    let network = Network {
+        genesis_time: 1_700_000_000,
+        seconds_per_slot: 4,
+        slots_per_epoch: 32,
+        genesis_validators_root: [3; 32],
+        forks: Vec::leak(
+            Network::parse_schedule(
+                "phase0=0x10000038@0,altair=0x20000038@0,bellatrix=0x30000038@0,\
+                 capella=0x40000038@0,deneb=0x50000038@0,electra=0x60000038@0,\
+                 fulu=0x70000038@0,gloas=0x80000038@10",
+            )
+            .unwrap(),
+        ),
+    };
+    assert_eq!(network.validate(), Ok(()));
+    network
+}
+
+fn ptc_vote(slot: u64) -> Duty {
+    Duty::PayloadAttestation(crate::eth::gloas::PayloadAttestationData {
+        beacon_block_root: [9; 32],
+        slot,
+        payload_present: true,
+        blob_data_available: true,
+    })
+}
+
+fn preferences(proposal_slot: u64) -> Duty {
+    Duty::ProposerPreferences(crate::eth::gloas::ProposerPreferences {
+        dependent_root: [8; 32],
+        proposal_slot,
+        validator_index: 12,
+        fee_recipient: [1; 20],
+        target_gas_limit: 60_000_000,
+    })
+}
+
+fn aggregate(slot: u64) -> Box<crate::eth::types::AggregateAndProofElectra> {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../fixtures/gloas/AggregateAndProof.json")).unwrap();
+    let mut aggregate: crate::eth::types::AggregateAndProofElectra =
+        serde_json::from_value(fixture["cases"][0]["value"].clone()).unwrap();
+    aggregate.aggregate.data.slot = slot;
+    Box::new(aggregate)
+}
+
+/// Gloas duties exist only from the schedule's Gloas epoch on; an aggregate takes its epoch's
+/// form, which the API resolves and voters check.
+#[test]
+fn gloas_follows_the_schedule() {
+    let devnet = gloas_devnet();
+    assert_eq!(devnet.gloas_epoch(), Some(10));
+    assert!(!devnet.is_gloas(9));
+    assert!(devnet.is_gloas(10));
+    let fulu = fork(0x6000_0038, 0x7000_0038, 0);
+    let gloas = fork(0x7000_0038, 0x8000_0038, 10);
+    let check = |duty: Duty, fork| devnet.check(&request(&devnet, duty, fork));
+    // A PTC vote: from Gloas's first slot.
+    assert_eq!(check(ptc_vote(320), gloas), Ok(()));
+    assert!(matches!(
+        check(ptc_vote(319), fulu),
+        Err(WrongFork::BeforeGloas { epoch: 9, .. })
+    ));
+    // Preferences for Gloas's first epoch, signed in the epoch before: Gloas's version, as
+    // Lighthouse names it (`fork_at(proposal epoch)`).
+    assert_eq!(devnet.fork_info(&preferences(320)).fork, gloas);
+    assert_eq!(check(preferences(320), gloas), Ok(()));
+    assert!(matches!(
+        check(preferences(320), fulu),
+        Err(WrongFork::WrongVersion { epoch: 10, .. })
+    ));
+    assert!(matches!(
+        check(preferences(300), fulu),
+        Err(WrongFork::BeforeGloas { epoch: 9, .. })
+    ));
+    // Aggregates: the client's Electra shape becomes the Gloas form at a Gloas epoch only.
+    let electra_at = |slot| Duty::AggregateAndProof(AggregateAndProof::Electra(aggregate(slot)));
+    let gloas_at = |slot| Duty::AggregateAndProof(AggregateAndProof::Gloas(aggregate(slot)));
+    assert_eq!(devnet.resolve(electra_at(320)), gloas_at(320));
+    assert_eq!(devnet.resolve(electra_at(319)), electra_at(319));
+    assert_eq!(check(gloas_at(320), gloas), Ok(()));
+    assert_eq!(check(electra_at(319), fulu), Ok(()));
+    assert!(matches!(
+        check(electra_at(320), gloas),
+        Err(WrongFork::AggregateForm { epoch: 10, .. })
+    ));
+    assert!(matches!(
+        check(gloas_at(319), fulu),
+        Err(WrongFork::AggregateForm { epoch: 9, .. })
+    ));
+    // The two forms root differently: the signing root follows the form.
+    let fork_info = devnet.fork_info(&gloas_at(320));
+    assert_ne!(
+        gloas_at(320).signing_root(&fork_info),
+        electra_at(320).signing_root(&fork_info)
+    );
+}
+
+/// Where Gloas is not scheduled (mainnet, Hoodi), no Gloas duty passes, and aggregates keep
+/// Electra's form.
+#[test]
+fn without_gloas_no_gloas_duty() {
+    let mainnet = Network::MAINNET;
+    let fulu = fork(0x0500_0000, 0x0600_0000, 411_392);
+    let slot = 500_000 * 32;
+    assert!(matches!(
+        mainnet.check(&request(&mainnet, ptc_vote(slot), fulu)),
+        Err(WrongFork::BeforeGloas { ref gloas, .. }) if gloas == "none"
+    ));
+    let electra = Duty::AggregateAndProof(AggregateAndProof::Electra(aggregate(slot)));
+    assert_eq!(mainnet.resolve(electra.clone()), electra);
+    assert_eq!(mainnet.check(&request(&mainnet, electra, fulu)), Ok(()));
 }

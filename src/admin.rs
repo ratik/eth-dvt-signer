@@ -1050,7 +1050,9 @@ pub fn describe(command: &Command) -> String {
         Command::SetRegistrationPolicy(policy) => format!(
             "set the builder registration policy (digest 0x{}): fee recipients {}; gas limit \
              {} to {}; timestamps at most {} s ahead and {} s behind the clock. Every builder \
-             registration signed from now on must meet it; any other is refused",
+             registration signed from now on must meet it; any other is refused. From Gloas on \
+             it also decides on proposer preferences (fee recipient, target gas limit) and on \
+             the envelopes of self-built payloads (fee recipient)",
             hex::encode(policy.digest()),
             if policy.fee_recipients.is_empty() {
                 "none (no registration is signed)".to_string()

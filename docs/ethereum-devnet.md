@@ -152,6 +152,22 @@ relay's, mev-boost's, the builder's and the beacon node's logs. The MEV images a
 floating tags: the report records their digests
 ([below](#builder-registrations-runs-k-and-l)).
 
+`IT_RUN=run-gloas ./integration/ethereum/scripts/run.sh` signs across the Gloas fork
+(`kurtosis/network-gloas.yaml`: the same devnet with Gloas at epoch 16, ethereum-package pinned to
+a main commit, since 6.1.0's genesis generator predates the Amsterdam EIPs of the clients;
+Lighthouse v8.3.3; no builder, so every block is self-built). The signers take the devnet's
+schedule, Gloas included. The approvers set the registration policy (the validator client's fee
+recipient, gas limits up to 300 000 000: the devnet's schedule raises the gas limit to 200 000 000
+at Gloas), which binds preferences and envelopes. The validator activates a few epochs before the
+fork (the run fails if it activates too late to sign before it). The run observes the validator
+from its activation to six epochs after the fork, counts Lighthouse's Gloas requests (PTC votes,
+envelopes, preferences, and the preferences for Gloas's first epoch signed before the fork) with
+their latency, checks for each of the validator's proposals after the fork that its envelope was
+signed and its payload revealed (the execution node has its block hash and the next block's bid
+builds on it), and adds four refusals to the security checks (a second PTC vote for a slot, an
+envelope of a slot without the validator's block, an envelope and preferences paying another fee
+recipient) ([below](#gloas-run-m)).
+
 The evidence of an observed window (attestations and proposals in the beacon state) is read in
 the background, each epoch two epochs after it: a scenario goes on as soon as its window's last
 epoch ends, and the run waits for every reading before its report.
@@ -575,6 +591,28 @@ In run L, Lighthouse's beacon node logged "Block broadcast was delayed" for 5 of
 them builder blocks: the relay's unblinding adds a round trip to the MPC signature on 4 s slots);
 every one of them is canonical. The relay and the builder logged 441 MB in run L; the driver now
 keeps the last 100 000 lines of each.
+
+### Gloas (run M)
+
+Run M (`20261109T115356Z`), `IT_RUN=run-gloas`: the devnet of `network-gloas.yaml` (Gloas at epoch
+16, version `0x80000038`; ethereum-package `5795b77e`; Lighthouse v8.3.3 beacon node and validator
+client; geth v1.17.10). Exit 0.
+
+| | Run M |
+| --- | --- |
+| Signers | started with the devnet's schedule, Gloas included (`gloas=0x80000038@16`) |
+| Registration policy | approved by two approvers before Lighthouse started (fee recipient `0xafF0…9896`, gas limit 30 000 000 to 300 000 000) |
+| The validator | active from epoch 11; attested in every epoch of 11 to 21 (target and head), 5 before the fork and 6 after it; 13 proposals assigned, 13 canonical |
+| Preferences before the fork | Lighthouse signed the preferences for Gloas's first epoch in epoch 15, naming Gloas's version; published |
+| From the fork on (the observed window) | 11 proposals, all canonical, all self-built (Gloas blocks); 11 envelopes signed, every payload revealed (the execution node has its block, the next block's bid builds on it); block to envelope 478 to 858 ms on 4 s slots (the payload is due at 2 s) |
+| Requests from the fork on, all signed (`200`) | PTC votes 7 (p50 340 ms, max 622 ms), envelopes 11 (p50 297 ms, max 567 ms), preferences 12 (p50 291 ms, max 549 ms), blocks 11, aggregates 7 (Gloas form), attestations 7 |
+| Whole run | 107 signing requests from Lighthouse, all signed, none retried; 17 blocks signed, all canonical, 13 finalized; Lighthouse logged no warning, error or failure to sign, and published 12 envelopes, 8 PTC votes and 8 sets of preferences |
+| Security checks | 12 of 12, with the four Gloas ones: a second PTC vote of a slot `412 too_many_roots`, an envelope of a slot without the validator's block `412 envelope_without_own_block`, an envelope and preferences paying another fee recipient `412 fee_recipient` |
+
+A validator votes in the PTC only in its attestation slot: the committee is drawn from that slot's
+beacon committees (`compute_ptc`), so once per epoch at most (here, one vote per epoch). No
+builder ran: the run shows self-built Gloas blocks only; proposer preferences were signed and
+published, but no builder bid on them.
 
 ## Troubleshooting
 

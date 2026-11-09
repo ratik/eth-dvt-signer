@@ -1,0 +1,61 @@
+{
+ "source": "consensus-specs v1.7.0-beta.4 mainnet.tar.gz (sha256 67762986572372a08d3b182535aa760433c86e174e14e0bbd756f350dd19398c), tests/mainnet/gloas/ssz_static",
+ "type": "ProposerPreferences",
+ "cases": [
+  {
+   "case": "ssz_random/case_0",
+   "value": {
+    "dependent_root": "0xc4e1edcd34d041df8f005c002312c82575c46beb21d1a32483609ae4ce9b5b0b",
+    "proposal_slot": "14521827915840817726",
+    "validator_index": "4807878250209551519",
+    "fee_recipient": "0x444adcf95a1762332b5f690cdffe0d6bb0a5d132",
+    "target_gas_limit": "11529231148629119243"
+   },
+   "root": "0x90c15141c95e8c47ddbb1f0dc77c69d4bf9e3ed1af5eaefc269e2a4572dc6a46"
+  },
+  {
+   "case": "ssz_random/case_1",
+   "value": {
+    "dependent_root": "0x25d698b5ca15a8e3ec2afd7f6cf41e3e5c32ab389ae1de44ecb6ad61f6cc8eae",
+    "proposal_slot": "11194915926162597852",
+    "validator_index": "2239244022230275766",
+    "fee_recipient": "0x9a801adfe5377ee90aa42b23d9f1a87ec6e5d577",
+    "target_gas_limit": "5681316583603722286"
+   },
+   "root": "0xe08abee2ed82a5612507775def87d28095811973e21847fdc1ade7be2ab3484f"
+  },
+  {
+   "case": "ssz_random/case_2",
+   "value": {
+    "dependent_root": "0x425d4765efe7e1d187e73b62efe9f75cc7cb5f912a94f282436996e4144e110f",
+    "proposal_slot": "14875263238005702020",
+    "validator_index": "7492281608615680885",
+    "fee_recipient": "0x229310654827f1aa98f14ae422860bd14a020896",
+    "target_gas_limit": "13540780374081263638"
+   },
+   "root": "0xb8996e70458d7e16477f0bc5da4f1622aa06c67feee239cc0a9b51fd62b1fda8"
+  },
+  {
+   "case": "ssz_random/case_3",
+   "value": {
+    "dependent_root": "0x0b52800b67521e85ada5745ab7276fb792728b760d125432eb1b67071a9debee",
+    "proposal_slot": "2202999331860145812",
+    "validator_index": "2067583358869348912",
+    "fee_recipient": "0xd0f432b53320d3a0512354d8e9270c31f14ad2e7",
+    "target_gas_limit": "11814133109870945390"
+   },
+   "root": "0x1f70bf0f3ee1f3158adc004d6a3d2820dfe4c5b592b1e02adaf69ee97e6eabff"
+  },
+  {
+   "case": "ssz_random/case_4",
+   "value": {
+    "dependent_root": "0x0a04704bcaa54f4333f9dafef639820ce0f007fade97311a6915335038dbea46",
+    "proposal_slot": "18373119123250592991",
+    "validator_index": "15949774658323287039",
+    "fee_recipient": "0xedd5fd22ebcb0bcb4c66559e37c146e80df9f483",
+    "target_gas_limit": "3822672908175646293"
+   },
+   "root": "0xdf8bc724a5c823ddd297f31249bda74eb563b7722fdf8b9ea96813a3d37bda0b"
+  }
+ ]
+}

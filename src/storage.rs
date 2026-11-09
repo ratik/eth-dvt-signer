@@ -34,7 +34,7 @@ use crate::{
         types::Root,
     },
     slashing::{
-        Activation, ActivationOutcome, Approved, Attested, ChainIdentity, Decision,
+        Activation, ActivationOutcome, Approved, Attested, Bound, ChainIdentity, Decision,
         DutyAuthorization, Floors, HistoryOutcome, ImportedValidator, Protection, Record,
         Refusal as DutyRefusal, Registered, Signed, Validator,
     },
@@ -97,6 +97,9 @@ const EPOCH_PREFIX: u8 = 8;
 const APPROVAL_PREFIX: u8 = 9;
 /// `(validator, sequence number)`: an authorized builder registration (`Registered::sequence`).
 const REGISTRATION_PREFIX: u8 = 10;
+/// `(validator, sequence number)`: the policy terms of an authorized Gloas preference or envelope
+/// (`Bound::sequence`).
+const BOUND_PREFIX: u8 = 11;
 /// `16 + duty kind`, `(validator, period)`: authorized roots of non-slashable duties.
 const BOUNDED_PREFIX: u8 = 16;
 
@@ -145,6 +148,9 @@ enum Value {
     Registration(Root, Registered),
     /// The builder registration policy.
     RegistrationPolicy(Box<RegistrationPolicy>),
+    /// The policy terms of an authorized Gloas preference or envelope (stored under its validator
+    /// and sequence number).
+    Bound(Root, Bound),
 }
 
 fn write_optional_u64(value: Option<u64>, buf: &mut impl BufMut) {
@@ -363,12 +369,23 @@ impl Write for Value {
                 buf.put_slice(root);
                 registered.timestamp.write(buf);
                 buf.put_slice(&registered.terms.fee_recipient);
-                registered.terms.gas_limit.write(buf);
+                registered
+                    .terms
+                    .gas_limit
+                    .expect("a registration's terms name its gas limit")
+                    .write(buf);
                 registered.height.write(buf);
             }
             Self::RegistrationPolicy(policy) => {
                 17u8.write(buf);
                 policy.write(buf);
+            }
+            Self::Bound(root, bound) => {
+                18u8.write(buf);
+                buf.put_slice(root);
+                (bound.kind as u8).write(buf);
+                bound.period.write(buf);
+                bound.terms.write(buf);
             }
         }
     }
@@ -469,9 +486,24 @@ impl Read for Value {
                         timestamp,
                         terms: Terms {
                             fee_recipient,
-                            gas_limit: u64::read(buf)?,
+                            gas_limit: Some(u64::read(buf)?),
                         },
                         height: u64::read(buf)?,
+                        sequence: 0,
+                    },
+                ))
+            }
+            18 => {
+                let root = read_root(buf)?;
+                let kind = DutyKind::from_u8(u8::read(buf)?)
+                    .filter(|kind| kind.is_policy_bound())
+                    .ok_or(CodecError::Invalid("Value", "bad kind of policy terms"))?;
+                Ok(Self::Bound(
+                    root,
+                    Bound {
+                        kind,
+                        period: u64::read(buf)?,
+                        terms: Terms::read(buf)?,
                         sequence: 0,
                     },
                 ))
@@ -513,6 +545,7 @@ impl EncodeSize for Value {
             Self::Approval(..) => 32 + 1 + u64::SIZE,
             Self::Registration(..) => 32 + u64::SIZE + 20 + 2 * u64::SIZE,
             Self::RegistrationPolicy(policy) => policy.encode_size(),
+            Self::Bound(_, bound) => 32 + 1 + u64::SIZE + bound.terms.encode_size(),
         }
     }
 }
@@ -695,6 +728,13 @@ fn persist<E: Context>(
                 Value::Registration(root, registered),
             )
         }
+        Record::Bound { id, root } => {
+            let bound = *protection.bound(id, &root).expect("recorded policy terms");
+            metadata.put(
+                key(BOUND_PREFIX, id, bound.sequence),
+                Value::Bound(root, bound),
+            )
+        }
     };
 }
 
@@ -802,6 +842,9 @@ impl<E: Context> Store<E> {
                             ..*registered
                         },
                     );
+                }
+                ((BOUND_PREFIX, id, sequence), Some(Value::Bound(root, bound))) => {
+                    protection.restore_bound(id, *root, Bound { sequence, ..*bound });
                 }
                 // Read above.
                 ((EPOCH_PREFIX, _, 0), Some(Value::Epoch(_))) => {}
@@ -1124,13 +1167,13 @@ impl<E: Context> Store<E> {
                             outcome => Effect::Start(outcome),
                         }
                     }
-                    // A registration the policy in force refuses is not authorized, a retry of an
-                    // authorized one included (`eth::registration`).
+                    // A registration, Gloas preference or envelope the policy in force refuses is
+                    // not authorized, a retry of an authorized one included (`eth::registration`).
                     Command::Duty(request)
-                        if request.duty.registration().is_some_and(|registration| {
+                        if request.duty.terms().is_some_and(|terms| {
                             self.registration_policy
                                 .as_ref()
-                                .is_none_or(|policy| policy.allows(&registration.into()).is_err())
+                                .is_none_or(|policy| policy.allows(&terms).is_err())
                         }) =>
                     {
                         Effect::Duty(

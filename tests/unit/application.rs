@@ -132,7 +132,7 @@ fn the_policy_in_force_follows_block_order() {
     let leeway = Horizon::VOTE;
     // A policy of A, then a registration of B: refused.
     let block = [set(policy(&[1])), registration(2, NOW)];
-    let refused = refused_registrations(&block, start.clone(), now(), leeway);
+    let refused = refused_by_policy(&block, start.clone(), now(), leeway);
     assert_eq!(refused.len(), 1);
     assert_eq!(refused[0].0, 1);
     assert!(matches!(
@@ -141,14 +141,14 @@ fn the_policy_in_force_follows_block_order() {
     ));
     // A registration of B, then a policy of A: B is decided by the policy before, which allows it.
     let block = [registration(2, NOW), set(policy(&[1]))];
-    assert!(refused_registrations(&block, start.clone(), now(), leeway).is_empty());
+    assert!(refused_by_policy(&block, start.clone(), now(), leeway).is_empty());
     // No policy before: refused, until a policy allows it.
     let block = [
         registration(2, NOW),
         set(policy(&[2])),
         registration(2, NOW),
     ];
-    let refused = refused_registrations(&block, None, now(), leeway);
+    let refused = refused_by_policy(&block, None, now(), leeway);
     assert_eq!(refused.len(), 1);
     assert_eq!(refused[0], (0, registration::Refusal::NoPolicy));
     // The window, by this node's clock with the voters' leeway.
@@ -158,7 +158,7 @@ fn the_policy_in_force_follows_block_order() {
         registration(2, NOW - 3600 - 4),
         registration(2, NOW - 3600 - 5),
     ];
-    let refused: Vec<usize> = refused_registrations(&block, start, now(), leeway)
+    let refused: Vec<usize> = refused_by_policy(&block, start, now(), leeway)
         .into_iter()
         .map(|(index, _)| index)
         .collect();

@@ -934,6 +934,7 @@ fn views(nodes: &[Node]) -> Vec<(&Node, Option<View>)> {
 fn status(nodes: &[Node]) -> Result<(), String> {
     let mut networks = std::collections::BTreeSet::new();
     let mut policies = std::collections::BTreeSet::new();
+    let mut gloas_scheduled = false;
     for (node, view) in views(nodes) {
         let admin = node.get("/admin");
         // The builder registration policy it applies.
@@ -960,7 +961,25 @@ fn status(nodes: &[Node]) -> Result<(), String> {
                         .unwrap_or_default()
                         .to_string(),
                 );
-                let text = format!("network {}  forks {}", short(&identity), short(&schedule));
+                // Gloas (`eth::gloas`), if the schedule has it.
+                let gloas = network["forks"].as_array().and_then(|forks| {
+                    forks
+                        .iter()
+                        .find(|fork| fork["name"] == json!("gloas"))
+                        .and_then(|fork| fork["epoch"].as_str().map(str::to_string))
+                });
+                let text = format!(
+                    "network {}  forks {}{}",
+                    short(&identity),
+                    short(&schedule),
+                    gloas
+                        .as_ref()
+                        .map(|epoch| format!("  gloas @{epoch}"))
+                        .unwrap_or_default()
+                );
+                if gloas.is_some() {
+                    gloas_scheduled = true;
+                }
                 networks.insert((identity, schedule));
                 text
             },
@@ -995,6 +1014,13 @@ fn status(nodes: &[Node]) -> Result<(), String> {
         println!(
             "NOTE: nodes report different registration policies: those behind have not applied \
              the latest block yet"
+        );
+    }
+    if gloas_scheduled && policies.contains("") {
+        println!(
+            "WARNING: Gloas is scheduled and no registration policy is set: no proposer \
+             preferences or payload envelope is signed, so self-built Gloas blocks lose their \
+             payloads (draft set-registration-policy)"
         );
     }
     Ok(())

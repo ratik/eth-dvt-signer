@@ -359,3 +359,84 @@ fn approvals_do_not_lift_the_horizon() {
     );
     assert_eq!(horizon.command(&approved, now, Horizon::VOTE), expected);
 }
+
+/// Gloas: a PTC vote and an envelope sign from their slot (as a block does), proposer
+/// preferences up to two epochs ahead of their proposal slot's epoch; a keyholder the same.
+#[test]
+fn gloas_duties_follow_their_slots() {
+    use crate::eth::gloas::{EnvelopeSummary, PayloadAttestationData, ProposerPreferences};
+    let horizon = horizon();
+    let now = at(100, 5);
+    let ptc = |slot| {
+        request(Duty::PayloadAttestation(PayloadAttestationData {
+            beacon_block_root: [4; 32],
+            slot,
+            payload_present: true,
+            blob_data_available: true,
+        }))
+    };
+    let envelope = |slot| {
+        request(Duty::ExecutionPayloadEnvelope(Box::new(EnvelopeSummary {
+            parent_hash: [0; 32],
+            fee_recipient: [1; 20],
+            state_root: [0; 32],
+            receipts_root: [0; 32],
+            logs_bloom_root: [0; 32],
+            prev_randao: [0; 32],
+            block_number: 0,
+            gas_limit: 0,
+            gas_used: 0,
+            timestamp: 0,
+            extra_data_root: [0; 32],
+            base_fee_per_gas: [0; 32],
+            block_hash: [0; 32],
+            transactions_root: [0; 32],
+            withdrawals_root: [0; 32],
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+            block_access_list_root: [0; 32],
+            slot_number: slot,
+            execution_requests_root: [0; 32],
+            builder_index: u64::MAX,
+            beacon_block_root: [0; 32],
+            parent_beacon_block_root: [0; 32],
+        })))
+    };
+    let preferences = |proposal_slot| {
+        request(Duty::ProposerPreferences(ProposerPreferences {
+            dependent_root: [0; 32],
+            proposal_slot,
+            validator_index: 5,
+            fee_recipient: [1; 20],
+            target_gas_limit: 60_000_000,
+        }))
+    };
+    for duty in [ptc(100), envelope(100), ptc(3), envelope(3)] {
+        assert_eq!(horizon.duty(&duty, now, Horizon::ADMISSION), Ok(()));
+    }
+    for duty in [ptc(101), envelope(101)] {
+        assert_eq!(
+            horizon.duty(&duty, now, Horizon::ADMISSION),
+            Err(Beyond::FutureSlot {
+                slot: 101,
+                latest: 100
+            })
+        );
+    }
+    // Slot 100 is in epoch 3: preferences for epoch 5 pass, for epoch 6 not.
+    assert_eq!(
+        horizon.duty(&preferences(5 * 32 + 31), now, Horizon::ADMISSION),
+        Ok(())
+    );
+    assert_eq!(
+        horizon.duty(&preferences(6 * 32), now, Horizon::ADMISSION),
+        Err(Beyond::FutureEpoch { epoch: 6, limit: 5 })
+    );
+    let check = |kind, period| horizon.authorized(kind, period, now, Horizon::VOTE);
+    assert_eq!(check(DutyKind::PayloadAttestation, 100), Ok(()));
+    assert!(check(DutyKind::PayloadAttestation, 101).is_err());
+    assert_eq!(check(DutyKind::ExecutionPayloadEnvelope, 100), Ok(()));
+    assert!(check(DutyKind::ExecutionPayloadEnvelope, 101).is_err());
+    assert_eq!(check(DutyKind::ProposerPreferences, 5 * 32), Ok(()));
+    assert!(check(DutyKind::ProposerPreferences, 6 * 32).is_err());
+}

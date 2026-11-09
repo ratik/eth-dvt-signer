@@ -370,6 +370,11 @@ pub struct Options {
 /// Largest EIP-3076 interchange accepted (a full history of years of attestations).
 const MAX_INTERCHANGE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Largest signing request accepted (`413` above): a Gloas envelope carries its whole payload,
+/// whose execution block EIP-7934 caps at 10 MiB of RLP, about twice that as JSON hex. Only the
+/// envelope's summary enters consensus (`eth::gloas`).
+pub const MAX_SIGN_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+
 pub fn router(
     client: Client,
     dkg: dkg::Client,
@@ -392,7 +397,9 @@ pub fn router(
         .route("/api/v1/eth2/publicKeys", get(eth2_public_keys))
         .route(
             "/api/v1/eth2/sign/{identifier}",
-            coordinates(post(eth2_sign)),
+            coordinates(
+                post(eth2_sign).layer(axum::extract::DefaultBodyLimit::max(MAX_SIGN_REQUEST_BYTES)),
+            ),
         )
         .route("/upcheck", get(|| async { "OK" }))
         .route("/status", get(status))
@@ -816,10 +823,15 @@ async fn eth2_sign(
             None => return fork_error(WrongFork::NotConfigured),
         }
     }
+    // An aggregate is rooted in its epoch's form (progressive from Gloas on), which the request
+    // does not tell: the pinned schedule does (`Network::resolve`; voters check it).
     let duty = DutyRequest {
         validator,
         fork,
-        duty: request.duty,
+        duty: match api.options.horizon.network() {
+            Some(network) => network.resolve(request.duty),
+            None => request.duty,
+        },
     };
     let endorsement = match approve_duty(&api, &duty, &body).await {
         Ok(endorsement) => endorsement,
@@ -863,9 +875,10 @@ async fn eth2_sign(
         | SignError::Refused(DutyRefusal::UnknownValidator | DutyRefusal::NotActivated) => {
             StatusCode::NOT_FOUND
         }
-        SignError::RootMismatch(_) | SignError::Refused(DutyRefusal::SourceAfterTarget { .. }) => {
-            StatusCode::BAD_REQUEST
-        }
+        SignError::RootMismatch(_)
+        | SignError::Refused(
+            DutyRefusal::SourceAfterTarget { .. } | DutyRefusal::NotSelfBuilt { .. },
+        ) => StatusCode::BAD_REQUEST,
         SignError::NotApproved => StatusCode::FORBIDDEN,
         SignError::Refused(_) => StatusCode::PRECONDITION_FAILED,
         SignError::NotReady(_)

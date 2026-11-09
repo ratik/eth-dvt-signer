@@ -142,7 +142,7 @@ struct Args {
     eth_genesis_validators_root: Option<String>,
 
     /// Another network's fork schedule: `phase0=0x<version>@0,altair=0x<version>@<epoch>,...`,
-    /// every fork it has scheduled, in order (`phase0` to `fulu`).
+    /// every fork it has scheduled, in order (`phase0` to `gloas`).
     #[arg(long, requires = "eth_genesis_time")]
     eth_fork_schedule: Option<String>,
 

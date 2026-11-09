@@ -266,9 +266,22 @@ fn registration_count(block: &Block) -> usize {
         .count()
 }
 
-/// The registrations of `transactions` that `policy` (the policy in force before the first)
-/// and each policy change among them, in order, refuse at `now` with `leeway`: `(index, why)`.
-fn refused_registrations(
+/// The duties of `block` the fee-recipient policy binds (registrations, Gloas preferences and
+/// envelopes): with none, and no protected command, a voter needs neither policy nor nonce.
+fn policy_bound_count(block: &Block) -> usize {
+    block
+        .transactions
+        .iter()
+        .filter(|transaction| {
+            matches!(&transaction.command, Command::Duty(request) if request.duty.terms().is_some())
+        })
+        .count()
+}
+
+/// The duties of `transactions` the fee-recipient policy binds that `policy` (the policy in
+/// force before the first) and each policy change among them, in order, refuse at `now` with
+/// `leeway` (a registration's window; `registration::check_duty`): `(index, why)`.
+fn refused_by_policy(
     transactions: &[Transaction],
     mut policy: Option<Arc<Policy>>,
     now: SystemTime,
@@ -281,8 +294,8 @@ fn refused_registrations(
             continue;
         }
         if let Command::Duty(request) = &transaction.command
-            && let Some(registration) = request.duty.registration()
-            && let Err(refusal) = registration::check(policy.as_deref(), registration, now, leeway)
+            && let Err(refusal) =
+                registration::check_duty(policy.as_deref(), &request.duty, now, leeway)
         {
             refused.push((index, refusal));
         }
@@ -465,9 +478,10 @@ impl Application {
     }
 
     /// `transactions` with the builder registrations moved after every other transaction, at
-    /// most [MAX_REGISTRATIONS_PER_BLOCK] of them, and without those the policy in force at them
-    /// (from `policy`, the one at the parent) or the window at `now` refuses (dropped from the
-    /// mempool: validator clients sign again). A reconfiguration goes alone.
+    /// most [MAX_REGISTRATIONS_PER_BLOCK] of them, and without the duties the policy in force at
+    /// them (from `policy`, the one at the parent) or a registration's window at `now` refuses:
+    /// registrations, Gloas preferences and envelopes (dropped from the mempool: validator
+    /// clients sign again). A reconfiguration goes alone.
     fn with_registrations(
         &self,
         transactions: Vec<Transaction>,
@@ -478,21 +492,20 @@ impl Application {
         let reconfigures = transactions.iter().any(|transaction| {
             matches!(&transaction.command, Command::Admin(authorized) if matches!(authorized.command, Command::Reconfigure(_)))
         });
-        if reconfigures || registrations.is_empty() {
-            return transactions;
-        }
-        let first = transactions.len();
         let mut block = transactions;
-        block.extend(registrations.into_iter().take(MAX_REGISTRATIONS_PER_BLOCK));
-        let refused = refused_registrations(&block, policy, now, Horizon::ADMISSION);
+        if !reconfigures {
+            block.extend(registrations.into_iter().take(MAX_REGISTRATIONS_PER_BLOCK));
+        }
+        // Registrations, and Gloas preferences and envelopes among the others, as voters check
+        // them: the policy in force at each.
+        let refused = refused_by_policy(&block, policy, now, Horizon::ADMISSION);
         if refused.is_empty() {
             return block;
         }
         let mut dropped = Vec::new();
         for (index, refusal) in refused.iter().rev() {
-            debug_assert!(*index >= first, "only registrations are checked");
             let transaction = block.remove(*index);
-            warn!(id = transaction.id, %refusal, "dropping a builder registration");
+            warn!(id = transaction.id, %refusal, "dropping a duty the registration policy refuses");
             dropped.push(transaction);
         }
         self.mempool.remove_all(&dropped);
@@ -725,7 +738,7 @@ where
             );
             return false;
         }
-        if admin_count(&block) == 0 && registrations == 0 {
+        if admin_count(&block) == 0 && policy_bound_count(&block) == 0 {
             return true;
         }
         let Some((next, policy)) = self.unapplied(&parent, &mut ancestry).await else {
@@ -737,7 +750,7 @@ where
             return false;
         };
         if let Some((index, refusal)) =
-            refused_registrations(&block.transactions, policy, now, Horizon::VOTE)
+            refused_by_policy(&block.transactions, policy, now, Horizon::VOTE)
                 .into_iter()
                 .next()
         {
@@ -745,7 +758,7 @@ where
                 height = block.height.get(),
                 id = block.transactions[index].id,
                 %refusal,
-                "refusing a block with a builder registration the policy in force refuses"
+                "refusing a block with a duty the registration policy in force refuses"
             );
             return false;
         }

@@ -1,7 +1,8 @@
 //! Requests of the Web3Signer Ethereum signing API
 //! (`POST /api/v1/eth2/sign/{identifier}`, Consensys Web3Signer `openapi-specs/eth2`), as validator
-//! clients send them (Lighthouse v8.3.2: snake_case objects, quoted integers, `signingRoot` always
-//! present, `AGGREGATE_AND_PROOF` for every fork with the Electra attestation shape from Electra on).
+//! clients send them (Lighthouse v8.3: snake_case objects, quoted integers, `signingRoot` always
+//! present, `AGGREGATE_AND_PROOF` for every fork with the Electra attestation shape from Electra on,
+//! the Gloas types of remote-signing-api v1.4.0 as `{"version": "GLOAS", "data": ...}`).
 //!
 //! Parsing only: the duty object is checked to have exactly the specification's shape, and the
 //! client's `signingRoot` is kept to be compared with the one computed from the duty. Nothing here
@@ -9,6 +10,7 @@
 
 use super::{
     duty::{AggregateAndProof, Duty, Fork, ForkInfo, ValidatorKey},
+    gloas::{ExecutionPayloadEnvelope, PayloadAttestationData, ProposerPreferences},
     types::{
         AggregateAndProofElectra, AggregateAndProofPhase0, AttestationData, BeaconBlockHeader,
         ContributionAndProof, DepositMessage, Root, SyncAggregatorSelectionData,
@@ -19,13 +21,17 @@ use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
 
 /// Block versions signed from their header (`BLOCK_V2` with `block_header`): every fork from
-/// Bellatrix to Fulu. Phase 0 and Altair blocks come whole and are not supported.
-pub const BLOCK_HEADER_VERSIONS: [&str; 5] = ["BELLATRIX", "CAPELLA", "DENEB", "ELECTRA", "FULU"];
+/// Bellatrix to Gloas. Phase 0 and Altair blocks come whole and are not supported.
+pub const BLOCK_HEADER_VERSIONS: [&str; 6] =
+    ["BELLATRIX", "CAPELLA", "DENEB", "ELECTRA", "FULU", "GLOAS"];
 
 /// `AGGREGATE_AND_PROOF_V2` versions with the phase 0 attestation shape.
 const PHASE0_AGGREGATE_VERSIONS: [&str; 5] = ["PHASE0", "ALTAIR", "BELLATRIX", "CAPELLA", "DENEB"];
 /// `AGGREGATE_AND_PROOF_V2` versions with the Electra attestation shape.
 const ELECTRA_AGGREGATE_VERSIONS: [&str; 2] = ["ELECTRA", "FULU"];
+/// The version of the Gloas objects (`{"version": "GLOAS", "data": ...}`) and of a Gloas
+/// `AGGREGATE_AND_PROOF_V2` (Electra's shape, rooted progressively).
+const GLOAS: &str = "GLOAS";
 
 /// Why a request cannot be signed as sent (HTTP 400).
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -122,8 +128,35 @@ fn field<T: DeserializeOwned>(body: &Value, name: &str) -> Result<T, ParseError>
     let value = body
         .get(name)
         .ok_or_else(|| ParseError::Invalid(format!("missing `{name}`")))?;
-    serde_json::from_value(value.clone())
-        .map_err(|err| ParseError::Invalid(format!("`{name}`: {err}")))
+    // Deserialized from the borrowed value: an envelope's payload is not copied.
+    T::deserialize(value).map_err(|err| ParseError::Invalid(format!("`{name}`: {err}")))
+}
+
+/// A Gloas object (`{"version": "GLOAS", "data": ...}`) of request type `kind`.
+fn gloas<T: DeserializeOwned>(body: &Value, kind: &str, name: &str) -> Result<T, ParseError> {
+    let value = body
+        .get(name)
+        .ok_or_else(|| ParseError::Invalid(format!("missing `{name}`")))?;
+    match value.get("version").and_then(Value::as_str) {
+        Some(GLOAS) => {}
+        Some(version) => {
+            return Err(ParseError::Unsupported(format!("{kind} version {version}")));
+        }
+        None => return Err(ParseError::Invalid(format!("`{name}`: missing `version`"))),
+    }
+    if let Some(object) = value.as_object()
+        && let Some(other) = object
+            .keys()
+            .find(|key| *key != "version" && *key != "data")
+    {
+        return Err(ParseError::Invalid(format!(
+            "`{name}`: unknown field `{other}`"
+        )));
+    }
+    let data = value
+        .get("data")
+        .ok_or_else(|| ParseError::Invalid(format!("`{name}`: missing `data`")))?;
+    T::deserialize(data).map_err(|err| ParseError::Invalid(format!("`{name}.data`: {err}")))
 }
 
 fn object<T: DeserializeOwned>(value: Value, name: &str) -> Result<T, ParseError> {
@@ -141,8 +174,8 @@ fn root(text: &str) -> Result<Root, ParseError> {
 pub fn parse_request(body: &[u8]) -> Result<Request, ParseError> {
     let body: Value =
         serde_json::from_slice(body).map_err(|err| ParseError::Invalid(err.to_string()))?;
-    let envelope: Envelope =
-        serde_json::from_value(body.clone()).map_err(|err| ParseError::Invalid(err.to_string()))?;
+    let envelope =
+        Envelope::deserialize(&body).map_err(|err| ParseError::Invalid(err.to_string()))?;
     let duty = match envelope.kind.as_str() {
         "BLOCK_V2" => {
             let block: BeaconBlockRequest = field(&body, "beacon_block")?;
@@ -201,6 +234,11 @@ pub fn parse_request(body: &[u8]) -> Result<Request, ParseError> {
                 )?))
             } else if ELECTRA_AGGREGATE_VERSIONS.contains(&version) {
                 AggregateAndProof::Electra(Box::new(object(
+                    versioned.data,
+                    "aggregate_and_proof.data",
+                )?))
+            } else if version == GLOAS {
+                AggregateAndProof::Gloas(Box::new(object(
                     versioned.data,
                     "aggregate_and_proof.data",
                 )?))
@@ -281,6 +319,36 @@ pub fn parse_request(body: &[u8]) -> Result<Request, ParseError> {
                 duty: Duty::ValidatorRegistration(registration),
                 signing_root,
             });
+        }
+        "PAYLOAD_ATTESTATION_MESSAGE" => Duty::PayloadAttestation(gloas::<PayloadAttestationData>(
+            &body,
+            "PAYLOAD_ATTESTATION_MESSAGE",
+            "payload_attestation_message",
+        )?),
+        // The whole payload, hashed here into the summary consensus carries (`eth::gloas`).
+        "EXECUTION_PAYLOAD_ENVELOPE" => {
+            let envelope = gloas::<ExecutionPayloadEnvelope>(
+                &body,
+                "EXECUTION_PAYLOAD_ENVELOPE",
+                "execution_payload_envelope",
+            )?;
+            Duty::ExecutionPayloadEnvelope(Box::new(
+                envelope
+                    .summary()
+                    .map_err(|err| ParseError::Invalid(err.to_string()))?,
+            ))
+        }
+        "PROPOSER_PREFERENCES" => Duty::ProposerPreferences(gloas::<ProposerPreferences>(
+            &body,
+            "PROPOSER_PREFERENCES",
+            "proposer_preferences",
+        )?),
+        "EXECUTION_PAYLOAD_BID" => {
+            return Err(ParseError::Unsupported(
+                "EXECUTION_PAYLOAD_BID: a builder's message, never a validator's (a self-built \
+                 bid carries no signature)"
+                    .into(),
+            ));
         }
         "BLOCK" => {
             return Err(ParseError::Unsupported(

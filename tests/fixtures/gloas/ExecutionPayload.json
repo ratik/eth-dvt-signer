@@ -1,0 +1,178 @@
+{
+ "source": "consensus-specs v1.7.0-beta.4 mainnet.tar.gz (sha256 67762986572372a08d3b182535aa760433c86e174e14e0bbd756f350dd19398c), tests/mainnet/gloas/ssz_static",
+ "type": "ExecutionPayload",
+ "cases": [
+  {
+   "case": "ssz_random/case_0",
+   "value": {
+    "parent_hash": "0x1a96d6a866d5a79fc25d1d67abed34db3b53a96604ad535c5a796f4a8da3b2ab",
+    "fee_recipient": "0x568a5969f04a5e9432afd278eb13b54841772fee",
+    "state_root": "0x8f0ab5302192fd73728d450f083ea1d3dd72afce417b5ce6ae2162aa64cfe202",
+    "receipts_root": "0xa4c35f97f686c30eb6b52a4190851eace34ca0504389509ac00f4098001e89e1",
+    "logs_bloom": "0x27c7761dc7338ad98c09694345eba497e93db6c2676cf1a44b07da22c0847d616eddbf0e86ddc771ad34b5b62c5444cc29195e738dfc8c1a12151fbd9ed6c17ad0dfcb39177dcf7ab32be9f7c709ec0b9ed7c82f0aa13dc0b4df0e5d04ce58df00292bdd8be9bfdc8d8d4484925c0ce3d0905530205a523e127ecf21642ec16ab6f897ce6c51dff0cf66095c92f85e312e82c11606f9f00a6d6e5da460feeb289fdac7560c268518c84d24389f5fc231583accae463e1edcef4b3f1b724afb8b24587da46c33119700557db6ed13c7c0d308a7628caf2b0a6d57a44ada110208b9d0f8035edc5b7832bd0e429f1f55ff3ab12ba4f43c92a148e5d9991f23525c",
+    "prev_randao": "0xa43eb21e43e1efbf167b27218b980416ecf7e0865bce0abb86128a50408aa04d",
+    "block_number": "18065514478419790501",
+    "gas_limit": "6189314013508202578",
+    "gas_used": "5610042885138231461",
+    "timestamp": "10634655297332115058",
+    "extra_data": "0xb15ccc233b882b",
+    "base_fee_per_gas": "73305370501426904427764324876887145002591238852969008244724293660591409516609",
+    "block_hash": "0x9959784e894aba4459eccbde48e04c991d6d08031d56776bb7a3c4017416128d",
+    "transactions": [
+     "0x72",
+     "0x28206c",
+     "0x6dc3d860",
+     "0x782610"
+    ],
+    "withdrawals": [
+     {
+      "index": "13608078982600312816",
+      "validator_index": "17997564107109247702",
+      "address": "0x433f9b79ee2d19d1834117516290324fc2776dec",
+      "amount": "16389432634935945101"
+     },
+     {
+      "index": "10250309250506843233",
+      "validator_index": "11463788873143621430",
+      "address": "0xf861b3999b5a7bc8a790348b2303d2884ab74999",
+      "amount": "11197682875632660924"
+     },
+     {
+      "index": "10239126102907534901",
+      "validator_index": "17262880733878986586",
+      "address": "0x62390b92e788aa66124d6ae0c76aa24788da5e0a",
+      "amount": "765001958978397621"
+     },
+     {
+      "index": "8179226176204460503",
+      "validator_index": "5642065755271215005",
+      "address": "0xec5663dbf1a03ce362615bfbab6b2344b28c70f7",
+      "amount": "2666420495559041491"
+     },
+     {
+      "index": "8747391791136458140",
+      "validator_index": "5715466387940883512",
+      "address": "0x91e722bdaad03668d9ee996fdc0865bb18b80e9c",
+      "amount": "8792914570307613735"
+     },
+     {
+      "index": "7080353920128147642",
+      "validator_index": "2902899338238441095",
+      "address": "0x9e57e1c145723cdc16caf11e64e782248ddea596",
+      "amount": "4595124524527492646"
+     },
+     {
+      "index": "15741652807597687057",
+      "validator_index": "5727582668232836987",
+      "address": "0x450617ef41474ad7ca518b0127f5aa8c6a47bc2f",
+      "amount": "6007896006908602337"
+     },
+     {
+      "index": "8182982226289691680",
+      "validator_index": "17737772676615356731",
+      "address": "0x43e97e94cc65fdabb8782ef6b366c33fbdfdbf54",
+      "amount": "2832575754104880399"
+     }
+    ],
+    "blob_gas_used": "18409925242178375297",
+    "excess_blob_gas": "15845779447959581975",
+    "block_access_list": "0x",
+    "slot_number": "17541812684983622589"
+   },
+   "root": "0xfc03d9891dc3a7382568b0bbb81c2565729986ee4f24b0a37ada04d8efc4c27c"
+  },
+  {
+   "case": "ssz_random/case_1",
+   "value": {
+    "parent_hash": "0xc3c442f2fe2b18746abcd059e82a3825b357043b7f3ae652351ec809a347fb46",
+    "fee_recipient": "0xf0df149bd2c393050d7f0b625840b895de51c989",
+    "state_root": "0x95eda19540d89fdd098eb62421890d3b6fa80f3d324707b0c1201e7c1e4f4159",
+    "receipts_root": "0xa071a79694ad135f1a012ca4e16240b28aa62f505ad94e1b5e5198fa373628e1",
+    "logs_bloom": "0x6a82e569cd2a1f13ba2ba07f41a11bc45014bd7d182b6cb8b3fe92a572eb0973606ec7a44a8ee2440525f6b81e4562de96b673ce2c82e36e1e6495bc0c477cde46eacef2baaeaa9aae8b697ed069cd93321ef6907af1ca78ba04a73cc8b7c945128c6ae5287438e46a57098759999727a47118bb37041b514d5c026d9bb66dfbed6898c95d1f9eca0b8adc4ee25b2b3bb37aced1aa9cf9b783ba8f053adba546fb8d649c09d4ae3c85f3bd71438dc0950a0cab303d68fc7caa4ff5c191e86041cf3f6d6d4d69c5a6867f53c9e517799a17e619378ceeef0345b89a89c6ce560a3eed727a0a293b2e9827c4d8818b3f0722e75021951d5d6653e5c2cafdeec834",
+    "prev_randao": "0xcf61d50ad6e55883290832355e72c259b5dc2bfb775074711d53caff1015f4c0",
+    "block_number": "3391854527507673351",
+    "gas_limit": "14015164696683469624",
+    "gas_used": "15992327263507299826",
+    "timestamp": "1697088446569892934",
+    "extra_data": "0x9e6f",
+    "base_fee_per_gas": "52423027054376812371024036751862059647486610788747079199034366781437186959425",
+    "block_hash": "0xcb05cce83056a98d8b5706ff5813338a9e384a2afc6faf76de40206f8ea73e21",
+    "transactions": [
+     "0x",
+     "0x64d9471a",
+     "0x23",
+     "0x0e4d",
+     "0x734537",
+     "0xc11615f5",
+     "0x",
+     "0x9f"
+    ],
+    "withdrawals": [
+     {
+      "index": "9778997450328007755",
+      "validator_index": "9296441100764255727",
+      "address": "0xce4d1b52820d2b66b233abcf18b317ddd9939448",
+      "amount": "15900306663851407393"
+     }
+    ],
+    "blob_gas_used": "10158180345422211650",
+    "excess_blob_gas": "11331532726900370757",
+    "block_access_list": "0x1cc31ecbd26d8d",
+    "slot_number": "17385836348542548357"
+   },
+   "root": "0x98dc8f5d0f411e6a73b98563b66ee6a3e37b3468a127fa3a6e3ebef11f6dcf7e"
+  },
+  {
+   "case": "ssz_random/case_2",
+   "value": {
+    "parent_hash": "0x821a355f57a25f6ce3c085f87f09686a6024af4743d89919f3eedf25af2e3ea4",
+    "fee_recipient": "0xeca11143d3c44fe80f98cb19da38a060711edfc1",
+    "state_root": "0xdfc99c12d1399bcaad8d3b465368c7444c075f19c72c212582b98033d92bc669",
+    "receipts_root": "0xe0c5e87cd7903f9d425450b4c9650a1b39112979fbc509fbf1334d00e432cf77",
+    "logs_bloom": "0x60eb8a54ac08624a9fac0a53559d99779627b54136d588b59fe33f2c05c7bf70ecdeb1e52726f258a3e910594a68e2621a27759b2e679da028496396708d35e53aa27c3e5700a317da37fdc432287415c63c3c9cbcfad7cca9d1b2ab8f9ddf825ce23e4435387fea13750bf87908ec74521b23a6b4d3c50ae3a1665a65dcaeb66c87fa83bf9cd5aca2f34919472a5e68358697b5ba4dc1c98a678905b5b51af2cdbbb8ed4fba01f1fd87f3bfff14239c52d5fafe3e48e6b5c2c759d0c72a62057d6ae855ba4b08c8ce50c5e818f4370604719f6360416b8f3146d51ef046ef7995e7a6be19c0f8b6f2749738fe6452f7fa70459f923a31e0157fb9cf5012b432",
+    "prev_randao": "0x3bb6a08a6c0f0582ed548cec320028e36d8bc28cc39fe1ab34528afbd91fb4d2",
+    "block_number": "2083523174893053709",
+    "gas_limit": "2478179496985609011",
+    "gas_used": "1608437766578319766",
+    "timestamp": "12513826181179556517",
+    "extra_data": "0x068e39fff320edaf25fec4f87439d4977f38da20cb676aded5394db1d803a6",
+    "base_fee_per_gas": "37748325051337309199365856694222052305932007483647035510028504725691396167980",
+    "block_hash": "0xd3183e42009b51de0b19623b2502329bb4de1145aee1e0d08e83a3a74121c76c",
+    "transactions": [
+     "0x5a",
+     "0xb5d381",
+     "0xacbc",
+     "0xf2140913",
+     "0x28a502",
+     "0xbc",
+     "0x51"
+    ],
+    "withdrawals": [
+     {
+      "index": "17950221071563937068",
+      "validator_index": "6931844652306760397",
+      "address": "0x0506227dfc402db0faa4016572ed879c5a777144",
+      "amount": "2514978167120474868"
+     },
+     {
+      "index": "11466157397370964934",
+      "validator_index": "8850044088687131120",
+      "address": "0x8d20286a96e483b0946d6cbe761227ca468aa6cc",
+      "amount": "7332991769898443156"
+     },
+     {
+      "index": "11644180355701309994",
+      "validator_index": "8177430074639703605",
+      "address": "0xacc14da8a85a711277fdf74b937e3721cf3ea294",
+      "amount": "12779319924346444421"
+     }
+    ],
+    "blob_gas_used": "8804645296453621212",
+    "excess_blob_gas": "1833366926912261101",
+    "block_access_list": "0x",
+    "slot_number": "6234511644256862732"
+   },
+   "root": "0xf52b5e1d0655b389a1925cfb3bb4de1dba41699cdb3f9fe7d7612123feffe212"
+  }
+ ]
+}

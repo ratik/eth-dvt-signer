@@ -17,9 +17,15 @@
 //!
 //! A version the schedule does not have (a fork this build does not know, another network's) is
 //! refused: a fork is signed for only once a release adds it to the schedule.
+//!
+//! Gloas (`eth::gloas`) also changes what is signed, so the schedule gates it as well: a PTC vote,
+//! an envelope or proposer preferences only at or after the schedule's Gloas epoch
+//! ([`WrongFork::BeforeGloas`]), and an aggregate in the form of its epoch's fork (progressive
+//! from Gloas on, [`WrongFork::AggregateForm`]). The request does not tell the two aggregate forms
+//! apart; the API takes the schedule's ([`Network::resolve`]).
 
 use super::{
-    duty::{Duty, DutyRequest, Fork, ForkInfo, SLOTS_PER_EPOCH},
+    duty::{AggregateAndProof, Duty, DutyKind, DutyRequest, Fork, ForkInfo, SLOTS_PER_EPOCH},
     types::{Root, Version},
 };
 use commonware_cryptography::{Hasher as _, Sha256, sha256::Digest};
@@ -37,10 +43,11 @@ pub enum ForkName {
     Deneb,
     Electra,
     Fulu,
+    Gloas,
 }
 
 impl ForkName {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Phase0,
         Self::Altair,
         Self::Bellatrix,
@@ -48,6 +55,7 @@ impl ForkName {
         Self::Deneb,
         Self::Electra,
         Self::Fulu,
+        Self::Gloas,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -59,6 +67,7 @@ impl ForkName {
             Self::Deneb => "deneb",
             Self::Electra => "electra",
             Self::Fulu => "fulu",
+            Self::Gloas => "gloas",
         }
     }
 
@@ -85,7 +94,8 @@ const fn fork(name: ForkName, version: u32, epoch: u64) -> ScheduledFork {
     }
 }
 
-/// Mainnet's schedule (`consensus-specs`, `configs/mainnet.yaml`). Gloas is not scheduled.
+/// Mainnet's schedule (`consensus-specs`, `configs/mainnet.yaml`). Gloas (`0x07000000`) is not
+/// scheduled yet: a release adds its epoch once it is announced.
 const MAINNET_FORKS: [ScheduledFork; 7] = [
     fork(ForkName::Phase0, 0x0000_0000, 0),
     fork(ForkName::Altair, 0x0100_0000, 74_240),
@@ -96,7 +106,8 @@ const MAINNET_FORKS: [ScheduledFork; 7] = [
     fork(ForkName::Fulu, 0x0600_0000, 411_392),
 ];
 
-/// Hoodi's schedule (`eth-clients/hoodi`, `metadata/config.yaml`).
+/// Hoodi's schedule (`eth-clients/hoodi`, `metadata/config.yaml`). Gloas was scheduled and
+/// withdrawn again (2026-10-22); it is not scheduled.
 const HOODI_FORKS: [ScheduledFork; 7] = [
     fork(ForkName::Phase0, 0x1000_0910, 0),
     fork(ForkName::Altair, 0x2000_0910, 0),
@@ -166,6 +177,17 @@ pub enum WrongFork {
          genesis validators root"
     )]
     Registration { expected: String },
+    #[error(
+        "{kind:?} exists from Gloas on, and epoch {epoch} is before this network's Gloas ({gloas})"
+    )]
+    BeforeGloas {
+        kind: DutyKind,
+        epoch: u64,
+        /// The schedule's Gloas epoch, or `none`.
+        gloas: String,
+    },
+    #[error("an aggregate of epoch {epoch} is rooted in the {expected} form on this network")]
+    AggregateForm { epoch: u64, expected: String },
 }
 
 fn hex_version(version: &Version) -> String {
@@ -226,7 +248,7 @@ impl Network {
                     .split_once('@')
                     .ok_or_else(|| format!("{entry}: name=0x<version>@<epoch>"))?;
                 let name = ForkName::parse(name)
-                    .ok_or_else(|| format!("{name}: unknown fork (phase0 to fulu)"))?;
+                    .ok_or_else(|| format!("{name}: unknown fork (phase0 to gloas)"))?;
                 let version = hex::decode(version.strip_prefix("0x").unwrap_or(version))
                     .ok()
                     .and_then(|bytes| bytes.try_into().ok())
@@ -335,6 +357,56 @@ impl Network {
     /// The genesis fork version (Phase 0's).
     pub fn genesis_fork_version(&self) -> Version {
         self.forks[0].version
+    }
+
+    /// The schedule's Gloas epoch, if Gloas is scheduled.
+    pub fn gloas_epoch(&self) -> Option<u64> {
+        self.forks
+            .iter()
+            .find(|fork| fork.name == ForkName::Gloas)
+            .map(|fork| fork.epoch)
+    }
+
+    /// Whether Gloas is in effect at `epoch`.
+    pub fn is_gloas(&self, epoch: u64) -> bool {
+        self.gloas_epoch().is_some_and(|gloas| epoch >= gloas)
+    }
+
+    /// `duty` in the form this network signs it in: an Electra-shaped aggregate of a Gloas epoch
+    /// is rooted as a Gloas one (Lighthouse sends both alike). Every other duty is unchanged.
+    pub fn resolve(&self, duty: Duty) -> Duty {
+        match duty {
+            Duty::AggregateAndProof(AggregateAndProof::Electra(aggregate))
+                if self.is_gloas(aggregate.aggregate.data.slot / SLOTS_PER_EPOCH) =>
+            {
+                Duty::AggregateAndProof(AggregateAndProof::Gloas(aggregate))
+            }
+            other => other,
+        }
+    }
+
+    /// Whether `duty` exists, and has its form, at its epoch on this network (module docs).
+    fn check_form(&self, duty: &Duty) -> Result<(), WrongFork> {
+        let epoch = duty.epoch();
+        let gloas = self.is_gloas(epoch);
+        if duty.kind().is_gloas() && !gloas {
+            return Err(WrongFork::BeforeGloas {
+                kind: duty.kind(),
+                epoch,
+                gloas: self
+                    .gloas_epoch()
+                    .map_or_else(|| "none".into(), |gloas| gloas.to_string()),
+            });
+        }
+        if let Duty::AggregateAndProof(aggregate) = duty
+            && matches!(aggregate, AggregateAndProof::Gloas(_)) != gloas
+        {
+            return Err(WrongFork::AggregateForm {
+                epoch,
+                expected: if gloas { "gloas" } else { "pre-gloas" }.into(),
+            });
+        }
+        Ok(())
     }
 
     /// Capella's version, if a voluntary exit of `epoch` is signed with it (EIP-7044: the
@@ -453,7 +525,7 @@ impl Network {
                 expected: hex_version(&scheduled),
             });
         }
-        Ok(())
+        self.check_form(&request.duty)
     }
 
     /// What identifies the network: its genesis validators root, clock and genesis fork version.
