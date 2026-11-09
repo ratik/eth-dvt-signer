@@ -23,6 +23,14 @@
 //!   blocks.
 //! - `ETH_MPC_SIGNER_PROPOSE_PAST_TERMINAL=1`: as a leader, the node builds on a block that ends
 //!   its consensus epoch, as a faulty leader would (the others refuse such a block).
+//! - `ETH_MPC_SIGNER_CLOCK_OFFSET_FILE=<path>`: the clock of the time horizon (`eth::horizon`) is
+//!   the system clock plus the signed number of seconds in `<path>`, read at every use (a wrong,
+//!   skewed or jumping clock); nothing else reads it.
+//! - `ETH_MPC_SIGNER_NO_HORIZON=1`: the node's API and its blocks admit duties beyond the
+//!   horizon, as a faulty coordinator and leader would (its votes and partials still check it).
+//! - `ETH_MPC_SIGNER_INJECT_FILE=<path>`: as a leader, the node adds the transactions in `<path>`
+//!   (one hex-encoded transaction per line, read at every proposal) to every block it proposes,
+//!   unchecked, as a faulty leader would (its votes still check every block).
 //!
 //! Points:
 //!
@@ -148,6 +156,43 @@ mod enabled {
         std::env::var("ETH_MPC_SIGNER_PROPOSE_PAST_TERMINAL").is_ok()
     }
 
+    /// The time horizon's clock: `now`, offset by the seconds of the clock offset file.
+    pub fn clock(now: std::time::SystemTime) -> std::time::SystemTime {
+        let Some(offset) = std::env::var("ETH_MPC_SIGNER_CLOCK_OFFSET_FILE")
+            .ok()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| text.trim().parse::<i64>().ok())
+        else {
+            return now;
+        };
+        let shift = Duration::from_secs(offset.unsigned_abs());
+        if offset >= 0 {
+            now + shift
+        } else {
+            now - shift
+        }
+    }
+
+    /// Whether this node's API and blocks skip the time horizon.
+    pub fn no_horizon() -> bool {
+        std::env::var("ETH_MPC_SIGNER_NO_HORIZON").is_ok()
+    }
+
+    /// The transactions a faulty leader adds to its blocks.
+    pub fn injected() -> Vec<crate::types::Transaction> {
+        use commonware_codec::DecodeExt as _;
+        let Some(text) = std::env::var("ETH_MPC_SIGNER_INJECT_FILE")
+            .ok()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+        else {
+            return Vec::new();
+        };
+        text.lines()
+            .filter_map(|line| hex::decode(line.trim()).ok())
+            .filter_map(|bytes| crate::types::Transaction::decode(bytes.as_slice()).ok())
+            .collect()
+    }
+
     pub fn exit_on_stdin_eof() {
         if std::env::var("ETH_MPC_SIGNER_EXIT_ON_STDIN_EOF").is_ok() {
             std::thread::spawn(|| {
@@ -191,6 +236,18 @@ mod enabled {
 
     pub const fn propose_past_terminal() -> bool {
         false
+    }
+
+    pub const fn clock(now: std::time::SystemTime) -> std::time::SystemTime {
+        now
+    }
+
+    pub const fn no_horizon() -> bool {
+        false
+    }
+
+    pub const fn injected() -> Vec<crate::types::Transaction> {
+        Vec::new()
     }
 
     pub fn exit_on_stdin_eof() {}

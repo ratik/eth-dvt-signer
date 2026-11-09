@@ -13,7 +13,8 @@ use crate::{
 };
 use eth_mpc_signer::{
     eth::{
-        duty::format_root,
+        duty::{Duty, format_root},
+        network::Network,
         types::Root,
         web3signer::{parse_identifier, parse_request},
     },
@@ -67,11 +68,24 @@ fn lighthouse(name: &str) -> Value {
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
 
-fn fixture(name: &str) -> Value {
+/// The test chain every test node runs (`harness`): mainnet's fork schedule with [CHAIN], 1-second
+/// slots from the Unix epoch.
+pub(crate) fn test_network() -> Network {
+    Network {
+        genesis_time: 0,
+        seconds_per_slot: 1,
+        genesis_validators_root: unhex(&json!(CHAIN)).try_into().unwrap(),
+        ..Network::MAINNET
+    }
+}
+
+/// The Web3Signer example `name` (`tests/fixtures/web3signer`), with the fork a validator client
+/// names for its duty on the test chain and the signing root it computes.
+pub(crate) fn fixture(name: &str) -> Value {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/web3signer")
         .join(name);
-    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    with_root(serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap())
 }
 
 /// The signing root of a request, as the signer computes it.
@@ -80,13 +94,27 @@ pub(crate) fn signing_root(body: &Value) -> Root {
     request.duty.signing_root(&request.fork)
 }
 
-/// `body` with the `signingRoot` a client computes for it (Lighthouse always sends one).
-fn with_root(mut body: Value) -> Value {
+/// `body` with the fork a validator client names for its duty on the test chain (P0.3; its
+/// genesis validators root as it is). A deposit names its genesis fork version itself.
+pub(crate) fn pinned(mut body: Value) -> Value {
+    if let Ok(request) = parse_request(body.to_string().as_bytes())
+        && !matches!(request.duty, Duty::Deposit(_))
+    {
+        let fork = test_network().fork_info(&request.duty).fork;
+        body["fork_info"]["fork"] = serde_json::to_value(fork).unwrap();
+    }
+    body
+}
+
+/// `body` with the fork (`pinned`) and the `signingRoot` a client computes for it (Lighthouse
+/// always sends one).
+pub(crate) fn with_root(body: Value) -> Value {
+    let mut body = pinned(body);
     body["signingRoot"] = json!(format_root(&signing_root(&body)));
     body
 }
 
-fn hex32(byte: u8) -> String {
+pub(crate) fn hex32(byte: u8) -> String {
     format_root(&[byte; 32])
 }
 
@@ -114,7 +142,7 @@ pub(crate) fn attestation(source: u64, target: u64, vote: u8) -> Value {
 /// `POST /validators/activate` on node `via`.
 fn activate(network: &TestNetwork, via: usize, key: &str, chain: &str) -> (u16, Value) {
     let body = json!({ "public_key": key, "genesis_validators_root": chain });
-    network.post(via, "/validators/activate", &body)
+    network.approved(via, "activate", body)
 }
 
 /// The activation of `key` as node `node` has it (`GET /validators`), if any.
@@ -155,7 +183,7 @@ pub(crate) fn validator_network() -> (TestNetwork, String) {
     (network, key)
 }
 
-fn sign(network: &TestNetwork, via: usize, key: &str, body: &Value) -> (u16, Value) {
+pub(crate) fn sign(network: &TestNetwork, via: usize, key: &str, body: &Value) -> (u16, Value) {
     network.eth2_sign(via, key, body)
 }
 
@@ -169,6 +197,31 @@ pub(crate) fn signed(network: &TestNetwork, via: usize, key: &str, body: &Value)
         "{answer}"
     );
     answer["signature"].clone()
+}
+
+/// Sign `body` through `via`: as a validator client does, or for an exit or a deposit (P0.2), as
+/// an operator does: refused without approvals, then signed with two approvers' authorization
+/// and the next nonce.
+pub(crate) fn signed_any(network: &TestNetwork, via: usize, key: &str, body: &Value) -> Value {
+    let operation = match body["type"].as_str() {
+        Some("VOLUNTARY_EXIT") => "sign-exit",
+        Some("DEPOSIT") => "sign-deposit",
+        _ => return signed(network, via, key, body),
+    };
+    let (status, answer) = sign(network, via, key, body);
+    assert_eq!(status, 403, "{operation} without approvals: {answer}");
+    let mut request = body.clone();
+    request["public_key"] = json!(key);
+    let nonce = network.next_nonce();
+    let command = network.signed(operation, request, nonce, &[0, 1]);
+    let signature = signed(network, via, key, &command.body().unwrap());
+    // Every node applied the approval: the same duty signs again through any of them.
+    for node in network.all() {
+        network.wait_until(&format!("nonce {nonce} on node {node}"), || {
+            network.get(node, "/admin").1["nonce"].as_u64() >= Some(nonce)
+        });
+    }
+    signature
 }
 
 /// Expect slashing protection to refuse `body` through `via` with `reason`.
@@ -252,7 +305,7 @@ fn e2e_eth_1_web3signer_signs_every_supported_duty() {
     let mut signatures = Vec::new();
     for (index, name) in FIXTURES.iter().enumerate() {
         let body = fixture(name);
-        let signature = signed(&network, index % NODES, &key, &body);
+        let signature = signed_any(&network, index % NODES, &key, &body);
         // The client's root is the one the signer computed.
         let root = &body["signingRoot"];
         assert_eq!(
@@ -268,11 +321,10 @@ fn e2e_eth_1_web3signer_signs_every_supported_duty() {
     for (index, name) in LIGHTHOUSE.iter().enumerate() {
         let body = lighthouse(name);
         let root: Root = unhex(&body["signingRoot"]).try_into().unwrap();
-        let (status, answer) = sign(&network, index % NODES, &key, &body);
-        assert_eq!(status, 200, "{name}: {answer}");
+        let signature = signed_any(&network, index % NODES, &key, &body);
         assert!(
-            ethereum_verify(&json!(key), &root, &answer["signature"]),
-            "{name}: {answer}"
+            ethereum_verify(&json!(key), &root, &signature),
+            "{name}: {signature}"
         );
     }
     let (status, answer) = sign(
@@ -293,8 +345,8 @@ fn e2e_eth_1_web3signer_signs_every_supported_duty() {
     assert!(content_type.starts_with("text/plain"), "{content_type}");
     assert_eq!(json!(text), signatures[1]);
 
-    // Errors: unknown key (also the development key), bad identifier, malformed and unsupported
-    // requests, a signing root that is not the duty's.
+    // Errors: unknown key (also the development key), bad identifier, malformed requests, a
+    // signing root that is not the duty's.
     let (_, development) = network.get(0, "/dkg/public-key/development");
     for unknown in [
         format!("0x{}", "ab".repeat(48)),
@@ -320,7 +372,11 @@ fn e2e_eth_1_web3signer_signs_every_supported_duty() {
     for (body, what) in [
         (json!("not a request"), "not an object"),
         (missing_fork, "missing fork_info"),
-        (registration, "unsupported type"),
+        // Web3Signer's root of another registration (`tests/e2e/registrations.rs` signs them).
+        (
+            registration,
+            "a registration's signing root that is not its own",
+        ),
     ] {
         let (status, answer) = sign(&network, 2, &key, &body);
         assert_eq!(status, 400, "{what}: {answer}");
@@ -733,13 +789,14 @@ fn deposit(pubkey: &str, credentials: u8) -> Value {
             "pubkey": pubkey,
             "withdrawal_credentials": hex32(credentials),
             "amount": "32000000000",
-            "genesis_fork_version": "0x10000038",
+            "genesis_fork_version": "0x00000000",
         },
     }))
 }
 
 /// E2E-ETH-10: validator onboarding. With `--enable-deposit-signing`, an activated validator key
-/// signs one deposit message of its own key, verified with blst; the same message again returns
+/// signs one deposit message of its own key, with the approvers' authorization (P0.2), verified
+/// with blst; the same message again returns
 /// the same signature; other withdrawal credentials, or another key, are refused.
 #[test]
 fn e2e_eth_10_one_deposit_message_per_validator() {
@@ -756,7 +813,8 @@ fn e2e_eth_10_one_deposit_message_per_validator() {
     assert_eq!(status, 404, "{answer}");
     activate_everywhere(&network, 0, &key);
 
-    let signature = signed(&network, 2, &key, &deposit(&key, 1));
+    // Approved once (P0.2); the same message again needs no approvals.
+    let signature = signed_any(&network, 2, &key, &deposit(&key, 1));
     assert_eq!(signed(&network, 3, &key, &deposit(&key, 1)), signature);
     refused(&network, 0, &key, &deposit(&key, 2), "too_many_roots");
     refused(

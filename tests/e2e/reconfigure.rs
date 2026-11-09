@@ -7,7 +7,7 @@
 use crate::{
     eth2::{block, refused, signed},
     follower::{FOLLOWER, max_height, network_with_follower},
-    harness::{TestNetwork, peer::FakePeer},
+    harness::{TestNetwork, approver_keys, approvers, peer::FakePeer},
     replace::replacement,
     reshare::crash_at,
 };
@@ -18,11 +18,13 @@ use commonware_cryptography::{
 };
 use eth_mpc_signer::{
     engine,
-    types::{Command, Reconfiguration, Transaction},
+    types::{Command, Transaction},
 };
 use serde_json::{Value, json};
 use std::{
-    path::PathBuf,
+    io::Write as _,
+    os::unix::fs::OpenOptionsExt as _,
+    path::{Path, PathBuf},
     process::{Child, Command as Process, Stdio},
 };
 
@@ -64,11 +66,14 @@ fn epoch(network: &TestNetwork, node: usize) -> Option<u64> {
     }
 }
 
+/// `POST /consensus/reconfigure` through node `via`, approved (`admin`), starting the epoch after
+/// the one `via` runs.
 fn reconfigure(network: &TestNetwork, via: usize, remove: usize, add: usize) -> (u16, Value) {
-    network.post(
+    let next = epoch(network, via).expect("node answers") + 1;
+    network.approved(
         via,
-        "/consensus/reconfigure",
-        &json!({ "remove": identity(remove), "add": identity(add) }),
+        "reconfigure",
+        json!({ "epoch": next, "remove": identity(remove), "add": identity(add) }),
     )
 }
 
@@ -126,7 +131,7 @@ fn switched(network: &TestNetwork, nodes: &[usize]) -> u64 {
 }
 
 /// `mpc-admin` with every node of `network`.
-fn admin(network: &TestNetwork, args: &[&str]) -> Child {
+pub(crate) fn admin(network: &TestNetwork, args: &[&str]) -> Child {
     let nodes: Vec<String> = network
         .all()
         .iter()
@@ -142,8 +147,53 @@ fn admin(network: &TestNetwork, args: &[&str]) -> Child {
         .expect("failed to start mpc-admin")
 }
 
+/// `mpc-admin` without any node: what approvers run offline.
+pub(crate) fn offline(args: &[&str]) -> (bool, String) {
+    finished(
+        Process::new(ADMIN)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to start mpc-admin"),
+    )
+}
+
+/// What the approvers do with `draft`, offline: two of them each sign it with their own key file
+/// (`mpc-admin sign`). Returns the signed copies.
+pub(crate) fn approve(network: &TestNetwork, draft: &Path) -> Vec<PathBuf> {
+    let keys = approver_keys();
+    (0..2)
+        .map(|index| {
+            let key = network.dir.join(format!("approver-{index}.key"));
+            if !key.exists() {
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&key)
+                    .unwrap();
+                writeln!(file, "0x{}", hex::encode(keys[index].encode())).unwrap();
+            }
+            let signed = draft.with_extension(format!("signed-{index}.json"));
+            let (success, output) = offline(&[
+                "sign",
+                "--command",
+                draft.to_str().unwrap(),
+                "--key",
+                key.to_str().unwrap(),
+                "--output",
+                signed.to_str().unwrap(),
+                "--yes",
+            ]);
+            assert!(success, "{output}");
+            signed
+        })
+        .collect()
+}
+
 /// Whether `mpc-admin` succeeded, and what it printed.
-fn finished(child: Child) -> (bool, String) {
+pub(crate) fn finished(child: Child) -> (bool, String) {
     let output = child.wait_with_output().unwrap();
     let text = format!(
         "{}{}",
@@ -183,12 +233,59 @@ fn replace_d(network: &TestNetwork, via: usize) -> u64 {
     switched(network, &NEW_COMMITTEE)
 }
 
-/// R3-1: with D lost, the operator replaces it with E (`mpc-admin replace-node`). A, B, C and E
+/// R3-1 (and P0 test 12): with D lost, the operator replaces it with E (`mpc-admin replace-node`
+/// drafts it, two approvers sign it offline, `replace-node --command` submits it). A, B, C and E
 /// stop after the same block and, restarted, run epoch 1, E voting and leading; it finalizes.
 #[test]
 fn r3_1_replace_a_lost_voter() {
     let network = d_lost();
-    let admin = admin(&network, &["replace-node", "--old", "3", "--new", "4"]);
+    let draft = network.dir.join("replace.json");
+    let (success, output) = finished(admin(
+        &network,
+        &[
+            "replace-node",
+            "--old",
+            "3",
+            "--new",
+            "4",
+            "--output",
+            draft.to_str().unwrap(),
+        ],
+    ));
+    assert!(success, "{output}");
+    assert!(output.contains("replace consensus voter"), "{output}");
+    let signed = approve(&network, &draft);
+    // Inspectable offline, approvals checked against the approver file.
+    let file = network.dir.join("approvers-check.json");
+    std::fs::write(
+        &file,
+        serde_json::to_string(&approvers().to_json()).unwrap(),
+    )
+    .unwrap();
+    let (success, output) = offline(&[
+        "show",
+        "--command",
+        signed[0].to_str().unwrap(),
+        "--command",
+        signed[1].to_str().unwrap(),
+        "--approvers",
+        file.to_str().unwrap(),
+    ]);
+    assert!(success, "{output}");
+    assert!(
+        output.contains("2 valid approvals of 2 required"),
+        "{output}"
+    );
+    let admin = admin(
+        &network,
+        &[
+            "replace-node",
+            "--command",
+            signed[0].to_str().unwrap(),
+            "--command",
+            signed[1].to_str().unwrap(),
+        ],
+    );
     for node in NEW_COMMITTEE {
         restart_after(&network, node, engine::EXIT_RECONFIGURED);
     }
@@ -389,15 +486,18 @@ fn r3_7_refusals() {
     assert_eq!(status, 400, "{answer}");
 
     let boundary = replace_d(&network, 0);
-    // A reconfiguration of epoch 1 (the current one), from D's identity, now a known non-voter.
+    // A reconfiguration of epoch 1 (the current one), approved with the next nonce, from D's
+    // identity, now a known non-voter.
     let peer = FakePeer::start(&network, D, &[], Box::new(|_, _, _| Vec::new()));
+    let signed = network.signed(
+        "reconfigure",
+        json!({ "epoch": 1, "remove": identity(C), "add": identity(D) }),
+        network.next_nonce(),
+        &[0, 1],
+    );
     let stale = Transaction {
         id: 77,
-        command: Command::Reconfigure(Box::new(Reconfiguration {
-            epoch: 1,
-            remove: key(C),
-            add: key(D),
-        })),
+        command: Command::Admin(Box::new(signed.authorized(&approvers()).unwrap())),
     }
     .encode()
     .to_vec();
@@ -419,6 +519,27 @@ fn r3_7_refusals() {
     // D is no voter of epoch 1 any more.
     let (status, answer) = reconfigure(&network, 0, D, E);
     assert_eq!(status, 400, "{answer}");
+    // P0 test 10: what was signed before the switch is stale after it. The reconfiguration that
+    // ended epoch 0 again (its epoch is past, its nonce used), and another command signed with
+    // that nonce.
+    let used = network.next_nonce() - 1;
+    let replayed = network.signed(
+        "reconfigure",
+        json!({ "epoch": 1, "remove": identity(D), "add": identity(E) }),
+        used,
+        &[0, 1],
+    );
+    let (status, answer) = network.post_signed(0, &replayed);
+    assert_eq!(status, 400, "{answer}");
+    let earlier = network.signed(
+        "activate",
+        json!({ "public_key": format!("0x{}", "ab".repeat(48)), "genesis_validators_root": crate::eth2::CHAIN }),
+        used,
+        &[0, 1],
+    );
+    let (status, answer) = network.post_signed(1, &earlier);
+    assert_eq!(status, 409, "{answer}");
+    assert!(answer.to_string().contains("is used"), "{answer}");
 
     let height = network.height(0).unwrap();
     network.restart_node_with_args(0, &["--close-epoch-at", &height.to_string()]);

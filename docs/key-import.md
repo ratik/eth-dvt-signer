@@ -39,16 +39,22 @@ lifecycle before activation differs.
 
 ```
 PREPARED          offline: mpc-keytool split ──> manifest.json + node-<i>.enc (no network)
-   │  POST /keys/import (manifest) ──> RegisterImportedKey ──consensus──>
+   │  POST /keys/import (manifest, approved) ──> RegisterImportedKey ──consensus──>
 REGISTERED        ceremony "Imported", validator key (not activated), empty import state
    │  POST /keys/import/share on each node ──> the node opens and verifies its own share, stores it,
    │  and submits a ReadyAck signed with its consensus key ──> ImportedShareReady ──consensus──>
    │  (ready set: the participants whose signed acknowledgment is committed)
    │  POST /slashing-protection/import (EIP-3076) ──> ImportSlashingProtection ──consensus──>
 HISTORY_IMPORTED  floors from the previous signer's latest block and attestation, chain fixed
-   │  POST /validators/activate + acknowledgment ──> ActivateImportedValidator ──consensus──>
+   │  POST /validators/activate + acknowledgment, approved ──> ActivateImportedValidator ──consensus──>
 ACTIVATED         signs, through the Web3Signer API, like any validator key
 ```
+
+The registration and the activation are protected operations: they take effect only with a
+threshold of the approvers' offline signatures over the exact manifest or activation, and the
+network's next administrative nonce ([administration.md](administration.md)). Without them the API
+answers `403`, and honest voters refuse the command. The operator's acknowledgment is part of
+what the approvers sign.
 
 Shares can be installed before or after the history import. Activation checks everything at the
 moment consensus decides it:
@@ -181,9 +187,12 @@ the time the operator takes.
    verifies every share against the commitments, and the commitments' constant term against the
    keystore's public key, before writing anything. Nothing secret is printed or written in plain
    text. Randomness comes from the operating system.
-5. **Register** through any node:
-   `curl -s localhost:8080/keys/import -H 'content-type: application/json' -d @validator-shares/manifest.json`.
-   The answer is the import's state (`GET /keys/import/validator-migrated` on any node).
+5. **Register** through any node, approved:
+   `mpc-admin --nodes ... draft register-import --request "{\"manifest\": $(cat validator-shares/manifest.json)}" --output register.json`,
+   the approvers sign it offline (`mpc-admin sign`), then `mpc-admin --nodes ... submit --command
+   register-alice.json --command register-bob.json`. It posts `POST /keys/import` with
+   `{"manifest": .., "authorization": ..}`. The answer is the import's state
+   (`GET /keys/import/validator-migrated` on any node).
 6. **Install each share on its own node**:
    `curl -s localhost:<port of node i>/keys/import/share -H 'content-type: application/json' -d @validator-shares/node-<i>.enc`. A
    node refuses an envelope addressed to another node (`403`). Wait until `ready_shares` lists all
@@ -198,15 +207,21 @@ the time the operator takes.
    It parses the interchange, refuses it if it is slashable in itself, and checks every record of
    it against what the network already signed for the key. The answer gives the summary that would
    enter consensus.
-8. **Import the history**: the same request without `dry_run`. It is decided by consensus and
-   answered with `outcome: imported` and the block height.
-9. **Activate**, with the operator's acknowledgment:
+8. **Import the history**: the same import, approved (P0.1): `mpc-admin --nodes ... draft
+   import-history --interchange history.json --validator 0x.. --output import.json`, the
+   approvers check it (`mpc-admin show`: every key, record counts and ranges, the floors, the
+   interchange digest) and sign it offline, then `mpc-admin submit`. It is decided by consensus
+   and answered with `outcome: imported` and the block height. Without approvals it is refused
+   (`403`).
+9. **Activate**, with the operator's acknowledgment, approved as in step 5 (`draft activate`):
 
    ```bash
-   curl -s localhost:8080/validators/activate -H 'content-type: application/json' -d '{"public_key": "0x..",
+   mpc-admin --nodes ... draft activate --output activate.json --request '{"public_key": "0x..",
      "genesis_validators_root": "0x..", "acknowledgment": {"previous_signer_stopped": true,
      "no_other_active_signer": true, "history_exported_after_stop": true,
      "automatic_restart_disabled": true}}'
+   # each approver: mpc-admin sign --command activate.json --key <key> --output activate-<name>.json
+   mpc-admin --nodes ... submit --command activate-alice.json --command activate-bob.json
    ```
 10. **Point the validator client at the network** (Web3Signer API) and check that it attests in the
     beacon chain. `GET /slashing-protection/export/{public_key}` gives the history the network

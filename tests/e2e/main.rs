@@ -6,14 +6,18 @@
 //! cargo test --release --features test-hooks --test e2e latency -- --ignored --nocapture
 //! ```
 
+mod admin;
 mod adversarial;
 mod bench;
 mod concurrency;
 mod crash;
 mod eth2;
+mod exits;
 mod failures;
 mod follower;
+mod forks;
 mod harness;
+mod horizon;
 mod import;
 mod lag;
 mod lifecycle;
@@ -21,6 +25,7 @@ mod limits;
 mod readiness;
 mod reconfigure;
 mod recovery;
+mod registrations;
 mod replace;
 mod reshare;
 mod rollback;

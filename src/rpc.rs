@@ -34,8 +34,9 @@
 //! Validator keys (operations, not part of the Web3Signer API):
 //!
 //! - `GET /validators`: every validator key with a completed ceremony, and its activation.
-//! - `POST /validators/activate` `{"public_key": "0x..", "genesis_validators_root": "0x.."}`:
-//!   activates the key for that chain, through consensus. A key signs nothing before, and only for
+//! - `POST /validators/activate` `{"public_key": "0x..", "genesis_validators_root": "0x..",
+//!   "authorization": {..}}`: activates the key for that chain, through consensus (protected,
+//!   below). A key signs nothing before, and only for
 //!   that chain after; the activation never changes (`409` for another chain). An imported key also
 //!   needs `"acknowledgment": {"previous_signer_stopped": true, "no_other_active_signer": true,
 //!   "history_exported_after_stop": true, "automatic_restart_disabled": true}`, its slashing-
@@ -45,14 +46,16 @@
 //!
 //! - `GET /identity`: this node's consensus identity, share index and share-encryption public key
 //!   (what `mpc-keytool split` needs in `committee.json`).
-//! - `POST /keys/import` (a `manifest.json`): registers the imported key's public data through
-//!   consensus (idempotent; `409` if the id or the key is already registered).
+//! - `POST /keys/import` `{"manifest": <manifest.json>, "authorization": {..}}`: registers the
+//!   imported key's public data through consensus (protected, below; idempotent; `409` if the id
+//!   or the key is already registered).
 //! - `POST /keys/import/share` (a `node-<index>.enc`): this node opens, verifies and stores its own
 //!   share, then acknowledges it through consensus. Never returns the share.
 //! - `GET /keys/import/{ceremony_id}`: registration, acknowledged shares, history and activation.
 //! - `POST /slashing-protection/import` `{"interchange": <EIP-3076>, "dry_run": false,
-//!   "validators": ["0x.."]}`: validates the interchange, checks every record against this
-//!   network's records, and (unless `dry_run`) imports it through consensus. `validators` limits
+//!   "validators": ["0x.."], "authorization": {..}}`: validates the interchange, checks every
+//!   record against this network's records, and (unless `dry_run`) imports it through consensus
+//!   (protected, below; a dry run takes no approvals). `validators` limits
 //!   the import to those keys; without it, every key of the interchange must be an imported key.
 //!   An activated key takes no import (`409`, `activated`).
 //! - `GET /slashing-protection/export/{public_key}`: the validator's history as an EIP-3076
@@ -63,7 +66,7 @@
 //! - `POST /validators/reshare` `{"public_key": "0x..", "ceremony_id": ".."}`: refresh the active
 //!   generation's shares within the committee (R1). With `"from_round"` (the active generation),
 //!   `"dealers"` and `"players"` (consensus identities, `GET /identity`), replace keyholders (R2):
-//!   the given keyholders of that generation deal to the given new set.
+//!   the given keyholders of that generation deal to the given new set (protected, below).
 //! - `POST /validators/reshare/activate` and `/abort` `{"public_key", "ceremony_id"}`.
 //! - `GET /validators/reshare/{ceremony_id}`: its state, dealers, players, dealer logs and
 //!   acknowledged shares.
@@ -72,7 +75,8 @@
 //!
 //! - `GET /consensus`: the epoch this node runs, its committee, every earlier epoch, the keys a
 //!   reconfiguration may add, and the epoch's last block once this node saw it.
-//! - `POST /consensus/reconfigure` `{"remove": "0x..", "add": "0x.."}` (consensus identities):
+//! - `POST /consensus/reconfigure` `{"epoch": E, "remove": "0x..", "add": "0x..",
+//!   "authorization": {..}}` (consensus identities; protected, below):
 //!   end the epoch with the block that carries it; the next epoch's committee is the current one
 //!   with `remove` replaced by `add`, a configured follower. `202` once submitted (every node stops
 //!   after that block, so none answers with its outcome), `400` refused, `409` the epoch already
@@ -80,12 +84,24 @@
 //! - `POST /consensus/sync` `{"height": H}`: ask the peers for the finalization at `H`, as a node
 //!   left in an earlier epoch must to learn the block that ended it. `202`.
 //!
+//! Administration (docs/administration.md):
+//!
+//! - `GET /admin`: the approver set (`--approvers`), the cluster id approvals are bound to, and the
+//!   last administrative nonce applied.
+//! - A protected request carries `"authorization": {"nonce": N, "approvals": [{"approver":
+//!   "0x..", "signature": "0x.."}]}`: a threshold of approvers' signatures of exactly the command
+//!   the request asks for, with the next nonce (`mpc-admin draft`, `sign`, `submit`). `403` without
+//!   it or with approvals that do not verify, `409` for a nonce already used, `503` on a node
+//!   without an approver set. The approvals are checked here for a clear answer, and again by
+//!   every voter: this API is not what authorizes the command.
+//!
 //! A follower (not a committee member) serves no signing: the Web3Signer and development signing
 //! endpoints answer `403`.
 //!
 //! There is no authentication: the node binds this API to loopback only.
 
 use crate::{
+    admin::{Administration, AuthorizationJson, Endorsement},
     dkg::{
         CeremonyId, DkgStatus,
         actor::{self as dkg, Health, ShareStatus},
@@ -99,6 +115,9 @@ use crate::{
     epochs::EpochRecord,
     eth::{
         duty::{Duty, DutyRequest, ValidatorKey, format_root, format_validator},
+        horizon::{Beyond, Horizon},
+        network::{NetworkJson, WrongFork},
+        registration::Refusal as RegistrationRefusal,
         web3signer::{parse_identifier, parse_request},
     },
     executor::{Client, Status, Stopped},
@@ -108,6 +127,7 @@ use crate::{
         Acknowledgment, ActivationOutcome, ActivationRefusal, ChainIdentity, Floors,
         HistoryOutcome, HistoryRefusal, Refusal as DutyRefusal,
     },
+    types::Command,
 };
 #[cfg(feature = "dev-api")]
 use crate::{
@@ -334,13 +354,17 @@ struct Api {
 }
 
 /// What this node's API accepts beyond the defaults.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Options {
     /// Accept `DEPOSIT` signing requests (validator onboarding). Off by default: a deposit is a
     /// one-time operation, and the state machine signs one deposit message per key, ever.
     pub deposit_signing: bool,
     /// This node's share-encryption public key, if it has one (for `GET /identity`).
     pub share_key: Option<[u8; 32]>,
+    /// The time horizon of the duties and imports it admits (`eth::horizon`).
+    pub horizon: Horizon,
+    /// The approvers of protected requests (`admin`), if configured.
+    pub administration: Option<Administration>,
 }
 
 /// Largest EIP-3076 interchange accepted (a full history of years of attestations).
@@ -396,7 +420,13 @@ pub fn router(
         )
         .route("/consensus", get(consensus_status))
         .route("/consensus/reconfigure", post(reconfigure))
-        .route("/consensus/sync", post(sync_consensus));
+        .route("/consensus/sync", post(sync_consensus))
+        .route("/admin", get(admin_status))
+        .route("/eth/network", get(eth_network))
+        .route(
+            "/eth/registration-policy",
+            get(registration_policy).post(set_registration_policy),
+        );
     #[cfg(feature = "dev-api")]
     let router = router
         .route("/sign", coordinates(post(sign)))
@@ -476,6 +506,9 @@ struct ActivateBody {
     /// Required for an imported key, refused for any other.
     #[serde(default)]
     acknowledgment: Option<Acknowledgment>,
+    /// The approvals of the activation (`admin`).
+    #[serde(default)]
+    authorization: Option<AuthorizationJson>,
 }
 
 #[derive(Serialize)]
@@ -554,11 +587,32 @@ async fn activate_validator(State(api): State<Api>, Json(body): Json<ActivateBod
     let imported = committed
         .as_ref()
         .is_some_and(|validator| validator.imported);
+    let command = match (imported, &body.acknowledgment) {
+        (true, Some(acknowledgment)) => Command::ActivateImportedValidator {
+            validator: key,
+            chain,
+            acknowledgment: *acknowledgment,
+        },
+        _ => Command::ActivateValidator {
+            validator: key,
+            chain,
+        },
+    };
+    let checked = (imported == body.acknowledgment.is_some())
+        .then(|| authorize(&api, &command, body.authorization.clone()));
+    let endorsement = match checked {
+        Some(future) => match future.await {
+            Ok(endorsement) => Some(endorsement),
+            Err((status, error)) => return activation_error(status, error, None),
+        },
+        None => None,
+    };
     let receipt = match (imported, body.acknowledgment) {
         (true, Some(acknowledgment)) => {
             tokio::time::timeout(
                 SUBMIT_TIMEOUT,
-                api.client.activate_imported(key, chain, acknowledgment),
+                api.client
+                    .activate_imported(key, chain, acknowledgment, endorsement),
             )
             .await
         }
@@ -578,7 +632,11 @@ async fn activate_validator(State(api): State<Api>, Json(body): Json<ActivateBod
             );
         }
         (false, None) => {
-            tokio::time::timeout(SUBMIT_TIMEOUT, api.client.activate_validator(key, chain)).await
+            tokio::time::timeout(
+                SUBMIT_TIMEOUT,
+                api.client.activate_validator(key, chain, endorsement),
+            )
+            .await
         }
     };
     let receipt = match receipt {
@@ -624,8 +682,43 @@ struct Eth2Error {
     error: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     refusal: Option<DutyRefusal>,
+    /// The duty is beyond this node's time horizon (`eth::horizon`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    beyond: Option<Beyond>,
+    /// The duty's `fork_info` is not this node's network's (`eth::network`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fork: Option<WrongFork>,
+    /// The registration policy, or its window, refuses the builder registration
+    /// (`eth::registration`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    registration: Option<RegistrationRefusal>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     reasons: Vec<Reason>,
+}
+
+/// A duty beyond this node's horizon: refused before anything is submitted. A duty for another
+/// chain answers as consensus would (`other_chain`); a node without a network signs nothing.
+fn beyond_error(beyond: Beyond) -> Response {
+    let (status, refusal) = match beyond {
+        Beyond::NotConfigured => (StatusCode::SERVICE_UNAVAILABLE, None),
+        Beyond::OtherChain => (
+            StatusCode::PRECONDITION_FAILED,
+            Some(DutyRefusal::OtherChain),
+        ),
+        _ => (StatusCode::PRECONDITION_FAILED, None),
+    };
+    (
+        status,
+        Json(Eth2Error {
+            error: beyond.to_string(),
+            refusal,
+            beyond: (refusal.is_none()).then_some(beyond),
+            fork: None,
+            registration: None,
+            reasons: Vec::new(),
+        }),
+    )
+        .into_response()
 }
 
 fn eth2_error(status: StatusCode, error: String) -> Response {
@@ -634,10 +727,51 @@ fn eth2_error(status: StatusCode, error: String) -> Response {
         Json(Eth2Error {
             error,
             refusal: None,
+            beyond: None,
+            fork: None,
+            registration: None,
             reasons: Vec::new(),
         }),
     )
         .into_response()
+}
+
+/// A builder registration the policy in force, or its window, refuses (`412`).
+fn registration_error(refusal: RegistrationRefusal) -> Response {
+    (
+        StatusCode::PRECONDITION_FAILED,
+        Json(Eth2Error {
+            error: format!("refused by the registration policy: {refusal}"),
+            refusal: None,
+            beyond: None,
+            fork: None,
+            registration: Some(refusal),
+            reasons: Vec::new(),
+        }),
+    )
+        .into_response()
+}
+
+/// A duty whose `fork_info` is not this node's network's: refused before anything is submitted
+/// (`400`; voters refuse it too). Another chain answers as consensus would (`other_chain`), a node
+/// without a network signs nothing (`503`).
+fn fork_error(wrong: WrongFork) -> Response {
+    match wrong {
+        WrongFork::NotConfigured => beyond_error(Beyond::NotConfigured),
+        WrongFork::OtherChain => beyond_error(Beyond::OtherChain),
+        wrong => (
+            StatusCode::BAD_REQUEST,
+            Json(Eth2Error {
+                error: wrong.to_string(),
+                refusal: None,
+                beyond: None,
+                fork: Some(wrong),
+                registration: None,
+                reasons: Vec::new(),
+            }),
+        )
+            .into_response(),
+    }
 }
 
 /// Whether the client asked for a JSON response (Web3Signer answers `text/plain` otherwise).
@@ -667,14 +801,34 @@ async fn eth2_sign(
             "deposit signing is disabled on this node (--enable-deposit-signing)".into(),
         );
     }
+    // A builder registration carries no fork: its domain is the network's genesis fork version
+    // with a zero root, put in here (`Network::fork_info`), and its key must be the path's.
+    let mut fork = request.fork;
+    if let Some(registration) = request.duty.registration() {
+        if registration.pubkey != validator {
+            return eth2_error(
+                StatusCode::BAD_REQUEST,
+                "the registration's pubkey is not the validator key of the path".into(),
+            );
+        }
+        match api.options.horizon.network() {
+            Some(network) => fork = network.fork_info(&request.duty),
+            None => return fork_error(WrongFork::NotConfigured),
+        }
+    }
     let duty = DutyRequest {
         validator,
-        fork: request.fork,
+        fork,
         duty: request.duty,
+    };
+    let endorsement = match approve_duty(&api, &duty, &body).await {
+        Ok(endorsement) => endorsement,
+        Err((status, error)) => return eth2_error(status, error),
     };
     let result = tokio::time::timeout(
         SIGN_TIMEOUT,
-        api.signer.sign_duty(duty, request.signing_root),
+        api.signer
+            .sign_duty(duty, request.signing_root, endorsement),
     )
     .await;
     let error = match result {
@@ -694,6 +848,15 @@ async fn eth2_sign(
             );
         }
     };
+    if let SignError::Beyond(beyond) = error {
+        return beyond_error(beyond);
+    }
+    if let SignError::WrongFork(wrong) = error {
+        return fork_error(wrong);
+    }
+    if let SignError::Registration(refusal) = error {
+        return registration_error(refusal);
+    }
     let status = match &error {
         // A key this network does not sign for (yet): unknown, or not activated.
         SignError::UnknownValidator
@@ -703,10 +866,12 @@ async fn eth2_sign(
         SignError::RootMismatch(_) | SignError::Refused(DutyRefusal::SourceAfterTarget { .. }) => {
             StatusCode::BAD_REQUEST
         }
+        SignError::NotApproved => StatusCode::FORBIDDEN,
         SignError::Refused(_) => StatusCode::PRECONDITION_FAILED,
         SignError::NotReady(_)
         | SignError::InsufficientSigners { .. }
         | SignError::Busy
+        | SignError::Overloaded(_)
         | SignError::Stopped => StatusCode::SERVICE_UNAVAILABLE,
         SignError::AuthorizationTimeout | SignError::Timeout { .. } => StatusCode::GATEWAY_TIMEOUT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -717,12 +882,55 @@ async fn eth2_sign(
             SignError::Refused(refusal) => Some(*refusal),
             _ => None,
         },
+        beyond: None,
+        fork: None,
+        registration: None,
         reasons: match error {
             SignError::NotReady(reasons) => reasons,
             _ => Vec::new(),
         },
     };
     (status, Json(body)).into_response()
+}
+
+/// The approvals of an exit or a deposit (P0.2) in the request's `authorization`, checked as
+/// voters will check them; none for a root approved already (a retry signs it again) or without
+/// `authorization` (the coordinator refuses an unapproved one). Any other duty takes none.
+async fn approve_duty(
+    api: &Api,
+    duty: &DutyRequest,
+    body: &Bytes,
+) -> Result<Option<Endorsement>, ApiError> {
+    let authorization = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|body| body.get("authorization").cloned())
+        .filter(|authorization| !authorization.is_null());
+    let Some(authorization) = authorization else {
+        return Ok(None);
+    };
+    if !duty.duty.kind().needs_approval() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "only a voluntary exit or a deposit takes an authorization".into(),
+        ));
+    }
+    let authorization: AuthorizationJson = serde_json::from_value(authorization)
+        .map_err(|err| (StatusCode::BAD_REQUEST, format!("authorization: {err}")))?;
+    let check = api
+        .client
+        .check_duty(duty.clone())
+        .await
+        .map_err(unavailable)?;
+    if check.approved {
+        return Ok(None);
+    }
+    authorize(
+        api,
+        &Command::Duty(Box::new(duty.clone())),
+        Some(authorization),
+    )
+    .await
+    .map(Some)
 }
 
 #[cfg(feature = "dev-api")]
@@ -799,12 +1007,19 @@ async fn sign(State(api): State<Api>, body: Result<Json<SignBody>, JsonRejection
             (StatusCode::SERVICE_UNAVAILABLE, "INSUFFICIENT_SIGNERS")
         }
         SignError::Timeout { .. } => (StatusCode::GATEWAY_TIMEOUT, "SIGNING_TIMEOUT"),
-        SignError::Busy | SignError::Stopped => (StatusCode::SERVICE_UNAVAILABLE, "UNAVAILABLE"),
+        SignError::Busy | SignError::Overloaded(_) | SignError::Stopped => {
+            (StatusCode::SERVICE_UNAVAILABLE, "UNAVAILABLE")
+        }
         SignError::ValidatorKey => (StatusCode::FORBIDDEN, "VALIDATOR_KEY"),
+        // Duty outcomes, never of a development request.
         SignError::Invalid
         | SignError::UnknownValidator
         | SignError::RootMismatch(_)
-        | SignError::Refused(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL"),
+        | SignError::Refused(_)
+        | SignError::Beyond(_)
+        | SignError::WrongFork(_)
+        | SignError::Registration(_)
+        | SignError::NotApproved => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL"),
     };
     let (status, mut response) = failure(status, result, message);
     match error {
@@ -1059,6 +1274,9 @@ struct ReshareBody {
     from_round: Option<u64>,
     dealers: Option<Vec<String>>,
     players: Option<Vec<String>>,
+    /// The approvals of a reshare to new keyholders (`admin`); none for a refresh (R1).
+    #[serde(default)]
+    authorization: Option<AuthorizationJson>,
 }
 
 /// A set of consensus identities (`0x`-hex ed25519 public keys), each once, as many as a command
@@ -1141,9 +1359,32 @@ async fn start_resharing(State(api): State<Api>, Json(body): Json<ReshareBody>) 
         Ok(membership) => membership,
         Err(error) => return generation_error(StatusCode::BAD_REQUEST, error, None),
     };
+    // New keyholders are a protected command; a refresh within the committee is not.
+    let endorsement = match (&membership, body.authorization.clone()) {
+        (None, Some(_)) => {
+            return generation_error(
+                StatusCode::BAD_REQUEST,
+                "a refresh within the committee takes no authorization".into(),
+                None,
+            );
+        }
+        (None, None) => None,
+        (Some(membership), authorization) => {
+            let command = Command::StartResharing {
+                validator: key,
+                ceremony: id.clone(),
+                membership: Some(Box::new(membership.clone())),
+            };
+            match authorize(&api, &command, authorization).await {
+                Ok(endorsement) => Some(endorsement),
+                Err((status, error)) => return generation_error(status, error, None),
+            }
+        }
+    };
     let receipt = match tokio::time::timeout(
         SUBMIT_TIMEOUT,
-        api.client.start_resharing(key, id.clone(), membership),
+        api.client
+            .start_resharing(key, id.clone(), membership, endorsement),
     )
     .await
     {
@@ -1474,9 +1715,16 @@ async fn consensus_status(State(api): State<Api>) -> Json<ConsensusStatus> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReconfigureBody {
+    /// The epoch it starts (the current one plus one, which it defaults to).
+    #[serde(default)]
+    epoch: Option<u64>,
     remove: String,
     add: String,
+    /// The approvals of the reconfiguration (`admin`).
+    #[serde(default)]
+    authorization: Option<AuthorizationJson>,
 }
 
 fn parse_identity(field: &str, value: &str) -> Result<PublicKey, ApiError> {
@@ -1509,17 +1757,24 @@ async fn reconfigure(
         ));
     }
     // The same rules consensus applies, first, for a clear answer.
-    let epoch = epochs.current().epoch + 1;
+    let epoch = body.epoch.unwrap_or(epochs.current().epoch + 1);
     epochs
         .check(epoch, &remove, &add, Some(&api.consensus.candidates))
         .map_err(|refusal| (StatusCode::BAD_REQUEST, refusal.to_string()))?;
+    let change = crate::types::Reconfiguration {
+        epoch,
+        remove: remove.clone(),
+        add: add.clone(),
+    };
+    let endorsement = authorize(
+        &api,
+        &Command::Reconfigure(Box::new(change.clone())),
+        body.authorization,
+    )
+    .await?;
     let id = api
         .client
-        .reconfigure(crate::types::Reconfiguration {
-            epoch,
-            remove: remove.clone(),
-            add: add.clone(),
-        })
+        .reconfigure(change, Some(endorsement))
         .await
         .map_err(unavailable)?;
     let committee: Vec<String> = epochs
@@ -1548,6 +1803,169 @@ struct SyncBody {
 async fn sync_consensus(State(api): State<Api>, Json(body): Json<SyncBody>) -> StatusCode {
     api.consensus.sync(body.height);
     StatusCode::ACCEPTED
+}
+
+// ---------------------------------------------------------------------------------------------
+// Administration (docs/administration.md)
+
+/// The approvals of `command` in `authorization`, checked as voters will check them, with the
+/// nonce against this node's committed one (a later nonce may be valid once earlier commands
+/// apply, so only a used one is refused).
+async fn authorize(
+    api: &Api,
+    command: &Command,
+    authorization: Option<AuthorizationJson>,
+) -> Result<Endorsement, ApiError> {
+    let Some(admin) = &api.options.administration else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this node has no approver set (--approvers): protected operations are disabled".into(),
+        ));
+    };
+    let Some(authorization) = authorization else {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "a protected operation needs the approvers' authorization (mpc-admin draft, sign, \
+             submit; docs/administration.md)"
+                .into(),
+        ));
+    };
+    let approvals = admin
+        .approvals(&authorization.approvals)
+        .map_err(|error| (StatusCode::FORBIDDEN, error))?;
+    let committed = api.client.status().await.map_err(unavailable)?.admin_nonce;
+    if authorization.nonce <= committed {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "administrative nonce {} is used (the last applied is {committed}): sign the \
+                 command again with a new nonce",
+                authorization.nonce
+            ),
+        ));
+    }
+    let authorized = crate::types::Authorized {
+        nonce: authorization.nonce,
+        command: command.clone(),
+        approvals,
+    };
+    admin
+        .verify(&authorized)
+        .map_err(|reason| (StatusCode::FORBIDDEN, format!("not authorized: {reason}")))?;
+    Ok(Endorsement {
+        nonce: authorized.nonce,
+        approvals: authorized.approvals,
+    })
+}
+
+#[derive(Serialize)]
+struct AdminStatus {
+    /// This node has an approver set.
+    configured: bool,
+    /// What approvals are bound to: the genesis committee and the approver set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cluster_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    threshold: Option<u8>,
+    approvers: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approvers_digest: Option<String>,
+    /// The Ethereum network the approvals are bound to (`Network::identity`, P0.3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network: Option<String>,
+    /// The last administrative nonce applied; a protected command takes the next.
+    nonce: u64,
+    next_nonce: u64,
+}
+
+async fn admin_status(State(api): State<Api>) -> Result<Json<AdminStatus>, ApiError> {
+    let nonce = api.client.status().await.map_err(unavailable)?.admin_nonce;
+    let admin = api.options.administration.as_ref();
+    Ok(Json(AdminStatus {
+        configured: admin.is_some(),
+        cluster_id: admin.map(|admin| format!("0x{}", hex::encode(admin.cluster()))),
+        threshold: admin.map(|admin| admin.approvers().threshold()),
+        approvers: admin
+            .map(|admin| {
+                admin
+                    .approvers()
+                    .keys()
+                    .iter()
+                    .map(format_identity)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        approvers_digest: admin
+            .map(|admin| format!("0x{}", hex::encode(admin.approvers().digest()))),
+        network: admin
+            .and_then(|admin| admin.network())
+            .map(|network| format!("0x{}", hex::encode(network))),
+        nonce,
+        next_nonce: nonce + 1,
+    }))
+}
+
+/// `GET /eth/network`: the Ethereum network this node signs for, its fork schedule, and their
+/// digests to compare with other nodes' (P0.3).
+async fn eth_network(State(api): State<Api>) -> Result<Json<NetworkJson>, ApiError> {
+    api.options
+        .horizon
+        .network()
+        .map(|network| Json(network.to_json()))
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "this node has no Ethereum network configured (--eth-network)".into(),
+        ))
+}
+
+/// `GET /eth/registration-policy`: the builder registration policy in force (`null`: none, no
+/// registration is signed), its digest, and the height it is read at.
+async fn registration_policy(State(api): State<Api>) -> Result<Json<serde_json::Value>, ApiError> {
+    let (policy, height) = api
+        .client
+        .registration_policy()
+        .await
+        .map_err(unavailable)?;
+    Ok(Json(serde_json::json!({
+        "policy": policy.as_ref().map(crate::eth::registration::Policy::to_json),
+        "digest": policy.map(|policy| format!("0x{}", hex::encode(policy.digest()))),
+        "height": height,
+    })))
+}
+
+/// `POST /eth/registration-policy`: replace the builder registration policy (protected: the
+/// body's `authorization`; the rest is the policy, as `mpc-admin` drafted it).
+async fn set_registration_policy(
+    State(api): State<Api>,
+    body: Bytes,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let mut body: serde_json::Value = json_body(&body, "request")?;
+    let authorization = match body
+        .as_object_mut()
+        .and_then(|object| object.remove("authorization"))
+    {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            serde_json::from_value::<AuthorizationJson>(value)
+                .map_err(|err| (StatusCode::BAD_REQUEST, format!("authorization: {err}")))?,
+        ),
+    };
+    let command = crate::admin::command("set-registration-policy", &body)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    let Command::SetRegistrationPolicy(policy) = &command else {
+        unreachable!("the command of set-registration-policy");
+    };
+    let digest = format!("0x{}", hex::encode(policy.digest()));
+    let endorsement = authorize(&api, &command, authorization).await?;
+    let id = api
+        .client
+        .set_registration_policy(policy.as_ref().clone(), Some(endorsement))
+        .await
+        .map_err(unavailable)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "transaction_id": id, "digest": digest })),
+    ))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1582,8 +2000,24 @@ fn json_body<T: serde::de::DeserializeOwned>(body: &Bytes, what: &str) -> Result
     serde_json::from_slice(body).map_err(|err| (StatusCode::BAD_REQUEST, format!("{what}: {err}")))
 }
 
+/// `POST /keys/import`: `{"manifest", "authorization"}`. A bare manifest (as before approvals
+/// existed) is understood, and refused for want of approvals.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisterBody {
+    manifest: crate::import::manifest::ManifestJson,
+    #[serde(default)]
+    authorization: Option<AuthorizationJson>,
+}
+
 async fn register_import(State(api): State<Api>, body: Bytes) -> Result<Response, ApiError> {
-    let json: crate::import::manifest::ManifestJson = json_body(&body, "manifest")?;
+    let value: serde_json::Value = json_body(&body, "request")?;
+    let (json, authorization) = if value.get("manifest").is_some() {
+        let body: RegisterBody = json_body(&body, "request")?;
+        (body.manifest, body.authorization)
+    } else {
+        (json_body(&body, "manifest")?, None)
+    };
     let manifest = crate::import::manifest::Manifest::from_json(&json)
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
     // The same checks consensus applies, first, for a clear answer.
@@ -1591,15 +2025,24 @@ async fn register_import(State(api): State<Api>, body: Bytes) -> Result<Response
         .check(api.dkg.committee())
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
     let id = manifest.ceremony.clone();
-    let receipt = tokio::time::timeout(SUBMIT_TIMEOUT, api.client.register_import(manifest))
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::GATEWAY_TIMEOUT,
-                "registration not finalized in time (it may still be)".to_string(),
-            )
-        })?
-        .map_err(unavailable)?;
+    let endorsement = authorize(
+        &api,
+        &Command::RegisterImportedKey(Box::new(manifest.clone())),
+        authorization,
+    )
+    .await?;
+    let receipt = tokio::time::timeout(
+        SUBMIT_TIMEOUT,
+        api.client.register_import(manifest, Some(endorsement)),
+    )
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::GATEWAY_TIMEOUT,
+            "registration not finalized in time (it may still be)".to_string(),
+        )
+    })?
+    .map_err(unavailable)?;
     use crate::dkg::ceremony::ImportOutcome;
     match receipt.outcome {
         ImportOutcome::Registered(_) | ImportOutcome::Exists(_) => describe_import(&api, id).await,
@@ -1728,6 +2171,9 @@ struct ImportHistoryBody {
     /// Import only these keys (each must be in the interchange).
     #[serde(default)]
     validators: Option<Vec<String>>,
+    /// The approvals of the import (`admin`); a dry run takes none.
+    #[serde(default)]
+    authorization: Option<AuthorizationJson>,
 }
 
 fn history_error(status: StatusCode, error: String, refusal: Option<HistoryRefusal>) -> ApiError {
@@ -1778,6 +2224,23 @@ async fn import_history_inner(api: &Api, body: &Bytes) -> Result<Response, ApiEr
         .await
         .map_err(|err| history_error(StatusCode::SERVICE_UNAVAILABLE, err.to_string(), None))?
         .map_err(refused)?;
+    // Floors beyond this node's clock would stop the key until then: refused before anything is
+    // submitted (voters refuse them too, `eth::horizon`). Another chain than this node's is a
+    // conflict, as one with the key's own chain is.
+    if !crate::hooks::no_horizon()
+        && let Err(beyond) = api.options.horizon.import(
+            &import,
+            crate::hooks::clock(SystemTime::now()),
+            Horizon::ADMISSION,
+        )
+    {
+        let status = match beyond {
+            Beyond::NotConfigured => StatusCode::SERVICE_UNAVAILABLE,
+            Beyond::OtherChain => StatusCode::CONFLICT,
+            _ => StatusCode::BAD_REQUEST,
+        };
+        return Err(history_error(status, beyond.to_string(), None));
+    }
     let summary = |outcome: HistoryOutcome, dry_run: bool, height: Option<u64>| {
         Json(serde_json::json!({
             "dry_run": dry_run,
@@ -1804,16 +2267,27 @@ async fn import_history_inner(api: &Api, body: &Bytes) -> Result<Response, ApiEr
     if body.dry_run {
         return Ok(summary(checked, true, None));
     }
-    let receipt = tokio::time::timeout(SUBMIT_TIMEOUT, api.client.import_history(import.clone()))
-        .await
-        .map_err(|_| {
-            history_error(
-                StatusCode::GATEWAY_TIMEOUT,
-                "import not finalized in time (it may still be)".into(),
-                None,
-            )
-        })?
-        .map_err(|err| history_error(StatusCode::SERVICE_UNAVAILABLE, err.to_string(), None))?;
+    // The approvals of exactly this import: its interchange's digest and every summary.
+    let endorsement = authorize(
+        api,
+        &Command::ImportSlashingProtection(Box::new(import.clone())),
+        body.authorization,
+    )
+    .await
+    .map_err(|(status, error)| history_error(status, error, None))?;
+    let receipt = tokio::time::timeout(
+        SUBMIT_TIMEOUT,
+        api.client.import_history(import.clone(), Some(endorsement)),
+    )
+    .await
+    .map_err(|_| {
+        history_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "import not finalized in time (it may still be)".into(),
+            None,
+        )
+    })?
+    .map_err(|err| history_error(StatusCode::SERVICE_UNAVAILABLE, err.to_string(), None))?;
     match receipt.outcome {
         HistoryOutcome::Refused(refusal) => Err(refused(refusal)),
         outcome => Ok(summary(outcome, false, Some(receipt.height))),

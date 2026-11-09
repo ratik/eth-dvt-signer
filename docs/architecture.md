@@ -115,6 +115,24 @@ failover proxy (development)  ──>  4 eth-mpc-signer nodes (this repository)
    the next epoch from it, on its own journal and consensus channels. Marshal verifies every
    height with its own epoch's committee. A maintenance operation (`mpc-admin replace-node`), not
    online reconfiguration.
+9. Done: P0 hardening. A time horizon: each node admits, proposes and votes for a duty or a
+   slashing-protection import only once its slot (or epochs) started by its own clock; the state
+   machine never reads a clock ([ethereum-signing.md](ethereum-signing.md#time-horizon)).
+   Administration signed by approvers: activations, imported-key registrations, reshares to new
+   keyholders and reconfigurations need a threshold of offline Ed25519 approvals and the next
+   administrative nonce, checked by every voter; only an approved reconfiguration ends an epoch
+   ([administration.md](administration.md)).
+10. Done: P0.1 to P0.3. EIP-3076 imports, voluntary exits and deposits need approvals over the
+   exact command; a keyholder signs an exit or a deposit only if the state records its root as
+   approved. Every duty's `fork_info` must follow the node's pinned fork schedule
+   ([ethereum-signing.md](ethereum-signing.md#fork-schedule)), checked by the API, the leader and
+   every voter; the network's identity is part of the cluster id.
+11. Done: builder registrations. `VALIDATOR_REGISTRATION` is signed only under the registration
+   policy the approvers set (replicated state, applied in block order): its fee recipients, gas
+   limit range and timestamp window, checked by the API, the leader, every voter, the block
+   application and every keyholder, a retry included. Registrations go after every other
+   transaction, at most 16 per block, from a bounded queue
+   ([ethereum-signing.md](ethereum-signing.md#builder-registrations)).
 
 ## Anvil
 

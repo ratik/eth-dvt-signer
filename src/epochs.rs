@@ -32,20 +32,26 @@ use commonware_cryptography::{
 use commonware_utils::{TryCollect as _, ordered::Set};
 use std::sync::Arc;
 
-/// The reconfiguration a block carries, if any: `(epoch, removed, added)`.
+/// The reconfiguration a block carries with its approvals (`admin`), if any:
+/// `(epoch, removed, added)`. A bare one, without approvals, is no reconfiguration: honest voters
+/// refuse a block carrying one, and it ends no epoch.
 pub fn reconfiguration(block: &Block) -> Option<(u64, &PublicKey, &PublicKey)> {
     block
         .transactions
         .iter()
         .find_map(|transaction| match &transaction.command {
-            Command::Reconfigure(change) => Some((change.epoch, &change.remove, &change.add)),
+            Command::Admin(authorized) => match &authorized.command {
+                Command::Reconfigure(change) => Some((change.epoch, &change.remove, &change.add)),
+                _ => None,
+            },
             _ => None,
         })
 }
 
-/// Whether `block` is the last of its epoch: it carries a reconfiguration, so no block may follow
-/// it in the epoch. Decided by the block's content alone, so every honest node refuses its
-/// children, whatever it has applied.
+/// Whether `block` is the last of its epoch: it carries an approved reconfiguration, so no block
+/// may follow it in the epoch. Decided by the block's content alone, so every honest node refuses
+/// its children, whatever it has applied. Only a block honest voters notarized can be a parent,
+/// and they notarize one only if its reconfiguration's approvals and nonce check (`admin`).
 pub fn is_terminal(block: &Block) -> bool {
     reconfiguration(block).is_some()
 }

@@ -22,6 +22,21 @@ What this protects against, and what it does not:
 | **History rewritten consistently** by someone with write access to the storage of 2 or more nodes | **Yes** | The same as a rollback: beyond the fault model. |
 | More than `f` Byzantine nodes | Possible | Beyond consensus' assumptions. |
 
+A different hazard is not a double signature but a **poisoned history**: a duty implausibly far in
+the future, recorded once, refuses the validator's real duties for good. An attestation with an
+old source and a far-future target surrounds every later vote. Far-future roots fill a period. An
+import with far-future floors stops the key. Each of these is valid for slashing protection
+alone. A duty or import whose slot or epochs have not started, by each node's clock, is never
+admitted, proposed or voted for (the time horizon,
+[ethereum-signing.md](ethereum-signing.md#time-horizon)). The replicated rules below never read a
+clock.
+
+| Situation | Poisoned history? | Why |
+| --------- | ----------------- | --- |
+| A client, a faulty coordinator or a faulty leader sends a far-future duty or import | No | Honest voters refuse the block (3 of 4 votes needed); the API and honest leaders refuse it first. |
+| One node's clock wrong (behind, ahead, jumping) | No | Only that node's admissions and votes change; it may refuse current duties until its clock is fixed. |
+| Two or more voters faulty, or with clocks far ahead | **Possible** | Beyond the voting rule's assumption, as for any consensus rule. |
+
 The network makes no claim of protection against whole-network rollback: that needs slashing
 history outside the nodes ([proposed design](#proposal-an-independent-durable-anchor), not
 implemented).
@@ -125,6 +140,20 @@ of the previous signer's latest message is refused too: its root may be absent f
 interchange, and the network never signed it. The network's own records stay complete above the
 floors, and its own exact repeats stay idempotent. These refusals count as slashing refusals
 (`412`).
+
+**Not ahead of time.** An import whose latest block slot, or attestation source or target epoch,
+has not started by the node's clock is refused (`400`, "has not started"), by the API and by every
+honest voter, so far-future floors cannot stop a key before it signs (the time horizon,
+[ethereum-signing.md](ethereum-signing.md#time-horizon)). Without a configured network, every
+import is refused.
+
+**Approved (P0.1).** An import that is not a dry run takes effect only with a threshold of the
+approvers' offline signatures over exactly that import: the chain, every key imported and the
+floors it gets, and, through the interchange's digest, every record of the interchange
+([administration.md](administration.md#eip-3076-history-imports-p01)). Without them, the API
+refuses it (`403`), and honest leaders and voters refuse it in a block. The approvals add a
+requirement and lift none: every check above and below still applies to an approved import. An
+import finalized before approvals existed is still applied when a node replays the history.
 
 **Only more restrictive, and only before the activation.** A later import can only raise floors.
 An older or identical interchange changes nothing (`outcome: unchanged`). Imports are accepted

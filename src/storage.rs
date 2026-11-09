@@ -19,6 +19,7 @@
 //! epoch 0, whose committee is the command line's.
 
 use crate::{
+    admin::{AdminRecord, Administration},
     dkg::{
         CeremonyId, DkgStatus,
         ceremony::{
@@ -29,19 +30,21 @@ use crate::{
     epochs::{EpochRecord, Epochs},
     eth::{
         duty::{DutyKind, ValidatorKey},
+        registration::{Policy as RegistrationPolicy, Terms},
         types::Root,
     },
     slashing::{
-        Activation, ActivationOutcome, Attested, ChainIdentity, Decision, DutyAuthorization,
-        Floors, HistoryOutcome, ImportedValidator, Protection, Record, Signed, Validator,
+        Activation, ActivationOutcome, Approved, Attested, ChainIdentity, Decision,
+        DutyAuthorization, Floors, HistoryOutcome, ImportedValidator, Protection, Record,
+        Refusal as DutyRefusal, Registered, Signed, Validator,
     },
     state::{self, Authorization, State},
-    types::{Command, Outcome, PayloadHash, Transaction},
+    types::{Authorized, Command, Outcome, PayloadHash, Transaction},
 };
 use bytes::{Buf, BufMut};
 use commonware_codec::{Encode as _, varint::UInt};
 use commonware_codec::{EncodeSize, Error as CodecError, FixedSize, Read, ReadExt, Write};
-use commonware_cryptography::{ed25519::PublicKey, sha256::Digest};
+use commonware_cryptography::{Digest as _, ed25519::PublicKey, sha256::Digest};
 use commonware_storage::{
     Context,
     metadata::{self, Config, Metadata},
@@ -90,6 +93,10 @@ const ATTESTATION_PREFIX: u8 = 6;
 const IMPORTED_PREFIX: u8 = 7;
 /// `(epoch, 0)`: consensus epochs after the first (`epochs`).
 const EPOCH_PREFIX: u8 = 8;
+/// `(validator, administrative nonce)`: approved signing roots of exits and deposits (P0.2).
+const APPROVAL_PREFIX: u8 = 9;
+/// `(validator, sequence number)`: an authorized builder registration (`Registered::sequence`).
+const REGISTRATION_PREFIX: u8 = 10;
 /// `16 + duty kind`, `(validator, period)`: authorized roots of non-slashable duties.
 const BOUNDED_PREFIX: u8 = 16;
 
@@ -101,6 +108,16 @@ fn applied_height() -> Key {
 /// [FORMAT_VERSION] of the data.
 fn format_version() -> Key {
     key(META_PREFIX, 1, 0)
+}
+
+/// The administrative record (`admin`): the last nonce and its approver set.
+fn admin_record() -> Key {
+    key(META_PREFIX, 2, 0)
+}
+
+/// The builder registration policy (`eth::registration`), once one is set.
+fn registration_policy() -> Key {
+    key(META_PREFIX, 3, 0)
 }
 
 /// Value stored under a [Key].
@@ -120,6 +137,14 @@ enum Value {
     ReshareCeremony(Box<Ceremony>),
     /// A consensus epoch after the first (stored under its number).
     Epoch(Box<EpochRecord>),
+    /// The last administrative nonce and the approver set it was applied under.
+    Admin(AdminRecord),
+    /// An approved signing root (stored under its validator and the approving nonce, P0.2).
+    Approval(Root, Approved),
+    /// An authorized builder registration (stored under its validator and sequence number).
+    Registration(Root, Registered),
+    /// The builder registration policy.
+    RegistrationPolicy(Box<RegistrationPolicy>),
 }
 
 fn write_optional_u64(value: Option<u64>, buf: &mut impl BufMut) {
@@ -320,6 +345,31 @@ impl Write for Value {
                 12u8.write(buf);
                 record.write(buf);
             }
+            // Tag 13 is the layout before the network identity (P0.3): read, never written.
+            Self::Admin(record) => {
+                15u8.write(buf);
+                record.nonce.write(buf);
+                record.approvers.write(buf);
+                record.network.write(buf);
+            }
+            Self::Approval(root, approved) => {
+                14u8.write(buf);
+                buf.put_slice(root);
+                (approved.kind as u8).write(buf);
+                approved.period.write(buf);
+            }
+            Self::Registration(root, registered) => {
+                16u8.write(buf);
+                buf.put_slice(root);
+                registered.timestamp.write(buf);
+                buf.put_slice(&registered.terms.fee_recipient);
+                registered.terms.gas_limit.write(buf);
+                registered.height.write(buf);
+            }
+            Self::RegistrationPolicy(policy) => {
+                17u8.write(buf);
+                policy.write(buf);
+            }
         }
     }
 }
@@ -384,6 +434,51 @@ impl Read for Value {
                 buf, true,
             )?))),
             12 => Ok(Self::Epoch(Box::new(EpochRecord::read(buf)?))),
+            13 => Ok(Self::Admin(AdminRecord {
+                nonce: u64::read(buf)?,
+                approvers: Digest::read(buf)?,
+                network: Digest::EMPTY,
+            })),
+            15 => Ok(Self::Admin(AdminRecord {
+                nonce: u64::read(buf)?,
+                approvers: Digest::read(buf)?,
+                network: Digest::read(buf)?,
+            })),
+            // The nonce is the key's: `Approved::nonce` is set when restoring.
+            14 => {
+                let root = read_root(buf)?;
+                let kind = DutyKind::from_u8(u8::read(buf)?)
+                    .ok_or(CodecError::Invalid("Value", "duty kind"))?;
+                Ok(Self::Approval(
+                    root,
+                    Approved {
+                        kind,
+                        period: u64::read(buf)?,
+                        nonce: 0,
+                    },
+                ))
+            }
+            // The sequence number is the key's: `Registered::sequence` is set when restoring.
+            16 => {
+                let root = read_root(buf)?;
+                let timestamp = u64::read(buf)?;
+                let fee_recipient = <[u8; 20]>::read(buf)?;
+                Ok(Self::Registration(
+                    root,
+                    Registered {
+                        timestamp,
+                        terms: Terms {
+                            fee_recipient,
+                            gas_limit: u64::read(buf)?,
+                        },
+                        height: u64::read(buf)?,
+                        sequence: 0,
+                    },
+                ))
+            }
+            17 => Ok(Self::RegistrationPolicy(Box::new(
+                RegistrationPolicy::read(buf)?,
+            ))),
             tag => Err(CodecError::InvalidEnum(tag)),
         }
     }
@@ -412,6 +507,12 @@ impl EncodeSize for Value {
             Self::ImportedValidator(imported) => imported_size(imported),
             Self::ReshareCeremony(ceremony) => ceremony.reshare_encode_size(),
             Self::Epoch(record) => record.encode_size(),
+            Self::Admin(record) => {
+                u64::SIZE + record.approvers.encode_size() + record.network.encode_size()
+            }
+            Self::Approval(..) => 32 + 1 + u64::SIZE,
+            Self::Registration(..) => 32 + u64::SIZE + 20 + 2 * u64::SIZE,
+            Self::RegistrationPolicy(policy) => policy.encode_size(),
         }
     }
 }
@@ -491,6 +592,8 @@ pub enum Effect {
     Abort(AbortOutcome),
     /// The consensus epoch the block starts once it is committed (it ends the current one).
     Reconfigure(Box<EpochRecord>),
+    /// The builder registration policy is now this one (its digest).
+    RegistrationPolicy(commonware_cryptography::sha256::Digest),
 }
 
 /// Result of applying a block, once it is durably committed.
@@ -509,6 +612,8 @@ pub struct Applied {
     pub generations: Vec<(ValidatorKey, u64)>,
     /// The consensus epoch the block starts: it was the current epoch's last block.
     pub reconfigured: Option<EpochRecord>,
+    /// The builder registration policy the block set, if it set one (the last, if several).
+    pub registration_policy: Option<RegistrationPolicy>,
 }
 
 /// In-memory replicated state mirrored to disk.
@@ -523,6 +628,12 @@ pub struct Store<E: Context> {
     ceremonies: Ceremonies,
     protection: Protection,
     epochs: Epochs,
+    /// The last administrative nonce applied, and its approver set.
+    admin: AdminRecord,
+    /// The approver set protected commands are checked against (`--approvers`), if any.
+    administration: Option<Administration>,
+    /// The builder registration policy in force (`eth::registration`).
+    registration_policy: Option<RegistrationPolicy>,
     height: u64,
 }
 
@@ -568,6 +679,22 @@ fn persist<E: Context>(
             key(IMPORTED_PREFIX, id, 0),
             Value::ImportedValidator(*protection.imported(id).expect("recorded import")),
         ),
+        Record::Approval { id, root } => {
+            let approved = *protection.approval(id, &root).expect("recorded approval");
+            metadata.put(
+                key(APPROVAL_PREFIX, id, approved.nonce),
+                Value::Approval(root, approved),
+            )
+        }
+        Record::Registration { id, root } => {
+            let registered = *protection
+                .registration(id, &root)
+                .expect("recorded registration");
+            metadata.put(
+                key(REGISTRATION_PREFIX, id, registered.sequence),
+                Value::Registration(root, registered),
+            )
+        }
     };
 }
 
@@ -616,6 +743,8 @@ impl<E: Context> Store<E> {
         let mut state = State::default();
         let mut ceremonies = Ceremonies::new(epochs.current().committee.clone());
         let mut protection = Protection::default();
+        let mut admin = AdminRecord::default();
+        let mut policy = None;
         let mut height = 0;
         for stored in metadata.keys() {
             match (parse(stored), metadata.get(stored)) {
@@ -626,6 +755,10 @@ impl<E: Context> Store<E> {
                     state.authorizations.insert((round, nonce), *authorization);
                 }
                 ((META_PREFIX, 0, 0), Some(Value::Number(h))) => height = *h,
+                ((META_PREFIX, 2, 0), Some(Value::Admin(record))) => admin = *record,
+                ((META_PREFIX, 3, 0), Some(Value::RegistrationPolicy(stored))) => {
+                    policy = Some(stored.as_ref().clone());
+                }
                 ((META_PREFIX, 1, 0), Some(Value::Number(_))) => {}
                 ((CEREMONY_PREFIX, _, 0), Some(Value::Ceremony(ceremony)))
                 | ((CEREMONY_PREFIX, _, 0), Some(Value::ImportedCeremony(ceremony)))
@@ -654,6 +787,22 @@ impl<E: Context> Store<E> {
                     let kind = DutyKind::from_u8(prefix - BOUNDED_PREFIX).expect("checked");
                     protection.restore_bounded(id, kind, period, roots.clone());
                 }
+                ((APPROVAL_PREFIX, id, nonce), Some(Value::Approval(root, approved))) => {
+                    protection.restore_approval(id, *root, Approved { nonce, ..*approved });
+                }
+                (
+                    (REGISTRATION_PREFIX, id, sequence),
+                    Some(Value::Registration(root, registered)),
+                ) => {
+                    protection.restore_registration(
+                        id,
+                        *root,
+                        Registered {
+                            sequence,
+                            ..*registered
+                        },
+                    );
+                }
                 // Read above.
                 ((EPOCH_PREFIX, _, 0), Some(Value::Epoch(_))) => {}
                 (parsed, _) => return Err(Error::Corrupt(format!("{parsed:?}"))),
@@ -667,8 +816,63 @@ impl<E: Context> Store<E> {
             ceremonies,
             protection,
             epochs,
+            admin,
+            administration: None,
+            registration_policy: policy,
             height,
         })
+    }
+
+    /// The builder registration policy in force (`eth::registration`); none: no registration
+    /// is signed.
+    pub const fn registration_policy(&self) -> Option<&RegistrationPolicy> {
+        self.registration_policy.as_ref()
+    }
+
+    /// Check protected commands against `administration` from now on (`--approvers`).
+    pub fn administer(&mut self, administration: Option<Administration>) {
+        self.administration = administration;
+    }
+
+    /// The last administrative nonce applied, and its approver set.
+    pub const fn admin(&self) -> AdminRecord {
+        self.admin
+    }
+
+    /// Admit a finalized protected command: the next nonce, approved by this node's approver
+    /// set. Honest voters checked both before the block could be finalized, so a failure means
+    /// this node's approver set or state is not the network's: it stops, rather than diverge.
+    fn admit(
+        &mut self,
+        authorized: &Authorized,
+        height: u64,
+        metadata: &mut Metadata<E, Key, Value>,
+    ) {
+        let Some(administration) = &self.administration else {
+            panic!(
+                "finalized block {height} carries a protected command, but this node has no \
+                 approver set (--approvers): refusing to continue"
+            );
+        };
+        let expected = self.admin.nonce + 1;
+        assert!(
+            authorized.nonce == expected,
+            "finalized block {height} carries administrative nonce {}, the next is {expected}: \
+             refusing to continue",
+            authorized.nonce
+        );
+        if let Err(reason) = administration.verify(authorized) {
+            panic!(
+                "finalized block {height} carries a protected command that does not verify here \
+                 ({reason}): this node's approver set is not the network's; refusing to continue"
+            );
+        }
+        self.admin = AdminRecord {
+            nonce: authorized.nonce,
+            approvers: administration.approvers().digest(),
+            network: administration.network().unwrap_or(Digest::EMPTY),
+        };
+        let _ = metadata.put(admin_record(), Value::Admin(self.admin));
     }
 
     /// Validator keys and their history must agree with each other and with the ceremonies: a
@@ -846,213 +1050,271 @@ impl<E: Context> Store<E> {
         let mut designated = Vec::new();
         let mut generations = Vec::new();
         let mut reconfigured = None;
+        let mut policy_set = None;
         let effects = transactions
             .iter()
-            .map(|transaction| match &transaction.command {
-                Command::Sign(request) => {
-                    let ceremony = self.ceremonies.get(&request.ceremony);
-                    // A validator key signs nothing but validator duties.
-                    if ceremony
-                        .is_some_and(|ceremony| self.protection.is_validator_round(ceremony.round))
-                    {
-                        return Effect::Sign(Outcome::ValidatorKey, None);
+            .map(|transaction| {
+                // A protected command with its approvals applies as the command itself, once its
+                // nonce and approvals check (`admin`).
+                let (command, approval) = match &transaction.command {
+                    Command::Admin(authorized) => {
+                        self.admit(authorized, height, &mut metadata);
+                        (&authorized.command, Some(authorized.nonce))
                     }
-                    let outcome = state::apply(&mut self.state, ceremony, request, height);
-                    let round = ceremony.map(|ceremony| ceremony.round);
-                    let authorization = round.and_then(|round| {
-                        self.state
-                            .authorizations
-                            .get(&(round, request.nonce))
-                            .copied()
-                    });
-                    if let (Outcome::Accepted, Some(round), Some(authorization)) =
-                        (outcome, round, authorization)
-                    {
-                        metadata.put(
-                            key(AUTHORIZATION_PREFIX, round, request.nonce),
-                            Value::Authorization(authorization),
-                        );
-                        authorized.push(Committed {
-                            round,
-                            nonce: request.nonce,
-                            authorization,
+                    command => (command, None),
+                };
+                match command {
+                    Command::Sign(request) => {
+                        let ceremony = self.ceremonies.get(&request.ceremony);
+                        // A validator key signs nothing but validator duties.
+                        if ceremony.is_some_and(|ceremony| {
+                            self.protection.is_validator_round(ceremony.round)
+                        }) {
+                            return Effect::Sign(Outcome::ValidatorKey, None);
+                        }
+                        let outcome = state::apply(&mut self.state, ceremony, request, height);
+                        let round = ceremony.map(|ceremony| ceremony.round);
+                        let authorization = round.and_then(|round| {
+                            self.state
+                                .authorizations
+                                .get(&(round, request.nonce))
+                                .copied()
                         });
-                    }
-                    Effect::Sign(outcome, authorization)
-                }
-                Command::StartCeremony(config) => {
-                    match self.ceremonies.start(config.clone(), height, digest) {
-                        // The id belongs to a validator key: not the same configuration.
-                        StartOutcome::Exists(round)
-                            if self.protection.is_validator_round(round) =>
+                        if let (Outcome::Accepted, Some(round), Some(authorization)) =
+                            (outcome, round, authorization)
                         {
-                            Effect::Start(StartOutcome::Conflict(round))
+                            metadata.put(
+                                key(AUTHORIZATION_PREFIX, round, request.nonce),
+                                Value::Authorization(authorization),
+                            );
+                            authorized.push(Committed {
+                                round,
+                                nonce: request.nonce,
+                                authorization,
+                            });
                         }
-                        outcome => Effect::Start(outcome),
+                        Effect::Sign(outcome, authorization)
                     }
-                }
-                Command::StartValidatorCeremony(config) => {
-                    match self.ceremonies.start(config.clone(), height, digest) {
-                        StartOutcome::Started(round) => {
-                            self.protection.designate(round);
-                            metadata.put(key(VALIDATOR_ROUND_PREFIX, round, 0), Value::Number(1));
-                            designated.push(round);
-                            Effect::Start(StartOutcome::Started(round))
+                    Command::StartCeremony(config) => {
+                        match self.ceremonies.start(config.clone(), height, digest) {
+                            // The id belongs to a validator key: not the same configuration.
+                            StartOutcome::Exists(round)
+                                if self.protection.is_validator_round(round) =>
+                            {
+                                Effect::Start(StartOutcome::Conflict(round))
+                            }
+                            outcome => Effect::Start(outcome),
                         }
-                        // The id belongs to a development key: not the same configuration.
-                        StartOutcome::Exists(round)
-                            if !self.protection.is_validator_round(round) =>
-                        {
-                            Effect::Start(StartOutcome::Conflict(round))
+                    }
+                    Command::StartValidatorCeremony(config) => {
+                        match self.ceremonies.start(config.clone(), height, digest) {
+                            StartOutcome::Started(round) => {
+                                self.protection.designate(round);
+                                metadata
+                                    .put(key(VALIDATOR_ROUND_PREFIX, round, 0), Value::Number(1));
+                                designated.push(round);
+                                Effect::Start(StartOutcome::Started(round))
+                            }
+                            // The id belongs to a development key: not the same configuration.
+                            StartOutcome::Exists(round)
+                                if !self.protection.is_validator_round(round) =>
+                            {
+                                Effect::Start(StartOutcome::Conflict(round))
+                            }
+                            outcome => Effect::Start(outcome),
                         }
-                        outcome => Effect::Start(outcome),
                     }
-                }
-                Command::Duty(request) => {
-                    let (root, decision, records) = self.protection.authorize(request, height);
-                    for record in records {
-                        persist(&mut metadata, &self.protection, record);
-                    }
-                    if decision.is_authorized() {
-                        let (id, _) = self
-                            .protection
-                            .validator_of(&request.validator)
-                            .expect("authorized for a known validator");
-                        duties.push(self.protection.duty_authorization(id, root));
-                    }
-                    Effect::Duty(decision, root)
-                }
-                Command::ActivateValidator { validator, chain } => {
-                    let (outcome, records) = self.protection.activate(validator, *chain, height);
-                    for record in records {
-                        persist(&mut metadata, &self.protection, record);
-                    }
-                    // Records an earlier version wrote become signable with the activation.
-                    if outcome == ActivationOutcome::Activated
-                        && let Some((id, _)) = self.protection.validator_of(validator)
+                    // A registration the policy in force refuses is not authorized, a retry of an
+                    // authorized one included (`eth::registration`).
+                    Command::Duty(request)
+                        if request.duty.registration().is_some_and(|registration| {
+                            self.registration_policy
+                                .as_ref()
+                                .is_none_or(|policy| policy.allows(&registration.into()).is_err())
+                        }) =>
                     {
-                        duties.extend(self.protection.duties_of(id));
+                        Effect::Duty(
+                            Decision::Refused(DutyRefusal::RegistrationPolicy),
+                            request.signing_root(),
+                        )
                     }
-                    Effect::Activate(outcome)
-                }
-                Command::DealerLog { round, log } => {
-                    Effect::Log(self.ceremonies.record(*round, log.as_ref().clone()))
-                }
-                Command::RegisterImportedKey(manifest) => {
-                    // An id and a key are registered once, whatever ceremony holds them (every
-                    // validator key is a ceremony's key): its history is never reset.
-                    let outcome = self.ceremonies.import(manifest.as_ref().clone(), height);
-                    if let ImportOutcome::Registered(round) = outcome {
-                        let (_, records) = self
-                            .protection
-                            .register_imported(round, manifest.validator)
-                            .expect("a new key");
-                        metadata.put(key(VALIDATOR_ROUND_PREFIX, round, 0), Value::Number(1));
-                        designated.push(round);
+                    Command::Duty(request) => {
+                        let (root, decision, records) = self.protection.authorize(request, height);
                         for record in records {
                             persist(&mut metadata, &self.protection, record);
                         }
+                        if decision.is_authorized() {
+                            // An exit or a deposit authorized with approvals is approved (also a
+                            // root authorized before, bare); one authorized bare stays unsigned.
+                            if let Some(nonce) = approval {
+                                for record in self.protection.approve(request, root, nonce) {
+                                    persist(&mut metadata, &self.protection, record);
+                                }
+                            }
+                            let (id, _) = self
+                                .protection
+                                .validator_of(&request.validator)
+                                .expect("authorized for a known validator");
+                            let kind = request.duty.kind();
+                            if self.protection.is_signable(id, kind, &root) {
+                                duties.push(self.protection.duty_authorization(
+                                    id,
+                                    kind,
+                                    request.duty.protection().period(),
+                                    root,
+                                ));
+                            }
+                        }
+                        Effect::Duty(decision, root)
                     }
-                    Effect::Register(outcome)
-                }
-                Command::ShareReady(ack) => Effect::Ready(self.ceremonies.ready(ack)),
-                Command::ImportSlashingProtection(import) => {
-                    let (outcome, records) = self.protection.import_history(import);
-                    for record in records {
-                        persist(&mut metadata, &self.protection, record);
+                    Command::ActivateValidator { validator, chain } => {
+                        let (outcome, records) =
+                            self.protection.activate(validator, *chain, height);
+                        for record in records {
+                            persist(&mut metadata, &self.protection, record);
+                        }
+                        // Records an earlier version wrote become signable with the activation.
+                        if outcome == ActivationOutcome::Activated
+                            && let Some((id, _)) = self.protection.validator_of(validator)
+                        {
+                            duties.extend(self.protection.duties_of(id));
+                        }
+                        Effect::Activate(outcome)
                     }
-                    Effect::History(outcome)
-                }
-                Command::ActivateImportedValidator {
-                    validator,
-                    chain,
-                    acknowledgment,
-                } => {
-                    let shares = self
-                        .protection
-                        .validator_of(validator)
-                        .and_then(|(_, validator)| self.ceremonies.by_round(validator.round))
-                        .and_then(|ceremony| {
-                            let imported = ceremony.imported()?;
-                            Some((imported.ready.len() as u32, ceremony.config.threshold))
-                        })
-                        .unwrap_or((0, u32::MAX));
-                    let (outcome, records) = self.protection.activate_imported(
+                    Command::DealerLog { round, log } => {
+                        Effect::Log(self.ceremonies.record(*round, log.as_ref().clone()))
+                    }
+                    Command::RegisterImportedKey(manifest) => {
+                        // An id and a key are registered once, whatever ceremony holds them (every
+                        // validator key is a ceremony's key): its history is never reset.
+                        let outcome = self.ceremonies.import(manifest.as_ref().clone(), height);
+                        if let ImportOutcome::Registered(round) = outcome {
+                            let (_, records) = self
+                                .protection
+                                .register_imported(round, manifest.validator)
+                                .expect("a new key");
+                            metadata.put(key(VALIDATOR_ROUND_PREFIX, round, 0), Value::Number(1));
+                            designated.push(round);
+                            for record in records {
+                                persist(&mut metadata, &self.protection, record);
+                            }
+                        }
+                        Effect::Register(outcome)
+                    }
+                    Command::ShareReady(ack) => Effect::Ready(self.ceremonies.ready(ack)),
+                    Command::ImportSlashingProtection(import) => {
+                        let (outcome, records) = self.protection.import_history(import);
+                        for record in records {
+                            persist(&mut metadata, &self.protection, record);
+                        }
+                        Effect::History(outcome)
+                    }
+                    Command::ActivateImportedValidator {
                         validator,
-                        *chain,
-                        *acknowledgment,
-                        shares,
-                        height,
-                    );
-                    for record in records {
-                        persist(&mut metadata, &self.protection, record);
-                    }
-                    Effect::Activate(outcome)
-                }
-                Command::StartResharing {
-                    validator,
-                    ceremony,
-                    membership,
-                } => {
-                    let outcome = match self.protection.validator_of(validator) {
-                        None => ReshareOutcome::UnknownValidator,
-                        Some((_, entry)) if entry.activation.is_none() => {
-                            ReshareOutcome::NotActivated
+                        chain,
+                        acknowledgment,
+                    } => {
+                        let shares = self
+                            .protection
+                            .validator_of(validator)
+                            .and_then(|(_, validator)| self.ceremonies.by_round(validator.round))
+                            .and_then(|ceremony| {
+                                let imported = ceremony.imported()?;
+                                Some((imported.ready.len() as u32, ceremony.config.threshold))
+                            })
+                            .unwrap_or((0, u32::MAX));
+                        let (outcome, records) = self.protection.activate_imported(
+                            validator,
+                            *chain,
+                            *acknowledgment,
+                            shares,
+                            height,
+                        );
+                        for record in records {
+                            persist(&mut metadata, &self.protection, record);
                         }
-                        Some((_, entry)) => {
-                            let active = entry.round;
-                            self.ceremonies.reshare(
-                                ceremony.clone(),
-                                *validator,
-                                active,
-                                membership.as_deref(),
-                                height,
-                                digest,
-                            )
+                        Effect::Activate(outcome)
+                    }
+                    Command::StartResharing {
+                        validator,
+                        ceremony,
+                        membership,
+                    } => {
+                        let outcome = match self.protection.validator_of(validator) {
+                            None => ReshareOutcome::UnknownValidator,
+                            Some((_, entry)) if entry.activation.is_none() => {
+                                ReshareOutcome::NotActivated
+                            }
+                            Some((_, entry)) => {
+                                let active = entry.round;
+                                self.ceremonies.reshare(
+                                    ceremony.clone(),
+                                    *validator,
+                                    active,
+                                    membership.as_deref(),
+                                    height,
+                                    digest,
+                                )
+                            }
+                        };
+                        if let ReshareOutcome::Started(round) = outcome {
+                            // The new generation signs only validator duties, like the key's others.
+                            self.protection.designate(round);
+                            metadata.put(key(VALIDATOR_ROUND_PREFIX, round, 0), Value::Number(1));
+                            designated.push(round);
                         }
-                    };
-                    if let ReshareOutcome::Started(round) = outcome {
-                        // The new generation signs only validator duties, like the key's others.
-                        self.protection.designate(round);
-                        metadata.put(key(VALIDATOR_ROUND_PREFIX, round, 0), Value::Number(1));
-                        designated.push(round);
+                        Effect::Reshare(outcome)
                     }
-                    Effect::Reshare(outcome)
-                }
-                Command::ActivateGeneration { validator, round } => {
-                    let outcome = self.activate_generation(validator, *round, &mut metadata);
-                    if let GenerationOutcome::Activated { .. } = outcome {
-                        generations.push((*validator, *round));
+                    Command::ActivateGeneration { validator, round } => {
+                        let outcome = self.activate_generation(validator, *round, &mut metadata);
+                        if let GenerationOutcome::Activated { .. } = outcome {
+                            generations.push((*validator, *round));
+                        }
+                        Effect::Generation(outcome)
                     }
-                    Effect::Generation(outcome)
-                }
-                Command::AbortResharing { validator, round } => {
-                    Effect::Abort(self.abort_resharing(validator, *round))
-                }
-                Command::Reconfigure(change) => {
-                    // The committee verified it before finalizing this block, against the epoch
-                    // this process runs (the current one): a finalized block that breaks the rules
-                    // means this node's state is not the committee's, so it stops.
-                    assert!(
-                        transactions.len() == 1,
-                        "finalized block {height} carries a reconfiguration with other \
+                    Command::AbortResharing { validator, round } => {
+                        Effect::Abort(self.abort_resharing(validator, *round))
+                    }
+                    Command::Reconfigure(change) => {
+                        // The committee verified it before finalizing this block, against the epoch
+                        // this process runs (the current one): a finalized block that breaks the rules
+                        // means this node's state is not the committee's, so it stops.
+                        assert!(
+                            transactions.len() == 1,
+                            "finalized block {height} carries a reconfiguration with other \
                          transactions: refusing to continue"
-                    );
-                    let next = self
-                        .epochs
-                        .next(change.epoch, &change.remove, &change.add, height, *digest)
-                        .unwrap_or_else(|refusal| {
-                            panic!(
-                                "finalized block {height} carries an invalid reconfiguration \
+                        );
+                        let next = self
+                            .epochs
+                            .next(change.epoch, &change.remove, &change.add, height, *digest)
+                            .unwrap_or_else(|refusal| {
+                                panic!(
+                                    "finalized block {height} carries an invalid reconfiguration \
                                  ({refusal}): refusing to continue"
-                            )
-                        });
-                    metadata.put(
-                        key(EPOCH_PREFIX, next.epoch, 0),
-                        Value::Epoch(Box::new(next.clone())),
-                    );
-                    reconfigured = Some(next.clone());
-                    Effect::Reconfigure(Box::new(next))
+                                )
+                            });
+                        metadata.put(
+                            key(EPOCH_PREFIX, next.epoch, 0),
+                            Value::Epoch(Box::new(next.clone())),
+                        );
+                        reconfigured = Some(next.clone());
+                        Effect::Reconfigure(Box::new(next))
+                    }
+                    Command::SetRegistrationPolicy(policy) => {
+                        // Only a valid policy decodes (`Policy::read`).
+                        metadata.put(
+                            registration_policy(),
+                            Value::RegistrationPolicy(policy.clone()),
+                        );
+                        self.registration_policy = Some(policy.as_ref().clone());
+                        policy_set = Some(policy.as_ref().clone());
+                        Effect::RegistrationPolicy(policy.digest())
+                    }
+                    Command::Admin(_) => {
+                        unreachable!(
+                            "approvals authorize a protected command, never other approvals"
+                        )
+                    }
                 }
             })
             .collect();
@@ -1097,6 +1359,7 @@ impl<E: Context> Store<E> {
             designated,
             generations,
             reconfigured,
+            registration_policy: policy_set,
         })
     }
 

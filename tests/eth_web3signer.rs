@@ -118,7 +118,7 @@ fn unsupported_requests_are_refused() {
     unsupported(value);
     for kind in [
         "BLOCK",
-        "VALIDATOR_REGISTRATION",
+        "BUILDER_REQUEST_AUTH",
         "SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF_V9",
         "EXECUTION_PAYLOAD_ENVELOPE",
         "PAYLOAD_ATTESTATION_MESSAGE",
@@ -343,4 +343,37 @@ fn deposits_reproduce_the_web3signer_example_root() {
     let mut short_version = value;
     short_version["deposit"]["genesis_fork_version"] = json!("0x0001");
     assert!(matches!(parse(&short_version), Err(ParseError::Invalid(_))));
+}
+
+#[test]
+fn registrations_parse_without_fork_info() {
+    // Web3Signer's VALIDATOR_REGISTRATION example (its root: `tests/unit/eth/registration.rs`).
+    let value = fixture("validator_registration.json");
+    let request = parse(&value).unwrap();
+    assert_eq!(request.duty.kind(), DutyKind::ValidatorRegistration);
+    let registration = request.duty.registration().unwrap();
+    assert_eq!(registration.gas_limit, 4_658_411_424_342_975_020);
+    assert_eq!(registration.timestamp, 4_663_368_873_993_027_404);
+    assert_eq!(
+        format_root(&request.signing_root.unwrap()),
+        value["signingRoot"].as_str().unwrap()
+    );
+    // The fork is the network's, put in by the API: the parser leaves none.
+    assert_eq!(request.fork.fork.current_version, [0; 4]);
+    // Sent with `fork_info`, an unknown field, a short address, an unquoted number: refused.
+    let mut with_fork = value.clone();
+    with_fork["fork_info"] = fixture("attestation.json")["fork_info"].clone();
+    assert!(matches!(parse(&with_fork), Err(ParseError::Invalid(_))));
+    let mut extra = value.clone();
+    extra["validator_registration"]["builder"] = json!("0x00");
+    assert!(matches!(parse(&extra), Err(ParseError::Invalid(_))));
+    let mut short = value.clone();
+    short["validator_registration"]["fee_recipient"] = json!("0x1234");
+    assert!(matches!(parse(&short), Err(ParseError::Invalid(_))));
+    let mut missing = value;
+    missing["validator_registration"]
+        .as_object_mut()
+        .unwrap()
+        .remove("timestamp");
+    assert!(matches!(parse(&missing), Err(ParseError::Invalid(_))));
 }

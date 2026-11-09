@@ -35,7 +35,12 @@ use super::{
     signing, wire,
 };
 use crate::{
-    eth::{duty::ValidatorKey, types::Root},
+    eth::{
+        duty::{DutyKind, ValidatorKey},
+        horizon::Horizon,
+        registration::{Policy as RegistrationPolicy, Refusal as RegistrationRefusal, Terms},
+        types::Root,
+    },
     executor::{self, StartReceipt, Stopped},
     import::envelope::{self, EncryptedShare, ShareKey},
     signer::wire::{self as sign_wire, AuthorizationRef, Refusal},
@@ -99,6 +104,9 @@ pub enum Message {
     /// Share generations a block activated (`(validator key, its new round)`), sent once the block
     /// is durable here, before the ceremonies it retired.
     Generations(Vec<(ValidatorKey, u64)>),
+    /// The builder registration policy a block set, sent once the block is durable here, before
+    /// the duties it authorized (`eth::registration`).
+    RegistrationPolicy(Option<RegistrationPolicy>),
     /// This node's partial signature for an authorization (from its own coordinator).
     Partial {
         ceremony: CeremonyId,
@@ -382,7 +390,13 @@ pub struct Actor<
     /// The ceremony round that holds each validator key.
     validators: HashMap<ValidatorKey, u64>,
     /// Validator duty signing roots committed on this node (their slashing records), by key.
-    duty_roots: HashSet<(ValidatorKey, Root)>,
+    /// Authorized duty roots of validator keys, with each duty's kind and protection period (and
+    /// a registration's terms).
+    duty_roots: HashMap<(ValidatorKey, Root), (DutyKind, u64, Option<Terms>)>,
+    /// The builder registration policy in force here: no partial for a registration it refuses.
+    registration_policy: Option<RegistrationPolicy>,
+    /// This node's time horizon: no partial for a duty beyond it.
+    horizon: Horizon,
     parked: Parked,
     /// Blocks applied since start.
     blocks: u64,
@@ -421,6 +435,7 @@ impl<
         share_key: Option<ShareKey>,
         committee: Set<PublicKey>,
         approvals: Approvals,
+        horizon: Horizon,
     ) -> Self {
         let mut validators = HashMap::new();
         for (key, round) in duties
@@ -455,8 +470,15 @@ impl<
             validators,
             duty_roots: duties
                 .iter()
-                .map(|duty| (duty.validator, duty.signing_root))
+                .map(|duty| {
+                    (
+                        (duty.validator, duty.signing_root),
+                        (duty.kind, duty.period, duty.terms),
+                    )
+                })
                 .collect(),
+            registration_policy: None,
+            horizon,
             parked: Parked::default(),
             blocks: 0,
             share_key,
@@ -465,6 +487,12 @@ impl<
             reshares: HashMap::new(),
             retired: BTreeSet::new(),
         }
+    }
+
+    /// The builder registration policy committed when the node starts.
+    pub fn with_registration_policy(mut self, policy: Option<RegistrationPolicy>) -> Self {
+        self.registration_policy = policy;
+        self
     }
 
     pub fn start(mut self) -> Handle<()> {
@@ -494,11 +522,15 @@ impl<
                 Message::AuthorizedDuties(duties) => {
                     for duty in duties {
                         advance(&mut self.validators, duty.validator, duty.round);
-                        self.duty_roots.insert((duty.validator, duty.signing_root));
+                        self.duty_roots.insert(
+                            (duty.validator, duty.signing_root),
+                            (duty.kind, duty.period, duty.terms),
+                        );
                     }
                     self.release_parked();
                 }
                 Message::ValidatorRounds(rounds) => self.validator_rounds.extend(rounds),
+                Message::RegistrationPolicy(policy) => self.registration_policy = policy,
                 Message::Generations(generations) => {
                     for (key, round) in generations {
                         info!(validator = %crate::eth::duty::format_validator(&key), round, "share generation activated");
@@ -1141,10 +1173,37 @@ impl<
                 if !validator_key {
                     return Err(Refusal::WrongPurpose);
                 }
-                if self.validators.get(validator) != Some(&round)
-                    || !self.duty_roots.contains(&(*validator, *payload_hash))
-                {
+                if self.validators.get(validator) != Some(&round) {
                     return Err(Refusal::NotAuthorized);
+                }
+                let &(kind, period, terms) = self
+                    .duty_roots
+                    .get(&(*validator, *payload_hash))
+                    .ok_or(Refusal::NotAuthorized)?;
+                let now = crate::hooks::clock(self.context.current());
+                if let Err(beyond) = self.horizon.authorized(kind, period, now, Horizon::VOTE) {
+                    warn!(?kind, period, %beyond, "not signing a duty beyond this node's horizon");
+                    return Err(Refusal::BeyondHorizon);
+                }
+                // A registration only while the policy in force allows it, an authorized one
+                // asked again included (`eth::registration`).
+                if kind == DutyKind::ValidatorRegistration {
+                    let checked = match (&self.registration_policy, terms) {
+                        (Some(policy), Some(terms)) => policy
+                            .allows(&terms)
+                            .map_err(|refusal| (refusal, Refusal::NotAuthorized))
+                            .and_then(|()| {
+                                policy
+                                    .window(period, now, Horizon::VOTE)
+                                    .map_err(|refusal| (refusal, Refusal::BeyondHorizon))
+                            }),
+                        // No policy, or (impossible) a registration recorded without terms.
+                        _ => Err((RegistrationRefusal::NoPolicy, Refusal::NotAuthorized)),
+                    };
+                    if let Err((why, refusal)) = checked {
+                        warn!(%why, "not signing a builder registration");
+                        return Err(refusal);
+                    }
                 }
                 Ok(signing::Message::Ethereum(*payload_hash).partial_sign(share))
             }
@@ -1245,7 +1304,7 @@ impl<
                         authorizations.contains_key(&(*round, nonce))
                     }
                     AuthorizationRef::Duty { validator } => {
-                        duty_roots.contains(&(validator, request.payload_hash))
+                        duty_roots.contains_key(&(validator, request.payload_hash))
                             && validators.get(&validator) == Some(round)
                     }
                 })

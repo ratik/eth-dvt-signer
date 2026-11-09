@@ -28,15 +28,17 @@ pub(crate) fn crash_at(point: &str) -> Vec<(String, String)> {
 
 /// A network (node `i` with the environment `env(i)`) with the activated DKG validator key
 /// [VALIDATOR]; returns it and the key.
-fn validator_network_with(env: impl Fn(usize) -> Vec<(String, String)>) -> (TestNetwork, String) {
+pub(crate) fn validator_network_with(
+    env: impl Fn(usize) -> Vec<(String, String)>,
+) -> (TestNetwork, String) {
     let network = TestNetwork::start_with(NODES, env);
     network.wait_for_ready(&network.all());
     network.start_validator_dkg(0, VALIDATOR);
     let key = network.wait_for_dkg(VALIDATOR, &network.all());
-    let (status, activated) = network.post(
+    let (status, activated) = network.approved(
         0,
-        "/validators/activate",
-        &json!({ "public_key": key, "genesis_validators_root": CHAIN }),
+        "activate",
+        json!({ "public_key": key, "genesis_validators_root": CHAIN }),
     );
     assert_eq!(status, 200, "{activated}");
     for node in network.all() {
@@ -452,7 +454,12 @@ fn e2e_rsh_4_invalid_participants_never_activate_an_unauthorized_generation() {
 fn e2e_rsh_5_imported_key() {
     let (network, dir) = import_network();
     let (manifest, envelopes) = split(&network, &dir, IMPORTED, "shares");
-    assert_eq!(network.post(0, "/keys/import", &manifest).0, 200);
+    assert_eq!(
+        network
+            .approved(0, "register-import", json!({ "manifest": manifest }))
+            .0,
+        200
+    );
     for (node, envelope) in envelopes.iter().enumerate() {
         // Each node installs once it applied the registration.
         network.wait_until(&format!("the registration on node {node}"), || {
@@ -467,11 +474,7 @@ fn e2e_rsh_5_imported_key() {
         json!([{"slot": "100"}]),
         json!([{"source_epoch": "10", "target_epoch": "11"}]),
     );
-    let (status, imported) = network.post(
-        1,
-        "/slashing-protection/import",
-        &json!({"interchange": history}),
-    );
+    let (status, imported) = network.approved(1, "import-history", json!({"interchange": history}));
     assert_eq!(status, 200, "{imported}");
     network.wait_until("every share acknowledged", || {
         let (_, status) = network.get(0, &format!("/keys/import/{IMPORTED}"));
@@ -480,10 +483,10 @@ fn e2e_rsh_5_imported_key() {
             .is_some_and(|ready| ready.len() == NODES)
     });
     let acknowledgment: Value = serde_json::from_str(ACKNOWLEDGED).unwrap();
-    let (status, activated) = network.post(
+    let (status, activated) = network.approved(
         0,
-        "/validators/activate",
-        &json!({"public_key": IMPORTED_KEY, "genesis_validators_root": CHAIN, "acknowledgment": acknowledgment}),
+        "activate",
+        json!({"public_key": IMPORTED_KEY, "genesis_validators_root": CHAIN, "acknowledgment": acknowledgment}),
     );
     assert_eq!(status, 200, "{activated}");
     for node in network.all() {

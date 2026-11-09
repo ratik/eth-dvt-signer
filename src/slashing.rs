@@ -15,7 +15,10 @@
 //! - for the other duties, which are not slashable, the signing roots authorized per (kind, period):
 //!   retries are idempotent, and at most `MAX_ROOTS_PER_PERIOD` distinct roots per period are
 //!   authorized. A validator signs one deposit message, ever (`MAX_DEPOSIT_MESSAGES`): the
-//!   withdrawal credentials of its first deposit cannot be replaced through the signer.
+//!   withdrawal credentials of its first deposit cannot be replaced through the signer;
+//! - every authorized builder registration, by signing root, with what the registration policy
+//!   decides on (`eth::registration`): retries are idempotent, and nothing limits distinct ones
+//!   here (the policy, the timestamp window and the per-block limit bound them).
 //!
 //! History is keyed by the validator public key, never by ceremony: a ceremony is only how the key
 //! signs today. A reshare moves the key to another ceremony (its new share generation,
@@ -56,6 +59,7 @@
 
 use crate::eth::{
     duty::{Duty, DutyKind, DutyRequest, Protection as Rule, ValidatorKey},
+    registration::Terms,
     types::{Root, hex_bytes},
 };
 use serde::Serialize;
@@ -97,6 +101,25 @@ pub struct DutyAuthorization {
     pub validator: ValidatorKey,
     pub round: u64,
     pub signing_root: Root,
+    /// The duty's kind and protection period (`Protection::period`): a keyholder checks them
+    /// against its clock before signing (`eth::horizon`; a registration's period is its
+    /// timestamp).
+    pub kind: DutyKind,
+    pub period: u64,
+    /// A registration's fee recipient and gas limit: a keyholder checks them against the
+    /// registration policy in force before signing (`eth::registration`).
+    pub terms: Option<Terms>,
+}
+
+/// An authorized builder registration: its timestamp, what the registration policy decides on,
+/// the block that authorized it, and its sequence number among the validator's records (its
+/// storage key).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Registered {
+    pub timestamp: u64,
+    pub terms: Terms,
+    pub height: u64,
+    pub sequence: u64,
 }
 
 /// An authorized signing root and the block that authorized it.
@@ -320,6 +343,22 @@ pub enum Record {
         kind: DutyKind,
         period: u64,
     },
+    /// The approval of validator `id`'s signing root `root` (P0.2).
+    Approval { id: u64, root: Root },
+    /// The builder registration of validator `id` with signing root `root`.
+    Registration { id: u64, root: Root },
+}
+
+/// The approval of an authorized signing root whose kind needs one (`DutyKind::needs_approval`,
+/// P0.2): the root is one of the validator's `kind` records in `period`, and the approved command
+/// with administrative nonce `nonce` authorized it (or authorized it again). A keyholder signs
+/// such a root only once it is approved; a root a block authorized bare (history written before
+/// approvals existed) stays recorded, and is never signed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Approved {
+    pub kind: DutyKind,
+    pub period: u64,
+    pub nonce: u64,
 }
 
 /// Why a duty is not authorized.
@@ -340,6 +379,13 @@ pub enum Refusal {
     /// A deposit message for another public key than the validator's.
     #[error("the deposit message is for another public key")]
     DepositForAnotherKey,
+    /// A builder registration for another public key than the validator's.
+    #[error("the builder registration is for another public key")]
+    RegistrationForAnotherKey,
+    /// The registration policy in force when the block applied refuses the registration (its fee
+    /// recipient or gas limit, or there is none: `eth::registration`).
+    #[error("the registration policy in force refuses the builder registration")]
+    RegistrationPolicy,
     #[error("another block was signed for slot {slot}")]
     DoubleProposal { slot: u64 },
     #[error("another attestation was signed for target epoch {target}")]
@@ -468,6 +514,10 @@ pub struct Protection {
     bounded: BTreeMap<(u64, DutyKind, u64), Vec<Signed>>,
     /// Imported keys, by validator id.
     imported: BTreeMap<u64, ImportedValidator>,
+    /// Approved signing roots of the kinds that need approval, by validator id and root.
+    approved: BTreeMap<(u64, Root), Approved>,
+    /// Authorized builder registrations, by validator id and signing root.
+    registrations: BTreeMap<(u64, Root), Registered>,
 }
 
 /// One validator's history as an EIP-3076 interchange holds it ([Protection::export]).
@@ -906,7 +956,23 @@ impl Protection {
                 .iter()
                 .find(|signed| signed.signing_root == root)
                 .map(|signed| signed.height),
+            Rule::Registration { .. } => self
+                .registrations
+                .get(&(id, root))
+                .map(|registered| registered.height),
         }
+    }
+
+    /// Validator `id`'s authorized registration with signing root `root`, if there is one.
+    pub fn registration(&self, id: u64, root: &Root) -> Option<&Registered> {
+        self.registrations.get(&(id, *root))
+    }
+
+    /// Validator `id`'s authorized registrations, by signing root.
+    pub fn registrations_of(&self, id: u64) -> impl Iterator<Item = (&Root, &Registered)> {
+        self.registrations
+            .range((id, [0; 32])..=(id, [0xff; 32]))
+            .map(|((_, root), registered)| (root, registered))
     }
 
     /// Decide `request` in the block at `height`, and record it if newly authorized. Returns the
@@ -923,13 +989,22 @@ impl Protection {
             Ok(None) => return (root, Decision::AlreadyAccepted, Vec::new()),
             Err(refusal) => return (root, Decision::Refused(refusal), Vec::new()),
         };
-        let records = self.record(
-            id,
-            request.duty.protection(),
-            request.duty.kind(),
-            root,
-            height,
-        );
+        let records = match request.duty.registration() {
+            Some(registration) => self.record_registration(
+                id,
+                root,
+                registration.timestamp,
+                registration.into(),
+                height,
+            ),
+            None => self.record(
+                id,
+                request.duty.protection(),
+                request.duty.kind(),
+                root,
+                height,
+            ),
+        };
         (root, Decision::Accepted, records)
     }
 
@@ -947,6 +1022,7 @@ impl Protection {
             Rule::Proposal { .. } => DutyKind::BlockProposal,
             Rule::Attestation { .. } => DutyKind::Attestation,
             Rule::Bounded { .. } => DutyKind::RandaoReveal,
+            Rule::Registration { .. } => unreachable!("not an EIP-3076 rule"),
         };
         match self.decide_rule(id, rule, kind, &root) {
             Ok(Some(id)) => {
@@ -994,10 +1070,36 @@ impl Protection {
                     .push(signed);
                 Record::Bounded { id, kind, period }
             }
+            Rule::Registration { .. } => unreachable!("recorded with its terms"),
         };
         let validator = self.validators.get_mut(&id).expect("decided validator");
         validator.records += 1;
         vec![record, Record::Validator(id)]
+    }
+
+    /// Record an accepted builder registration of validator `id`. Its sequence number is the
+    /// validator's record count before it: unique among the validator's records.
+    fn record_registration(
+        &mut self,
+        id: u64,
+        root: Root,
+        timestamp: u64,
+        terms: Terms,
+        height: u64,
+    ) -> Vec<Record> {
+        let validator = self.validators.get_mut(&id).expect("decided validator");
+        let sequence = validator.records;
+        validator.records += 1;
+        self.registrations.insert(
+            (id, root),
+            Registered {
+                timestamp,
+                terms,
+                height,
+                sequence,
+            },
+        );
+        vec![Record::Registration { id, root }, Record::Validator(id)]
     }
 
     /// `Ok(Some(id))`: new authorization for validator `id`; `Ok(None)`: already authorized.
@@ -1021,6 +1123,12 @@ impl Protection {
             Duty::Deposit(message) => {
                 if message.pubkey != request.validator {
                     return Err(Refusal::DepositForAnotherKey);
+                }
+            }
+            // Nor is a registration's: its domain uses the genesis fork version only.
+            Duty::ValidatorRegistration(registration) => {
+                if registration.pubkey != request.validator {
+                    return Err(Refusal::RegistrationForAnotherKey);
                 }
             }
             _ => {
@@ -1099,6 +1207,9 @@ impl Protection {
                     Ok(Some(id))
                 }
             }
+            Rule::Registration { .. } => {
+                Ok((!self.registrations.contains_key(&(id, *root))).then_some(id))
+            }
         }
     }
 
@@ -1131,12 +1242,25 @@ impl Protection {
     }
 
     /// The duty authorization of `root` for validator `id`, as the keyholder knows it.
-    pub fn duty_authorization(&self, id: u64, signing_root: Root) -> DutyAuthorization {
+    pub fn duty_authorization(
+        &self,
+        id: u64,
+        kind: DutyKind,
+        period: u64,
+        signing_root: Root,
+    ) -> DutyAuthorization {
         let validator = &self.validators[&id];
         DutyAuthorization {
             validator: validator.key,
             round: validator.round,
             signing_root,
+            kind,
+            period,
+            terms: self
+                .registrations
+                .get(&(id, signing_root))
+                .filter(|_| kind == DutyKind::ValidatorRegistration)
+                .map(|registered| registered.terms),
         }
     }
 
@@ -1152,25 +1276,77 @@ impl Protection {
             .collect()
     }
 
-    /// The authorized signing roots of validator `id`.
+    /// Record that the approved command with administrative nonce `nonce` authorized `request`
+    /// (whose signing root is `root`): a keyholder may sign it from now on. Nothing changes for a
+    /// kind that needs no approval, for a root that is not authorized, or for one approved
+    /// already.
+    pub fn approve(&mut self, request: &DutyRequest, root: Root, nonce: u64) -> Vec<Record> {
+        let kind = request.duty.kind();
+        let period = request.duty.protection().period();
+        let Some((id, _)) = self.validator_of(&request.validator) else {
+            return Vec::new();
+        };
+        let authorized = self
+            .bounded(id, kind, period)
+            .iter()
+            .any(|signed| signed.signing_root == root);
+        if !kind.needs_approval() || !authorized || self.approved.contains_key(&(id, root)) {
+            return Vec::new();
+        }
+        self.approved.insert(
+            (id, root),
+            Approved {
+                kind,
+                period,
+                nonce,
+            },
+        );
+        vec![Record::Approval { id, root }]
+    }
+
+    /// The approval of validator `id`'s signing root `root`, if it has one.
+    pub fn approval(&self, id: u64, root: &Root) -> Option<&Approved> {
+        self.approved.get(&(id, *root))
+    }
+
+    /// Whether a keyholder may sign validator `id`'s authorized `kind` root `root`: always for a
+    /// kind that needs no approval, only once approved for one that does.
+    pub fn is_signable(&self, id: u64, kind: DutyKind, root: &Root) -> bool {
+        !kind.needs_approval() || self.approved.contains_key(&(id, *root))
+    }
+
+    /// Whether `request`'s signing root is approved (P0.2): `false` for an unknown validator.
+    pub fn is_approved(&self, request: &DutyRequest) -> bool {
+        self.validator_of(&request.validator)
+            .is_some_and(|(id, _)| self.approved.contains_key(&(id, request.signing_root())))
+    }
+
+    /// The authorized signing roots of validator `id` that a keyholder may sign (an exit or a
+    /// deposit only once approved).
     pub fn duties_of(&self, id: u64) -> Vec<DutyAuthorization> {
         let roots = self
             .proposals
             .range((id, 0)..=(id, u64::MAX))
-            .map(|(_, signed)| signed.signing_root)
-            .chain(
-                self.attestations
-                    .range((id, 0)..=(id, u64::MAX))
-                    .map(|(_, attested)| attested.signing_root),
-            )
+            .map(|((_, slot), signed)| (DutyKind::BlockProposal, *slot, signed.signing_root))
+            .chain(self.attestations.range((id, 0)..=(id, u64::MAX)).map(
+                |((_, target), attested)| (DutyKind::Attestation, *target, attested.signing_root),
+            ))
             .chain(
                 self.bounded
                     .iter()
                     .filter(|((validator, _, _), _)| *validator == id)
-                    .flat_map(|(_, roots)| roots.iter().map(|signed| signed.signing_root)),
-            );
+                    .flat_map(|((_, kind, period), roots)| {
+                        roots
+                            .iter()
+                            .map(move |signed| (*kind, *period, signed.signing_root))
+                    }),
+            )
+            .chain(self.registrations_of(id).map(|(root, registered)| {
+                (DutyKind::ValidatorRegistration, registered.timestamp, *root)
+            }));
         roots
-            .map(|root| self.duty_authorization(id, root))
+            .filter(|(kind, _, root)| self.is_signable(id, *kind, root))
+            .map(|(kind, period, root)| self.duty_authorization(id, kind, period, root))
             .collect()
     }
 
@@ -1197,6 +1373,14 @@ impl Protection {
         self.imported.insert(id, imported);
     }
 
+    pub fn restore_approval(&mut self, id: u64, root: Root, approved: Approved) {
+        self.approved.insert((id, root), approved);
+    }
+
+    pub fn restore_registration(&mut self, id: u64, root: Root, registered: Registered) {
+        self.registrations.insert((id, root), registered);
+    }
+
     /// Consistency of restored history: every record belongs to a known validator, validator ids
     /// are dense and keys unique, and each validator has exactly the number of records it counted
     /// (a lost or extra record means the history cannot be trusted).
@@ -1219,7 +1403,8 @@ impl Protection {
                 self.bounded
                     .iter()
                     .map(|((id, _, _), roots)| (*id, roots.len() as u64)),
-            );
+            )
+            .chain(self.registrations.keys().map(|(id, _)| (*id, 1)));
         for (id, records) in ids {
             if !self.validators.contains_key(&id) {
                 return Err(format!("records of unknown validator {id}"));
@@ -1278,6 +1463,35 @@ impl Protection {
                 return Err(format!(
                     "imported validator {id} is activated without its history for that chain or \
                      the operator's acknowledgement"
+                ));
+            }
+        }
+        // Approvals: each of an authorized root of a kind that needs one.
+        for (&(id, root), approved) in &self.approved {
+            if !approved.kind.needs_approval()
+                || !self
+                    .bounded(id, approved.kind, approved.period)
+                    .iter()
+                    .any(|signed| signed.signing_root == root)
+            {
+                return Err(format!(
+                    "validator {id} has an approval (nonce {}) of a {:?} root it never authorized",
+                    approved.nonce, approved.kind
+                ));
+            }
+        }
+        // Registrations: each under its own sequence number, one of its validator's records.
+        let mut sequences = BTreeSet::new();
+        for (&(id, _), registered) in &self.registrations {
+            let records = self
+                .validators
+                .get(&id)
+                .map_or(0, |validator| validator.records);
+            if registered.sequence >= records || !sequences.insert((id, registered.sequence)) {
+                return Err(format!(
+                    "validator {id} has a registration with sequence number {} that is not one \
+                     of its records",
+                    registered.sequence
                 ));
             }
         }

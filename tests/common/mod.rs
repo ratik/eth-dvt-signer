@@ -16,11 +16,14 @@ use commonware_runtime::{
 };
 use commonware_utils::{NZU64, NZUsize, TryCollect as _, ordered::Set, probability};
 use eth_mpc_signer::{
+    admin::{Administration, Approvers, Endorsement},
     dkg::{self, CeremonyId, DkgStatus, actor::ShareStatus, ceremony::Ceremony},
     engine::{self, Channels, Retention},
-    executor::Client,
+    eth::duty::ValidatorKey,
+    executor::{ActivationReceipt, Client, Stopped},
     signer::coordinator,
-    types::SignRequest,
+    slashing::ChainIdentity,
+    types::{Command, SignRequest},
 };
 use std::{collections::VecDeque, fmt, num::NonZeroU32, time::Duration};
 
@@ -86,8 +89,23 @@ impl<R: Receiver<PublicKey = PublicKey>> Receiver for Tap<R> {
     }
 }
 
+/// The simulated network's approvers (`admin`): 2 of these 3 keys.
+pub fn approver_keys() -> Vec<PrivateKey> {
+    (0..3)
+        .map(|index| PrivateKey::from_seed(1_000 + index))
+        .collect()
+}
+
+/// The approver set of the network whose committee is `participants`.
+pub fn administration(participants: &Set<PublicKey>) -> Administration {
+    let keys = approver_keys().iter().map(|key| key.public_key()).collect();
+    Administration::new(Approvers::new(2, keys).unwrap(), participants)
+}
+
 pub struct Cluster {
     pub clients: Vec<Client>,
+    /// The approver set every node runs with.
+    pub admin: Administration,
     pub dkg: Vec<dkg::actor::Client>,
     pub signers: Vec<coordinator::Client>,
     pub keys: Vec<PublicKey>,
@@ -109,6 +127,45 @@ impl Cluster {
                 self.oracle.remove_link(key.clone(), me).await.unwrap();
             }
         }
+    }
+
+    /// `command` approved by two approvers with `nonce`.
+    pub fn endorse(&self, nonce: u64, command: &Command) -> Endorsement {
+        let mut approvals: Vec<_> = approver_keys()
+            .iter()
+            .take(2)
+            .map(|key| self.admin.approve(key, nonce, command).unwrap())
+            .collect();
+        approvals.sort_by_key(|approval| approval.approver);
+        Endorsement { nonce, approvals }
+    }
+
+    /// The next administrative nonce: one above the highest any node applied.
+    pub async fn next_nonce(&self) -> u64 {
+        let mut nonce = 0;
+        for client in &self.clients {
+            if let Ok(status) = client.status().await {
+                nonce = nonce.max(status.admin_nonce);
+            }
+        }
+        nonce + 1
+    }
+
+    /// Activate `key` for `chain` through node `via`, approved with the next nonce.
+    pub async fn activate(
+        &self,
+        via: usize,
+        key: ValidatorKey,
+        chain: ChainIdentity,
+    ) -> Result<ActivationReceipt, Stopped> {
+        let command = Command::ActivateValidator {
+            validator: key,
+            chain,
+        };
+        let endorsement = self.endorse(self.next_nonce().await, &command);
+        self.clients[via]
+            .activate_validator(key, chain, Some(endorsement))
+            .await
     }
 
     /// Restore the links of node `index`.
@@ -192,6 +249,10 @@ pub async fn start_network_with(
                 allow_missing_consensus_journal: false,
                 share_key: None,
                 approved_reshares: None,
+                // Simulated time starts at the Unix epoch, and these tests name several chains:
+                // the horizon has its own unit and end-to-end tests.
+                horizon: eth_mpc_signer::eth::horizon::Horizon::unbounded(),
+                administration: Some(administration(&participants)),
             },
         )
         .await
@@ -244,6 +305,7 @@ pub async fn start_network_with(
     }
     Cluster {
         clients,
+        admin: administration(&participants),
         dkg,
         signers: coordinators,
         keys,

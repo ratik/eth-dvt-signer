@@ -171,6 +171,10 @@ pub enum Refusal {
     /// has committed: a coordinator asks again with the active generation.
     #[error("stale share generation")]
     StaleGeneration,
+    /// The duty is beyond this node's time horizon (`eth::horizon`): its slot has not started,
+    /// or its epoch is too far ahead, by this node's clock.
+    #[error("the duty is beyond this node's time horizon")]
+    BeyondHorizon,
 }
 
 impl Refusal {
@@ -193,6 +197,7 @@ impl Refusal {
             5 => Self::NotParticipant,
             6 => Self::WrongPurpose,
             7 => Self::StaleGeneration,
+            8 => Self::BeyondHorizon,
             _ => return None,
         })
     }

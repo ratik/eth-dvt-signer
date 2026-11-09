@@ -5,7 +5,10 @@ use crate::{
         CeremonyConfig, CeremonyId, MAX_PARTICIPANTS,
         ceremony::{Membership, ReadyAck, SignedLog},
     },
-    eth::duty::{DutyRequest, ValidatorKey},
+    eth::{
+        duty::{DutyRequest, ValidatorKey},
+        registration::Policy as RegistrationPolicy,
+    },
     import::manifest::Manifest,
     slashing::{
         Acknowledgment, ChainIdentity, HistoryImport, HistorySummary, ImportedAttestation,
@@ -15,7 +18,11 @@ use crate::{
 use bytes::{Buf, BufMut};
 use commonware_codec::{Encode, EncodeSize, Error, Read, ReadExt, Write, varint::UInt};
 use commonware_consensus::{Heightable, types::Height};
-use commonware_cryptography::{Digestible, Hasher, Sha256, ed25519::PublicKey, sha256::Digest};
+use commonware_cryptography::{
+    Digestible, Hasher, Sha256,
+    ed25519::{self, PublicKey},
+    sha256::Digest,
+};
 use serde::Serialize;
 
 /// What a client wants signed: a 32-byte Ethereum signing root.
@@ -122,6 +129,72 @@ pub enum Command {
     /// R3, `epochs`). The block carrying it carries nothing else, and no block follows it in the
     /// epoch.
     Reconfigure(Box<Reconfiguration>),
+    /// A protected command with the approvals that authorize it (`admin`): the only form in which
+    /// a protected command enters a new block.
+    Admin(Box<Authorized>),
+    /// Replace the policy builder registrations must meet (`eth::registration`): from the next
+    /// transaction on, every registration is checked against it.
+    SetRegistrationPolicy(Box<RegistrationPolicy>),
+}
+
+impl Command {
+    /// Whether the command changes a trusted identity or a validator's slashing protection, or
+    /// authorizes an irreversible signature, and needs approvals (`admin`): a consensus
+    /// reconfiguration, a reshare to new keyholders, a validator activation, an imported key's
+    /// registration, an EIP-3076 history import, a voluntary exit or a deposit
+    /// (`DutyKind::needs_approval`), the builder registration policy. Bare, it is refused in a new
+    /// block (it still applies from history written before approvals existed).
+    pub fn is_protected(&self) -> bool {
+        match self {
+            Self::Duty(request) => request.duty.kind().needs_approval(),
+            _ => matches!(
+                self,
+                Self::Reconfigure(_)
+                    | Self::ImportSlashingProtection(_)
+                    | Self::StartResharing {
+                        membership: Some(_),
+                        ..
+                    }
+                    | Self::ActivateValidator { .. }
+                    | Self::ActivateImportedValidator { .. }
+                    | Self::RegisterImportedKey(_)
+                    | Self::SetRegistrationPolicy(_)
+            ),
+        }
+    }
+
+    /// Whether the command asks for a builder registration (`eth::registration`).
+    pub fn is_registration(&self) -> bool {
+        matches!(self, Self::Duty(request) if request.duty.registration().is_some())
+    }
+
+    /// The registration policy the command sets, approved or not.
+    pub fn registration_policy(&self) -> Option<&RegistrationPolicy> {
+        match self {
+            Self::SetRegistrationPolicy(policy) => Some(policy),
+            Self::Admin(authorized) => authorized.command.registration_policy(),
+            _ => None,
+        }
+    }
+}
+
+/// Most approvals one command carries (the largest approver set).
+pub const MAX_APPROVALS: usize = 8;
+
+/// One approver's signature of a protected command (`admin::message`), by its index in the
+/// approver set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Approval {
+    pub approver: u8,
+    pub signature: ed25519::Signature,
+}
+
+/// A protected command, its administrative nonce and its approvals, sorted by approver.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Authorized {
+    pub nonce: u64,
+    pub command: Command,
+    pub approvals: Vec<Approval>,
 }
 
 /// The next consensus epoch: `epoch`, whose committee is the current one with `remove` replaced by
@@ -331,6 +404,20 @@ impl Write for Command {
                 change.remove.write(buf);
                 change.add.write(buf);
             }
+            Self::Admin(authorized) => {
+                15u8.write(buf);
+                UInt(authorized.nonce).write(buf);
+                authorized.command.write(buf);
+                UInt(authorized.approvals.len() as u32).write(buf);
+                for approval in &authorized.approvals {
+                    approval.approver.write(buf);
+                    approval.signature.write(buf);
+                }
+            }
+            Self::SetRegistrationPolicy(policy) => {
+                16u8.write(buf);
+                policy.write(buf);
+            }
         }
     }
 }
@@ -404,6 +491,52 @@ impl Read for Command {
                 remove: PublicKey::read(buf)?,
                 add: PublicKey::read(buf)?,
             }))),
+            15 => {
+                let nonce = UInt::read(buf)?.into();
+                // One level only: approvals authorize a protected command, never another set of
+                // approvals. Refused before reading it, or nested approvals would recurse without
+                // bound (a stack overflow on every node decoding the transaction).
+                if buf.chunk().first() == Some(&15) {
+                    return Err(Error::Invalid("Command", "nested approvals"));
+                }
+                let command = Self::read(buf)?;
+                if !command.is_protected() {
+                    return Err(Error::Invalid(
+                        "Command",
+                        "approvals of an unprotected command",
+                    ));
+                }
+                let count = u32::from(UInt::<u32>::read(buf)?) as usize;
+                if count == 0 || count > MAX_APPROVALS {
+                    return Err(Error::Invalid("Command", "approval count"));
+                }
+                let mut approvals = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let approval = Approval {
+                        approver: u8::read(buf)?,
+                        signature: ed25519::Signature::read(buf)?,
+                    };
+                    // Sorted by approver, each once: one encoding per set of approvals.
+                    if approvals
+                        .last()
+                        .is_some_and(|last: &Approval| last.approver >= approval.approver)
+                    {
+                        return Err(Error::Invalid(
+                            "Command",
+                            "approvals not sorted or repeated",
+                        ));
+                    }
+                    approvals.push(approval);
+                }
+                Ok(Self::Admin(Box::new(Authorized {
+                    nonce,
+                    command,
+                    approvals,
+                })))
+            }
+            16 => Ok(Self::SetRegistrationPolicy(Box::new(
+                RegistrationPolicy::read(buf)?,
+            ))),
             tag => Err(Error::InvalidEnum(tag)),
         }
     }
@@ -440,6 +573,17 @@ impl EncodeSize for Command {
                     + change.remove.encode_size()
                     + change.add.encode_size()
             }
+            Self::Admin(authorized) => {
+                UInt(authorized.nonce).encode_size()
+                    + authorized.command.encode_size()
+                    + UInt(authorized.approvals.len() as u32).encode_size()
+                    + authorized
+                        .approvals
+                        .iter()
+                        .map(|approval| 1 + approval.signature.encode_size())
+                        .sum::<usize>()
+            }
+            Self::SetRegistrationPolicy(policy) => policy.encode_size(),
         }
     }
 }

@@ -29,6 +29,7 @@ use commonware_utils::{
 };
 use eth_mpc_signer::{
     engine::{self, Channels},
+    eth::horizon::{Horizon, Network},
     executor::Stop,
     rpc,
     signer::coordinator,
@@ -116,6 +117,52 @@ struct Args {
     /// the node is about to deal: without a matching line it deals nothing to new keyholders.
     #[arg(long)]
     approved_reshares: Option<PathBuf>,
+
+    /// The Ethereum network whose clock bounds the duties this node admits and signs, and whose
+    /// fork schedule their `fork_info` must follow (`mainnet` or `hoodi`): no duty for a slot
+    /// that has not started, or an epoch too far ahead, or under another fork's domain
+    /// (`docs/ethereum-signing.md`, time horizon and fork schedule). Without a network (this
+    /// flag, or the `--eth-genesis-*` and `--eth-fork-schedule` flags of another one) the node
+    /// signs no duty.
+    #[arg(long, conflicts_with = "eth_genesis_time")]
+    eth_network: Option<String>,
+
+    /// Another network's genesis time (unix seconds), with `--eth-seconds-per-slot`,
+    /// `--eth-genesis-validators-root` and `--eth-fork-schedule`: a devnet.
+    #[arg(
+        long,
+        requires_all = ["eth_seconds_per_slot", "eth_genesis_validators_root", "eth_fork_schedule"]
+    )]
+    eth_genesis_time: Option<u64>,
+
+    #[arg(long, requires = "eth_genesis_time")]
+    eth_seconds_per_slot: Option<u64>,
+
+    #[arg(long, requires = "eth_genesis_time")]
+    eth_genesis_validators_root: Option<String>,
+
+    /// Another network's fork schedule: `phase0=0x<version>@0,altair=0x<version>@<epoch>,...`,
+    /// every fork it has scheduled, in order (`phase0` to `fulu`).
+    #[arg(long, requires = "eth_genesis_time")]
+    eth_fork_schedule: Option<String>,
+
+    /// Another network's slots per epoch: only the mainnet preset's 32 is supported.
+    #[arg(long, requires = "eth_genesis_time", default_value_t = 32)]
+    eth_slots_per_epoch: u64,
+
+    /// The approvers of protected operations (`docs/administration.md`): a JSON file
+    /// `{"threshold": M, "approvers": ["0x<ed25519 public key>", ...]}`, the same on every node.
+    /// Without it, no protected operation (validator activation, key registration, reshare to new
+    /// keyholders, reconfiguration) is proposed, voted for or applied.
+    #[arg(long)]
+    approvers: Option<PathBuf>,
+}
+
+/// Load the approver file.
+fn load_approvers(path: &std::path::Path) -> Result<eth_mpc_signer::admin::Approvers, String> {
+    let text = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    eth_mpc_signer::admin::Approvers::from_json(&text)
+        .map_err(|err| format!("{}: {err}", path.display()))
 }
 
 /// Load the share-encryption key: owner-only permissions, or the node refuses to start.
@@ -169,6 +216,29 @@ fn main() {
         Ipv4Addr::LOCALHOST,
         args.http_port + u16::try_from(args.id).expect("id too large"),
     ));
+    let horizon = match network(&args) {
+        Ok(network) => {
+            match &network {
+                None => {
+                    warn!(
+                        "no Ethereum network configured (--eth-network): this node signs no duty"
+                    );
+                }
+                Some(network) => info!(
+                    identity = %network.identity(),
+                    schedule = %network.schedule_digest(),
+                    genesis_validators_root = %hex::encode(network.genesis_validators_root),
+                    forks = ?network.forks.iter().map(|fork| (fork.name.name(), hex::encode(fork.version), fork.epoch)).collect::<Vec<_>>(),
+                    "Ethereum network"
+                ),
+            }
+            Horizon::new(network)
+        }
+        Err(err) => {
+            error!(%err, "refusing to start");
+            std::process::exit(1);
+        }
+    };
     let share_key = match args
         .share_encryption_key
         .as_deref()
@@ -182,6 +252,25 @@ fn main() {
         }
     };
     let share_key_public = share_key.as_ref().map(|key| *key.public());
+    let administration = match args.approvers.as_deref().map(load_approvers).transpose() {
+        // Approvals are bound to the network too (P0.3).
+        Ok(Some(approvers)) => Some(eth_mpc_signer::admin::Administration::with_network(
+            approvers,
+            &participants,
+            horizon.network().map(|network| network.identity()),
+        )),
+        Ok(None) => {
+            warn!(
+                "no approver set (--approvers): this node takes no protected operation \
+                 (docs/administration.md)"
+            );
+            None
+        }
+        Err(err) => {
+            error!(%err, "refusing to start");
+            std::process::exit(1);
+        }
+    };
     let storage = args.data_dir.join(format!("node-{}", args.id));
     // The node directory holds private key shares (not encrypted): owner access only.
     std::fs::create_dir_all(&storage).expect("failed to create data directory");
@@ -224,6 +313,8 @@ fn main() {
                 allow_missing_consensus_journal: args.allow_missing_consensus_journal,
                 share_key,
                 approved_reshares: args.approved_reshares.clone(),
+                horizon,
+                administration: administration.clone(),
             },
         )
         .await;
@@ -289,6 +380,8 @@ fn main() {
             rpc::Options {
                 deposit_signing: args.enable_deposit_signing,
                 share_key: share_key_public,
+                horizon,
+                administration,
             },
         );
         let rpc_handle = context.child("rpc").spawn(move |_| async move {
@@ -316,4 +409,43 @@ fn main() {
             }
         }
     });
+}
+
+/// The Ethereum network of the command line, if any.
+fn network(args: &Args) -> Result<Option<Network>, String> {
+    if let Some(name) = &args.eth_network {
+        return Network::named(name)
+            .map(Some)
+            .ok_or(format!("unknown Ethereum network {name} (mainnet, hoodi)"));
+    }
+    let Some(genesis_time) = args.eth_genesis_time else {
+        return Ok(None);
+    };
+    let seconds_per_slot = args
+        .eth_seconds_per_slot
+        .filter(|seconds| *seconds > 0)
+        .ok_or("--eth-seconds-per-slot must be above 0")?;
+    let root = args.eth_genesis_validators_root.as_deref().unwrap_or("");
+    let genesis_validators_root = hex::decode(root.strip_prefix("0x").unwrap_or(root))
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or("--eth-genesis-validators-root must be 32 bytes of hex")?;
+    let schedule = args
+        .eth_fork_schedule
+        .as_deref()
+        .ok_or("another network needs its fork schedule (--eth-fork-schedule)")?;
+    let forks =
+        Network::parse_schedule(schedule).map_err(|err| format!("--eth-fork-schedule: {err}"))?;
+    let network = Network {
+        genesis_time,
+        seconds_per_slot,
+        slots_per_epoch: args.eth_slots_per_epoch,
+        genesis_validators_root,
+        // Read once, for the life of the process.
+        forks: Vec::leak(forks),
+    };
+    network
+        .validate()
+        .map_err(|err| format!("--eth-fork-schedule: {err}"))?;
+    Ok(Some(network))
 }

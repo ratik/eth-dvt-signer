@@ -306,7 +306,9 @@ The admin API is unauthenticated (a prototype limitation). Without a further che
 - R1 (players are the generation's keyholders) needs no approval.
 - The approval is local configuration, not replicated state: consensus accepts any well-formed membership, and nodes may disagree about approvals without diverging. An unapproved reshare stays `in_progress` without a single dealer log and is aborted (or fails at its deadline).
 
-A reshare completes only with at least the threshold of dealers (3), so a recipient set that fewer than three operators approved never receives a usable sharing. Each approving dealer does give each recipient one evaluation of its dealing polynomial, so approve only identities you operate. This is a prototype safeguard, not an authorization system: there are no operator signatures, no governance and no authenticated admin API.
+A reshare completes only with at least the threshold of dealers (3), so a recipient set that fewer than three operators approved never receives a usable sharing. Each approving dealer does give each recipient one evaluation of its dealing polynomial, so approve only identities you operate.
+
+The local approval is the second of two gates. The first is replicated: a reshare to new keyholders is a protected operation ([administration.md](administration.md)). The `StartResharing` command with a membership is voted for only with a threshold of the approvers' offline signatures over that exact membership, and with the next administrative nonce. Without them, the API refuses it (`403`), and so do honest leaders and voters. A refresh within the committee (R1) needs neither gate.
 
 ### Lifecycle and activation
 
@@ -332,7 +334,7 @@ The coordinator already sends partial-signature requests to the active generatio
 1. All nodes run with `--participants 4 --followers 1`, voters with `--approved-reshares <file>` (a rolling restart if they were not: each restart pauses finalization while D is offline).
 2. Start E (node 4). Wait until `GET /ready` on E is `200` (it applied the finalized history) and `GET /validators` on E lists the key.
 3. On A, B and C, append the approval line for the key and A, B, C, E (identities from `GET /identity`).
-4. `POST /validators/reshare` with the membership above, on a voter. Wait until `GET /validators/reshare/<id>` is `ready` on A, B, C and E.
+4. Draft the reshare with the membership above (`mpc-admin draft reshare --request '{"public_key", "ceremony_id", "from_round", "dealers", "players"}'`), have the approvers sign it offline, and submit it (`mpc-admin submit`, which posts `POST /validators/reshare` with its `authorization`). Wait until `GET /validators/reshare/<id>` is `ready` on A, B, C and E.
 5. `POST /validators/reshare/activate` on a voter. Wait until `GET /validators` on every keyholder shows the new `ceremony_id`.
 6. Keep D off. Never restart it with its old data: its old share is useless only as long as the old shares of A, B and C are really erased.
 
@@ -342,8 +344,7 @@ The coordinator already sends partial-signature requests to the active generatio
 - The new generation's shares are fresh: D's old share does not combine with them, and a partial signature from any old share fails against the new verification shares.
 - **Resharing does not revoke copied shares.** D's old share (lost or stolen with D), and any backup of an old share of A, B or C, remain shares of `g`. Three shares of `g` still sign as the key. R2 protects against an attacker who holds D's share only if the old shares of A, B and C are erased and no backups of them exist (erasure is operational, L-15).
 - **Consensus: no fault tolerance left while D is offline.** See [above](#what-r2-restores-and-what-it-does-not).
-- **Unauthenticated admin API.** Anyone with access to a node's loopback API can start or abort reshares; the local approval only limits who receives shares.
-- **The approval is a prototype safeguard**, local and unauthenticated, not an authorization system (no operator signatures or governance).
+- **Approved by signatures.** A reshare to new keyholders needs the approvers' signatures (replicated check) and each dealer's local approval. Anyone with access to a node's loopback API can still start a refresh within the committee (R1) or abort a reshare: denial of service, not a change of keyholders.
 - **Follower bootstrap needs the retained history** or a restored state copy, whose correctness E cannot check (no state root).
 - L-1, L-15, L-16, L-17 and every other documented limitation are unchanged ([audit.md](audit.md)).
 

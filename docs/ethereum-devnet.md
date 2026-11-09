@@ -50,7 +50,9 @@ shared or public host, the whole integration therefore runs inside one Docker-in
 3. **Activation in the signer.** `POST /validators/activate` with the devnet's
    `genesis_validators_root` (`GET /eth/v1/beacon/genesis`), decided by consensus, immutable.
 4. **Deposit.** The deposit message is signed by the MPC network, as a `DEPOSIT` Web3Signer request
-   to the one node started with `--enable-deposit-signing`. The withdrawal credentials are `0x01`
+   to the one node started with `--enable-deposit-signing`, with the approvers' authorization
+   (P0.2: the driver checks that the request without it is refused, `403`, then drafts it with
+   `mpc-admin draft sign-deposit`, has two approvers sign it, and submits it). The withdrawal credentials are `0x01`
    with ethereum-package's published test account 20. The integration computes
    `deposit_data_root` and sends the transaction to the deposit contract with `cast` (Foundry). The
    beacon chain verifies the signature when it processes the deposit.
@@ -76,6 +78,8 @@ deposit request, pending deposits, activation queue.
 The Web3Signer API's `DEPOSIT` request is supported, with these rules:
 
 - **Off by default.** A node accepts it only with `--enable-deposit-signing`.
+- **Approved (P0.2).** Only with the approvers' authorization over its exact withdrawal
+  credentials, amount and genesis fork version, which every voter checks.
 - **Decided like any duty.** The state machine requires an activated key, and the message must be
   for the validator's own key.
 - **One message per key, ever.** The withdrawal credentials of the first deposit cannot be
@@ -84,9 +88,10 @@ The Web3Signer API's `DEPOSIT` request is supported, with these rules:
   zero genesis validators root. It is checked against consensus-spec-tests vectors and Web3Signer's
   example root.
 
-Trust assumption: whoever can reach the API of a node with the flag can obtain that one deposit
-signature, and so choose the withdrawal credentials, if nobody did before. Enable the flag for
-onboarding only.
+Trust assumption: a threshold of approvers chooses the withdrawal credentials (before P0.2,
+whoever reached the API of a node with the flag first did). The signers also take the devnet's
+fork schedule from the beacon node (`--eth-fork-schedule`, P0.3: every fork up to Fulu at
+genesis), and sign only the `fork_info` it gives each duty.
 
 ### Proposals
 
@@ -119,14 +124,48 @@ Steps one at a time (inside the environment, `env.sh exec python3 /it/src/integr
 `devnet up|down`, `signers start|stop`, `report`, `stop`.
 
 `IT_RUN=run-r2 ./integration/ethereum/scripts/run.sh` runs only the replacement of a lost
-keyholder (R2) after the onboarding and a baseline: no other fault scenario and no migration
-([below](#replacing-a-lost-keyholder-run-g)). Every run starts the signers with `--followers 1`
-(node 4's slot, used only by the replacement), the voters with `--approved-reshares`.
+keyholder (R2), with no other fault scenario ([below](#replacing-a-lost-keyholder-run-g)). It
+does not wait for a deposit's activation (about 11 epochs): the DKG key is activated and
+deposited as in the full run, but R2 is observed on the genesis validator, migrated into the
+network as soon as its original client has attested twice (the migration without its node-offline
+window). Both keys are reshared to E. The DKG validator, active on the beacon chain by the end, is
+observed for one more epoch. Every run starts the signers with `--followers 1` (node 4's slot,
+used only by the replacement), the voters with `--approved-reshares`.
 
 `IT_RUN=run-r3 ./integration/ethereum/scripts/run.sh` runs the same, then replaces the lost voter
 too (R3, [reconfiguration.md](reconfiguration.md)): `mpc-admin replace-node` ends consensus epoch
 0, the script restarts each signer that stops with status 75 (as a supervisor would), and
 Lighthouse keeps signing ([below](#replacing-a-lost-consensus-voter-run-h)).
+
+`IT_RUN=run-mev ./integration/ethereum/scripts/run.sh` runs builder registrations end to end
+(`kurtosis/network-mev.yaml`: the same devnet with ethereum-package's Flashbots stack, a
+mev-boost-relay, an rbuilder participant and mev-boost; the beacon node gets `--builder`). The
+approvers set the registration policy (the validator client's fee recipient, gas limits up to
+60 000 000), then Lighthouse's validator client runs with `--builder-proposals
+--prefer-builder-proposals --gas-limit 60000000`. The run checks that the relay holds the
+registration the MPC network signed (its data API; the relay checks the signature itself) with
+that fee recipient, observes the validator's proposals and, for each, whether the relay delivered
+its payload to the registered fee recipient, and adds three refusals to the security checks
+(another fee recipient, a timestamp beyond the window, another key in the body). spamoor sends
+transactions, so the builder has something to build. The run keeps the last 100 000 lines of the
+relay's, mev-boost's, the builder's and the beacon node's logs. The MEV images are the package's
+floating tags: the report records their digests
+([below](#builder-registrations-runs-k-and-l)).
+
+The evidence of an observed window (attestations and proposals in the beacon state) is read in
+the background, each epoch two epochs after it: a scenario goes on as soon as its window's last
+epoch ends, and the run waits for every reading before its report.
+
+Every run also starts the signers with the devnet's genesis and fork schedule
+(`--eth-genesis-time`, `--eth-seconds-per-slot`, `--eth-genesis-validators-root`,
+`--eth-fork-schedule`, read from the beacon node: the time horizon and the fork checks) and an
+approver file (`--approvers`, 2 of 3 keys that `mpc-admin approver-key` creates
+in `$IT_WORK/approvers`). Every protected operation of a run (activations, the imported key's
+registration and history import, R2's reshare, R3's reconfiguration) is drafted with
+`mpc-admin`, signed offline by two approvers (`mpc-admin sign`, a container without network) and
+submitted with its approvals ([administration.md](administration.md)). The security checks
+include an activation without approvals (`403`); the migration checks that the history import
+without approvals is refused (`403`) before submitting the approved one.
 
 The repository's own checks run on the same host, in the same pinned Rust image, with their own
 target directory: fmt, clippy (all features and default), `cargo test`, the E2E suite three times,
@@ -155,7 +194,7 @@ signing requests the proxy forwarded (`requests/`, duty data only).
 | In-flight failure | node 0 restarted with the `authorized` crash point, re-armed (up to 3 crashes) until a crash follows a new authorization: one node 0 itself submitted, which consensus then accepted | node 0 dies after the authorization, before answering; the proxy retries on another node, which returns the signature of the same authorization; the duty is accepted at exactly one height |
 | Migration | a genesis validator moves from Lighthouse's local keystore to the MPC network ([below](#migration-of-a-genesis-validator)), then node 2 is stopped for 2 epochs | the key's duties before, during and after; the same public key; the imported history refuses the previous signer's messages; 3 keyholders keep signing |
 | Resharing | both MPC validator keys (the DKG key, then the migrated imported key) get a new share generation while Lighthouse signs ([resharing.md](resharing.md)), then node 2 is stopped for an epoch | the same keys; every verification share and the generation ids changed; every node switched and the old shares retired; signatures with the old generation while the new one is prepared and with the new one after; duties in the beacon state; interruptions, retries, latency before and after; node 2 back with the new generation |
-| Replacing a lost keyholder (`run-r2`) | node 3 (D) stopped for good; node 4 (E) started as a non-voting follower; the DKG key reshared by nodes 0, 1, 2 to nodes 0, 1, 2, 4 ([resharing.md](resharing.md#r2-replacing-a-lost-keyholder)) while Lighthouse signs; then node 2's partial signatures switched off for an epoch | duties with D lost; E's catching up; the same key, new verification shares and generation; every keyholder switched; with node 2's partials off, every signature combines E's share (coordinator logs); duties in the beacon state, latency, failures and retries throughout; the security checks with D still offline |
+| Replacing a lost keyholder (`run-r2`) | the genesis validator migrated into the network (observed on it from then on); node 3 (D) stopped for good; node 4 (E) started as a non-voting follower; the migrated key and the DKG key reshared by nodes 0, 1, 2 to nodes 0, 1, 2, 4 ([resharing.md](resharing.md#r2-replacing-a-lost-keyholder)) while Lighthouse signs; then node 2's partial signatures switched off for an epoch | duties with D lost; E's catching up; the same key, new verification shares and generation; every keyholder switched; with node 2's partials off, every signature combines E's share (coordinator logs); duties in the beacon state, latency, failures and retries throughout; the security checks with D still offline |
 | Replacing a lost consensus voter (`run-r3`, after `run-r2`'s scenario) | `mpc-admin replace-node --old 3 --new 4`: the committee A, B, C finalizes the block ending epoch 0; nodes 0, 1, 2, 4 stop (status 75) and are restarted in epoch 1 (A, B, C, E); then node 2 stopped for an epoch; then node 3 (D) started with its old data, and caught up with `mpc-admin resume` | every node's epoch, committee and boundary; the signing pause around the switch (Lighthouse requests, failures, retries, latency); with node 2 stopped, A, B and E finalize and sign (signer sets in the coordinators' logs); D stays in epoch 0 without disturbing epoch 1, then follows it as a non-voter; duties in the beacon state throughout; the security checks |
 
 The proxy retries only on a connection failure, `502`, `503` or `504`, never on `4xx`. That is
@@ -431,6 +470,7 @@ from its `scenarios.json` and logs: the run's own `report.md` lacks it because t
 details overwrote its name (an `it.py` bug, fixed after the run; the scenario is recorded as
 `validator-devnet-r2` in `scenarios.json` and its window table).
 
+
 ### Replacing a lost consensus voter (run H)
 
 Run H (`20261031T105527Z`, `IT_RUN=run-r3`) is the R3 demonstration
@@ -466,6 +506,75 @@ fell into that window, so this run shows no request waiting on it (the E2E tests
 across the switch: R3-2/R3-3). Consensus authorization stayed at p50 178 ms, p95 391 ms during the
 reconfiguration scenario (175 / 412 ms with D lost): D's 2 s leader turns are gone with D from
 the committee.
+
+### P0 hardening (run I)
+
+Run I (`20261103T204438Z`, `IT_RUN=run-r3`) is run H's scenario with the P0 changes: every signer
+runs with the devnet's genesis (the time horizon) and the same 2-of-3 approver file, and every
+protected operation is drafted with `mpc-admin`, signed offline by two approvers and submitted.
+
+| | Run I |
+| --- | --- |
+| Protected operations | activation (block 8, nonce 1), R2 reshare (block 1482, nonce 2), R3 reconfiguration (block 2051, nonce 3, the end of epoch 0) |
+| Duties | epochs 11 to 33 attested (23 of 23), 23 of 23 proposals canonical, 24 blocks signed and canonical |
+| Lighthouse requests | 123, 0 failed, 0 retried by the proxy; none refused as beyond the horizon |
+| Latency, end to end p50/p95 | baseline 235/352 ms, R2 270/489 ms, R3 262/455 ms |
+| R2 | E caught up in 14.1 s, ceremony 3.3 s; without C every signature included E's share |
+| R3 | every voter stopped within 1.4 s; epoch 1's first block 6.9 s after the first stop; D back in epoch 0, then followed epoch 1 after `mpc-admin resume` |
+| Security checks | 9 of 9, including an activation without approvals (`403`) and the administrative nonce (3) |
+
+### Approved deposit and pinned fork schedule (run J)
+
+Run J (`20261107T082254Z`, `IT_RUN=run-r3`) is run I's scenario with P0.2 and P0.3: the deposit
+is a protected operation, and every signer pins the devnet's fork schedule, read from the beacon
+node (`--eth-fork-schedule`: every fork from phase 0 to Fulu at epoch 0, versions `0x10000038` to
+`0x70000038`).
+
+The first attempt (`20261107T072938Z`) refused every one of Lighthouse's 3 355 requests with
+`not_a_fork`. On a network that starts at a later fork, the beacon state's fork is
+`{previous: Fulu, current: Fulu, epoch: 0}`, and Lighthouse signs with the state's fork.
+The first rule accepted only a transition between two consecutive versions, as `fork_at_epoch`
+computes it. It now also accepts the state's form: the same version twice, at an epoch where that
+version is in effect. The version at the duty's epoch must still be the schedule's. A unit test
+and `forks::p03_1` cover this form (`docs/ethereum-signing.md`, fork schedule).
+
+| | Run J |
+| --- | --- |
+| Protected operations | 9, each drafted with `mpc-admin`, signed by two of three approvers and submitted (nonces 1 to 9): the DKG key's activation, its deposit, the import's registration, an early activation the scenario expects to fail, the EIP-3076 history import, the imported key's activation, the two R2 reshares, the R3 reconfiguration |
+| Deposit | the request without approvals refused (`403`); approved and signed, in execution block 2 |
+| Fork checks | no request refused for its fork: the only refused duties are the unapproved deposit, the imported-history and double-signing security checks, and the R3 switch (below) |
+| Duties | DKG key: epochs 11 to 19, 9 of 9 attested with the correct target and head, 7 of 7 proposals canonical. Migrated key: 16 of 16 epochs attested after the migration, 18 of 18 proposals canonical |
+| Lighthouse requests | 3 716; 3 709 signed. The 7 others arrived during the R3 switch: 6 while every voter had stopped to restart (connection refused on every node) and 1 while the nodes were starting (`503`). They were 1 aggregation selection proof, 4 sync committee selection proofs, 1 sync committee message and 1 contribution. None was an attestation or a block |
+| Latency, end to end p50/p95 | baseline 255/530 ms, D lost 281/547 ms, after R2 303/564 ms, epoch 1 263/457 ms, without C 316/618 ms |
+| R2 | E caught up in 16.1 s, ceremony 3.1 s; without C, all 362 signatures combined A, B and E |
+| R3 | epoch 0 ended at block 1873; every voter stopped within 1.3 s; epoch 1's first block 5.1 s after the first stop; D came back in epoch 0, then followed epoch 1 after `mpc-admin resume` |
+| Security checks | 9 of 9; the network identity is in `/admin`; administrative nonce 9 |
+
+Runs H and I had no request in the R3 switch window. In run J, 7 requests fell into it and failed:
+a reconfiguration restarts every voter, so the network cannot sign for about 5 s. Lighthouse
+does not retry a signing request. P0.2 and P0.3 do not change the switch.
+
+### Builder registrations (runs K and L)
+
+Runs K (`20261107T215200Z`) and L (`20261107T222939Z`), `IT_RUN=run-mev`: the devnet with
+ethereum-package's Flashbots stack (images `ethpandaops/mev-boost-relay:main` `sha256:3600f04f…`,
+`ethpandaops/mev-boost:develop` `sha256:47ef3f0c…`, `ethpandaops/reth-rbuilder:develop`
+`sha256:916ba84d…`). Run L added spamoor and observed six epochs instead of two.
+
+| | Run K | Run L |
+| --- | --- | --- |
+| Registration policy | approved by two approvers, applied on every node before Lighthouse started | the same |
+| Lighthouse's registrations | 1 signing request (236 ms in run L), signed; published to the builder network every epoch from its cache | the same |
+| The relay | holds the registration: fee recipient `0xafF0…9896`, gas limit 60 000 000 (it checks the signature) | the same |
+| Proposals observed | 2, both canonical, both built locally: no transactions, so no builder payload | 7, all canonical; 5 with the relay's payload to the registered fee recipient (0.0092 to 0.0121 ETH), 2 built locally (0 and 3 builder submissions for those slots) |
+| Blocks signed for Lighthouse, whole run | 3, all canonical | 17, all canonical: 11 blinded (builder), 6 full |
+| Refusals through the proxy | another fee recipient `412 fee_recipient`, a timestamp 600 s ahead `412 too_new`, another key `400` | the same |
+| Security checks | 12 of 12 | 12 of 12 |
+
+In run L, Lighthouse's beacon node logged "Block broadcast was delayed" for 5 of its blocks (4 of
+them builder blocks: the relay's unblinding adds a round trip to the MPC signature on 4 s slots);
+every one of them is canonical. The relay and the builder logged 441 MB in run L; the driver now
+keeps the last 100 000 lines of each.
 
 ## Troubleshooting
 

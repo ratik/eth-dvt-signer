@@ -18,7 +18,10 @@ use blst::{
     min_pk::{PublicKey as EthPublicKey, Signature as EthSignature},
 };
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
-use eth_mpc_signer::dkg::signing::ETHEREUM_DST;
+use eth_mpc_signer::{
+    admin::{Approvers, SignedCommand},
+    dkg::signing::ETHEREUM_DST,
+};
 use serde_json::{Value, json};
 use std::{
     fs::{self, OpenOptions},
@@ -33,6 +36,42 @@ use std::{
 };
 
 pub const NODES: usize = 4;
+
+/// The approvers every test node runs with (`--approvers`, docs/administration.md): any 2 of
+/// these 3 keys authorize a protected operation.
+/// The test chain's fork schedule (`--eth-fork-schedule`): mainnet's.
+pub fn fork_schedule() -> String {
+    eth_mpc_signer::eth::network::Network::MAINNET
+        .forks
+        .iter()
+        .map(|fork| {
+            format!(
+                "{}=0x{}@{}",
+                fork.name.name(),
+                hex::encode(fork.version),
+                fork.epoch
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+pub fn approver_keys() -> Vec<PrivateKey> {
+    (0..3)
+        .map(|index| PrivateKey::from_seed(1_000 + index))
+        .collect()
+}
+
+/// The approver set of [approver_keys].
+pub fn approvers() -> Approvers {
+    let keys = approver_keys().iter().map(|key| key.public_key()).collect();
+    Approvers::new(2, keys).unwrap()
+}
+
+/// The approver file of [approver_keys].
+pub fn approvers_json() -> String {
+    serde_json::to_string(&approvers().to_json()).unwrap()
+}
 
 /// The binary built for this test run (with the `test-hooks` feature).
 const BINARY: &str = env!("CARGO_BIN_EXE_eth-mpc-signer");
@@ -307,8 +346,10 @@ impl TestNetwork {
                 "--signing-timeout",
                 &SIGNING_TIMEOUT_SECS.to_string(),
             ])
+            .args(self.chain(&nodes[id].args))
             .arg("--data-dir")
             .arg(self.dir.join("data"))
+            .args(self.approvers(&nodes[id].args))
             .args(&self.args)
             .args(&nodes[id].args)
             .env(
@@ -325,6 +366,116 @@ impl TestNetwork {
             .expect("failed to start node");
         nodes[id].stdin = child.stdin.take();
         nodes[id].child = Some(child);
+    }
+
+    /// `--approvers` with the test approver file, unless the node is given its own.
+    /// The test chain, unless the node is given another network: 1-second slots from the Unix
+    /// epoch (the slots the tests sign are long started, and `now` is the current slot,
+    /// `eth::horizon`), and mainnet's fork schedule (`eth::network`), as Lighthouse's own requests
+    /// have it.
+    fn chain(&self, args: &[String]) -> Vec<String> {
+        if self
+            .args
+            .iter()
+            .chain(args)
+            .any(|arg| arg == "--eth-genesis-time" || arg == "--eth-network")
+        {
+            return Vec::new();
+        }
+        [
+            "--eth-genesis-time",
+            "0",
+            "--eth-seconds-per-slot",
+            "1",
+            "--eth-genesis-validators-root",
+            crate::eth2::CHAIN,
+            "--eth-fork-schedule",
+            &fork_schedule(),
+        ]
+        .map(str::to_string)
+        .to_vec()
+    }
+
+    fn approvers(&self, args: &[String]) -> Vec<String> {
+        if self.args.iter().chain(args).any(|arg| arg == "--approvers") {
+            return Vec::new();
+        }
+        let path = self.dir.join("approvers.json");
+        if !path.exists() {
+            fs::write(&path, approvers_json()).unwrap();
+        }
+        vec!["--approvers".into(), path.display().to_string()]
+    }
+
+    /// The next administrative nonce: above the highest any answering node applied.
+    pub fn next_nonce(&self) -> u64 {
+        self.all()
+            .into_iter()
+            .filter_map(|node| match self.try_call(node, "GET", "/admin", None) {
+                Ok((200, admin)) => admin["nonce"].as_u64(),
+                _ => None,
+            })
+            .max()
+            .unwrap_or_else(|| self.fail("no node answers GET /admin"))
+            + 1
+    }
+
+    /// `request` to `operation` (`admin::KINDS`), drafted for the network's cluster with
+    /// `nonce`, as approvers `signers` (indices of [approver_keys]) sign it offline.
+    pub fn signed(
+        &self,
+        operation: &str,
+        request: Value,
+        nonce: u64,
+        signers: &[usize],
+    ) -> SignedCommand {
+        self.try_signed(operation, request, nonce, signers)
+            .unwrap_or_else(|err| self.fail(&format!("drafting {operation}: {err}")))
+    }
+
+    /// As [TestNetwork::signed]; `Err` if no command can be built from `request`.
+    pub fn try_signed(
+        &self,
+        operation: &str,
+        request: Value,
+        nonce: u64,
+        signers: &[usize],
+    ) -> Result<SignedCommand, String> {
+        let cluster = self
+            .all()
+            .into_iter()
+            .find_map(|node| match self.try_call(node, "GET", "/admin", None) {
+                Ok((200, admin)) => admin["cluster_id"].as_str().map(str::to_string),
+                _ => None,
+            })
+            .unwrap_or_else(|| self.fail("no node has an approver set"));
+        let cluster = unhex(&json!(cluster));
+        let cluster = commonware_codec::DecodeExt::decode(cluster.as_slice()).unwrap();
+        let keys = approver_keys();
+        let mut command = SignedCommand::draft(&cluster, operation, nonce, request)?;
+        for signer in signers {
+            command.sign(&keys[*signer]).unwrap();
+        }
+        Ok(command)
+    }
+
+    /// `operation` with `request`, approved by two approvers with the next nonce, posted to
+    /// node `via`.
+    pub fn approved(&self, via: usize, operation: &str, request: Value) -> (u16, Value) {
+        match self.try_signed(operation, request.clone(), self.next_nonce(), &[0, 1]) {
+            Ok(command) => self.post_signed(via, &command),
+            // A request no command is built from: the node refuses it as it is (400).
+            Err(_) => self.post(
+                via,
+                &eth_mpc_signer::admin::request_endpoint(operation, &request).unwrap(),
+                &request,
+            ),
+        }
+    }
+
+    /// `command` posted to its endpoint on node `via`.
+    pub fn post_signed(&self, via: usize, command: &SignedCommand) -> (u16, Value) {
+        self.post(via, &command.endpoint().unwrap(), &command.body().unwrap())
     }
 
     /// Kill node `id` (like a crash: no shutdown).

@@ -1,0 +1,30 @@
+# `it.py run-mev`: the devnet of network.yaml with ethereum-package's Flashbots MEV stack: a
+# mev-boost-relay (its data API shows the registrations it accepted and the payloads it
+# delivered), an rbuilder participant and mev-boost; the beacon node gets `--builder`
+# (docs/ethereum-devnet.md, builder registrations). spamoor sends transactions (the package's
+# MEV example does too): a builder needs some to build a block worth bidding. The MEV images are
+# the package's defaults, floating tags: the run records the digests it used.
+participants:
+  - el_type: geth
+    el_image: ethereum/client-go:v1.17.10
+    cl_type: lighthouse
+    cl_image: sigp/lighthouse:v8.3.2
+    vc_type: lighthouse
+    vc_image: sigp/lighthouse:v8.3.2
+    supernode: true
+    keymanager_enabled: true
+    count: 1
+network_params:
+  preset: mainnet
+  seconds_per_slot: 4
+  slot_duration_ms: 4000
+  num_validator_keys_per_node: 32
+  genesis_delay: 30
+  deneb_fork_epoch: 0
+  electra_fork_epoch: 0
+  fulu_fork_epoch: 0
+  gloas_fork_epoch: 18446744073709551615
+mev_type: flashbots
+additional_services:
+  - spamoor
+persistent: false

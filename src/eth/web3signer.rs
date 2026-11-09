@@ -11,8 +11,8 @@ use super::{
     duty::{AggregateAndProof, Duty, Fork, ForkInfo, ValidatorKey},
     types::{
         AggregateAndProofElectra, AggregateAndProofPhase0, AttestationData, BeaconBlockHeader,
-        ContributionAndProof, DepositMessage, Root, SyncAggregatorSelectionData, Version,
-        VoluntaryExit, hex_bytes,
+        ContributionAndProof, DepositMessage, Root, SyncAggregatorSelectionData,
+        ValidatorRegistration, Version, VoluntaryExit, hex_bytes,
     },
 };
 use serde::{Deserialize, de::DeserializeOwned};
@@ -254,6 +254,31 @@ pub fn parse_request(body: &[u8]) -> Result<Request, ParseError> {
                     withdrawal_credentials: deposit.withdrawal_credentials,
                     amount: deposit.amount,
                 }),
+                signing_root,
+            });
+        }
+        // Fork-agnostic (`compute_domain(DOMAIN_APPLICATION_BUILDER)`), sent without `fork_info`
+        // (Web3Signer's API; Lighthouse omits it). The domain needs the network's genesis fork
+        // version, which the request does not carry: the API puts the network's form in place of
+        // this zero one (`Network::fork_info`), and the fork check refuses any other.
+        "VALIDATOR_REGISTRATION" => {
+            if envelope.fork_info.is_some() {
+                return Err(ParseError::Invalid(
+                    "VALIDATOR_REGISTRATION takes no `fork_info`".into(),
+                ));
+            }
+            let registration: ValidatorRegistration = field(&body, "validator_registration")?;
+            let signing_root = envelope.signing_root.as_deref().map(root).transpose()?;
+            return Ok(Request {
+                fork: ForkInfo {
+                    fork: Fork {
+                        previous_version: [0; 4],
+                        current_version: [0; 4],
+                        epoch: 0,
+                    },
+                    genesis_validators_root: [0; 32],
+                },
+                duty: Duty::ValidatorRegistration(registration),
                 signing_root,
             });
         }

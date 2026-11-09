@@ -5,7 +5,8 @@
 //! ([Stop]) and applies nothing more, and the process exits to restart in the next epoch.
 
 use crate::{
-    application::{Mempool, Scheme},
+    admin::{Endorsement, endorse},
+    application::{Committed, Mempool, Scheme},
     dkg::{
         self, CeremonyConfig, CeremonyId, DkgStatus,
         ceremony::{
@@ -17,6 +18,7 @@ use crate::{
     engine::Retention,
     eth::{
         duty::{DutyRequest, ValidatorKey, format_root, format_validator},
+        registration::{MAX_PENDING_REGISTRATIONS, Policy as RegistrationPolicy},
         types::Root,
     },
     hooks,
@@ -169,6 +171,25 @@ pub struct DutyCheck {
     pub decision: Decision,
     /// The block that authorized it, when it already is.
     pub height: Option<u64>,
+    /// Its signing root is approved (P0.2): a keyholder signs an exit or a deposit only then.
+    pub approved: bool,
+    /// For a builder registration, the registration policy in force (none: none is set).
+    pub policy: Option<RegistrationPolicy>,
+}
+
+/// The node's mempool holds [MAX_PENDING_REGISTRATIONS] registrations already: a new one is not
+/// submitted (retry later).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("too many builder registrations are waiting for consensus: retry later")]
+pub struct Overloaded;
+
+/// Why a duty was not submitted.
+#[derive(Debug, thiserror::Error)]
+pub enum SubmitError {
+    #[error(transparent)]
+    Stopped(#[from] Stopped),
+    #[error(transparent)]
+    Overloaded(#[from] Overloaded),
 }
 
 /// A ceremony and the authorization of one of its nonces, as committed.
@@ -202,6 +223,8 @@ pub struct Status {
     pub authorizations: usize,
     /// Requests waiting for a block.
     pub mempool: usize,
+    /// The last administrative nonce applied (`admin`): a protected command needs the next.
+    pub admin_nonce: u64,
     /// What this node applied and knows of (for readiness).
     pub progress: Progress,
 }
@@ -236,10 +259,22 @@ pub enum Message {
         block: Arc<Block>,
         ack: Exact,
     },
-    /// Submit a validator duty for authorization.
+    /// Submit a validator duty for authorization, with the approvals an exit or a deposit needs.
     SubmitDuty {
         request: Box<DutyRequest>,
-        response: oneshot::Sender<DutyReceipt>,
+        endorsement: Option<Endorsement>,
+        response: oneshot::Sender<Result<DutyReceipt, Overloaded>>,
+    },
+    /// Submit a builder registration policy (protected: with its approvals); returns the
+    /// transaction id at once.
+    SetRegistrationPolicy {
+        policy: Box<RegistrationPolicy>,
+        endorsement: Option<Endorsement>,
+        response: oneshot::Sender<u64>,
+    },
+    /// The builder registration policy in force, and the height it is read at.
+    RegistrationPolicy {
+        response: oneshot::Sender<(Option<RegistrationPolicy>, u64)>,
     },
     /// Check a validator duty against the committed state, recording nothing.
     CheckDuty {
@@ -264,11 +299,13 @@ pub enum Message {
     ActivateValidator {
         validator: ValidatorKey,
         chain: ChainIdentity,
+        endorsement: Option<Endorsement>,
         response: oneshot::Sender<ActivationReceipt>,
     },
     /// Register an imported key (through consensus).
     RegisterImport {
         manifest: Box<Manifest>,
+        endorsement: Option<Endorsement>,
         response: oneshot::Sender<RegisterReceipt>,
     },
     /// This node's acknowledgement of its imported share (sent by the DKG actor, no answer).
@@ -278,6 +315,7 @@ pub enum Message {
     /// Import a slashing-protection history (through consensus).
     ImportHistory {
         import: Box<HistoryImport>,
+        endorsement: Option<Endorsement>,
         response: oneshot::Sender<HistoryReceipt>,
     },
     /// What an import would decide now, with every record of its full histories checked against
@@ -292,6 +330,7 @@ pub enum Message {
         validator: ValidatorKey,
         chain: ChainIdentity,
         acknowledgment: Acknowledgment,
+        endorsement: Option<Endorsement>,
         response: oneshot::Sender<ActivationReceipt>,
     },
     /// The committed state of the imported key of ceremony `id`.
@@ -309,6 +348,7 @@ pub enum Message {
         validator: ValidatorKey,
         ceremony: CeremonyId,
         membership: Option<Box<Membership>>,
+        endorsement: Option<Endorsement>,
         response: oneshot::Sender<ReshareReceipt>,
     },
     /// Activate a reshare as the key's share generation (through consensus).
@@ -327,6 +367,7 @@ pub enum Message {
     /// transaction id once submitted: no node answers after the epoch ends.
     Reconfigure {
         change: Box<Reconfiguration>,
+        endorsement: Option<Endorsement>,
         response: oneshot::Sender<u64>,
     },
 }
@@ -366,15 +407,48 @@ impl Client {
         receiver.await.map_err(|_| Stopped)
     }
 
-    /// Submit a validator duty and wait until consensus decided it (finalized and durably
-    /// applied). The replicated state machine decides; this only authorizes, like [Client::submit].
-    pub async fn submit_duty(&self, request: DutyRequest) -> Result<DutyReceipt, Stopped> {
+    /// Submit a validator duty (an exit or a deposit with its approvals) and wait until consensus
+    /// decided it (finalized and durably applied). The replicated state machine decides; this
+    /// only authorizes, like [Client::submit].
+    pub async fn submit_duty(
+        &self,
+        request: DutyRequest,
+        endorsement: Option<Endorsement>,
+    ) -> Result<DutyReceipt, SubmitError> {
         let (response, receiver) = oneshot::channel();
         self.sender
             .send(Message::SubmitDuty {
                 request: Box::new(request),
+                endorsement,
                 response,
             })
+            .map_err(|_| Stopped)?;
+        Ok(receiver.await.map_err(|_| Stopped)??)
+    }
+
+    /// Submit a builder registration policy; returns its transaction id at once (protected, as
+    /// [Client::reconfigure]).
+    pub async fn set_registration_policy(
+        &self,
+        policy: RegistrationPolicy,
+        endorsement: Option<Endorsement>,
+    ) -> Result<u64, Stopped> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(Message::SetRegistrationPolicy {
+                policy: Box::new(policy),
+                endorsement,
+                response,
+            })
+            .map_err(|_| Stopped)?;
+        receiver.await.map_err(|_| Stopped)
+    }
+
+    /// The builder registration policy in force, and the height it is read at.
+    pub async fn registration_policy(&self) -> Result<(Option<RegistrationPolicy>, u64), Stopped> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(Message::RegistrationPolicy { response })
             .map_err(|_| Stopped)?;
         receiver.await.map_err(|_| Stopped)
     }
@@ -400,17 +474,20 @@ impl Client {
         receiver.await.map_err(|_| Stopped)
     }
 
-    /// Activate validator `validator` for `chain` and wait until consensus decided it.
+    /// Activate validator `validator` for `chain` and wait until consensus decided it. A
+    /// protected command (`admin`): without `endorsement`, honest voters refuse it.
     pub async fn activate_validator(
         &self,
         validator: ValidatorKey,
         chain: ChainIdentity,
+        endorsement: Option<Endorsement>,
     ) -> Result<ActivationReceipt, Stopped> {
         let (response, receiver) = oneshot::channel();
         self.sender
             .send(Message::ActivateValidator {
                 validator,
                 chain,
+                endorsement,
                 response,
             })
             .map_err(|_| Stopped)?;
@@ -434,12 +511,18 @@ impl Client {
         receiver.await.map_err(|_| Stopped)
     }
 
-    /// Register an imported key and wait until consensus decided it.
-    pub async fn register_import(&self, manifest: Manifest) -> Result<RegisterReceipt, Stopped> {
+    /// Register an imported key and wait until consensus decided it (protected, as
+    /// [Client::activate_validator]).
+    pub async fn register_import(
+        &self,
+        manifest: Manifest,
+        endorsement: Option<Endorsement>,
+    ) -> Result<RegisterReceipt, Stopped> {
         let (response, receiver) = oneshot::channel();
         self.sender
             .send(Message::RegisterImport {
                 manifest: Box::new(manifest),
+                endorsement,
                 response,
             })
             .map_err(|_| Stopped)?;
@@ -447,11 +530,17 @@ impl Client {
     }
 
     /// Import a slashing-protection history and wait until consensus decided it.
-    pub async fn import_history(&self, import: HistoryImport) -> Result<HistoryReceipt, Stopped> {
+    /// A protected command (as [Client::activate_validator]).
+    pub async fn import_history(
+        &self,
+        import: HistoryImport,
+        endorsement: Option<Endorsement>,
+    ) -> Result<HistoryReceipt, Stopped> {
         let (response, receiver) = oneshot::channel();
         self.sender
             .send(Message::ImportHistory {
                 import: Box::new(import),
+                endorsement,
                 response,
             })
             .map_err(|_| Stopped)?;
@@ -475,12 +564,14 @@ impl Client {
         receiver.await.map_err(|_| Stopped)
     }
 
-    /// Activate an imported key and wait until consensus decided it.
+    /// Activate an imported key and wait until consensus decided it (protected, as
+    /// [Client::activate_validator]).
     pub async fn activate_imported(
         &self,
         validator: ValidatorKey,
         chain: ChainIdentity,
         acknowledgment: Acknowledgment,
+        endorsement: Option<Endorsement>,
     ) -> Result<ActivationReceipt, Stopped> {
         let (response, receiver) = oneshot::channel();
         self.sender
@@ -488,6 +579,7 @@ impl Client {
                 validator,
                 chain,
                 acknowledgment,
+                endorsement,
                 response,
             })
             .map_err(|_| Stopped)?;
@@ -495,12 +587,14 @@ impl Client {
     }
 
     /// Start a reshare of `validator`'s key as ceremony `ceremony` (dealt and held as `membership`
-    /// says, or within the committee); wait until consensus decided.
+    /// says, or within the committee); wait until consensus decided. With a membership, a
+    /// protected command (as [Client::activate_validator]).
     pub async fn start_resharing(
         &self,
         validator: ValidatorKey,
         ceremony: CeremonyId,
         membership: Option<Membership>,
+        endorsement: Option<Endorsement>,
     ) -> Result<ReshareReceipt, Stopped> {
         let (response, receiver) = oneshot::channel();
         self.sender
@@ -508,18 +602,25 @@ impl Client {
                 validator,
                 ceremony,
                 membership: membership.map(Box::new),
+                endorsement,
                 response,
             })
             .map_err(|_| Stopped)?;
         receiver.await.map_err(|_| Stopped)
     }
 
-    /// Submit a reconfiguration ending the consensus epoch; returns its transaction id at once.
-    pub async fn reconfigure(&self, change: Reconfiguration) -> Result<u64, Stopped> {
+    /// Submit a reconfiguration ending the consensus epoch; returns its transaction id at once
+    /// (protected, as [Client::activate_validator]).
+    pub async fn reconfigure(
+        &self,
+        change: Reconfiguration,
+        endorsement: Option<Endorsement>,
+    ) -> Result<u64, Stopped> {
         let (response, receiver) = oneshot::channel();
         self.sender
             .send(Message::Reconfigure {
                 change: Box::new(change),
+                endorsement,
                 response,
             })
             .map_err(|_| Stopped)?;
@@ -596,7 +697,7 @@ pub enum Stop {
 enum Waiter {
     Sign(oneshot::Sender<Receipt>),
     Start(oneshot::Sender<StartReceipt>),
-    Duty(oneshot::Sender<DutyReceipt>),
+    Duty(oneshot::Sender<Result<DutyReceipt, Overloaded>>),
     Activate(oneshot::Sender<ActivationReceipt>),
     Register(oneshot::Sender<RegisterReceipt>),
     History(oneshot::Sender<HistoryReceipt>),
@@ -610,6 +711,8 @@ pub struct Executor<E: CryptoRng + Spawner + Context, S: Sender> {
     store: Store<E>,
     mempool: Mempool,
     executed: Arc<AtomicU64>,
+    /// The applied height and administrative nonce, for the application's checks.
+    committed: Committed,
     /// Highest finalized height marshal knows of.
     tip: Arc<AtomicU64>,
     /// When this process last applied a new block.
@@ -640,6 +743,7 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
         store: Store<E>,
         mempool: Mempool,
         executed: Arc<AtomicU64>,
+        committed: Committed,
         tip: Arc<AtomicU64>,
         gossip: S,
         marshal: Marshal<Scheme, Standard<Block>>,
@@ -650,12 +754,18 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
         stopped: Arc<OnceLock<Stop>>,
     ) -> (Self, mpsc::UnboundedSender<Message>, Client) {
         executed.store(store.height(), Ordering::Release);
+        committed.set(
+            store.height(),
+            store.admin().nonce,
+            store.registration_policy().cloned(),
+        );
         let (sender, mailbox) = mpsc::unbounded_channel();
         let executor = Self {
             context: ContextCell::new(context),
             store,
             mempool,
             executed,
+            committed,
             tip,
             last_applied: None,
             gossip,
@@ -729,9 +839,13 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                 Message::ActivateValidator {
                     validator,
                     chain,
+                    endorsement,
                     response,
                 } => {
-                    let id = self.submit(Command::ActivateValidator { validator, chain });
+                    let id = self.submit(endorse(
+                        Command::ActivateValidator { validator, chain },
+                        endorsement,
+                    ));
                     info!(
                         id,
                         validator = %format_validator(&validator),
@@ -740,10 +854,15 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                     );
                     self.waiters.insert(id, Waiter::Activate(response));
                 }
-                Message::RegisterImport { manifest, response } => {
+                Message::RegisterImport {
+                    manifest,
+                    endorsement,
+                    response,
+                } => {
                     let ceremony = manifest.ceremony.clone();
                     let validator = format_validator(&manifest.validator);
-                    let id = self.submit(Command::RegisterImportedKey(manifest));
+                    let id =
+                        self.submit(endorse(Command::RegisterImportedKey(manifest), endorsement));
                     info!(id, %ceremony, %validator, "submitted imported key registration");
                     self.waiters.insert(id, Waiter::Register(response));
                 }
@@ -756,13 +875,17 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                     validator,
                     ceremony,
                     membership,
+                    endorsement,
                     response,
                 } => {
-                    let id = self.submit(Command::StartResharing {
-                        validator,
-                        ceremony: ceremony.clone(),
-                        membership,
-                    });
+                    let id = self.submit(endorse(
+                        Command::StartResharing {
+                            validator,
+                            ceremony: ceremony.clone(),
+                            membership,
+                        },
+                        endorsement,
+                    ));
                     info!(id, %ceremony, validator = %format_validator(&validator), "submitted reshare start");
                     self.waiters.insert(id, Waiter::Reshare(response));
                 }
@@ -784,19 +907,30 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                     info!(id, round, validator = %format_validator(&validator), "submitted reshare abort");
                     self.waiters.insert(id, Waiter::Abort(response));
                 }
-                Message::Reconfigure { change, response } => {
+                Message::Reconfigure {
+                    change,
+                    endorsement,
+                    response,
+                } => {
                     let (epoch, remove, add) = (
                         change.epoch,
                         hex::encode(change.remove.encode()),
                         hex::encode(change.add.encode()),
                     );
-                    let id = self.submit(Command::Reconfigure(change));
+                    let id = self.submit(endorse(Command::Reconfigure(change), endorsement));
                     info!(id, epoch, remove, add, "submitted reconfiguration");
                     let _ = response.send(id);
                 }
-                Message::ImportHistory { import, response } => {
+                Message::ImportHistory {
+                    import,
+                    endorsement,
+                    response,
+                } => {
                     let validators = import.validators.len();
-                    let id = self.submit(Command::ImportSlashingProtection(import));
+                    let id = self.submit(endorse(
+                        Command::ImportSlashingProtection(import),
+                        endorsement,
+                    ));
                     info!(id, validators, "submitted slashing-protection import");
                     self.waiters.insert(id, Waiter::History(response));
                 }
@@ -812,13 +946,17 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                     validator,
                     chain,
                     acknowledgment,
+                    endorsement,
                     response,
                 } => {
-                    let id = self.submit(Command::ActivateImportedValidator {
-                        validator,
-                        chain,
-                        acknowledgment,
-                    });
+                    let id = self.submit(endorse(
+                        Command::ActivateImportedValidator {
+                            validator,
+                            chain,
+                            acknowledgment,
+                        },
+                        endorsement,
+                    ));
                     info!(
                         id,
                         validator = %format_validator(&validator),
@@ -860,11 +998,24 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                             });
                     let _ = response.send(entry);
                 }
-                Message::SubmitDuty { request, response } => {
+                Message::SubmitDuty {
+                    request,
+                    endorsement,
+                    response,
+                } => {
                     let validator = format_validator(&request.validator);
                     let kind = request.duty.kind();
                     let signing_root = format_root(&request.signing_root());
-                    let id = self.submit(Command::Duty(request));
+                    // A burst of registrations waits in a bounded queue: beyond it, a retryable
+                    // refusal (`eth::registration`).
+                    if request.duty.registration().is_some()
+                        && self.mempool.registrations() >= MAX_PENDING_REGISTRATIONS
+                    {
+                        warn!(%validator, %signing_root, "builder registration queue full: not submitted");
+                        let _ = response.send(Err(Overloaded));
+                        continue;
+                    }
+                    let id = self.submit(endorse(Command::Duty(request), endorsement));
                     info!(id, %validator, ?kind, %signing_root, "submitted validator duty");
                     self.waiters.insert(id, Waiter::Duty(response));
                 }
@@ -879,7 +1030,29 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                         signing_root,
                         decision,
                         height: protection.authorized_at(&request),
+                        approved: protection.is_approved(&request),
+                        policy: request
+                            .duty
+                            .registration()
+                            .and(self.store.registration_policy().cloned()),
                     });
+                }
+                Message::SetRegistrationPolicy {
+                    policy,
+                    endorsement,
+                    response,
+                } => {
+                    let digest = format!("0x{}", hex::encode(policy.digest()));
+                    let id =
+                        self.submit(endorse(Command::SetRegistrationPolicy(policy), endorsement));
+                    info!(id, %digest, "submitted builder registration policy");
+                    let _ = response.send(id);
+                }
+                Message::RegistrationPolicy { response } => {
+                    let _ = response.send((
+                        self.store.registration_policy().cloned(),
+                        self.store.height(),
+                    ));
                 }
                 Message::ValidatorRound { round, response } => {
                     let _ = response.send(self.store.protection().is_validator_round(round));
@@ -916,6 +1089,7 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                         height,
                         authorizations: self.store.authorization_count(),
                         mempool: self.mempool.len(),
+                        admin_nonce: self.store.admin().nonce,
                         progress: Progress {
                             applied: height,
                             known_finalized: self.tip.load(Ordering::Acquire).max(height),
@@ -1068,13 +1242,29 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
             );
             let _ = self.stopped.set(Stop::Closed { height });
         }
+        let nonce = self.store.admin().nonce;
+        self.committed
+            .set(height, nonce, self.store.registration_policy().cloned());
         self.executed.store(height, Ordering::Release);
         self.last_applied = Some(applied_at);
         self.mempool.remove_all(&block.transactions);
+        // Protected commands whose nonce is now used never apply: forget them.
+        let used = |transaction: &Transaction| matches!(&transaction.command, Command::Admin(authorized) if authorized.nonce <= nonce);
+        self.mempool.retain(|transaction| {
+            let forget = used(transaction);
+            if forget {
+                debug!(
+                    id = transaction.id,
+                    "forgetting a protected command whose nonce is used"
+                );
+            }
+            !forget
+        });
         if let Some(unfinalized) = &mut self.unfinalized {
             for transaction in &block.transactions {
                 unfinalized.remove(&transaction.digest());
             }
+            unfinalized.retain(|_, transaction| !used(transaction));
             if height.is_multiple_of(REGOSSIP_BLOCKS) {
                 for transaction in unfinalized.values() {
                     debug!(
@@ -1136,6 +1326,13 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                 .dkg
                 .send(dkg::actor::Message::Authorized(applied.authorized));
         }
+        // The keyholder checks registrations against the policy in force: before the duties the
+        // same block authorized under it.
+        if let Some(policy) = applied.registration_policy.clone() {
+            let _ = self
+                .dkg
+                .send(dkg::actor::Message::RegistrationPolicy(Some(policy)));
+        }
         if !applied.duties.is_empty() {
             let _ = self
                 .dkg
@@ -1165,7 +1362,21 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
 
         for (transaction, effect) in block.transactions.iter().zip(applied.effects) {
             let waiter = self.waiters.remove(&transaction.id);
-            match (&transaction.command, effect) {
+            // An approved protected command has the command's own effect.
+            let command = match &transaction.command {
+                Command::Admin(authorized) => {
+                    info!(
+                        height,
+                        id = transaction.id,
+                        nonce = authorized.nonce,
+                        approvals = authorized.approvals.len(),
+                        "applied an approved protected command"
+                    );
+                    &authorized.command
+                }
+                command => command,
+            };
+            match (command, effect) {
                 (Command::Sign(request), Effect::Sign(outcome, authorization)) => {
                     info!(
                         height,
@@ -1206,14 +1417,14 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                         "applied validator duty"
                     );
                     if let Some(Waiter::Duty(waiter)) = waiter {
-                        let _ = waiter.send(DutyReceipt {
+                        let _ = waiter.send(Ok(DutyReceipt {
                             decision,
                             signing_root,
                             height,
                             authorized_at: self.store.protection().authorized_at(request),
                             finalized_at,
                             applied_at,
-                        });
+                        }));
                     }
                 }
                 (Command::ActivateValidator { validator, chain }, Effect::Activate(outcome)) => {
@@ -1333,6 +1544,19 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                     if let Some(Waiter::Activate(waiter)) = waiter {
                         let _ = waiter.send(ActivationReceipt { outcome, height });
                     }
+                }
+                (Command::SetRegistrationPolicy(policy), Effect::RegistrationPolicy(digest)) => {
+                    info!(
+                        height,
+                        id = transaction.id,
+                        digest = %format!("0x{}", hex::encode(digest)),
+                        fee_recipients = policy.fee_recipients.len(),
+                        gas_limit_min = policy.gas_limit_min,
+                        gas_limit_max = policy.gas_limit_max,
+                        max_future_seconds = policy.max_future_seconds,
+                        max_age_seconds = policy.max_age_seconds,
+                        "applied builder registration policy"
+                    );
                 }
                 // Nobody waits: the node stops right after this block (`Stop`).
                 (Command::Reconfigure { .. }, Effect::Reconfigure(record)) => info!(

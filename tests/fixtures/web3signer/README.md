@@ -28,6 +28,12 @@ from the examples of the Web3Signer API specification (Consensys/web3signer
   computes, and the Electra containers themselves are checked against the consensus
   specification vectors in `tests/vectors`.
 
+- `validator_registration.json`: Web3Signer's `VALIDATOR_REGISTRATION` example, sent without
+  `fork_info` as Lighthouse sends it. Its domain uses the network's genesis fork version, which
+  the request does not carry: Web3Signer's root is for `0x00000001`, the network of its examples
+  (its `DEPOSIT` example names it). `ssz_roots.py` takes it as `--genesis-fork-version`
+  (default `0x00000001`).
+
 `ssz_roots.py` computes signing roots with a minimal SSZ implementation that shares no code with the
 signer (Python standard library only). It reproduces every Web3Signer root above, and the original
 minimal-preset contribution example with `--minimal`:

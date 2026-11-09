@@ -194,6 +194,25 @@ pub struct DepositData {
     pub signature: Signature,
 }
 
+/// An execution-layer address (`ExecutionAddress`, 20 bytes).
+pub type Address = [u8; 20];
+
+/// `ValidatorRegistrationV1` (builder-specs): what a builder registration's signature covers.
+/// A relay pays for a validator's builder blocks to `fee_recipient`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, TreeHash)]
+#[serde(deny_unknown_fields)]
+pub struct ValidatorRegistration {
+    #[serde(with = "hex_bytes")]
+    pub fee_recipient: Address,
+    #[serde(with = "serde_utils::quoted_u64")]
+    pub gas_limit: u64,
+    /// Seconds since the Unix epoch.
+    #[serde(with = "serde_utils::quoted_u64")]
+    pub timestamp: u64,
+    #[serde(with = "hex_bytes")]
+    pub pubkey: [u8; 48],
+}
+
 /// `ForkData`: what `compute_fork_data_root` hashes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TreeHash)]
 #[serde(deny_unknown_fields)]

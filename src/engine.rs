@@ -17,7 +17,7 @@
 //! (`participants`).
 
 use crate::{
-    application::{Application, MAX_IDLE, Mempool, Scheme},
+    application::{Application, Committed, MAX_IDLE, Mempool, Rules, Scheme},
     dkg::{self, DkgStatus, secrets::Secrets},
     epochs::{EpochRecord, Epochs, Heights, Schemes},
     executor::{self, Client, Executor, Stop},
@@ -33,9 +33,10 @@ use commonware_consensus::{
     types::{Epoch, ViewDelta},
 };
 use commonware_cryptography::{
-    Crc32, Digestible as _, Hasher as _, Sha256, Signer as _,
+    Crc32, Digest as _, Digestible as _, Hasher as _, Sha256, Signer as _,
     certificate::Verifier as _,
     ed25519::{PrivateKey, PublicKey},
+    sha256::Digest,
 };
 use commonware_p2p::{Blocker, Provider, Receiver, Sender};
 use commonware_parallel::Sequential;
@@ -162,6 +163,12 @@ pub struct Config<B, P> {
     pub share_key: Option<crate::import::envelope::ShareKey>,
     /// The operator's approvals of reshares to new keyholders (`dkg::approval`), if any.
     pub approved_reshares: Option<std::path::PathBuf>,
+    /// The Ethereum network whose clock bounds the duties this node admits and signs
+    /// (`eth::horizon`); without one it signs no duty.
+    pub horizon: crate::eth::horizon::Horizon,
+    /// The approvers of protected commands (`admin`, `--approvers`); without, none is proposed,
+    /// voted for or applied.
+    pub administration: Option<crate::admin::Administration>,
 }
 
 /// Registered p2p channels, one `(sender, receiver)` pair per purpose.
@@ -298,6 +305,64 @@ pub enum StartError {
          would never reach it; refusing to start"
     )]
     CloseBelowState { close: u64, height: u64 },
+    #[error(
+        "the replicated state applied administrative nonce {nonce} under approver set {recorded}, \
+         but this node is started {configured}: refusing to start (every node needs the \
+         network's approver file, --approvers)"
+    )]
+    Approvers {
+        nonce: u64,
+        recorded: String,
+        configured: String,
+    },
+    #[error(
+        "the replicated state applied administrative nonce {nonce} for Ethereum network \
+         {recorded}, but this node is started {configured}: refusing to start (every node needs \
+         the network's --eth-network, or the same --eth-genesis-* values)"
+    )]
+    Network {
+        nonce: u64,
+        recorded: String,
+        configured: String,
+    },
+}
+
+/// The approver set must be the one the replicated state applied protected commands under, if
+/// it applied any: a node with another one would refuse (and stop at) the next protected
+/// command, or accept one the network refuses.
+fn check_approvers<E: commonware_storage::Context>(
+    store: &Store<E>,
+    administration: Option<&crate::admin::Administration>,
+) -> Result<(), StartError> {
+    let record = store.admin();
+    if record.nonce == 0 {
+        return Ok(());
+    }
+    let configured = administration.map(|admin| admin.approvers().digest());
+    if configured != Some(record.approvers) {
+        return Err(StartError::Approvers {
+            nonce: record.nonce,
+            recorded: format!("0x{}", hex::encode(record.approvers)),
+            configured: configured.map_or_else(
+                || "without one".to_string(),
+                |digest| format!("with approver set 0x{}", hex::encode(digest)),
+            ),
+        });
+    }
+    // The Ethereum network the protected commands were approved for (P0.3; none recorded by an
+    // earlier version): a node started for another one would refuse (and stop at) the next.
+    let network = administration.and_then(|admin| admin.network());
+    if record.network != Digest::EMPTY && network != Some(record.network) {
+        return Err(StartError::Network {
+            nonce: record.nonce,
+            recorded: format!("0x{}", hex::encode(record.network)),
+            configured: network.map_or_else(
+                || "without one".to_string(),
+                |digest| format!("for network 0x{}", hex::encode(digest)),
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Refuse durable state that contradicts itself: running on it could skip finalized blocks, keep
@@ -466,7 +531,10 @@ where
     )
     .await;
     crate::hooks::crash_point("after-diagnostics");
-    let store = Store::init(context.child("store"), prefix, config.participants.clone()).await?;
+    let mut store =
+        Store::init(context.child("store"), prefix, config.participants.clone()).await?;
+    check_approvers(&store, config.administration.as_ref())?;
+    store.administer(config.administration.clone());
     // A secret store that cannot be read is fatal: the node must not run with lost or
     // inconsistent shares.
     let secrets = Secrets::init(context.child("secrets"), format!("{prefix}-secrets")).await?;
@@ -631,6 +699,7 @@ where
         let authorizations = store.authorizations();
         let validator_rounds = store.protection().validator_rounds().collect();
         let duties = store.protection().authorized_duties();
+        let registration_policy = store.registration_policy().cloned();
         // Every validator key's active share generation: the keyholder signs with no other.
         let generations = store
             .protection()
@@ -639,6 +708,7 @@ where
             .collect();
         let mempool = Mempool::default();
         let executed = Arc::new(AtomicU64::new(0));
+        let committed = Committed::new(store.height(), store.admin().nonce);
         let tip = Arc::new(AtomicU64::new(0));
         let (mempool_sender, mempool_receiver) = channels.mempool;
         let (dkg_sender, dkg_mailbox) = mpsc::unbounded_channel();
@@ -648,6 +718,7 @@ where
             store,
             mempool.clone(),
             executed.clone(),
+            committed.clone(),
             tip.clone(),
             mempool_sender,
             marshal.clone(),
@@ -688,7 +759,9 @@ where
             config.share_key,
             committee,
             dkg::approval::Approvals::new(config.approved_reshares),
+            config.horizon,
         )
+        .with_registration_policy(registration_policy)
         .start();
         let dkg_receiver_handle = context.child("dkg_receiver").spawn({
             let dkg_sender = dkg_sender.clone();
@@ -701,6 +774,7 @@ where
             context.child("coordinator"),
             public_key.clone(),
             config.signing,
+            config.horizon,
             executor_mailbox.clone(),
             dkg_sender.clone(),
             signing_sender,
@@ -735,12 +809,16 @@ where
             context.child("application"),
             Application::new(
                 mempool,
-                executed,
                 tip,
                 executor_mailbox,
-                consensus_status.epochs.clone(),
-                consensus_status.candidates.clone(),
-                consensus_status.terminal.clone(),
+                Rules {
+                    epochs: consensus_status.epochs.clone(),
+                    candidates: consensus_status.candidates.clone(),
+                    terminal: consensus_status.terminal.clone(),
+                    horizon: config.horizon,
+                    admin: config.administration.clone(),
+                    committed,
+                },
             ),
             marshal.clone(),
             heights,

@@ -11,7 +11,7 @@
 use super::types::{
     AggregateAndProofElectra, AggregateAndProofPhase0, AttestationData, BeaconBlockHeader,
     ContributionAndProof, DepositMessage, ForkData, Root, SigningData, SyncAggregatorSelectionData,
-    Version, VoluntaryExit, hex_bytes,
+    ValidatorRegistration, Version, VoluntaryExit, hex_bytes,
 };
 use bytes::{Buf, BufMut};
 use commonware_codec::{EncodeSize, Error as CodecError, Read, ReadExt as _, Write, varint::UInt};
@@ -48,6 +48,8 @@ pub mod domain {
     pub const SYNC_COMMITTEE: DomainType = [0x07, 0, 0, 0];
     pub const SYNC_COMMITTEE_SELECTION_PROOF: DomainType = [0x08, 0, 0, 0];
     pub const CONTRIBUTION_AND_PROOF: DomainType = [0x09, 0, 0, 0];
+    /// `DOMAIN_APPLICATION_BUILDER` (builder-specs): builder registrations.
+    pub const APPLICATION_BUILDER: DomainType = [0x00, 0, 0, 0x01];
 }
 
 /// A compressed BLS12-381 G1 public key (an Ethereum validator public key).
@@ -173,6 +175,9 @@ pub enum Duty {
     /// genesis validators root (`compute_domain(DOMAIN_DEPOSIT)`): the request's [ForkInfo] holds
     /// that version as both versions and a zero root.
     Deposit(DepositMessage),
+    /// A builder registration (`eth::registration`). Its domain is a deposit's, with
+    /// `DOMAIN_APPLICATION_BUILDER`: the genesis fork version and a zero genesis validators root.
+    ValidatorRegistration(ValidatorRegistration),
 }
 
 /// Kind of duty (stable numbering: part of the replicated state's keys).
@@ -190,10 +195,11 @@ pub enum DutyKind {
     ContributionAndProof = 7,
     VoluntaryExit = 8,
     Deposit = 9,
+    ValidatorRegistration = 10,
 }
 
 impl DutyKind {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::BlockProposal,
         Self::Attestation,
         Self::RandaoReveal,
@@ -204,9 +210,19 @@ impl DutyKind {
         Self::ContributionAndProof,
         Self::VoluntaryExit,
         Self::Deposit,
+        Self::ValidatorRegistration,
     ];
 
-    /// Distinct roots authorized per period for a non-slashable kind.
+    /// Whether signing this kind needs the approvers (P0.2, `admin`): a voluntary exit cannot be
+    /// undone, and a key's one deposit sets its withdrawal credentials for good. Such a duty
+    /// enters a new block only with approvals over exactly it, and a keyholder signs only a root
+    /// recorded as approved.
+    pub const fn needs_approval(self) -> bool {
+        matches!(self, Self::VoluntaryExit | Self::Deposit)
+    }
+
+    /// Distinct roots authorized per period for a kind protected per period
+    /// ([`Protection::Bounded`]; a registration is not, [`Protection::Registration`]).
     pub const fn max_roots(self) -> usize {
         match self {
             Self::Deposit => MAX_DEPOSIT_MESSAGES,
@@ -229,6 +245,23 @@ pub enum Protection {
     /// Not slashable: retries are idempotent, and at most [MAX_ROOTS_PER_PERIOD] distinct roots per
     /// period (slot or epoch) are authorized.
     Bounded { period: u64 },
+    /// A builder registration: retries are idempotent, and nothing limits distinct ones (a
+    /// validator client signs a new one at each restart); the registration policy, its timestamp
+    /// window and the per-block limit bound them instead (`eth::registration`).
+    Registration { timestamp: u64 },
+}
+
+impl Protection {
+    /// The slot or epoch the protection applies to: a proposal's slot, an attestation's target
+    /// epoch, a non-slashable duty's period.
+    pub const fn period(self) -> u64 {
+        match self {
+            Self::Proposal { slot } => slot,
+            Self::Attestation { target, .. } => target,
+            Self::Bounded { period } => period,
+            Self::Registration { timestamp } => timestamp,
+        }
+    }
 }
 
 /// A duty that can never be signed, whatever the history.
@@ -254,6 +287,15 @@ impl Duty {
             Self::ContributionAndProof(_) => DutyKind::ContributionAndProof,
             Self::VoluntaryExit(_) => DutyKind::VoluntaryExit,
             Self::Deposit(_) => DutyKind::Deposit,
+            Self::ValidatorRegistration(_) => DutyKind::ValidatorRegistration,
+        }
+    }
+
+    /// The builder registration, if the duty is one.
+    pub const fn registration(&self) -> Option<&ValidatorRegistration> {
+        match self {
+            Self::ValidatorRegistration(registration) => Some(registration),
+            _ => None,
         }
     }
 
@@ -269,6 +311,7 @@ impl Duty {
             Self::ContributionAndProof(_) => domain::CONTRIBUTION_AND_PROOF,
             Self::VoluntaryExit(_) => domain::VOLUNTARY_EXIT,
             Self::Deposit(_) => domain::DEPOSIT,
+            Self::ValidatorRegistration(_) => domain::APPLICATION_BUILDER,
         }
     }
 
@@ -286,7 +329,7 @@ impl Duty {
             Self::ContributionAndProof(proof) => proof.contribution.slot / SLOTS_PER_EPOCH,
             Self::VoluntaryExit(exit) => exit.epoch,
             // Fork-agnostic: the fork info carries the genesis fork version only.
-            Self::Deposit(_) => 0,
+            Self::Deposit(_) | Self::ValidatorRegistration(_) => 0,
         }
     }
 
@@ -299,7 +342,10 @@ impl Duty {
             Self::AggregateAndProof(aggregate) => Some(aggregate.slot()),
             Self::SyncSelectionProof(data) => Some(data.slot),
             Self::ContributionAndProof(proof) => Some(proof.contribution.slot),
-            Self::RandaoReveal { .. } | Self::VoluntaryExit(_) | Self::Deposit(_) => None,
+            Self::RandaoReveal { .. }
+            | Self::VoluntaryExit(_)
+            | Self::Deposit(_)
+            | Self::ValidatorRegistration(_) => None,
         }
     }
 
@@ -318,15 +364,18 @@ impl Duty {
             Self::ContributionAndProof(proof) => proof.tree_hash_root().0,
             Self::VoluntaryExit(exit) => exit.tree_hash_root().0,
             Self::Deposit(message) => message.tree_hash_root().0,
+            Self::ValidatorRegistration(registration) => registration.tree_hash_root().0,
         }
+    }
+
+    /// The domain of the signature under `fork`.
+    pub fn domain(&self, fork: &ForkInfo) -> Root {
+        fork.domain(self.domain_type(), self.epoch())
     }
 
     /// The signing root under `fork`.
     pub fn signing_root(&self, fork: &ForkInfo) -> Root {
-        compute_signing_root(
-            self.object_root(),
-            fork.domain(self.domain_type(), self.epoch()),
-        )
+        compute_signing_root(self.object_root(), self.domain(fork))
     }
 
     pub fn protection(&self) -> Protection {
@@ -350,6 +399,9 @@ impl Duty {
             Self::VoluntaryExit(exit) => Protection::Bounded { period: exit.epoch },
             // One period for all of a validator's deposits: one message, ever.
             Self::Deposit(_) => Protection::Bounded { period: 0 },
+            Self::ValidatorRegistration(registration) => Protection::Registration {
+                timestamp: registration.timestamp,
+            },
         }
     }
 
@@ -391,6 +443,7 @@ impl Duty {
             Self::ContributionAndProof(proof) => (8, proof.as_ssz_bytes()),
             Self::VoluntaryExit(exit) => (9, exit.as_ssz_bytes()),
             Self::Deposit(message) => (10, message.as_ssz_bytes()),
+            Self::ValidatorRegistration(registration) => (11, registration.as_ssz_bytes()),
         }
     }
 
@@ -428,6 +481,9 @@ impl Duty {
             )),
             9 => Self::VoluntaryExit(VoluntaryExit::from_ssz_bytes(body).map_err(invalid)?),
             10 => Self::Deposit(DepositMessage::from_ssz_bytes(body).map_err(invalid)?),
+            11 => Self::ValidatorRegistration(
+                ValidatorRegistration::from_ssz_bytes(body).map_err(invalid)?,
+            ),
             _ => return Err(CodecError::InvalidEnum(tag)),
         })
     }

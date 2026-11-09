@@ -28,6 +28,13 @@ A 4-node threshold signer built on [commonware](https://github.com/commonwarexyz
   instead of the lost node (A, B, C, D → A, B, C, E), from one operator command (`mpc-admin
   replace-node`); the key, its shares and its history unchanged
   ([docs/reconfiguration.md](docs/reconfiguration.md));
+- a time horizon on signing: no duty, and no slashing-protection import, whose slot or epochs have
+  not started by each node's clock is admitted, proposed or voted for, so a far-future duty cannot
+  poison a validator's history ([docs/ethereum-signing.md](docs/ethereum-signing.md#time-horizon));
+- administration signed by approvers: activations, imported-key registrations, EIP-3076 history
+  imports, reshares to new keyholders and reconfigurations take effect only with a threshold of
+  offline Ed25519 approver signatures and the next administrative nonce, checked by every voter (`mpc-admin draft`, `sign`,
+  `submit`; [docs/administration.md](docs/administration.md));
 - for development builds only (`dev-api` feature): `POST /sign` authorizes
   `(ceremony_id, nonce) -> payload_hash` once, through consensus, and returns the threshold
   signature of any 32-byte payload (see [Signing](#signing)).
@@ -36,9 +43,9 @@ A real Lighthouse v8.3.2 validator client has run against it on a local proof-of
 (Kurtosis), as a validator whose key exists only as the network's shares
 ([docs/ethereum-devnet.md](docs/ethereum-devnet.md)).
 
-**Not production-ready**: no client authentication (loopback only), development node keys, no
-independent audit, and slashing history that a rollback of every node would lose
-([Limitations](#limitations-next-steps)).
+**Not production-ready**: no client authentication for signing (loopback only; protected
+operations need approvers' signatures), development node keys, no independent audit, and slashing
+history that a rollback of every node would lose ([Limitations](#limitations-next-steps)).
 
 Design notes: [docs/architecture.md](docs/architecture.md) (signing, E2E harness, Ethereum
 integration), [docs/security-review.md](docs/security-review.md) and the adversarial audit
@@ -288,8 +295,11 @@ consensus and atomic `Metadata` writes. Guarantees from this application:
   duties of the Web3Signer API ([docs/ethereum-signing.md](docs/ethereum-signing.md)). They are
   checked against consensus-spec-tests vectors, the roots Web3Signer publishes, and an independent
   Python SSZ implementation.
-- **Not covered:** deposits and validator registrations (their domain needs the network's genesis
-  fork version), full Phase 0 and Altair blocks, Gloas types. `POST /sign` (`dev-api`) signs
+- **Not covered:** full Phase 0 and Altair blocks, `BUILDER_REQUEST_AUTH`, Gloas types. Voluntary
+  exits and deposits are signed only with the approvers' authorization (P0.2), every duty's
+  `fork_info` must follow the node's pinned fork schedule (P0.3), and builder registrations are
+  signed only under the approvers' registration policy (fee recipients, gas limit range, timestamp
+  window; [docs/ethereum-signing.md](docs/ethereum-signing.md#builder-registrations)). `POST /sign` (`dev-api`) signs
   whatever root it is given, with no slashing protection: its nonce is not a slot or an epoch.
 
 ## Signing
@@ -341,6 +351,19 @@ Node `i` serves p2p on `127.0.0.1:300i` and HTTP on `127.0.0.1:808i`. Data is in
 Development keys come from the node index (`ed25519::PrivateKey::from_seed(i)`). Do not use them
 outside a local network.
 
+Every node needs the same two settings:
+
+- `--eth-network mainnet|hoodi` (or `--eth-genesis-time`, `--eth-seconds-per-slot`,
+  `--eth-genesis-validators-root` and `--eth-fork-schedule` for a devnet). Without it, the node
+  signs no duty ([time horizon](docs/ethereum-signing.md#time-horizon),
+  [fork schedule](docs/ethereum-signing.md#fork-schedule)).
+- `--approvers approvers.json`, the approvers' public keys and threshold. Without it, no protected
+  operation (activation, key registration, reshare to new keyholders, reconfiguration, EIP-3076
+  import, voluntary exit, deposit) is possible
+  ([docs/administration.md](docs/administration.md)).
+
+`scripts/local-net.sh` passes them from `ETH_NETWORK=hoodi` and `APPROVERS=approvers.json`.
+
 A follower (a keyholder that does not vote, R2) is node `participants + j`, run with the same
 `--participants` and `--followers` as every other node: `cargo run --release -- --id 4
 --followers 1`, the voters also with `--followers 1`. A voter deals to new keyholders only with
@@ -369,8 +392,11 @@ Validator keys and the Web3Signer API ([docs/ethereum-signing.md](docs/ethereum-
 curl -s localhost:8080/dkg/start -H 'content-type: application/json' \
   -d '{"ceremony_id": "validator-eth", "validator": true}'
 curl -s localhost:8081/validators                      # [{"public_key":"0xa1b2..","status":"inactive",..}]
-curl -s localhost:8081/validators/activate -H 'content-type: application/json' \
-  -d '{"public_key": "0xa1b2..", "genesis_validators_root": "0x0470.."}'   # once, through consensus
+# Activation is a protected operation: drafted, signed offline by the approvers, submitted.
+mpc-admin --nodes 127.0.0.1:8080,127.0.0.1:8081,127.0.0.1:8082,127.0.0.1:8083 draft activate \
+  --request '{"public_key": "0xa1b2..", "genesis_validators_root": "0x0470.."}' --output activate.json
+mpc-admin sign --command activate.json --key alice.key --output activate-alice.json   # offline
+mpc-admin --nodes ... submit --command activate-alice.json --command activate-bob.json  # once, through consensus
 curl -s localhost:8081/api/v1/eth2/publicKeys          # ["0xa1b2.."] once activated
 curl -s localhost:8082/api/v1/eth2/sign/0xa1b2.. -H 'content-type: application/json' \
   -H 'accept: application/json' -d @tests/fixtures/web3signer/attestation.json
@@ -647,18 +673,25 @@ Signing an existing authorization costs one p2p round trip and four pairings.
 
 ## Limitations (next steps)
 
-- Static validator set, development keys, **no client authentication or rate limiting**: anyone who
-  can reach the HTTP port can have duties authorized and signed (within slashing protection), and
-  can burn a validator's slot or epoch with a duty for the wrong block or fork. The HTTP API
-  therefore binds to `127.0.0.1` only.
+- Static validator set, development keys, **no client authentication or rate limiting** for
+  signing: anyone who can reach the HTTP port can have duties authorized and signed (within
+  slashing protection and the time horizon), and can burn a validator's slot or epoch with a duty
+  for the wrong block or fork. The HTTP API therefore binds to `127.0.0.1` only. Protected
+  operations need the approvers' offline signatures; a threshold of compromised approver keys can
+  still perform them (no time lock, rotation or HSM; audit L-25).
+- The time horizon trusts each node's system clock: one wrong clock costs that node's votes, two or
+  more far ahead could let a far-future duty through (audit L-24). No trusted time source.
 - A whole-network rollback (every node restored to older storage) forgets slashing history and
   signs a conflicting duty (a double proposal is reproduced). It cannot be detected without state
   outside the nodes. An anchor design is proposed, not implemented
   ([docs/slashing-protection.md](docs/slashing-protection.md)).
-- Ethereum: mainnet preset only. No validator registrations, Phase 0 and Altair blocks or Gloas
-  types. Deposits only on a node started with `--enable-deposit-signing`, one deposit message per
-  key. The client's fork versions are trusted for the domain (the chain is the explicit
-  activation). EIP-3076 import is accepted for imported keys only, before their activation, and
+- Ethereum: mainnet preset only. No Phase 0 and Altair blocks, `BUILDER_REQUEST_AUTH` or Gloas
+  types. Builder registrations only under the approved registration policy; it does not cover the
+  fee recipient of a block the beacon node builds itself, and within the policy any API client can
+  choose among its fee recipients (audit L-27). Deposits only on a node started with `--enable-deposit-signing`, one deposit message per
+  key; exits and deposits only with the approvers' authorization. Only the fork versions of the
+  pinned schedule are signed (mainnet, Hoodi, or a devnet's `--eth-fork-schedule`), in the fork
+  forms Lighthouse sends. EIP-3076 import is accepted for imported keys only, before their activation, and
   cannot be undone (audit L-17); the export's compatibility with other signers is modeled, not tested. Only Lighthouse
   v8.3.2 has been run against the API, on a local devnet
   ([docs/ethereum-signing.md](docs/ethereum-signing.md#compatibility-evidence)).
@@ -678,13 +711,12 @@ Signing an existing authorization costs one p2p round trip and four pairings.
 - Replacing a lost keyholder (R2) restores the key's redundancy, not consensus: the committee
   stays A, B, C, D, so with D offline **losing another voter stops finalization** (and signing).
   The lost node's leader turns keep costing a 2 s timeout, until a reconfiguration (R3) replaces
-  it as a voter. The approval of new keyholders is a local file, a prototype safeguard behind an
-  unauthenticated admin API, not an authorization system. A new follower builds its state from the
+  it as a voter. New keyholders need the approvers' signatures and each dealer's local approval
+  file. A new follower builds its state from the
   retained history, or from a restored copy it cannot check (no state root)
   ([docs/resharing.md](docs/resharing.md#security-properties-and-limitations)).
 - Replacing a lost voter (R3) stops and restarts every node, with a signing pause of a few
-  seconds; anyone who reaches a node's API (or a faulty voter) can submit one, and only a configured
-  follower can be added, so an honest voter can be evicted (L-22). If the epoch's last block is
+  seconds; it needs the approvers' signatures, and only a configured follower can be added. If the epoch's last block is
   notarized but never finalized, an operator must restart the voters with `--close-epoch-at` (L-21)
   ([docs/reconfiguration.md](docs/reconfiguration.md#security-properties-and-limitations)).
   - Liveness: every participant must be online, and a single non-cooperating player can make a

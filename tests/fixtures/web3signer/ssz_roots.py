@@ -2,11 +2,13 @@
 code with the signer (Python standard library only), to cross-check fixtures whose root Web3Signer
 did not publish.
 
-    python3 -I ssz_roots.py [--minimal] FILE.json...
+    python3 -I ssz_roots.py [--minimal] [--genesis-fork-version 0x..] FILE.json...
     python3 -I ssz_roots.py --write-block-fixtures DIRECTORY
 
 Prints the computed signing root and the request's `signingRoot` for each file. `--minimal` uses
 the minimal preset's list and vector limits (Web3Signer's contribution example is written for it).
+`--genesis-fork-version` is the network's for a `VALIDATOR_REGISTRATION`, which carries none
+(default `0x00000001`, the network of Web3Signer's examples, as their `DEPOSIT` shows).
 `--write-block-fixtures` writes the per-fork BLOCK_V2 requests (see `block_fixtures`).
 """
 
@@ -127,6 +129,9 @@ DOMAINS = {
     "DEPOSIT": 3,
 }
 
+# DOMAIN_APPLICATION_BUILDER (builder-specs).
+APPLICATION_BUILDER = bytes([0, 0, 0, 1])
+
 
 def object_root_and_epoch(request, p):
     kind = request["type"]
@@ -189,16 +194,33 @@ def object_root_and_epoch(request, p):
             uint64(d["amount"]),
         )
         return root, 0
+    if kind == "VALIDATOR_REGISTRATION":
+        r = request["validator_registration"]
+        root = container(
+            hexbytes(r["fee_recipient"], 20).ljust(32, b"\0"),
+            uint64(r["gas_limit"]),
+            uint64(r["timestamp"]),
+            merkleize(pack(hexbytes(r["pubkey"], 48))),
+        )
+        return root, 0
     raise ValueError(f"unsupported type {kind}")
 
 
-def signing_root(request, p):
+def genesis_domain(domain_type, version):
+    """compute_domain with the genesis fork version and a zero genesis validators root."""
+    fork_data_root = container(hexbytes(version, 4).ljust(32, b"\0"), b"\0" * 32)
+    return domain_type + fork_data_root[:28]
+
+
+def signing_root(request, p, genesis_fork_version="0x00000001"):
     root, epoch = object_root_and_epoch(request, p)
     if request["type"] == "DEPOSIT":
         # compute_domain(DOMAIN_DEPOSIT): genesis fork version, zero genesis validators root.
         version = request["deposit"]["genesis_fork_version"]
-        fork_data_root = container(hexbytes(version, 4).ljust(32, b"\0"), b"\0" * 32)
-        return container(root, bytes([DOMAINS["DEPOSIT"], 0, 0, 0]) + fork_data_root[:28])
+        return container(root, genesis_domain(bytes([DOMAINS["DEPOSIT"], 0, 0, 0]), version))
+    if request["type"] == "VALIDATOR_REGISTRATION":
+        # compute_domain(DOMAIN_APPLICATION_BUILDER): the network's genesis fork version.
+        return container(root, genesis_domain(APPLICATION_BUILDER, genesis_fork_version))
     fork = request["fork_info"]["fork"]
     version = fork["previous_version"] if epoch < int(fork["epoch"]) else fork["current_version"]
     fork_data_root = container(
@@ -265,10 +287,15 @@ def main(args):
         return
     minimal = "--minimal" in args
     p = preset(minimal)
+    version = "0x00000001"
+    if "--genesis-fork-version" in args:
+        at = args.index("--genesis-fork-version")
+        version = args[at + 1]
+        args = args[:at] + args[at + 2 :]
     for path in (arg for arg in args if arg != "--minimal"):
         with open(path) as file:
             request = json.load(file)
-        computed = "0x" + signing_root(request, p).hex()
+        computed = "0x" + signing_root(request, p, version).hex()
         given = request.get("signingRoot")
         mark = "match" if computed == given else "DIFFERENT"
         print(f"{path}: computed {computed} given {given} {mark}")

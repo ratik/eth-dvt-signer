@@ -83,19 +83,22 @@ A finalization that does not verify is refused, so the request cannot be abused.
 ## Procedure
 
 1. Every node runs this version with the same `--participants` and `--followers`. E runs as a follower, has applied the finalized history, and holds a share of every active validator key (R2). Each node has a supervisor that restarts it when it exits.
-2. ```sh
-   mpc-admin --nodes 127.0.0.1:8080,127.0.0.1:8081,127.0.0.1:8082,127.0.0.1:8083,127.0.0.1:8084 replace-node --old 3 --new 4
+2. The reconfiguration is a protected operation ([administration.md](administration.md)): the approvers sign it offline.
+   ```sh
+   mpc-admin --nodes 127.0.0.1:8080,127.0.0.1:8081,127.0.0.1:8082,127.0.0.1:8083,127.0.0.1:8084 replace-node --old 3 --new 4 --output replace.json
+   mpc-admin sign --command replace.json --key alice.key --output replace-alice.json   # each approver, offline
+   mpc-admin --nodes ... replace-node --command replace-alice.json --command replace-bob.json
    ```
-   It checks that every answering node runs the same epoch and that the change follows the rules. It warns if:
+   Both runs check that every answering node runs the same epoch and that the change follows the rules. They warn if:
    - D still answers;
    - E is behind or holds no share of an active key;
    - a node does not answer.
 
-   It then submits the reconfiguration through a voter, follows each node through its stop and restart, and waits until the new epoch finalizes a block.
+   The first run drafts the reconfiguration (the next epoch, the network's next administrative nonce). The second submits it with its approvals through a voter, follows each node through its stop and restart, and waits until the new epoch finalizes a block.
 3. If it does not complete: `mpc-admin resume` (idempotent; it never submits anything).
 4. Keep D off, or let it come back as a follower of the new epoch (step 3 brings it there).
 
-Signing pauses from T's finalization until the new epoch's first finalization: the restarts plus a view or two. Requests in flight at the stop get an error. Lighthouse retries, and a repeated request returns the same authorization and signature.
+Signing pauses from T's finalization until the new epoch's first finalization: the restarts plus a view or two. Requests in flight at the stop get an error. A repeated request returns the same authorization and signature, but Lighthouse does not repeat a failed signing request. In devnet run J (`20261107T082254Z`) the switch took about 5 s and 7 requests failed: selection proofs, a sync committee message and a contribution. No attestation or block request failed ([ethereum-devnet.md](ethereum-devnet.md#approved-deposit-and-pinned-fork-schedule-run-j)).
 
 ## Signing and slashing protection
 
@@ -107,14 +110,15 @@ Signing pauses from T's finalization until the new epoch's first finalization: t
 ## Security properties and limitations
 
 - **Byzantine model.** At most one faulty voter per committee. A faulty leader that builds on T is refused (R3-8); a faulty D cannot reach a quorum in either epoch.
-- **Who may reconfigure.** The admin API is unauthenticated, so anyone who reaches a node's API, or a faulty voter as leader, can submit a reconfiguration.
-  - Only a configured follower can be added, so an unknown key never becomes a voter.
-  - An honest voter can be removed in favor of a configured follower. That is an availability risk (L-22), not a safety break while each committee has at most one faulty member.
-  - There is no governance and no operator approval of the new committee.
+- **Who may reconfigure.** Only the approvers: a threshold of their offline signatures over the exact change, with the network's next administrative nonce ([administration.md](administration.md)). Every honest voter checks them before voting.
+  - A bare `Reconfigure` (as before this version) ends nothing: honest voters refuse its block, and the terminal guard recognizes only an approved one, with approvals that verify on that node.
+  - A reconfiguration whose nonce is used or skipped is never voted for, so a stale or replayed one cannot freeze an epoch (test `admin_2`).
+  - Only a configured follower can be added, so an unknown key never becomes a voter, even with approvals.
+  - Compromised approvers (a threshold of them) can still remove an honest voter (L-22). There is no time lock or governance.
 - **Stalled last block** (L-21): needs the closing restart above, by an operator.
 - **Restored backups** (L-23): a node restored from a copy taken before the switch replays epoch 0 harmlessly (no epoch-0 quorum is left). But at its restart in epoch 1 it has no epoch-1 journal, although the real node may have voted in epoch 1. The missing-journal check cannot see this, because the node has no epoch-1 history yet. As before, never restore a consensus journal (L-7).
 - **Retention.** A node behind by more than the retained history (`--retain-blocks`) cannot fetch the block that ended its epoch, as for any lagging node.
-- **Upgrade first.** Every node must run this version before the first reconfiguration (new command, new channels). Before one exists, the state is unchanged and an older binary still reads it.
+- **Upgrade first.** Every node must run this version before the first reconfiguration (new command, new channels), with the same approver file (`--approvers`). Before one exists, the state is unchanged and an older binary still reads it.
 
 ## Tests
 

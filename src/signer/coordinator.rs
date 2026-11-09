@@ -18,12 +18,15 @@
 
 use super::wire::{self, AuthorizationRef, Refusal, Request};
 use crate::{
+    admin::Endorsement,
     dkg::{self, CeremonyId, DkgStatus, Variant, ceremony::Ceremony, signing},
     eth::{
         duty::{DutyRequest, ValidatorKey, format_root, format_validator},
+        horizon::{Beyond, Horizon, WrongFork},
+        registration::{self, Refusal as RegistrationRefusal},
         types::Root,
     },
-    executor::{self, DutyCheck, DutyReceipt, Lookup, Receipt},
+    executor::{self, DutyCheck, DutyReceipt, Lookup, Overloaded, Receipt},
     hooks,
     readiness::{Readiness, Reason},
     slashing::{Decision, Refusal as DutyRefusal},
@@ -168,6 +171,27 @@ pub enum SignError {
     /// Slashing protection (or another rule of the replicated state) refuses the duty.
     #[error("refused by slashing protection: {0}")]
     Refused(DutyRefusal),
+    /// The duty is new and beyond this node's time horizon (`eth::horizon`): not submitted.
+    #[error("{0}")]
+    Beyond(Beyond),
+    /// A voluntary exit or a deposit whose signing root is not approved, sent without the
+    /// approvers' authorization (P0.2): not submitted.
+    #[error(
+        "a voluntary exit or a deposit needs the approvers' authorization (mpc-admin draft \
+         sign-exit or sign-deposit, sign, submit; docs/administration.md)"
+    )]
+    NotApproved,
+    /// The duty's `fork_info` is not this node's network's (`eth::network`, P0.3): not
+    /// submitted, not signed.
+    #[error("{0}")]
+    WrongFork(WrongFork),
+    /// A builder registration the policy in force, or its window, refuses (`eth::registration`):
+    /// not submitted, not signed, a retry of an authorized one included.
+    #[error("refused by the registration policy: {0}")]
+    Registration(RegistrationRefusal),
+    /// Too many builder registrations wait for consensus on this node: retry later.
+    #[error("{0}")]
+    Overloaded(Overloaded),
 }
 
 /// What to sign.
@@ -175,24 +199,28 @@ pub enum SignError {
 enum Work {
     /// An arbitrary payload under a `(ceremony, nonce)` authorization (development keys).
     Payload(SignRequest),
-    /// A validator duty, and the signing root the client expects, if it sent one.
-    Duty(Box<DutyRequest>, Option<Root>),
+    /// A validator duty, the signing root the client expects, if it sent one, and the approvals
+    /// of an exit or a deposit.
+    Duty(Box<DutyRequest>, Option<Root>, Option<Endorsement>),
 }
 
-/// Identical requests in flight share one task.
+/// Identical requests in flight share one task (requests with approvals by their nonce).
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum Identity {
     Payload(SignRequest),
-    Duty(ValidatorKey, Root, Option<Root>),
+    Duty(ValidatorKey, Root, Option<Root>, Option<u64>),
 }
 
 impl Work {
     fn identity(&self) -> Identity {
         match self {
             Self::Payload(request) => Identity::Payload(request.clone()),
-            Self::Duty(request, expected) => {
-                Identity::Duty(request.validator, request.signing_root(), *expected)
-            }
+            Self::Duty(request, expected, endorsement) => Identity::Duty(
+                request.validator,
+                request.signing_root(),
+                *expected,
+                endorsement.as_ref().map(|endorsement| endorsement.nonce),
+            ),
         }
     }
 }
@@ -234,13 +262,16 @@ impl Client {
 
     /// Authorize (if needed, under slashing protection) and sign a validator duty with the key of
     /// `request.validator`. `expected` is the client's signing root: refused unless it is the
-    /// duty's.
+    /// duty's. An exit or a deposit is submitted only with `endorsement`, the approvers'
+    /// authorization; one whose root is approved already is signed again without.
     pub async fn sign_duty(
         &self,
         request: DutyRequest,
         expected: Option<Root>,
+        endorsement: Option<Endorsement>,
     ) -> Result<Signed, SignError> {
-        self.submit(Work::Duty(Box::new(request), expected)).await
+        self.submit(Work::Duty(Box::new(request), expected, endorsement))
+            .await
     }
 
     async fn submit(&self, work: Work) -> Result<Signed, SignError> {
@@ -328,6 +359,8 @@ impl Drop for Registration<'_> {
 struct Deps<S> {
     me: PublicKey,
     config: Config,
+    /// The time horizon of the new duty authorizations it submits.
+    horizon: Horizon,
     executor: mpsc::UnboundedSender<executor::Message>,
     keyholder: mpsc::UnboundedSender<dkg::actor::Message>,
     sender: S,
@@ -346,10 +379,12 @@ pub struct Coordinator<E: Clock + Spawner, S: Sender<PublicKey = PublicKey>> {
 }
 
 impl<E: Clock + Spawner, S: Sender<PublicKey = PublicKey>> Coordinator<E, S> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         context: E,
         me: PublicKey,
         config: Config,
+        horizon: Horizon,
         executor: mpsc::UnboundedSender<executor::Message>,
         keyholder: mpsc::UnboundedSender<dkg::actor::Message>,
         sender: S,
@@ -368,6 +403,7 @@ impl<E: Clock + Spawner, S: Sender<PublicKey = PublicKey>> Coordinator<E, S> {
             deps: Deps {
                 me,
                 config,
+                horizon,
                 executor,
                 keyholder,
                 sender,
@@ -410,7 +446,7 @@ impl<E: Clock + Spawner, S: Sender<PublicKey = PublicKey>> Coordinator<E, S> {
             self.context.child("sign").spawn(move |context| async move {
                 let result = match job.work {
                     Work::Payload(request) => sign(&context, &deps, request).await,
-                    Work::Duty(request, expected) => {
+                    Work::Duty(request, expected, endorsement) => {
                         let started = context.current();
                         let (validator, duty, slot, epoch) = (
                             format_validator(&request.validator),
@@ -418,7 +454,8 @@ impl<E: Clock + Spawner, S: Sender<PublicKey = PublicKey>> Coordinator<E, S> {
                             request.duty.slot(),
                             request.duty.epoch(),
                         );
-                        let result = sign_duty(&context, &deps, *request, expected).await;
+                        let result =
+                            sign_duty(&context, &deps, *request, expected, endorsement).await;
                         // Successes are logged by `sign_duty` ("signed validator duty").
                         if let Err(error) = &result {
                             warn!(
@@ -632,15 +669,20 @@ async fn check_duty(
 async fn submit_duty(
     executor: &mpsc::UnboundedSender<executor::Message>,
     request: DutyRequest,
+    endorsement: Option<Endorsement>,
 ) -> Result<DutyReceipt, SignError> {
     let (response, receiver) = oneshot::channel();
     executor
         .send(executor::Message::SubmitDuty {
             request: Box::new(request),
+            endorsement,
             response,
         })
         .map_err(|_| SignError::Stopped)?;
-    receiver.await.map_err(|_| SignError::Stopped)
+    receiver
+        .await
+        .map_err(|_| SignError::Stopped)?
+        .map_err(SignError::Overloaded)
 }
 
 /// Sign a validator duty: its signing root is authorized by the replicated state machine (which
@@ -650,6 +692,7 @@ async fn sign_duty<E: Clock, S: Sender<PublicKey = PublicKey>>(
     deps: &Deps<S>,
     request: DutyRequest,
     expected: Option<Root>,
+    endorsement: Option<Endorsement>,
 ) -> Result<Signed, SignError> {
     let received = context.current();
     let mut timings = Timings::default();
@@ -659,15 +702,45 @@ async fn sign_duty<E: Clock, S: Sender<PublicKey = PublicKey>>(
     //    is final: slashing history only grows.
     let check = check_duty(&deps.executor, request.clone()).await?;
     let validator = check.validator.ok_or(SignError::UnknownValidator)?;
+    // 0. The domain is the pinned network's, never the client's choice (P0.3): checked for every
+    //    request, new or authorized; voters check it again for a new one.
+    deps.horizon.fork(&request).map_err(SignError::WrongFork)?;
     if expected.is_some_and(|expected| expected != check.signing_root) {
         return Err(SignError::RootMismatch(check.signing_root));
     }
+    // A builder registration only while the policy in force allows it and its timestamp is in
+    // the window, checked before any answer: a retry of one authorized before a policy change
+    // gets no signature from this node either (`eth::registration`).
+    if let Some(registration) = request.duty.registration() {
+        registration::check(
+            check.policy.as_ref(),
+            registration,
+            hooks::clock(context.current()),
+            Horizon::ADMISSION,
+        )
+        .map_err(SignError::Registration)?;
+    }
+    // An exit or a deposit is signed only once approved: an approved one again (a retry), any
+    // other only with the approvers' authorization, which approves it.
+    let approval = request.duty.kind().needs_approval();
     let (signing_root, height, kind) = match (check.decision, check.height) {
-        (Decision::AlreadyAccepted, Some(height)) => {
+        (Decision::AlreadyAccepted, Some(height)) if !approval || check.approved => {
             (check.signing_root, height, AuthorizationKind::Existing)
         }
         (Decision::Refused(refusal), _) => return Err(SignError::Refused(refusal)),
+        _ if approval && endorsement.is_none() => return Err(SignError::NotApproved),
         _ => {
+            // A new authorization: nothing beyond the horizon is submitted (voters refuse it
+            // too). A committed one above was decided already.
+            if !hooks::no_horizon() {
+                deps.horizon
+                    .duty(
+                        &request,
+                        hooks::clock(context.current()),
+                        Horizon::ADMISSION,
+                    )
+                    .map_err(SignError::Beyond)?;
+            }
             let blockers = submission_readiness(context, &deps.executor)
                 .await?
                 .submission_blockers();
@@ -676,7 +749,7 @@ async fn sign_duty<E: Clock, S: Sender<PublicKey = PublicKey>>(
             }
             let submitted = context.current();
             let receipt = select! {
-                receipt = submit_duty(&deps.executor, request.clone()) => { receipt? },
+                receipt = submit_duty(&deps.executor, request.clone(), endorsement) => { receipt? },
                 _ = context.sleep(deps.config.authorization_timeout) => {
                     return Err(SignError::AuthorizationTimeout);
                 },

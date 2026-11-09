@@ -48,6 +48,7 @@ repaired.
 | Consensus epochs follow from the committee | the state's epoch records do not follow, one by one, from `--participants` | the command line names another original committee than the one this state's epochs come from |
 | Epoch boundary matches the history | in an epoch after the first: the stored block at the epoch's start differs from the recorded one, or a finalization of an earlier epoch is stored above it | the previous epoch would have finalized past its last block; marshal could hand such a block to the executor as this epoch's |
 | Closing height reachable | `--close-epoch-at` at or below the state's height | the node would never reach it, so never stop |
+| Approver set unchanged | the state applied a protected command under an approver set, and the node is started with another one or without `--approvers` | it would refuse, or accept, protected commands differently from the network; restore the network's approver file ([administration.md](administration.md)) |
 
 The executor keeps the run-time check of BUG-2: a finalized block delivered at a height other than
 the next one stops the node.

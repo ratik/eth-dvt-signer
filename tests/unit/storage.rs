@@ -113,6 +113,147 @@ fn survives_restart() {
     });
 }
 
+mod administration {
+    use super::*;
+    use crate::{
+        admin::{AdminRecord, Administration, Approvers},
+        slashing::ChainIdentity,
+        types::Authorized,
+    };
+    use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
+
+    pub(super) fn administration(committee: &Set<PublicKey>) -> Administration {
+        let approvers = (100..103)
+            .map(|seed| PrivateKey::from_seed(seed).public_key())
+            .collect();
+        Administration::new(Approvers::new(2, approvers).unwrap(), committee)
+    }
+
+    fn activation(byte: u8) -> Command {
+        Command::ActivateValidator {
+            validator: [byte; 48],
+            chain: ChainIdentity {
+                genesis_validators_root: [1; 32],
+            },
+        }
+    }
+
+    /// `command` approved by the approvers of `seeds` with `nonce`.
+    pub(super) fn approved(
+        admin: &Administration,
+        nonce: u64,
+        command: Command,
+        seeds: &[u64],
+    ) -> Transaction {
+        let mut approvals: Vec<_> = seeds
+            .iter()
+            .map(|seed| {
+                admin
+                    .approve(&PrivateKey::from_seed(*seed), nonce, &command)
+                    .unwrap()
+            })
+            .collect();
+        approvals.sort_by_key(|approval| approval.approver);
+        tx(Command::Admin(Box::new(Authorized {
+            nonce,
+            command,
+            approvals,
+        })))
+    }
+
+    /// P0 test 16: the administrative nonce is committed with its block and restored on restart,
+    /// with the approver set it was applied under. A bare protected command from history applies
+    /// as before and uses no nonce.
+    #[test]
+    fn the_nonce_survives_restart() {
+        deterministic::Runner::default().start(|mut context| async move {
+            let committee = committee(&signers());
+            let admin = administration(&committee);
+            let mut store = Store::init(context.child("first"), "node", committee.clone())
+                .await
+                .unwrap();
+            store.administer(Some(admin.clone()));
+            assert_eq!(store.admin(), AdminRecord::default());
+            let block = Sha256::hash(&[b"block"]);
+            let applied = store
+                .apply_block(
+                    1,
+                    &block,
+                    &[
+                        approved(&admin, 1, activation(1), &[100, 101]),
+                        tx(activation(2)),
+                        approved(&admin, 2, activation(3), &[101, 102]),
+                    ],
+                    &mut context,
+                )
+                .await
+                .unwrap();
+            // Unknown keys: refused, as without approvals; the nonces are used all the same.
+            assert_eq!(applied.effects.len(), 3);
+            let record = AdminRecord {
+                nonce: 2,
+                approvers: admin.approvers().digest(),
+                ..AdminRecord::default()
+            };
+            assert_eq!(store.admin(), record);
+            drop(store);
+
+            let mut store = Store::init(context.child("second"), "node", committee)
+                .await
+                .unwrap();
+            assert_eq!(store.admin(), record);
+            store.administer(Some(admin.clone()));
+            store
+                .apply_block(
+                    2,
+                    &block,
+                    &[approved(&admin, 3, activation(4), &[100, 102])],
+                    &mut context,
+                )
+                .await
+                .unwrap();
+            assert_eq!(store.admin().nonce, 3);
+        });
+    }
+
+    /// A finalized protected command this node cannot admit stops it rather than diverge.
+    fn refused(transaction: impl FnOnce(&Administration) -> Transaction, configured: bool) {
+        deterministic::Runner::default().start(|mut context| async move {
+            let committee = committee(&signers());
+            let admin = administration(&committee);
+            let mut store = Store::init(context.child("store"), "node", committee)
+                .await
+                .unwrap();
+            store.administer(configured.then(|| admin.clone()));
+            let block = Sha256::hash(&[b"block"]);
+            let _ = store
+                .apply_block(1, &block, &[transaction(&admin)], &mut context)
+                .await;
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "administrative nonce 2, the next is 1")]
+    fn a_skipped_nonce_stops_the_node() {
+        refused(|admin| approved(admin, 2, activation(1), &[100, 101]), true);
+    }
+
+    #[test]
+    #[should_panic(expected = "does not verify here")]
+    fn too_few_approvals_stop_the_node() {
+        refused(|admin| approved(admin, 1, activation(1), &[100]), true);
+    }
+
+    #[test]
+    #[should_panic(expected = "has no approver set")]
+    fn a_node_without_approvers_stops() {
+        refused(
+            |admin| approved(admin, 1, activation(1), &[100, 101]),
+            false,
+        );
+    }
+}
+
 #[test]
 fn refuses_format_1_state() {
     deterministic::Runner::default().start(|context| async move {
@@ -141,7 +282,9 @@ mod validator {
     use crate::{
         eth::{
             duty::{Duty, DutyRequest, Fork, ForkInfo},
-            types::{AttestationData, BeaconBlockHeader, Checkpoint},
+            types::{
+                AttestationData, BeaconBlockHeader, Checkpoint, DepositMessage, VoluntaryExit,
+            },
         },
         slashing::{ActivationRefusal, Refusal},
     };
@@ -186,6 +329,9 @@ mod validator {
             validator: key,
             round: 0,
             signing_root: request.signing_root(),
+            kind: request.duty.kind(),
+            period: request.duty.protection().period(),
+            terms: request.duty.registration().map(Into::into),
         }
     }
 
@@ -452,6 +598,366 @@ mod validator {
         });
     }
 
+    /// P0.2 tests 1 to 4, 12 and 21 (storage): an exit or a deposit authorized bare (history
+    /// written before approvals existed) is recorded but never handed to the keyholder; one
+    /// authorized with approvals is, also after a restart. Approved later, the bare one is too.
+    #[test]
+    fn an_exit_or_a_deposit_is_signed_only_once_approved() {
+        deterministic::Runner::default().start(|mut context| async move {
+            let signers = signers();
+            let committee = committee(&signers);
+            let admin = super::administration::administration(&committee);
+            let mut store = Store::init(context.child("first"), "node", committee.clone())
+                .await
+                .unwrap();
+            store.administer(Some(admin.clone()));
+            let key = complete_validator(&mut context, &mut store, &signers).await;
+            let block = Sha256::hash(&[b"block"]);
+            let exit = |epoch| {
+                duty(
+                    key,
+                    Duty::VoluntaryExit(VoluntaryExit {
+                        epoch,
+                        validator_index: 7,
+                    }),
+                )
+            };
+            let deposit = DutyRequest {
+                validator: key,
+                fork: ForkInfo {
+                    fork: Fork {
+                        previous_version: [0, 0, 0, 1],
+                        current_version: [0, 0, 0, 1],
+                        epoch: 0,
+                    },
+                    genesis_validators_root: [0; 32],
+                },
+                duty: Duty::Deposit(DepositMessage {
+                    pubkey: key,
+                    withdrawal_credentials: [1; 32],
+                    amount: 32_000_000_000,
+                }),
+            };
+            let approved = |nonce, request: &DutyRequest| {
+                super::administration::approved(
+                    &admin,
+                    nonce,
+                    Command::Duty(Box::new(request.clone())),
+                    &[100, 101],
+                )
+            };
+            let (legacy, exit) = (exit(10), exit(11));
+            let applied = store
+                .apply_block(
+                    3,
+                    &block,
+                    &[
+                        activate(key, 9),
+                        submit(&legacy),
+                        approved(1, &exit),
+                        approved(2, &deposit),
+                    ],
+                    &mut context,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                applied.effects[1..],
+                [
+                    Effect::Duty(Decision::Accepted, legacy.signing_root()),
+                    Effect::Duty(Decision::Accepted, exit.signing_root()),
+                    Effect::Duty(Decision::Accepted, deposit.signing_root()),
+                ]
+            );
+            // The keyholder learns the approved ones only; the bare one is recorded (it counts
+            // against the epoch's roots) and never signed.
+            let signable = vec![authorized(key, &exit), authorized(key, &deposit)];
+            assert_eq!(applied.duties, signable);
+            assert_eq!(store.protection().authorized_duties(), signable);
+            assert_eq!(store.protection().authorized_at(&legacy), Some(3));
+            assert!(!store.protection().is_approved(&legacy));
+            assert!(store.protection().is_approved(&exit));
+            assert_eq!(
+                store
+                    .protection()
+                    .approval(0, &deposit.signing_root())
+                    .map(|approved| approved.nonce),
+                Some(2)
+            );
+            assert_eq!(store.admin().nonce, 2);
+            let protection = store.protection().clone();
+            drop(store);
+
+            // Restarted: the same approvals, so the same signable roots.
+            let mut store = Store::init(context.child("second"), "node", committee.clone())
+                .await
+                .unwrap();
+            store.administer(Some(admin.clone()));
+            assert_eq!(store.protection(), &protection);
+            assert_eq!(store.protection().authorized_duties(), signable);
+
+            // A bare repeat of the approved exit is a retry; the bare one approved later becomes
+            // signable (the same root, no new record).
+            let applied = store
+                .apply_block(
+                    4,
+                    &block,
+                    &[submit(&exit), approved(3, &legacy)],
+                    &mut context,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                applied.effects,
+                [
+                    Effect::Duty(Decision::AlreadyAccepted, exit.signing_root()),
+                    Effect::Duty(Decision::AlreadyAccepted, legacy.signing_root()),
+                ]
+            );
+            assert_eq!(
+                applied.duties,
+                vec![authorized(key, &exit), authorized(key, &legacy)]
+            );
+            assert_eq!(store.protection().validator(0).unwrap().records, 3);
+            assert_eq!(
+                store
+                    .protection()
+                    .approval(0, &legacy.signing_root())
+                    .map(|approved| approved.nonce),
+                Some(3)
+            );
+            drop(store);
+            let store = Store::init(context.child("third"), "node", committee)
+                .await
+                .unwrap();
+            assert_eq!(store.protection().authorized_duties().len(), 3);
+        });
+    }
+
+    /// Builder registrations (`eth::registration`): none without a policy; a policy applies from
+    /// the next transaction, in block order, so a registration after a policy change in the same
+    /// block is decided by the new policy and one before it by the old; a retry of an authorized
+    /// registration the policy in force no longer allows is refused; nothing limits distinct
+    /// registrations (a validator client signs one at each restart); a registration for another
+    /// key is refused. The policy and the registrations, with their terms for the keyholder,
+    /// survive a restart; a registration record that is not one of its validator's records stops
+    /// the node.
+    #[test]
+    fn registrations_follow_the_policy_in_force() {
+        use crate::eth::{
+            duty::DutyKind,
+            registration::{Policy, Terms},
+            types::ValidatorRegistration,
+        };
+        deterministic::Runner::default().start(|mut context| async move {
+            let signers = signers();
+            let committee = committee(&signers);
+            let admin = super::administration::administration(&committee);
+            let mut store = Store::init(context.child("first"), "node", committee.clone())
+                .await
+                .unwrap();
+            store.administer(Some(admin.clone()));
+            let key = complete_validator(&mut context, &mut store, &signers).await;
+            let block = Sha256::hash(&[b"block"]);
+            let genesis = ForkInfo {
+                fork: Fork {
+                    previous_version: [0, 0, 0, 1],
+                    current_version: [0, 0, 0, 1],
+                    epoch: 0,
+                },
+                genesis_validators_root: [0; 32],
+            };
+            let registration = |fee_recipient: u8, timestamp: u64| DutyRequest {
+                validator: key,
+                fork: genesis,
+                duty: Duty::ValidatorRegistration(ValidatorRegistration {
+                    fee_recipient: [fee_recipient; 20],
+                    gas_limit: 30_000_000,
+                    timestamp,
+                    pubkey: key,
+                }),
+            };
+            let policy = |fee_recipients: &[u8]| {
+                Policy::new(
+                    fee_recipients.iter().map(|byte| [*byte; 20]).collect(),
+                    30_000_000,
+                    60_000_000,
+                    30,
+                    3600,
+                )
+                .unwrap()
+            };
+            let set = |nonce, policy: Policy| {
+                super::administration::approved(
+                    &admin,
+                    nonce,
+                    Command::SetRegistrationPolicy(Box::new(policy)),
+                    &[100, 101],
+                )
+            };
+            let refused = |request: &DutyRequest| {
+                Effect::Duty(
+                    Decision::Refused(Refusal::RegistrationPolicy),
+                    request.signing_root(),
+                )
+            };
+            let accepted =
+                |request: &DutyRequest| Effect::Duty(Decision::Accepted, request.signing_root());
+
+            // No policy: refused. Then a policy of A (1): B (2) after it is refused, A accepted.
+            let (a1, b1) = (registration(1, 100), registration(2, 100));
+            let applied = store
+                .apply_block(
+                    3,
+                    &block,
+                    &[
+                        activate(key, 9),
+                        submit(&a1),
+                        set(1, policy(&[1])),
+                        submit(&b1),
+                        submit(&a1),
+                    ],
+                    &mut context,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                applied.effects[1..],
+                [
+                    refused(&a1),
+                    Effect::RegistrationPolicy(policy(&[1]).digest()),
+                    refused(&b1),
+                    accepted(&a1),
+                ]
+            );
+            assert_eq!(applied.registration_policy, Some(policy(&[1])));
+            assert_eq!(applied.duties, vec![authorized(key, &a1)]);
+            assert_eq!(
+                applied.duties[0].terms,
+                Some(Terms {
+                    fee_recipient: [1; 20],
+                    gas_limit: 30_000_000
+                })
+            );
+            assert_eq!(store.registration_policy(), Some(&policy(&[1])));
+
+            // A before a change to B's policy: decided by A's, accepted. After it: the retry of A
+            // is refused, B accepted.
+            let (a2, b2) = (registration(1, 200), registration(2, 200));
+            let applied = store
+                .apply_block(
+                    4,
+                    &block,
+                    &[submit(&a2), set(2, policy(&[2])), submit(&a1), submit(&b2)],
+                    &mut context,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                applied.effects,
+                [
+                    accepted(&a2),
+                    Effect::RegistrationPolicy(policy(&[2]).digest()),
+                    refused(&a1),
+                    accepted(&b2),
+                ]
+            );
+            assert_eq!(
+                applied.duties,
+                vec![authorized(key, &a2), authorized(key, &b2)]
+            );
+
+            // Twenty distinct registrations of B (twenty restarts of a validator client): all
+            // accepted; a retry of one is idempotent; one for another key is refused.
+            let many: Vec<DutyRequest> =
+                (0..20).map(|index| registration(2, 300 + index)).collect();
+            let mut other = registration(2, 400);
+            other.duty = Duty::ValidatorRegistration(ValidatorRegistration {
+                fee_recipient: [2; 20],
+                gas_limit: 30_000_000,
+                timestamp: 400,
+                pubkey: [9; 48],
+            });
+            let mut transactions: Vec<Transaction> = many.iter().map(submit).collect();
+            transactions.push(submit(&many[3]));
+            transactions.push(submit(&other));
+            let applied = store
+                .apply_block(5, &block, &transactions, &mut context)
+                .await
+                .unwrap();
+            assert!(
+                applied.effects[..20]
+                    .iter()
+                    .zip(&many)
+                    .all(|(effect, request)| *effect == accepted(request))
+            );
+            assert_eq!(
+                applied.effects[20..],
+                [
+                    Effect::Duty(Decision::AlreadyAccepted, many[3].signing_root()),
+                    Effect::Duty(
+                        Decision::Refused(Refusal::RegistrationForAnotherKey),
+                        other.signing_root()
+                    ),
+                ]
+            );
+            assert_eq!(store.protection().validator(0).unwrap().records, 23);
+            assert_eq!(store.protection().authorized_at(&a1), Some(3));
+            assert!(store.protection().export(0).blocks.is_empty());
+            let protection = store.protection().clone();
+            drop(store);
+
+            // Restarted: the same policy and registrations, terms included.
+            let store = Store::init(context.child("second"), "node", committee.clone())
+                .await
+                .unwrap();
+            assert_eq!(store.protection(), &protection);
+            assert_eq!(store.registration_policy(), Some(&policy(&[2])));
+            let registrations: Vec<_> = store
+                .protection()
+                .authorized_duties()
+                .into_iter()
+                .filter(|duty| duty.kind == DutyKind::ValidatorRegistration)
+                .collect();
+            assert_eq!(registrations.len(), 23);
+            assert!(registrations.iter().all(|duty| duty.terms.is_some()));
+            drop(store);
+
+            // A registration under a sequence number no record of its validator has: refused.
+            let mut metadata = Metadata::<_, Key, Value>::init(
+                context.child("tamper"),
+                Config {
+                    partition: "node-state".into(),
+                    codec_config: (),
+                },
+            )
+            .await
+            .unwrap();
+            let (root, registered) = protection
+                .registrations_of(0)
+                .next()
+                .map(|(root, registered)| (*root, *registered))
+                .unwrap();
+            metadata.put(
+                crate::storage::key(REGISTRATION_PREFIX, 0, 99),
+                Value::Registration(
+                    root,
+                    Registered {
+                        sequence: 99,
+                        ..registered
+                    },
+                ),
+            );
+            metadata.sync().await.unwrap();
+            assert!(matches!(
+                Store::init(context.child("third"), "node", committee)
+                    .await
+                    .map(|_| ()),
+                Err(Error::Slashing(_))
+            ));
+        });
+    }
+
     /// A validator stored by the version before activations is read as not activated, its
     /// chain kept only to check the activation.
     #[test]
@@ -615,7 +1121,7 @@ mod validator {
     #[test]
     fn altered_history_fails_closed() {
         type Tamper = fn(&mut Metadata<deterministic::Context, Key, Value>, ValidatorKey);
-        let cases: [(&str, Tamper); 9] = [
+        let cases: [(&str, Tamper); 10] = [
             ("proposal removed", |metadata, _| {
                 metadata.remove(&key(PROPOSAL_PREFIX, 0, 10));
             }),
@@ -668,6 +1174,20 @@ mod validator {
                         activation: None,
                         ..validator
                     }),
+                );
+            }),
+            // P0.2: an approval makes a root signable; one of a root never authorized is forged.
+            ("approval of an unauthorized exit", |metadata, _| {
+                let _ = metadata.put(
+                    key(APPROVAL_PREFIX, 0, 1),
+                    Value::Approval(
+                        [0xee; 32],
+                        crate::slashing::Approved {
+                            kind: DutyKind::VoluntaryExit,
+                            period: 10,
+                            nonce: 0,
+                        },
+                    ),
                 );
             }),
             ("attestation that surrounds another", |metadata, _| {
@@ -834,6 +1354,99 @@ mod validator {
             history_exported_after_stop: true,
             automatic_restart_disabled: true,
         };
+
+        /// P0.1 tests 18, 19, 25, 27 and 28 at the state machine: a history import from before
+        /// approvals existed still applies (bare, no nonce); an approved one applies as the
+        /// import itself, across a consensus epoch, and uses one nonce; one the state machine
+        /// refuses changes no floor (it still uses its nonce: voters cannot know an outcome
+        /// before applying it); a restart keeps floors and nonce.
+        #[test]
+        fn an_approved_import_applies_once_across_an_epoch() {
+            use crate::{
+                admin::AdminRecord,
+                storage::tests::administration::{administration, approved},
+                types::{Command, Reconfiguration},
+            };
+            use commonware_cryptography::Signer as _;
+            deterministic::Runner::default().start(|mut context| async move {
+                let signers = signers();
+                let committee = committee(&signers);
+                let admin = administration(&committee);
+                let block = Sha256::hash(&[b"block"]);
+                let manifest = manifest("imported", &committee, 1);
+                let key = manifest.validator;
+                let mut store = Store::init(context.child("first"), "node", committee.clone())
+                    .await
+                    .unwrap();
+                store.administer(Some(admin.clone()));
+                let floors = |store: &Store<_>| {
+                    let protection = store.protection();
+                    let (id, _) = protection.validator_of(&key).unwrap();
+                    protection.imported(id).unwrap().floors
+                };
+                let import =
+                    |slot, source, target| match history(key, 9, slot, source, target).command {
+                        command @ Command::ImportSlashingProtection(_) => command,
+                        _ => unreachable!(),
+                    };
+                let reconfigure = Command::Reconfigure(Box::new(Reconfiguration {
+                    epoch: 1,
+                    remove: committee.iter().next().unwrap().clone(),
+                    add: PrivateKey::from_seed(77).public_key(),
+                }));
+                let mut effects = Vec::new();
+                for (height, transactions) in [
+                    // Legacy history: bare, as before approvals existed.
+                    (1, vec![register(&manifest)]),
+                    (2, vec![history(key, 9, 100, 10, 11)]),
+                    // The end of consensus epoch 0, approved.
+                    (3, vec![approved(&admin, 1, reconfigure, &[100, 101])]),
+                    // In epoch 1: an approved import, then one for another chain.
+                    (
+                        4,
+                        vec![approved(&admin, 2, import(120, 12, 13), &[101, 102])],
+                    ),
+                    (
+                        5,
+                        vec![approved(
+                            &admin,
+                            3,
+                            match history(key, 8, 130, 13, 14).command {
+                                command @ Command::ImportSlashingProtection(_) => command,
+                                _ => unreachable!(),
+                            },
+                            &[100, 102],
+                        )],
+                    ),
+                ] {
+                    let applied = store
+                        .apply_block(height, &block, &transactions, &mut context)
+                        .await
+                        .unwrap();
+                    effects.push(applied.effects.into_iter().next().unwrap());
+                    if height == 2 {
+                        assert_eq!(store.admin(), AdminRecord::default());
+                    }
+                }
+                assert_eq!(effects[1], Effect::History(HistoryOutcome::Imported));
+                assert_eq!(effects[3], Effect::History(HistoryOutcome::Imported));
+                assert!(matches!(
+                    effects[4],
+                    Effect::History(HistoryOutcome::Refused(HistoryRefusal::OtherChain { .. }))
+                ));
+                assert_eq!(store.epochs().current().epoch, 1);
+                assert_eq!(store.admin().nonce, 3);
+                let imported = floors(&store);
+                assert_eq!(imported.block, Some(120));
+                drop(store);
+
+                let store = Store::init(context.child("second"), "node", committee)
+                    .await
+                    .unwrap();
+                assert_eq!(store.admin().nonce, 3);
+                assert_eq!(floors(&store), imported);
+            });
+        }
 
         /// Register an imported key at height 1, its history at 2, 3 acknowledgements at 3, and
         /// activate it at 4 (for the chain of [fork]). Returns its key.

@@ -29,7 +29,7 @@ use eth_mpc_signer::{
         Activation, ActivationOutcome, ActivationRefusal, ChainIdentity, Decision,
         Refusal as Slashing,
     },
-    types::{Outcome, SignRequest},
+    types::{Command, Outcome, SignRequest},
 };
 use std::{path::Path, time::Duration};
 
@@ -203,10 +203,7 @@ async fn validator(
     name: &str,
 ) -> ValidatorKey {
     let key = inactive_validator(context, cluster, name).await;
-    let receipt = cluster.clients[0]
-        .activate_validator(key, chain())
-        .await
-        .unwrap();
+    let receipt = cluster.activate(0, key, chain()).await.unwrap();
     assert_eq!(receipt.outcome, ActivationOutcome::Activated);
     let activation = wait_activated(context, cluster, key).await;
     assert_eq!(
@@ -221,7 +218,7 @@ async fn validator(
 
 async fn sign(cluster: &Cluster, via: usize, request: &DutyRequest) -> Result<Signed, SignError> {
     cluster.signers[via]
-        .sign_duty(request.clone(), Some(request.signing_root()))
+        .sign_duty(request.clone(), Some(request.signing_root()), None)
         .await
 }
 
@@ -273,8 +270,24 @@ fn signs_every_supported_duty() {
 
         for (index, name) in FIXTURES.iter().enumerate() {
             let (request, root) = fixture(name, key);
+            // A voluntary exit is signed only with the approvers' authorization (P0.2).
+            let endorsement = if request.duty.kind().needs_approval() {
+                assert!(
+                    matches!(
+                        cluster.signers[index % 4]
+                            .sign_duty(request.clone(), Some(root), None)
+                            .await,
+                        Err(SignError::NotApproved)
+                    ),
+                    "{name}"
+                );
+                let command = Command::Duty(Box::new(request.clone()));
+                Some(cluster.endorse(cluster.next_nonce().await, &command))
+            } else {
+                None
+            };
             let signed = cluster.signers[index % 4]
-                .sign_duty(request.clone(), Some(root))
+                .sign_duty(request.clone(), Some(root), endorsement)
                 .await
                 .unwrap_or_else(|err| panic!("{name}: {err}"));
             assert_eq!(signed.kind, AuthorizationKind::New, "{name}");
@@ -284,7 +297,7 @@ fn signs_every_supported_duty() {
             // The same duty again, through another node and without `signingRoot`: the same
             // signature, no new authorization.
             let again = cluster.signers[(index + 1) % 4]
-                .sign_duty(request, None)
+                .sign_duty(request, None, None)
                 .await
                 .unwrap();
             assert_eq!(again.kind, AuthorizationKind::Existing, "{name}");
@@ -375,7 +388,7 @@ fn slashing_protection_refuses_conflicting_duties() {
         // A signing root that is not the duty's is refused before anything is decided.
         let next = proposal(key, 66, 1);
         match cluster.signers[0]
-            .sign_duty(next.clone(), Some([0xee; 32]))
+            .sign_duty(next.clone(), Some([0xee; 32]), None)
             .await
         {
             Err(SignError::RootMismatch(computed)) => assert_eq!(computed, next.signing_root()),
@@ -540,7 +553,7 @@ fn byzantine_coordinators_cannot_sign_unauthorized_duties() {
         // state machine refuses it, and nobody signs it.
         let double = proposal(first, 10, 2);
         let receipt = cluster.clients[1]
-            .submit_duty(double.clone())
+            .submit_duty(double.clone(), None)
             .await
             .unwrap();
         assert_eq!(
@@ -568,12 +581,18 @@ fn authorization_outlives_its_coordinator() {
         // The coordinator died after consensus decided (an HTTP request that failed or timed out):
         // the authorization stands, and the conflict stays refused.
         let block = proposal(key, 20, 1);
-        let receipt = cluster.clients[0].submit_duty(block.clone()).await.unwrap();
+        let receipt = cluster.clients[0]
+            .submit_duty(block.clone(), None)
+            .await
+            .unwrap();
         assert_eq!(receipt.decision, Decision::Accepted);
         assert_eq!(receipt.authorized_at, Some(receipt.height));
         // The same duty submitted again is decided in a later block, and keeps the original
         // authorization.
-        let retry = cluster.clients[3].submit_duty(block.clone()).await.unwrap();
+        let retry = cluster.clients[3]
+            .submit_duty(block.clone(), None)
+            .await
+            .unwrap();
         assert_eq!(retry.decision, Decision::AlreadyAccepted);
         assert!(retry.height > receipt.height);
         assert_eq!(retry.authorized_at, Some(receipt.height));
@@ -651,8 +670,9 @@ fn slashing_history_survives_a_full_restart() {
             let entry = client.validators().await.unwrap()[0].clone();
             assert_eq!((entry.key, entry.activation), (key, Some(activation)));
         }
-        let receipt = cluster.clients[2]
-            .activate_validator(
+        let receipt = cluster
+            .activate(
+                2,
                 key,
                 ChainIdentity {
                     genesis_validators_root: [0x42; 32],
@@ -714,7 +734,10 @@ fn activation_is_explicit_decided_by_consensus_and_immutable() {
                 Err(SignError::Refused(Slashing::NotActivated))
             ));
         }
-        let receipt = cluster.clients[1].submit_duty(block.clone()).await.unwrap();
+        let receipt = cluster.clients[1]
+            .submit_duty(block.clone(), None)
+            .await
+            .unwrap();
         assert_eq!(receipt.decision, Decision::Refused(Slashing::NotActivated));
         nobody_signs(&cluster, KEY, key, block.signing_root()).await;
 
@@ -722,9 +745,20 @@ fn activation_is_explicit_decided_by_consensus_and_immutable() {
         let other = ChainIdentity {
             genesis_validators_root: [0x42; 32],
         };
+        // Approved with consecutive nonces: both apply, in nonce order.
+        let nonce = cluster.next_nonce().await;
+        let approved = |nonce, chain| {
+            Some(cluster.endorse(
+                nonce,
+                &Command::ActivateValidator {
+                    validator: key,
+                    chain,
+                },
+            ))
+        };
         let (a, b) = futures::join!(
-            cluster.clients[0].activate_validator(key, chain()),
-            cluster.clients[3].activate_validator(key, other)
+            cluster.clients[0].activate_validator(key, chain(), approved(nonce, chain())),
+            cluster.clients[3].activate_validator(key, other, approved(nonce + 1, other))
         );
         let (a, b) = (a.unwrap(), b.unwrap());
         let (winner, loser) = match (a.outcome, b.outcome) {
@@ -766,20 +800,14 @@ fn activation_is_explicit_decided_by_consensus_and_immutable() {
         ));
 
         // Immutable: the other chain is refused, the same one changes nothing.
-        let again = cluster.clients[2]
-            .activate_validator(key, loser)
-            .await
-            .unwrap();
+        let again = cluster.activate(2, key, loser).await.unwrap();
         assert_eq!(
             again.outcome,
             ActivationOutcome::Refused(ActivationRefusal::OtherChain {
                 genesis_validators_root: winner.genesis_validators_root
             })
         );
-        let same = cluster.clients[1]
-            .activate_validator(key, winner)
-            .await
-            .unwrap();
+        let same = cluster.activate(1, key, winner).await.unwrap();
         assert_eq!(
             same.outcome,
             ActivationOutcome::AlreadyActivated(activation)
@@ -797,10 +825,7 @@ fn stale_node_cannot_authorize_another_chain() {
         let key = inactive_validator(&context, &cluster, KEY).await;
 
         cluster.disconnect(3).await;
-        let receipt = cluster.clients[0]
-            .activate_validator(key, chain())
-            .await
-            .unwrap();
+        let receipt = cluster.activate(0, key, chain()).await.unwrap();
         assert_eq!(receipt.outcome, ActivationOutcome::Activated);
 
         let other = on_chain(
@@ -814,10 +839,11 @@ fn stale_node_cannot_authorize_another_chain() {
             Err(SignError::Refused(Slashing::NotActivated))
         ));
         // Submitted straight from the stale node, decided once ordered, with the activation.
-        let (receipt, ()) = futures::join!(cluster.clients[3].submit_duty(other.clone()), async {
-            context.sleep(Duration::from_secs(2)).await;
-            cluster.connect(3).await;
-        });
+        let (receipt, ()) =
+            futures::join!(cluster.clients[3].submit_duty(other.clone(), None), async {
+                context.sleep(Duration::from_secs(2)).await;
+                cluster.connect(3).await;
+            });
         assert_eq!(
             receipt.unwrap().decision,
             Decision::Refused(Slashing::OtherChain)

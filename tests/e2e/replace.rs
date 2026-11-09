@@ -6,7 +6,7 @@
 use crate::{
     eth2::{CHAIN, activation, attestation, block, refused, signed, signing_root},
     follower::{FOLLOWER, VOTERS},
-    harness::{TestNetwork, peer::FakePeer},
+    harness::{TestNetwork, approvers, peer::FakePeer},
     import::{
         ACKNOWLEDGED, CEREMONY as IMPORTED, PUBKEY as IMPORTED_KEY, import_network_with,
         interchange, original_signature, split,
@@ -137,10 +137,10 @@ fn replacement_with(env: impl Fn(usize) -> Vec<(String, String)>) -> Replacement
     network.wait_for_ready(&network.voters());
     network.start_validator_dkg(0, VALIDATOR);
     let key = network.wait_for_dkg(VALIDATOR, &network.voters());
-    let (status, activated) = network.post(
+    let (status, activated) = network.approved(
         0,
-        "/validators/activate",
-        &json!({ "public_key": key, "genesis_validators_root": CHAIN }),
+        "activate",
+        json!({ "public_key": key, "genesis_validators_root": CHAIN }),
     );
     assert_eq!(status, 200, "{activated}");
     for node in network.voters() {
@@ -230,11 +230,8 @@ impl Replacement {
     }
 
     fn replace(&self, via: usize, name: &str) -> (u16, Value) {
-        self.network.post(
-            via,
-            "/validators/reshare",
-            &self.body(name, &self.keyholders()),
-        )
+        self.network
+            .approved(via, "reshare", self.body(name, &self.keyholders()))
     }
 
     fn start(&self, via: usize, name: &str) -> Value {
@@ -538,7 +535,7 @@ fn r2_e2e_4_invalid_or_stale_membership() {
         )
     };
     let (d, f) = (seeded(D as u64), seeded(5));
-    let post = |body: Value| network.post(0, "/validators/reshare", &body);
+    let post = |body: Value| network.approved(0, "reshare", body);
     let with = |dealers: Vec<&String>, players: Vec<&String>| {
         let mut body = r2.body("validator-r2-bad", &[]);
         body["dealers"] = json!(dealers);
@@ -623,8 +620,16 @@ fn r2_e2e_4_invalid_or_stale_membership() {
     signed(network, 2, &r2.key, &block(50, 1));
 
     // The approved replacement, with replays from D's identity (a scripted peer in its place):
-    // its acknowledgement is not a keyholder's, a repeated start is the same reshare.
-    let started = r2.start(0, "validator-r2-g1");
+    // its acknowledgement is not a keyholder's; the start again, bare, is dropped for want of
+    // approvals, and with its approvals, for its used nonce (P0); through the API, `409`.
+    let approved = network.signed(
+        "reshare",
+        r2.body("validator-r2-g1", &r2.keyholders()),
+        network.next_nonce(),
+        &[0, 1],
+    );
+    let (status, started) = network.post_signed(0, &approved);
+    assert_eq!(status, 200, "{started}");
     let round = started["round"].as_u64().unwrap();
     let peer = FakePeer::start(network, D, &[], Box::new(|_, _, _| Vec::new()));
     let d_ack = acknowledgement(D as u64, round, session(&started), 7);
@@ -640,7 +645,7 @@ fn r2_e2e_4_invalid_or_stale_membership() {
         dealers: keys(&[0, 1, 2]),
         players: keys(&[0, 1, 2, E as u64]),
     };
-    let repeated = Transaction {
+    let bare = Transaction {
         id: 8,
         command: Command::StartResharing {
             validator: hex::decode(r2.key.trim_start_matches("0x"))
@@ -653,18 +658,37 @@ fn r2_e2e_4_invalid_or_stale_membership() {
     }
     .encode()
     .to_vec();
+    let replayed = Transaction {
+        id: 9,
+        command: Command::Admin(Box::new(approved.authorized(&approvers()).unwrap())),
+    }
+    .encode()
+    .to_vec();
     r2.wait(&KEYHOLDERS, "validator-r2-g1", "ready");
-    network.wait_until("node 0 to apply the replays", || {
+    network.wait_until("node 0 to ignore the replays", || {
         peer.send_on(engine::MEMPOOL_CHANNEL, 0, d_ack.clone());
-        peer.send_on(engine::MEMPOOL_CHANNEL, 0, repeated.clone());
+        peer.send_on(engine::MEMPOOL_CHANNEL, 0, bare.clone());
+        peer.send_on(engine::MEMPOOL_CHANNEL, 0, replayed.clone());
         let log = network.log(0);
         log.lines().any(|line| {
             line.contains("ignored share acknowledgement") && line.contains("not a participant")
-        }) && log
-            .lines()
-            .any(|line| line.contains("applied reshare start") && line.contains("Exists"))
+        }) && log.lines().any(|line| {
+            line.contains("dropping a transaction id=8")
+                && line.contains("a protected command without approvals")
+        }) && log.lines().any(|line| {
+            line.contains("id=9") && line.contains("protected command whose nonce is used")
+        })
     });
     drop(peer);
+    let (status, answer) = network.post_signed(1, &approved);
+    assert_eq!(status, 409, "{answer}");
+    assert!(
+        !network
+            .log(0)
+            .lines()
+            .any(|line| line.contains("applied reshare start") && line.contains("Exists")),
+        "a replay applied"
+    );
     let status = reshare_status(network, 0, "validator-r2-g1");
     assert_eq!(
         status["ready_shares"].as_array().unwrap().len(),
@@ -768,7 +792,12 @@ fn r2_e2e_6_slashing_protection_continuity() {
     });
     network.wait_for_ready(&network.voters());
     let (manifest, envelopes) = split(&network, &dir, IMPORTED, "shares");
-    assert_eq!(network.post(0, "/keys/import", &manifest).0, 200);
+    assert_eq!(
+        network
+            .approved(0, "register-import", json!({ "manifest": manifest }))
+            .0,
+        200
+    );
     for (node, envelope) in envelopes.iter().enumerate() {
         network.wait_until(&format!("the registration on node {node}"), || {
             network.get(node, &format!("/keys/import/{IMPORTED}")).0 == 200
@@ -782,11 +811,7 @@ fn r2_e2e_6_slashing_protection_continuity() {
         json!([{"slot": "100"}]),
         json!([{"source_epoch": "10", "target_epoch": "11"}]),
     );
-    let (status, imported) = network.post(
-        1,
-        "/slashing-protection/import",
-        &json!({"interchange": history}),
-    );
+    let (status, imported) = network.approved(1, "import-history", json!({"interchange": history}));
     assert_eq!(status, 200, "{imported}");
     network.wait_until("every share acknowledged", || {
         let (_, status) = network.get(0, &format!("/keys/import/{IMPORTED}"));
@@ -795,10 +820,10 @@ fn r2_e2e_6_slashing_protection_continuity() {
             .is_some_and(|ready| ready.len() == VOTERS)
     });
     let acknowledgment: Value = serde_json::from_str(ACKNOWLEDGED).unwrap();
-    let (status, activated) = network.post(
+    let (status, activated) = network.approved(
         0,
-        "/validators/activate",
-        &json!({"public_key": IMPORTED_KEY, "genesis_validators_root": CHAIN, "acknowledgment": acknowledgment}),
+        "activate",
+        json!({"public_key": IMPORTED_KEY, "genesis_validators_root": CHAIN, "acknowledgment": acknowledgment}),
     );
     assert_eq!(status, 200, "{activated}");
     for node in network.voters() {

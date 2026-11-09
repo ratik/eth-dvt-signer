@@ -164,12 +164,32 @@ fn block(height: u64, commands: Vec<Command>) -> Block {
     )
 }
 
-fn reconfigure(epoch: u64, remove: u64, add: u64) -> Command {
+fn bare_reconfigure(epoch: u64, remove: u64, add: u64) -> Command {
     Command::Reconfigure(Box::new(crate::types::Reconfiguration {
         epoch,
         remove: key(remove),
         add: key(add),
     }))
+}
+
+/// A reconfiguration with approvals (their signatures are the application's to check, not the
+/// epoch rules').
+fn reconfigure(epoch: u64, remove: u64, add: u64) -> Command {
+    Command::Admin(Box::new(crate::types::Authorized {
+        nonce: 1,
+        command: bare_reconfigure(epoch, remove, add),
+        approvals: Vec::new(),
+    }))
+}
+
+/// P0: a reconfiguration without approvals ends no epoch (honest voters refuse its block).
+#[test]
+fn a_bare_reconfiguration_ends_nothing() {
+    let epochs = Epochs::new(keys(&[0, 1, 2, 3]));
+    let bare = block(5, vec![bare_reconfigure(1, 3, 4)]);
+    assert_eq!(reconfiguration(&bare), None);
+    assert!(!is_terminal(&bare));
+    assert!(!epochs.ends_current(&bare));
 }
 
 #[test]

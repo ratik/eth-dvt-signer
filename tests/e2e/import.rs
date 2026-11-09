@@ -203,21 +203,24 @@ fn e2e_imp_1_an_imported_key_signs_only_once_safely_activated() {
     assert_eq!(code, 404, "{answer}");
 
     // Registration through any node, idempotent; the id and the key are registered once.
-    let (code, registered) = network.post(1, "/keys/import", &manifest);
+    let register = |via: usize, manifest: &Value| {
+        network.approved(via, "register-import", json!({ "manifest": manifest }))
+    };
+    let (code, registered) = register(1, &manifest);
     assert_eq!(code, 200, "{registered}");
     assert_eq!(registered["status"], "inactive");
     assert_eq!(registered["ready_shares"], json!([]));
-    let (code, again) = network.post(2, "/keys/import", &manifest);
+    let (code, again) = register(2, &manifest);
     assert_eq!(
         (code, &again["manifest_digest"]),
         (200, &registered["manifest_digest"]),
         "{again}"
     );
     let (resplit, _) = split(&network, &dir, CEREMONY, "resplit");
-    let (code, answer) = network.post(0, "/keys/import", &resplit);
+    let (code, answer) = register(0, &resplit);
     assert_eq!(code, 409, "same id, other split: {answer}");
     let (other_id, _) = split(&network, &dir, "imported-elsewhere", "other-id");
-    let (code, answer) = network.post(0, "/keys/import", &other_id);
+    let (code, answer) = register(0, &other_id);
     assert_eq!(code, 409, "same key, other id: {answer}");
     let mut tampered = manifest.clone();
     tampered["threshold"] = json!(2);
@@ -287,7 +290,7 @@ fn e2e_imp_1_an_imported_key_signs_only_once_safely_activated() {
         if let Some(acknowledgment) = acknowledgment {
             body["acknowledgment"] = serde_json::from_str(acknowledgment).unwrap();
         }
-        network.post(0, "/validators/activate", &body)
+        network.approved(0, "activate", body)
     };
     let (code, answer) = activate(None);
     assert_eq!(code, 400, "{answer}");
@@ -297,6 +300,30 @@ fn e2e_imp_1_an_imported_key_signs_only_once_safely_activated() {
         (409, Some("no_imported_history")),
         "{answer}"
     );
+
+    // A history whose latest block or vote has not started (a far-future watermark) would stop
+    // the key until then: refused, as a dry run and for real, and nothing is recorded (P0 test 10).
+    let far = interchange(
+        PUBKEY,
+        CHAIN,
+        json!([{"slot": "1000000000000"}]),
+        json!([{"source_epoch": "1000000000", "target_epoch": "1000000001"}]),
+    );
+    for body in [
+        json!({"interchange": far, "dry_run": true}),
+        json!({"interchange": far}),
+    ] {
+        let (code, answer) = network.post(1, "/slashing-protection/import", &body);
+        assert_eq!(code, 400, "{answer}");
+        assert!(
+            answer["error"]
+                .as_str()
+                .unwrap()
+                .contains("has not started"),
+            "{answer}"
+        );
+    }
+    assert_eq!(status(&network, 1)["history"]["imported"], false);
 
     // The previous signer's history: a dry run changes nothing; then the import, idempotent; a
     // history for another chain, or slashable in itself, is refused.
@@ -317,21 +344,63 @@ fn e2e_imp_1_an_imported_key_signs_only_once_safely_activated() {
         "{dry}"
     );
     assert_eq!(status(&network, 2)["history"]["imported"], false);
-    let (code, imported) = network.post(
-        2,
-        "/slashing-protection/import",
-        &json!({"interchange": history}),
+
+    // P0.1: the import needs the approvers' signatures over exactly this history. Refused without
+    // them, with approvals of another history or of another operation; nothing is recorded and
+    // no administrative nonce is used.
+    let nonce = network.next_nonce();
+    let import = json!({"interchange": history});
+    let refuse_import = |body: &Value, code: u16, why: &str| {
+        let (status, answer) = network.post(2, "/slashing-protection/import", body);
+        assert_eq!(status, code, "{answer}");
+        assert!(answer.to_string().contains(why), "expected {why}: {answer}");
+    };
+    refuse_import(&import, 403, "needs the approvers' authorization");
+    let approved = network.signed("import-history", import.clone(), nonce, &[0, 1]);
+    let mut moved = approved.body().unwrap();
+    moved["interchange"] = interchange(
+        PUBKEY,
+        CHAIN,
+        json!([{"slot": "99"}]),
+        json!([{"source_epoch": "10", "target_epoch": "11"}]),
     );
+    refuse_import(&moved, 403, "does not verify");
+    let signed_activation = network.signed(
+        "activate",
+        json!({"public_key": PUBKEY, "genesis_validators_root": CHAIN}),
+        nonce,
+        &[0, 1],
+    );
+    let mut misused = import.clone();
+    misused["authorization"] = signed_activation.body().unwrap()["authorization"].clone();
+    refuse_import(&misused, 403, "does not verify");
+    // Approved but invalid: far ahead, or for another chain; still refused.
+    let (code, answer) = network.approved(1, "import-history", json!({"interchange": far}));
+    assert_eq!(code, 400, "{answer}");
+    let (code, answer) = network.approved(
+        1,
+        "import-history",
+        json!({"interchange": interchange(PUBKEY, &format!("0x{}", "11".repeat(32)), json!([]), json!([]))}),
+    );
+    assert_eq!(code, 409, "{answer}");
+    assert_eq!(network.next_nonce(), nonce);
+    assert_eq!(status(&network, 2)["history"]["imported"], false);
+
+    // With them: imported, once. The same approvals again are used; a repeated import, newly
+    // approved, changes nothing.
+    let (code, imported) = network.post_signed(2, &approved);
     assert_eq!(
         (code, imported["outcome"].as_str()),
         (200, Some("imported")),
         "{imported}"
     );
-    let (code, again) = network.post(
-        3,
-        "/slashing-protection/import",
-        &json!({"interchange": history}),
-    );
+    for node in network.all() {
+        network.wait_until(&format!("the import's nonce on node {node}"), || {
+            network.get(node, "/admin").1["nonce"] == nonce
+        });
+    }
+    refuse_import(&approved.body().unwrap(), 409, "is used");
+    let (code, again) = network.approved(3, "import-history", import.clone());
     assert_eq!(
         (code, again["outcome"].as_str()),
         (200, Some("unchanged")),
@@ -385,6 +454,16 @@ fn e2e_imp_1_an_imported_key_signs_only_once_safely_activated() {
         (409, Some("not_acknowledged")),
         "{answer}"
     );
+    // P0 test 15: the complete acknowledgement without the approvers' authorization is refused,
+    // whatever the operator acknowledged; nothing is activated.
+    let (code, answer) = network.post(
+        0,
+        "/validators/activate",
+        &json!({"public_key": PUBKEY, "genesis_validators_root": CHAIN,
+                "acknowledgment": serde_json::from_str::<Value>(ACKNOWLEDGED).unwrap()}),
+    );
+    assert_eq!(code, 403, "{answer}");
+    assert!(activation(&network, 0, PUBKEY).is_none());
     let (code, activated) = activate(Some(ACKNOWLEDGED));
     assert_eq!(
         (
@@ -452,15 +531,22 @@ fn e2e_imp_1_an_imported_key_signs_only_once_safely_activated() {
         signed(&network, 0, PUBKEY, &next),
         json!(original_signature(&signing_root(&next)))
     );
+    let admin_nonce = network.get(0, "/admin").1["nonce"].clone();
     network.restart_node(3);
     network.wait_for_ready(&[3]);
     assert_eq!(status(&network, 3)["share"], "stored");
+    // P0.1: restarted, the imported floors and the administrative nonce are the same.
+    assert_eq!(network.get(3, "/admin").1["nonce"], admin_nonce);
+    assert_eq!(
+        status(&network, 3)["history"]["floors"],
+        json!({"block_slot": 100, "source_epoch": 10, "target_epoch": 11})
+    );
     let later = block(103, 1);
     signed(&network, 3, PUBKEY, &later);
 
     // A registration of the same key resets nothing.
-    assert_eq!(network.post(0, "/keys/import", &manifest).0, 200);
-    assert_eq!(network.post(0, "/keys/import", &other_id).0, 409);
+    assert_eq!(register(0, &manifest).0, 200);
+    assert_eq!(register(0, &other_id).0, 409);
     refused(&network, 1, PUBKEY, &block(101, 3), "double_proposal");
 
     // The export: the floors, then what the network signed above them.
@@ -544,9 +630,9 @@ fn e2e_imp_2_nodes_without_keys_and_dkg_keys() {
         "{answer}"
     );
     let body = json!({"public_key": key, "genesis_validators_root": CHAIN, "acknowledgment": serde_json::from_str::<Value>(ACKNOWLEDGED).unwrap()});
-    assert_eq!(network.post(0, "/validators/activate", &body).0, 400);
+    assert_eq!(network.approved(0, "activate", body).0, 400);
     let body = json!({"public_key": key, "genesis_validators_root": CHAIN});
-    assert_eq!(network.post(0, "/validators/activate", &body).0, 200);
+    assert_eq!(network.approved(0, "activate", body).0, 200);
     let (_, validators) = network.get(0, "/validators");
     assert_eq!(validators[0]["origin"], "dkg");
 }

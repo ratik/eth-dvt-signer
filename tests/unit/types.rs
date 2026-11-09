@@ -116,3 +116,38 @@ fn reconfigure_encoding() {
     );
     assert_eq!(Block::decode(block.encode()).unwrap(), block);
 }
+
+/// The builder registration policy command: tag 16, protected (bare it is refused in a new
+/// block; with approvals it decodes inside `Admin`), and only a valid policy decodes.
+#[test]
+fn registration_policy_encoding() {
+    let policy =
+        RegistrationPolicy::new(vec![[2; 20], [1; 20]], 30_000_000, 60_000_000, 30, 3600).unwrap();
+    let command = Command::SetRegistrationPolicy(Box::new(policy.clone()));
+    assert!(command.is_protected());
+    assert_eq!(command.registration_policy(), Some(&policy));
+    assert!(!command.is_registration());
+    let bytes = command.encode();
+    assert_eq!(bytes[0], 16);
+    assert_eq!(bytes.len(), command.encode_size());
+    assert_eq!(Command::decode(bytes.clone()).unwrap(), command);
+    // With approvals (an approver index and a signature: decoding checks only the shape).
+    let approved = Command::Admin(Box::new(Authorized {
+        nonce: 4,
+        command: command.clone(),
+        approvals: vec![Approval {
+            approver: 0,
+            signature: {
+                use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
+                PrivateKey::from_seed(1).sign(b"namespace", b"message")
+            },
+        }],
+    }));
+    assert_eq!(Command::decode(approved.encode()).unwrap(), approved);
+    assert_eq!(approved.registration_policy(), Some(&policy));
+    // A policy whose fee recipients are not sorted does not decode.
+    let mut unsorted = bytes.to_vec();
+    unsorted[2..22].copy_from_slice(&[2; 20]);
+    unsorted[22..42].copy_from_slice(&[1; 20]);
+    assert!(Command::decode(unsorted.as_slice()).is_err());
+}
