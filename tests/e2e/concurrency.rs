@@ -235,8 +235,10 @@ fn b4_cancellation() {
         assert_eq!(signed["authorization"], "EXISTING");
         assert_eq!(signed["height"], authorization["height"]);
     }
-    let (status, _) = network.get(1, &format!("/authorizations/{KEY}/203"));
-    assert_eq!(status, 200);
+    // Another node has it too, once it applied the block (node 0 answered as soon as it did).
+    network.wait_until("node 1 to apply authorization 203", || {
+        network.get(1, &format!("/authorizations/{KEY}/203")).0 == 200
+    });
 }
 
 /// E3: more distinct requests than the in-flight limit (256). Excess ones are refused at once,

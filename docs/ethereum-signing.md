@@ -259,7 +259,10 @@ Lighthouse v8.3 sends its new messages as remote-signing-api v1.4.0 defines them
   authorized. An envelope names its block's root: the state recomputes that block's signing root
   (`DOMAIN_BEACON_PROPOSER` at the payload's slot, under the envelope's checked `fork_info`) and
   signs the envelope only if this validator's authorized block of that slot has it. The binding is
-  in the replicated state, so it survives restarts.
+  in the replicated state, so it survives restarts. A node that has not applied the block yet
+  (asked a moment after another node signed it) does not refuse on its own: it submits the
+  envelope, and consensus, which orders it after the block, decides (`gloas::gl_5`). Every other
+  refusal its state gives is final at once, since slashing history only grows.
 - **Megabytes, not consensus.** An envelope carries its whole execution payload. The API node
   hashes it into a summary: the fields a rule reads as values, every other leaf of the payload as
   its root (`EnvelopeSummary`, 532 bytes). Only the summary enters consensus; its root is the
@@ -624,7 +627,7 @@ What still needs a running Lighthouse:
 | `BLOCK_V2` header, Gloas | Yes | the header's root as before (its body root is progressive; the header is unchanged) | Yes, one root per slot | Signed, double proposal (`gloas::gl_3`) |
 | `AGGREGATE_AND_PROOF` at a Gloas epoch (Gloas form), `_V2` `GLOAS` | Yes | Gloas `AggregateAndProof` and `Attestation` spec vectors (v1.7.0-beta.4) | Bounded | Signed; an Electra-rooted client root refused (`gloas::gl_3`) |
 | `PAYLOAD_ATTESTATION_MESSAGE` (Gloas) | Yes | `PayloadAttestationData` spec vectors; Web3Signer's request example (shape) | One root per slot | Signed, retried, a second vote refused (API and a faulty leader's block), before Gloas refused (`gloas::gl_1`) |
-| `EXECUTION_PAYLOAD_ENVELOPE` (Gloas) | Yes, self-built, under the registration policy | `ExecutionPayloadEnvelope`, `ExecutionPayload`, `ExecutionRequests` spec vectors through the summary; Web3Signer's request example (shape) | One root per slot, only for the validator's own block | Signed, retried, every refusal, a faulty leader's block, a faulty coordinator after a policy change, a 12 MB envelope, `413` (`gloas::gl_2`, `gl_4`) |
+| `EXECUTION_PAYLOAD_ENVELOPE` (Gloas) | Yes, self-built, under the registration policy | `ExecutionPayloadEnvelope`, `ExecutionPayload`, `ExecutionRequests` spec vectors through the summary; Web3Signer's request example (shape) | One root per slot, only for the validator's own block | Signed, retried, every refusal, a faulty leader's block, a faulty coordinator after a policy change, a 12 MB envelope, `413`, through a node that has not applied its block yet (`gloas::gl_2`, `gl_4`, `gl_5`) |
 | `PROPOSER_PREFERENCES` (Gloas) | Yes, under the registration policy | `ProposerPreferences` spec vectors; Web3Signer's request example (shape) | Bounded | Signed, re-signed for a new dependent root, policy refusals, before Gloas refused (`gloas::gl_3`) |
 | `BUILDER_REQUEST_AUTH`, `EXECUTION_PAYLOAD_BID` | No (400) | — | — | Refusal (unit) |
 

@@ -699,8 +699,10 @@ async fn sign_duty<E: Clock, S: Sender<PublicKey = PublicKey>>(
     let mut timings = Timings::default();
     hooks::pause_point(context, "received").await;
 
-    // 1. The committed decision, or consensus' decision if there is none yet. A refusal seen here
-    //    is final: slashing history only grows.
+    // 1. The committed decision, or consensus' decision if there is none yet. A refusal for a
+    //    record this node holds is final: slashing history only grows. One for a record it may
+    //    not have applied yet (an envelope's own block, signed through another node a moment
+    //    ago) is consensus' to decide: it orders the envelope after that block.
     let check = check_duty(&deps.executor, request.clone()).await?;
     let validator = check.validator.ok_or(SignError::UnknownValidator)?;
     // 0. The domain is the pinned network's, never the client's choice (P0.3): checked for every
@@ -727,7 +729,9 @@ async fn sign_duty<E: Clock, S: Sender<PublicKey = PublicKey>>(
         (Decision::AlreadyAccepted, Some(height)) if !approval || check.approved => {
             (check.signing_root, height, AuthorizationKind::Existing)
         }
-        (Decision::Refused(refusal), _) => return Err(SignError::Refused(refusal)),
+        (Decision::Refused(refusal), _) if !refusal.awaits_record() => {
+            return Err(SignError::Refused(refusal));
+        }
         _ if approval && endorsement.is_none() => return Err(SignError::NotApproved),
         _ => {
             // A new authorization: nothing beyond the horizon is submitted (voters refuse it

@@ -469,6 +469,14 @@ impl Refusal {
                 | Self::TargetAtOrBelowImported { .. }
         )
     }
+
+    /// Whether the refusal is for a record this state does not hold yet, rather than for one it
+    /// holds: an envelope's own block, authorized in a block a lagging node has not applied. A
+    /// node's own state cannot make it final; consensus, which orders the envelope after that
+    /// block, decides it.
+    pub const fn awaits_record(&self) -> bool {
+        matches!(self, Self::EnvelopeWithoutOwnBlock { .. })
+    }
 }
 
 /// Why an activation is refused.

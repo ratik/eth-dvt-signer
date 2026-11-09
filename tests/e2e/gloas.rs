@@ -614,3 +614,52 @@ fn gl_4_a_large_envelope() {
     // The node goes on.
     signed(&network, 1, &key, &ptc_vote(slot, true));
 }
+
+/// An envelope asked through a node that has not applied its block yet (node 3 holds the block
+/// that authorized it, as a node a moment behind would): its own state cannot refuse the envelope
+/// for a block it has not seen (`Refusal::awaits_record`), so it submits it, consensus orders it
+/// after the block, and it is signed. Without its block the state refuses it once decided
+/// (`gl_2`).
+#[test]
+fn gl_5_an_envelope_through_a_node_behind_its_block() {
+    let (network, key) = start(None);
+    set_policy(&network, 0, policy(&[A]), &network.all());
+    let hold = network.dir.join("hold-3");
+    network.restart_node_with(
+        3,
+        vec![
+            (
+                "ETH_MPC_SIGNER_HOLD_FILE".into(),
+                hold.display().to_string(),
+            ),
+            // Empty blocks still apply: node 3 stays within the backlog that lets it submit.
+            ("ETH_MPC_SIGNER_HOLD_FROM".into(), "transactions".into()),
+        ],
+    );
+    network.wait_for_ready(&network.all());
+    let height = network.height(0).unwrap();
+    network.wait_until("node 3 to catch up", || {
+        network.height(3).is_some_and(|applied| applied >= height)
+    });
+    std::fs::write(&hold, b"").unwrap();
+    network.wait_until("node 3 to hold blocks", || {
+        network.count(3, "test hook: holding block execution") > 0
+    });
+
+    let slot = GLOAS_SLOT + 500;
+    let block = gloas_block(slot, 1);
+    let body = envelope(slot, &block_root(&block), A, vec!["0x02f8".into()]);
+    signed(&network, 0, &key, &block);
+    let (status, answer) = std::thread::scope(|scope| {
+        let request = scope.spawn(|| network.eth2_sign(3, &key, &body));
+        std::thread::sleep(Duration::from_secs(2));
+        std::fs::remove_file(&hold).unwrap();
+        request.join().unwrap()
+    });
+    assert_eq!(status, 200, "node 3, behind the envelope's block: {answer}");
+    assert!(
+        ethereum_verify(&json!(key), &root(&body), &answer["signature"]),
+        "{answer}"
+    );
+    assert_eq!(signed(&network, 0, &key, &body), answer["signature"]);
+}
