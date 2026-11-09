@@ -34,6 +34,15 @@
 //! mpc-admin --nodes ... replace-node --old 3 --new 4 --output replace.json   # checks, drafts
 //! mpc-admin --nodes ... replace-node --command replace-1.json --command replace-2.json
 //! mpc-admin --nodes ... resume
+//!
+//! # The WORM anchor (docs/anchor.md): every node's latest record and the anchored marks; after a
+//! # rollback the nodes stopped for (exit status 77) and newer state is lost for good, draft the
+//! # approvers' acknowledgment, sign it like a command, and start the nodes with it.
+//! mpc-admin anchor check --anchor s3://bucket/prefix --cluster 0x.. --approvers approvers.json
+//! mpc-admin anchor acknowledge --anchor s3://bucket/prefix --cluster 0x.. \
+//!     --approvers approvers.json --output acknowledgment.json
+//! mpc-admin sign --command acknowledgment.json --key approver.key --output acknowledgment-1.json
+//! eth-mpc-signer ... --anchor s3://bucket/prefix --anchor-acknowledgment acknowledgment-signed.json
 //! ```
 //!
 //! Nothing the tool does decides safety: every voter checks the approvals and the nonce of a
@@ -53,6 +62,10 @@ use eth_mpc_signer::{
     admin::{
         Approvers, SignedCommand, duty_overview, duty_request, format_key, history_overview,
         signed_message,
+    },
+    anchor::{
+        self, AcknowledgmentDocument, AnchorStore, FAULTY, Marks, SignedRecord,
+        acknowledgment::{self, Acknowledgment},
     },
     eth::{
         duty::Duty,
@@ -224,6 +237,45 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         stall: u64,
     },
+    /// The WORM anchor (docs/anchor.md), read directly (credentials from the environment, as
+    /// the nodes').
+    Anchor {
+        #[command(subcommand)]
+        action: AnchorCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum AnchorCommand {
+    /// Every node's latest record, the acknowledgments, and the current generation's anchored
+    /// marks and gate height.
+    Check {
+        #[command(flatten)]
+        at: AnchorAt,
+        /// Check the acknowledgments' approvals (without, none is counted).
+        #[arg(long)]
+        approvers: Option<PathBuf>,
+    },
+    /// Draft the approvers' acknowledgment of a rollback: the next generation, under the current
+    /// one's anchored marks. Only once the newer state is lost for good (docs/anchor.md).
+    Acknowledge {
+        #[command(flatten)]
+        at: AnchorAt,
+        #[arg(long)]
+        approvers: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+}
+
+#[derive(clap::Args)]
+struct AnchorAt {
+    /// `s3://bucket/prefix`, `gs://bucket/prefix` or `file:///directory` (the nodes' `--anchor`).
+    #[arg(long)]
+    anchor: String,
+    /// The cluster id (`GET /admin`); default: the nodes' (`--nodes`).
+    #[arg(long)]
+    cluster: Option<String>,
 }
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -332,6 +384,16 @@ fn main() -> ExitCode {
             )
         }),
         Command::Resume { stall } => online(&nodes).and_then(|()| resume(&nodes, stall)),
+        Command::Anchor { action } => match action {
+            AnchorCommand::Check { at, approvers } => {
+                anchor_check(&nodes, &at, approvers.as_deref())
+            }
+            AnchorCommand::Acknowledge {
+                at,
+                approvers,
+                output,
+            } => anchor_acknowledge(&nodes, &at, &approvers, &output),
+        },
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -441,6 +503,9 @@ fn print_command(command: &SignedCommand) -> Result<(), String> {
 }
 
 fn show(paths: &[PathBuf], approvers: Option<&Path>) -> Result<(), String> {
+    if paths.first().is_some_and(|path| is_acknowledgment(path)) {
+        return show_acknowledgment(paths, approvers);
+    }
     let command = load_commands(paths)?;
     print_command(&command)?;
     let Some(path) = approvers else {
@@ -467,6 +532,9 @@ fn show(paths: &[PathBuf], approvers: Option<&Path>) -> Result<(), String> {
 }
 
 fn sign(path: &Path, key: &Path, output: &Path, yes: bool) -> Result<(), String> {
+    if is_acknowledgment(path) {
+        return sign_acknowledgment(path, key, output, yes);
+    }
     let mut command = load_command(path)?;
     let key = load_key(key)?;
     print_command(&command)?;
@@ -1003,6 +1071,22 @@ fn status(nodes: &[Node]) -> Result<(), String> {
             ),
             None => println!("{:<22} not answering", node.name),
         }
+        // The anchor (docs/anchor.md), if the node has one.
+        if let Some(anchor) = node
+            .get("/status")
+            .map(|status| status["anchor"].clone())
+            .filter(|anchor| !anchor.is_null())
+        {
+            println!(
+                "{:<22} anchor {}  generation {}  record {}  marks {}  anchored {}",
+                "",
+                anchor["state"].as_str().unwrap_or("?"),
+                anchor["generation"],
+                anchor["sequence"],
+                anchor["marks"],
+                anchor["anchored"],
+            );
+        }
     }
     if networks.len() > 1 {
         println!(
@@ -1374,4 +1458,311 @@ fn resume(nodes: &[Node], stall: u64) -> Result<(), String> {
          it is finalized (docs/reconfiguration.md, closing an epoch)"
     );
     Err("the epoch's last block is not finalized".into())
+}
+
+// ---------------------------------------------------------------------------------------------
+// The WORM anchor (docs/anchor.md)
+
+/// Whether `path` holds an acknowledgment of a rollback rather than a protected command.
+fn is_acknowledgment(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .is_some_and(|value| value["kind"] == acknowledgment::KIND)
+}
+
+/// Every copy of an acknowledgment merged into one, checked against its fields.
+fn load_acknowledgments(paths: &[PathBuf]) -> Result<AcknowledgmentDocument, String> {
+    let load = |path: &Path| {
+        let text =
+            std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
+        let document = AcknowledgmentDocument::from_json(&text)
+            .map_err(|err| format!("{}: {err}", path.display()))?;
+        document
+            .acknowledgment()
+            .map_err(|err| format!("{}: {err}", path.display()))?;
+        Ok::<_, String>(document)
+    };
+    let (first, rest) = paths.split_first().ok_or("no acknowledgment given")?;
+    let mut document = load(first)?;
+    for path in rest {
+        document
+            .merge(&load(path)?)
+            .map_err(|err| format!("{}: {err}", path.display()))?;
+    }
+    Ok(document)
+}
+
+fn print_acknowledgment(document: &AcknowledgmentDocument) -> Result<(), String> {
+    let message = document.acknowledgment()?.message();
+    println!("operation:   acknowledge a rollback (docs/anchor.md)");
+    println!("cluster:     {}", document.cluster_id);
+    println!("generation:  {}", document.generation);
+    println!(
+        "given up:    height {} (block {})",
+        document.height, document.digest
+    );
+    println!("description: {}", document.description);
+    println!(
+        "signed bytes SHA-256: 0x{} ({} bytes)",
+        hex::encode(Sha256::hash(&[message.as_slice()])),
+        message.len()
+    );
+    println!(
+        "signed bytes (namespace {}): {}",
+        String::from_utf8_lossy(acknowledgment::NAMESPACE),
+        document.message
+    );
+    println!("approvals:   {}", document.approvals.len());
+    Ok(())
+}
+
+fn show_acknowledgment(paths: &[PathBuf], approvers: Option<&Path>) -> Result<(), String> {
+    let document = load_acknowledgments(paths)?;
+    print_acknowledgment(&document)?;
+    let Some(path) = approvers else {
+        for approval in &document.approvals {
+            println!("  {} (not checked: no --approvers)", approval.approver);
+        }
+        return Ok(());
+    };
+    let text = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    let approvers = Approvers::from_json(&text)?;
+    let checks = document.check(&approvers)?;
+    let valid = checks.iter().filter(|check| check.is_ok()).count();
+    for (approval, check) in document.approvals.iter().zip(checks) {
+        match check {
+            Ok(()) => println!("  {} valid", approval.approver),
+            Err(err) => println!("  {} INVALID: {err}", approval.approver),
+        }
+    }
+    println!(
+        "{valid} valid approvals of {} required",
+        approvers.threshold()
+    );
+    Ok(())
+}
+
+fn sign_acknowledgment(path: &Path, key: &Path, output: &Path, yes: bool) -> Result<(), String> {
+    let mut document = load_acknowledgments(&[path.to_path_buf()])?;
+    let key = load_key(key)?;
+    print_acknowledgment(&document)?;
+    println!("signing as:  {}", format_key(&key.public_key()));
+    if !yes {
+        print!(
+            "Sign only if the newer state is lost for good: what was signed under it may be signed \
+             again differently by nobody, but it cannot be recovered. Type yes: "
+        );
+        io::stdout().flush().ok();
+        let mut answer = String::new();
+        io::stdin()
+            .lock()
+            .read_line(&mut answer)
+            .map_err(|err| err.to_string())?;
+        if answer.trim() != "yes" {
+            return Err("not signed".into());
+        }
+    }
+    document.sign(&key)?;
+    std::fs::write(output, document.to_json() + "\n")
+        .map_err(|err| format!("{}: {err}", output.display()))?;
+    println!("signed: {}", output.display());
+    Ok(())
+}
+
+/// The cluster id: `--cluster`, else the answering nodes'.
+fn anchor_cluster(nodes: &[Node], at: &AnchorAt) -> Result<Digest, String> {
+    match &at.cluster {
+        Some(cluster) => hex::decode(cluster.trim_start_matches("0x"))
+            .ok()
+            .and_then(|bytes| Digest::decode(bytes.as_slice()).ok())
+            .ok_or_else(|| format!("--cluster {cluster} is not 32 bytes of 0x-hex")),
+        None if nodes.is_empty() => Err("--cluster or --nodes is required".into()),
+        None => administration(nodes).map(|(cluster, _)| cluster),
+    }
+}
+
+/// What the anchor holds for a cluster.
+struct AnchorState {
+    /// Every node with records: its latest record, or why it does not verify.
+    nodes: Vec<(String, Result<Option<SignedRecord>, String>)>,
+    /// Every acknowledgment, with its verification (`None`: no approvers to check it).
+    acknowledgments: Vec<(
+        AcknowledgmentDocument,
+        Option<Result<Acknowledgment, String>>,
+    )>,
+}
+
+fn read_anchor_state(
+    location: &str,
+    cluster: &Digest,
+    approvers: Option<&Approvers>,
+) -> Result<AnchorState, String> {
+    let store = AnchorStore::open(location, cluster, &[]).map_err(|err| err.to_string())?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| err.to_string())?;
+    runtime.block_on(async {
+        let mut nodes = Vec::new();
+        for node in store.nodes().await.map_err(|err| err.to_string())? {
+            let latest = store.latest(&node).await.map_err(|err| err.to_string());
+            nodes.push((format_key(&node), latest));
+        }
+        let acknowledgments = store
+            .acknowledgments()
+            .await
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|document| {
+                let verified = approvers.map(|approvers| document.verify(approvers, cluster));
+                (document, verified)
+            })
+            .collect();
+        Ok(AnchorState {
+            nodes,
+            acknowledgments,
+        })
+    })
+}
+
+impl AnchorState {
+    /// The highest acknowledged generation and every acknowledged floor.
+    fn generation(&self) -> (u64, Marks) {
+        self.acknowledgments
+            .iter()
+            .filter_map(|(_, verified)| verified.as_ref()?.as_ref().ok())
+            .fold(
+                (0, Marks::default()),
+                |(generation, floor), acknowledgment| {
+                    (
+                        generation.max(acknowledgment.generation),
+                        floor.max(acknowledgment.marks),
+                    )
+                },
+            )
+    }
+
+    /// The current generation's view: its records, the anchored marks and the gate.
+    fn view(&self) -> anchor::View {
+        let (generation, floor) = self.generation();
+        let records = self
+            .nodes
+            .iter()
+            .filter_map(|(_, latest)| latest.as_ref().ok()?.clone())
+            .collect();
+        anchor::View::new(generation, records).with_floor(floor)
+    }
+}
+
+fn load_approvers(path: &Path) -> Result<Approvers, String> {
+    let text = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    Approvers::from_json(&text)
+}
+
+fn print_marks(marks: &Marks) -> String {
+    let mark = |value: Option<u64>| value.map_or_else(|| "-".to_string(), |v| v.to_string());
+    format!(
+        "block slot {}, source {}, target {}",
+        mark(marks.block_slot),
+        mark(marks.source),
+        mark(marks.target)
+    )
+}
+
+fn anchor_check(nodes: &[Node], at: &AnchorAt, approvers: Option<&Path>) -> Result<(), String> {
+    let cluster = anchor_cluster(nodes, at)?;
+    let approvers = approvers.map(load_approvers).transpose()?;
+    let state = read_anchor_state(&at.anchor, &cluster, approvers.as_ref())?;
+    println!("anchor {}  cluster 0x{}", at.anchor, hex::encode(cluster));
+    for (document, verified) in &state.acknowledgments {
+        let verdict = match verified {
+            None => "not checked: no --approvers".to_string(),
+            Some(Ok(_)) => "valid".to_string(),
+            Some(Err(err)) => format!("INVALID: {err}"),
+        };
+        println!(
+            "acknowledgment of generation {} ({}): {verdict}",
+            document.generation,
+            print_marks(&document.marks)
+        );
+    }
+    let (generation, _) = state.generation();
+    for (node, latest) in &state.nodes {
+        match latest {
+            Ok(Some(record)) => {
+                let record = &record.record;
+                println!(
+                    "{}  record {}  generation {}  height {}  block 0x{}  {}{}",
+                    short(node),
+                    record.sequence,
+                    record.generation,
+                    record.height,
+                    short(&hex::encode(record.digest)),
+                    print_marks(&record.marks),
+                    if record.generation == generation {
+                        ""
+                    } else {
+                        "  (another generation: not compared)"
+                    },
+                );
+            }
+            Ok(None) => println!("{}  no record", short(node)),
+            Err(err) => println!("{}  INVALID: {err}", short(node)),
+        }
+    }
+    let view = state.view();
+    println!(
+        "generation {generation}: {} records compared; anchored {}; gate height {} (a node signs \
+         once {} of the {} highest records lie on its chain)",
+        view.records().len(),
+        print_marks(&view.marks()),
+        view.gate_height()
+            .map_or_else(|| "none".to_string(), |height| height.to_string()),
+        FAULTY + 1,
+        2 * FAULTY + 1,
+    );
+    if approvers.is_none() && !state.acknowledgments.is_empty() {
+        println!("NOTE: acknowledgments not checked (--approvers): generation 0 assumed");
+    }
+    Ok(())
+}
+
+fn anchor_acknowledge(
+    nodes: &[Node],
+    at: &AnchorAt,
+    approvers: &Path,
+    output: &Path,
+) -> Result<(), String> {
+    let cluster = anchor_cluster(nodes, at)?;
+    let approvers = load_approvers(approvers)?;
+    let state = read_anchor_state(&at.anchor, &cluster, Some(&approvers))?;
+    let (generation, _) = state.generation();
+    let view = state.view();
+    // The state given up: the gate height, and the block the records name there.
+    let height = view.gate_height().unwrap_or(0);
+    let digest = view
+        .records()
+        .iter()
+        .find(|record| record.record.height == height)
+        .map_or_else(|| Digest::from([0; 32]), |record| record.record.digest);
+    let document = AcknowledgmentDocument::draft(&Acknowledgment {
+        cluster,
+        generation: generation + 1,
+        height,
+        digest,
+        marks: view.marks(),
+    });
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)
+        .and_then(|mut file| file.write_all((document.to_json() + "\n").as_bytes()))
+        .map_err(|err| format!("{}: {err}", output.display()))?;
+    print_acknowledgment(&document)?;
+    println!(
+        "draft: {} (each approver signs it offline: mpc-admin sign)",
+        output.display()
+    );
+    Ok(())
 }

@@ -2,6 +2,7 @@
 //! threshold signing of Ethereum signing roots, on a 4-node commonware network.
 
 pub mod admin;
+pub mod anchor;
 pub mod application;
 pub mod dkg;
 pub mod engine;

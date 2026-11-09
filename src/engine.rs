@@ -17,6 +17,10 @@
 //! (`participants`).
 
 use crate::{
+    anchor::{
+        AcknowledgmentDocument, AnchorError, AnchorStore, Marks, SignedRecord, Verdict, View,
+        Watch, keeper::Keeper,
+    },
     application::{Application, Committed, MAX_IDLE, Mempool, Rules, Scheme},
     dkg::{self, DkgStatus, secrets::Secrets},
     epochs::{EpochRecord, Epochs, Heights, Schemes},
@@ -38,6 +42,7 @@ use commonware_cryptography::{
     ed25519::{PrivateKey, PublicKey},
     sha256::Digest,
 };
+use commonware_macros::select;
 use commonware_p2p::{Blocker, Provider, Receiver, Sender};
 use commonware_parallel::Sequential;
 use commonware_runtime::{
@@ -169,6 +174,89 @@ pub struct Config<B, P> {
     /// The approvers of protected commands (`admin`, `--approvers`); without, none is proposed,
     /// voted for or applied.
     pub administration: Option<crate::admin::Administration>,
+    /// The WORM anchor (`anchor`, `--anchor`), if configured.
+    pub anchor: Option<AnchorConfig>,
+}
+
+/// Where the anchor is (`anchor`, docs/anchor.md) and how often an idle keyholder writes to it.
+#[derive(Clone, Debug)]
+pub struct AnchorConfig {
+    /// `s3://bucket/prefix`, `gs://bucket/prefix` or `file:///directory`.
+    pub location: String,
+    /// `object_store` config keys on top of the environment's (tests against a fake service).
+    pub options: Vec<(String, String)>,
+    pub heartbeat: Duration,
+    /// The approvers' acknowledgment of a rollback to write before reading (`anchor::acknowledgment`).
+    pub acknowledgment: Option<AcknowledgmentDocument>,
+}
+
+/// How long a node waits for the anchor's records at start before it starts degraded (the
+/// restart floor alone, the gate open).
+pub const ANCHOR_READ_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// What the anchor answered at start; `None` if it did not answer in time.
+struct AnchorReading {
+    store: Arc<AnchorStore>,
+    cluster: Digest,
+    heartbeat: Duration,
+    records: Option<AnchorRead>,
+}
+
+/// Every configured node's latest record, this node's own, and the acknowledged generation with
+/// its floors.
+struct AnchorRead {
+    records: Vec<SignedRecord>,
+    own: Option<SignedRecord>,
+    generation: u64,
+    floor: Marks,
+}
+
+/// The anchor's state for `cluster`: the highest generation an acknowledgment with enough valid
+/// approvals of `administration` names (0 without), the marks of every such acknowledgment as
+/// floors, every configured node's latest record, and `me`'s own. A node whose records do not
+/// verify is left out (a faulty writer); this node's own then cannot be continued, which is an
+/// error. Acknowledgments that do not verify are left out.
+async fn read_anchor(
+    store: &AnchorStore,
+    administration: &crate::admin::Administration,
+    nodes: &[PublicKey],
+    me: &PublicKey,
+) -> Result<AnchorRead, AnchorError> {
+    let cluster = administration.cluster();
+    let (mut generation, mut floor) = (0, Marks::default());
+    for document in store.acknowledgments().await? {
+        match document.verify(administration.approvers(), cluster) {
+            Ok(acknowledgment) => {
+                generation = generation.max(acknowledgment.generation);
+                floor = floor.max(acknowledgment.marks);
+            }
+            Err(err) => warn!(%err, "anchor: ignoring an acknowledgment"),
+        }
+    }
+    let mut records = Vec::new();
+    let mut own = None;
+    for node in nodes {
+        match store.latest(node).await {
+            Ok(Some(record)) if record.record.cluster == *cluster => {
+                if node == me {
+                    own = Some(record.clone());
+                }
+                records.push(record);
+            }
+            Ok(Some(_)) => warn!(node = %node, "anchor: ignoring a record of another cluster"),
+            Ok(None) => {}
+            Err(err @ AnchorError::Malformed { .. }) if node != me => {
+                warn!(node = %node, %err, "anchor: ignoring a node's records");
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(AnchorRead {
+        records,
+        own,
+        generation,
+        floor,
+    })
 }
 
 /// Registered p2p channels, one `(sender, receiver)` pair per purpose.
@@ -259,6 +347,13 @@ pub struct Recovery {
 pub enum StartError {
     #[error("failed to open replicated state: {0}")]
     State(#[from] crate::storage::Error),
+    #[error("anchor: {0}")]
+    Anchor(String),
+    #[error(
+        "the anchor shows this network was rolled back: {0} (restore newer state, or have the \
+         approvers acknowledge the rollback: docs/anchor.md)"
+    )]
+    RolledBack(String),
     #[error("failed to open secret store: {0}")]
     Secrets(#[from] dkg::secrets::Error),
     #[error(
@@ -508,6 +603,7 @@ pub struct Opened<E: commonware_storage::Context, B, P> {
     config: Config<B, P>,
     store: Store<E>,
     secrets: Secrets<E>,
+    anchor: Option<AnchorReading>,
 }
 
 /// Open the node's replicated state and secret store.
@@ -538,11 +634,79 @@ where
     // A secret store that cannot be read is fatal: the node must not run with lost or
     // inconsistent shares.
     let secrets = Secrets::init(context.child("secrets"), format!("{prefix}-secrets")).await?;
+    // The anchor's records (`anchor`): read before anything runs; without an answer, the node
+    // starts degraded and warns (signing under the restart floor alone).
+    let anchor = match &config.anchor {
+        None => None,
+        Some(anchor) => {
+            let administration = config.administration.as_ref().ok_or_else(|| {
+                StartError::Anchor(
+                    "an anchor needs the approvers (--approvers): its records are bound to the \
+                     cluster id"
+                        .into(),
+                )
+            })?;
+            let cluster = *administration.cluster();
+            let store = Arc::new(
+                AnchorStore::open(&anchor.location, &cluster, &anchor.options)
+                    .map_err(|err| StartError::Anchor(err.to_string()))?,
+            );
+            let nodes: Vec<PublicKey> = config
+                .participants
+                .iter()
+                .chain(config.followers.iter())
+                .cloned()
+                .collect();
+            let me = config.signer.public_key();
+            // An acknowledgment of a rollback: checked, then written (or found there) before
+            // anything is read; without the anchor, the node does not start.
+            if let Some(document) = &anchor.acknowledgment {
+                let acknowledgment = document
+                    .verify(administration.approvers(), &cluster)
+                    .map_err(|err| StartError::Anchor(format!("acknowledgment: {err}")))?;
+                select! {
+                    put = store.put_acknowledgment(document) => {
+                        put.map_err(|err| StartError::Anchor(format!("acknowledgment not written: {err}")))?;
+                    },
+                    _ = context.sleep(ANCHOR_READ_TIMEOUT) => {
+                        return Err(StartError::Anchor("acknowledgment not written: the anchor does not answer".into()));
+                    },
+                }
+                info!(
+                    generation = acknowledgment.generation,
+                    marks = ?acknowledgment.marks,
+                    "anchor: the approvers acknowledged a rollback"
+                );
+            }
+            let records = select! {
+                read = read_anchor(&store, administration, &nodes, &me) => {
+                    match read {
+                        Ok(read) => Some(read),
+                        Err(err) => {
+                            warn!(%err, "anchor unreachable at start: degraded, signing under the restart floor alone");
+                            None
+                        }
+                    }
+                },
+                _ = context.sleep(ANCHOR_READ_TIMEOUT) => {
+                    warn!(timeout = ?ANCHOR_READ_TIMEOUT, "anchor unreachable at start: degraded, signing under the restart floor alone");
+                    None
+                },
+            };
+            Some(AnchorReading {
+                store,
+                cluster,
+                heartbeat: anchor.heartbeat,
+                records,
+            })
+        }
+    };
     Ok(Opened {
         context,
         config,
         store,
         secrets,
+        anchor,
     })
 }
 
@@ -579,6 +743,7 @@ where
             config,
             store,
             secrets,
+            anchor,
         } = self;
         let public_key = config.signer.public_key();
         let signer = config.signer.clone();
@@ -619,6 +784,81 @@ where
         .await
         .expect("failed to open blocks archive");
         check_boundary(&epoch, &finalizations, &blocks).await?;
+        // The anchor's records against this node's chain, before anything runs: a contradiction
+        // stops it (exit 77); otherwise the keyholder signs once the chain is confirmed.
+        let (anchor_keeper, anchor_watch) = match anchor {
+            None => (None, None),
+            Some(reading) => {
+                let applied = store.height();
+                let digest_at = async |height: u64| {
+                    blocks
+                        .get(Identifier::Index(height))
+                        .await
+                        .expect("failed to read the blocks archive")
+                        .map(|block| block.digest())
+                };
+                let applied_digest = digest_at(applied).await.unwrap_or(Digest::from([0; 32]));
+                match reading.records {
+                    Some(AnchorRead {
+                        records,
+                        own,
+                        generation,
+                        floor,
+                    }) => {
+                        let view = View::new(generation, records).with_floor(floor);
+                        let mut observed = std::collections::BTreeMap::new();
+                        for record in view.records() {
+                            let height = record.record.height;
+                            if height <= applied
+                                && let Some(digest) = digest_at(height).await
+                            {
+                                observed.insert(height, digest);
+                            }
+                        }
+                        let mut watch = Watch::new(view.clone(), observed);
+                        let confirmed = match watch.start() {
+                            Verdict::RolledBack(why) => return Err(StartError::RolledBack(why)),
+                            Verdict::Confirmed => true,
+                            Verdict::Pending => false,
+                        };
+                        info!(
+                            generation,
+                            records = view.records().len(),
+                            gate = ?view.gate_height(),
+                            anchored = ?view.marks(),
+                            confirmed,
+                            "anchor: records read"
+                        );
+                        let keeper = Keeper::new(
+                            reading.store,
+                            signer.clone(),
+                            reading.cluster,
+                            Some((view, own, confirmed)),
+                            applied,
+                            applied_digest,
+                        );
+                        (
+                            Some((keeper, reading.heartbeat)),
+                            (!confirmed).then_some(watch),
+                        )
+                    }
+                    None => (
+                        Some((
+                            Keeper::new(
+                                reading.store,
+                                signer.clone(),
+                                reading.cluster,
+                                None,
+                                applied,
+                                applied_digest,
+                            ),
+                            reading.heartbeat,
+                        )),
+                        None,
+                    ),
+                }
+            }
+        };
         let genesis = Block::genesis();
         let (marshal_actor, marshal, marshal_floor) = Marshal::init(
             context.child("marshal"),
@@ -728,7 +968,7 @@ where
             config.close_epoch_at,
             stopped.clone(),
         );
-        let executor_handle = executor.start();
+        let executor_handle = executor.with_anchor(anchor_watch).start();
         let gossip_handle = context.child("gossip").spawn({
             let mempool = mempool.clone();
             move |_| executor::receive_gossip(mempool_receiver, mempool)
@@ -776,7 +1016,13 @@ where
             dkg::approval::Approvals::new(config.approved_reshares),
             config.horizon,
         )
-        .with_registration_policy(registration_policy)
+        .with_registration_policy(registration_policy);
+        let dkg_handle = match anchor_keeper {
+            Some((keeper, heartbeat)) => {
+                dkg_handle.with_anchor(keeper, heartbeat, dkg_sender.clone())
+            }
+            None => dkg_handle,
+        }
         .start();
         let dkg_receiver_handle = context.child("dkg_receiver").spawn({
             let dkg_sender = dkg_sender.clone();

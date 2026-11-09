@@ -28,6 +28,8 @@
 //!   skewed or jumping clock); nothing else reads it.
 //! - `ETH_MPC_SIGNER_NO_HORIZON=1`: the node's API and its blocks admit duties beyond the
 //!   horizon, as a faulty coordinator and leader would (its votes and partials still check it).
+//! - `ETH_MPC_SIGNER_ANCHOR_UNREACHABLE_FILE=<path>`: while `<path>` exists, every anchor read
+//!   and write fails as if the anchor did not answer (`anchor`).
 //! - `ETH_MPC_SIGNER_NO_RESTART_FLOOR=<anything but 0>`: the keyholder has no restart floor
 //!   (`eth::horizon::RestartFloor`). The E2E harness sets it for every node unless a test sets it
 //!   to `0`: its chain's slots are long past, so a floor would refuse every new duty after any
@@ -182,6 +184,12 @@ mod enabled {
         std::env::var("ETH_MPC_SIGNER_NO_HORIZON").is_ok()
     }
 
+    /// Whether the anchor answers nothing now (test hook).
+    pub fn anchor_unreachable() -> bool {
+        std::env::var("ETH_MPC_SIGNER_ANCHOR_UNREACHABLE_FILE")
+            .is_ok_and(|path| std::path::Path::new(&path).exists())
+    }
+
     /// Whether this keyholder has no restart floor.
     pub fn no_restart_floor() -> bool {
         std::env::var("ETH_MPC_SIGNER_NO_RESTART_FLOOR").is_ok_and(|value| value != "0")
@@ -256,6 +264,10 @@ mod enabled {
     }
 
     pub const fn no_restart_floor() -> bool {
+        false
+    }
+
+    pub const fn anchor_unreachable() -> bool {
         false
     }
 

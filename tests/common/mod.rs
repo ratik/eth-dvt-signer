@@ -253,6 +253,7 @@ pub async fn start_network_with(
                 // the horizon has its own unit and end-to-end tests.
                 horizon: eth_mpc_signer::eth::horizon::Horizon::unbounded(),
                 administration: Some(administration(&participants)),
+                anchor: None,
             },
         )
         .await

@@ -238,6 +238,9 @@ struct StatusResponse {
     /// Peer signing requests waiting for their authorization here.
     parked_requests: usize,
     readiness: ReadinessResponse,
+    /// The keyholder's WORM anchor (`anchor`, docs/anchor.md), if configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    anchor: Option<crate::dkg::actor::AnchorStatus>,
 }
 
 #[derive(Serialize)]
@@ -1089,7 +1092,16 @@ async fn observe(api: &Api) -> Result<(Status, Health, ReadinessResponse), ApiEr
     let now = SystemTime::now();
     let progress = status.progress;
     let readiness = ReadinessResponse {
-        readiness: Readiness::evaluate(progress, health.unavailable.len(), now),
+        readiness: Readiness::evaluate(progress, health.unavailable.len(), now).with_anchor(
+            health
+                .anchor
+                .as_ref()
+                .is_some_and(|anchor| anchor.state == "behind"),
+            health
+                .anchor
+                .as_ref()
+                .is_some_and(|anchor| anchor.state == "degraded"),
+        ),
         startup_checks: "passed",
         applied_height: progress.applied,
         known_finalized_height: progress.known_finalized,
@@ -1124,6 +1136,7 @@ async fn status(State(api): State<Api>) -> Result<Json<StatusResponse>, ApiError
         signing_sessions: signing.sessions,
         parked_requests: health.parked,
         readiness,
+        anchor: health.anchor,
     }))
 }
 

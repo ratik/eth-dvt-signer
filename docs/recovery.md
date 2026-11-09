@@ -11,7 +11,7 @@ enforces it. Passing tests are evidence, not proof (tests are listed in the last
 | Local storage opened | Yes | `Store::init`, `Secrets::init` and marshal's archives open, or the node exits |
 | State consistent with marshal's progress | Yes, at startup | marshal returns its durable processed height (`Floor`) from `init`; compared before any actor starts |
 | Slashing history internally consistent and matching the ceremonies | Yes, at startup | `Store::verify`: per-validator record counts, known validators, keys equal to their ceremony's group key ([slashing-protection.md](slashing-protection.md)) |
-| Slashing history complete with respect to the network | **No** | a history consistently older (a rollback) looks like a node that missed blocks; it replays them, and a rollback of every node is undetected (§7) |
+| Slashing history complete with respect to the network | **No** | a history consistently older (a rollback) looks like a node that missed blocks; it replays them, and a rollback of every node is undetected without the WORM anchor (§7) |
 | Key shares consistent with the state | Yes, at startup | every stored share must belong to a completed ceremony of the state; loaded shares are verified against the ceremony's public polynomial |
 | All locally known finalized blocks applied | Yes | marshal reports its finalized tip (`Update::Tip`); compared with the executor's height |
 | Caught up with the network | **No** | a node only knows what its peers told it. Nothing claims this |
@@ -199,7 +199,7 @@ What readiness does not claim:
 | Restoring an old consensus journal | the node forgets votes cast after the backup; votes above its floor can be repeated differently (an equivocation, a Byzantine fault) | not detectable when the rest of the directory is consistent with it; peers that see an equivocation block the node at the P2P layer for an hour (audit L-7) |
 | Replacing a node's directory with another node's | another node's key share (partials rejected) and votes (equivocation for that identity) | not detected by this node |
 | Restoring several nodes from stale snapshots | two or more nodes without their votes exceed `f = 1` | safety no longer guaranteed by consensus |
-| Whole-network rollback | §7 | conflicting signatures of the development `/sign`, a crafted surround vote (L-1); the restart floor refuses double proposals and double votes |
+| Whole-network rollback | §7 | without an anchor: conflicting signatures of the development `/sign`, a crafted surround vote (L-1); the restart floor refuses double proposals and double votes. With an anchor: every node stops, exit status 77 |
 
 ### Scenario summary
 
@@ -212,7 +212,7 @@ What readiness does not claim:
 | One offline peer | Yes | Yes | The restarting node is `ready` once consensus finalizes again with its votes; with a second node away, every node reports `no_recent_finalization`, new authorizations get `503 NOT_READY`, applied ones fail in bounded time |
 | Two nodes restarted together | Yes | Yes | Nothing is finalized while both are down. Once they are back, if they missed the certificate of the view the other two entered, consensus waits for the other two's next nullify retry (`timeout_retry`, 3 s), which carries it: 6.3 to 9.7 s measured after the restart in that case (audit L-14). Validator duties due meanwhile can be missed. Restart one node at a time, and wait for it to be `ready` |
 | Corrupted storage | The node does not run when the damage is detected (§2); a torn copy not yet acknowledged is replayed | Does not run | Exit status 1, storage left as is |
-| Whole-network rollback | **No** for the development `/sign` and crafted surround votes (L-1); blocks and attestations of slots and epochs before the restart: refused by the restart floor | **No** | Undetectable, unsupported |
+| Whole-network rollback | Without an anchor: **no** for the development `/sign` and crafted surround votes (L-1); blocks and attestations of slots and epochs before the restart: refused by the restart floor. With an anchor: nothing new is signed before the nodes stop | **No** | Without an anchor: undetectable, unsupported. With one: every node exits 77; restore newer state, or the approvers acknowledge the rollback (§7) |
 | Every node restarted at once (storage intact) | Yes; the restart floor refuses new duties of the current epoch (attestations) and slot (blocks) | Yes | Signs again from the next slot (blocks) and epoch (attestations) |
 
 ## 7. Whole-network rollback (L-1)
@@ -233,11 +233,10 @@ Why it cannot be detected here:
   directory is rolled back with it. Stored in another directory of the same machine, it is rolled
   back by the same operator action or backup system. It helps only if the rollback cannot reach it.
 
-What would detect it, all outside this task:
-
-- monotonic state that the rollback cannot reach: a hardware monotonic counter or TEE sealing, an
-  external append-only log or anchor (another chain, a transparency log) consulted before signing;
-- or peers that are not rolled back: more nodes than the faulty threshold kept independent.
+What detects it: monotonic state that the rollback cannot reach. This repository implements one,
+the WORM anchor ([anchor.md](anchor.md), `--anchor`): records on S3, GCS or a directory outside
+the nodes' storage and backups, written before a keyholder signs past them. Other designs (a
+hardware counter, TEE sealing, another chain, more nodes kept independent) are not implemented.
 
 The same holds for Ethereum slashing protection, which is now part of the replicated state
 ([slashing-protection.md](slashing-protection.md)): the state alone protects against every fault
@@ -253,9 +252,18 @@ have signed for before it started, known from its clock and the time horizon it 
 After a whole-network rollback every process restarted, and any two quorums share a keyholder: no
 double proposal or double vote is signed (`floor::floor_1`). It does not detect the rollback, and
 it does not refuse a surround vote a client crafts; that needs slashing history outside the nodes'
-rollback domain, an anchor designed in
-[slashing-protection.md](slashing-protection.md#proposal-an-independent-durable-anchor), not
-implemented. No local counter was added.
+rollback domain: the WORM anchor. No local counter was added.
+
+**With the WORM anchor** ([anchor.md](anchor.md)), each keyholder writes a record (its applied
+block, and the highest block slot and attestation source and target it may sign) before it signs
+past its previous one. After a whole-network rollback, no node signs before its chain holds what
+the records name, and every node stops with **exit status 77** once the network finalizes below
+them (`anchor::an_2`). Do not restart such nodes in a loop. Restore every node from newer state if
+any exists; they are confirmed at start. If none does, the approvers acknowledge the rollback
+(`mpc-admin anchor acknowledge`, then `sign`; nodes started with `--anchor-acknowledgment`): the
+nodes continue in a new anchor generation under the anchored marks, so nothing signed before can
+be signed again differently (`anchor::an_6`). One node rolled back alone is not stopped: it
+catches up from its peers (`anchor::an_3`).
 
 **Restarting nodes with the floor.** Restart one node at a time where you can: the other three
 keyholders sign, and nothing is missed. When every node restarts at once (an R3 reconfiguration,
@@ -299,4 +307,4 @@ signing a duty at or below this process's restart floor`). There is no switch to
 | Slashing history: persistence, fail-closed startup on altered history | `storage::tests::validator::*` (unit) |
 | Slashing history across crashes, restarts, a lagging node and a single-node rollback | `eth2::e2e_eth_3_*`, `eth2::e2e_eth_4_*`, `eth2::e2e_eth_5_*`, `eth2::e2e_eth_6_*`, `eth2::e2e_eth_7_*`, `tests/eth_duties.rs`, `storage::tests::validator::a_torn_duty_block_is_applied_again_identically` |
 | Chain identity across restarts and recovery | `slashing_history_survives_a_full_restart`, `stale_node_cannot_authorize_another_chain`, `eth2::e2e_eth_8_*`, `storage::tests::validator::altered_history_fails_closed` (activation removed) |
-| L-1 | `rollback::a2_whole_network_rollback`, `eth2::e2e_eth_l1_whole_network_rollback_signs_a_double_proposal` (ignored, fail) |
+| L-1 | `rollback::a2_whole_network_rollback`, `eth2::e2e_eth_l1_whole_network_rollback_signs_a_double_proposal` (ignored, fail: no floor, no anchor); `floor::floor_1` to `floor_3`; `anchor::an_1` to `an_6` |

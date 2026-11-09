@@ -56,7 +56,7 @@ use std::{
     },
     time::{Duration, SystemTime},
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// How often a held-back block is checked again (test hook only).
 const HOLD_POLL: Duration = Duration::from_millis(50);
@@ -228,9 +228,17 @@ pub struct Status {
     pub admin_nonce: u64,
     /// What this node applied and knows of (for readiness).
     pub progress: Progress,
+    /// This node's chain is not confirmed against the anchor yet (`anchor`): it submits no new
+    /// authorization.
+    pub anchor_behind: bool,
 }
 
 pub enum Message {
+    /// Stop this node: the keyholder found that another process writes its anchor records
+    /// (`anchor`).
+    Halt {
+        reason: String,
+    },
     Submit {
         request: SignRequest,
         response: oneshot::Sender<Receipt>,
@@ -684,7 +692,8 @@ impl Client {
     }
 }
 
-/// Why a node stops on its own: its consensus epoch ended with the last block it applied.
+/// Why a node stops on its own: its consensus epoch ended with the last block it applied, or the
+/// anchor shows its network was rolled back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stop {
     /// The block at `height` ended the epoch with a reconfiguration: the node restarts in `epoch`.
@@ -692,6 +701,9 @@ pub enum Stop {
     /// The epoch was closed at `height` (`--close-epoch-at`) by a block without a
     /// reconfiguration: the node restarts in the same epoch without the closing height.
     Closed { height: u64 },
+    /// The anchor's records show this node's chain is not the one that was signed under, or that
+    /// another process writes as it (`anchor`): exit status 77, an operator's matter.
+    RolledBack { height: u64 },
 }
 
 /// A client waiting for its transaction.
@@ -735,6 +747,9 @@ pub struct Executor<E: CryptoRng + Spawner + Context, S: Sender> {
     close: Option<u64>,
     /// Set, once, when the epoch ended with the last block applied; the executor then stops.
     stopped: Arc<OnceLock<Stop>>,
+    /// The anchor's records read at start, compared with this node's chain as it applies blocks
+    /// (`anchor`), until confirmed.
+    anchor: Option<crate::anchor::Watch>,
 }
 
 impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
@@ -778,11 +793,18 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
             unfinalized: follower.then(HashMap::new),
             close,
             stopped,
+            anchor: None,
         };
         let client = Client {
             sender: sender.clone(),
         };
         (executor, sender, client)
+    }
+
+    /// Compare this node's chain with the anchor's records as blocks are applied.
+    pub fn with_anchor(mut self, watch: Option<crate::anchor::Watch>) -> Self {
+        self.anchor = watch;
+        self
     }
 
     pub fn start(mut self) -> Handle<()> {
@@ -812,6 +834,13 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
             let Some(next) = next else { continue };
             let Some(message) = next else { return };
             match message {
+                Message::Halt { reason } => {
+                    error!(%reason, "stopping");
+                    let _ = self.stopped.set(Stop::RolledBack {
+                        height: self.store.height(),
+                    });
+                    return;
+                }
                 Message::Submit { request, response } => {
                     let ceremony = request.ceremony.clone();
                     let (nonce, payload_hash) = (request.nonce, request.payload_hash);
@@ -1096,6 +1125,7 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                             known_finalized: self.tip.load(Ordering::Acquire).max(height),
                             last_applied: self.last_applied,
                         },
+                        anchor_behind: self.anchor.is_some(),
                     });
                 }
                 Message::Finalized { block, ack } => {
@@ -1339,7 +1369,31 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                 .dkg
                 .send(dkg::actor::Message::AuthorizedDuties(applied.duties));
         }
-        let _ = self.dkg.send(dkg::actor::Message::Tick);
+        let _ = self.dkg.send(dkg::actor::Message::Tick {
+            height,
+            digest: block.digest(),
+        });
+        // The anchor's records against this chain: confirmed (the keyholder signs), or rolled back
+        // (stop: the network finalizes what it had finalized differently, or below it).
+        if let Some(watch) = &mut self.anchor {
+            match watch.applied(height, block.digest(), self.tip.load(Ordering::Acquire)) {
+                crate::anchor::Verdict::Pending => {}
+                crate::anchor::Verdict::Confirmed => {
+                    info!(height, "anchor: this chain holds what the records name");
+                    let _ = self.dkg.send(dkg::actor::Message::AnchorConfirmed);
+                    self.anchor = None;
+                }
+                crate::anchor::Verdict::RolledBack(why) => {
+                    error!(
+                        height,
+                        %why,
+                        "anchor: this network was rolled back behind the anchor: stopping (exit \
+                         status 77; docs/anchor.md)"
+                    );
+                    let _ = self.stopped.set(Stop::RolledBack { height });
+                }
+            }
+        }
 
         if !block.transactions.is_empty() {
             let accepted = applied

@@ -40,7 +40,7 @@ rand_core = "0.10.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2"
-tokio = { version = "1.52.3", features = ["net", "time"] }
+tokio = { version = "1.52.3", features = ["net", "rt", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 tree_hash = "0.12"
@@ -58,6 +58,9 @@ pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
 rpassword = "7"
 scrypt = { version = "0.12", default-features = false }
 sha2 = "0.11"
+# The WORM anchor (`anchor`, docs/anchor.md): append-only records on S3, GCS or a local directory.
+# No default features: the HTTP stores and the filesystem store only (rustls with aws-lc).
+object_store = { version = "0.14.2", default-features = false, features = ["aws", "gcp", "fs"] }
 unicode-normalization = "0.1"
 zeroize = "1"
 

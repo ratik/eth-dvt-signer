@@ -20,6 +20,10 @@ Keyholder               src/dkg/actor           shares; signs only committed aut
                                                 validator key's ceremony (its active share
                                                 generation only), (ceremony, nonce) for a
                                                 development key's.
+Anchor (optional)       src/anchor              append-only records on S3, GCS or a directory
+                                                outside the nodes' storage: written by a
+                                                keyholder before it signs past them, read at
+                                                start; a whole-network rollback stops the nodes.
 Crypto                  src/dkg/signing         Ethereum ciphersuite over raw 32-byte roots.
 Ethereum types          src/eth                 containers, SSZ hash_tree_root, domains, roots.
 ```
@@ -143,6 +147,12 @@ failover proxy (development)  ──>  4 eth-mpc-signer nodes (this repository)
    PTC votes and envelopes of the slot (attestations: the epoch) it may have signed for before it
    started, so a whole-network rollback signs no double proposal or double vote; no record, no
    switch ([slashing-protection.md](slashing-protection.md#the-restart-floor)).
+14. Done: the WORM anchor (L-1 narrowed further, optional, `--anchor`). Keyholders write signed,
+   create-only records to S3, GCS or a directory outside the nodes' rollback domain before they
+   sign past their marks; at start a node reads every node's latest record, signs only once its
+   chain holds what the records name, refuses surround votes under the anchored marks, and stops
+   (exit status 77) when the records show the network was rolled back. The approvers can
+   acknowledge a rollback whose newer state is lost ([anchor.md](anchor.md)).
 
 ## Anvil
 

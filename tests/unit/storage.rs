@@ -332,6 +332,10 @@ mod validator {
             kind: request.duty.kind(),
             period: request.duty.protection().period(),
             terms: request.duty.terms(),
+            source: match &request.duty {
+                Duty::Attestation(data) => Some(data.source.epoch),
+                _ => None,
+            },
         }
     }
 

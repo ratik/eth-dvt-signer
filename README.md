@@ -367,6 +367,11 @@ Every node needs the same two settings:
 
 `scripts/local-net.sh` passes them from `ETH_NETWORK=hoodi` and `APPROVERS=approvers.json`.
 
+Recommended in production: `--anchor s3://bucket/prefix` (or `gs://`), the same on every node, a
+WORM bucket that the node operators cannot delete from. Keyholders write a record there before
+they sign past their previous one, and a node that finds its whole network rolled back stops
+with exit status 77 ([docs/anchor.md](docs/anchor.md)).
+
 A follower (a keyholder that does not vote, R2) is node `participants + j`, run with the same
 `--participants` and `--followers` as every other node: `cargo run --release -- --id 4
 --followers 1`, the voters also with `--followers 1`. A voter deals to new keyholders only with
@@ -624,7 +629,9 @@ audit scenarios of
 [docs/audit.md](docs/audit.md) (rollback, crash boundaries, concurrency, cancellation, byzantine
 traffic, limits, lifecycle, corrupted storage) and the recovery scenarios R1-R6 of
 [docs/recovery.md](docs/recovery.md) (readiness after restarts, rollbacks, a lagging node,
-inconsistent storage, an offline peer). E2E-1 to E2E-9: cold start to a blst-verified signature,
+inconsistent storage, an offline peer), and the WORM anchor's `anchor::an_1` to `an_6`
+([docs/anchor.md](docs/anchor.md#tests); `tests/anchor_protocol.rs` checks the S3 and GCS
+requests against an in-process fake). E2E-1 to E2E-9: cold start to a blst-verified signature,
 idempotency, conflicting requests, one node offline, coordinator crash (after authorization and
 after 2 partials, through test hooks), full network restart, unauthorized p2p signing requests and
 byzantine partial signatures (from a scripted peer that takes a stopped node's identity on the real
@@ -689,8 +696,12 @@ Signing an existing authorization costs one p2p round trip and four pairings.
   signing a double proposal or a double vote (each refuses new duties of the slot and epoch it may
   have signed for before its process started); a surround vote a client crafts, and the
   development `POST /sign`, are not covered. The floor costs the current epoch's attestations when
-  every node restarts at once (an R3 reconfiguration), nothing when one does. An anchor design is
-  proposed, not implemented ([docs/slashing-protection.md](docs/slashing-protection.md#the-restart-floor)).
+  every node restarts at once (an R3 reconfiguration), nothing when one does
+  ([docs/slashing-protection.md](docs/slashing-protection.md#the-restart-floor)). With the WORM
+  anchor (`--anchor`), surround votes under the anchored marks are refused too, and the rollback
+  is detected: every node stops with exit status 77 ([docs/anchor.md](docs/anchor.md)). The anchor
+  tolerates one faulty node, lags detection by up to one record (about an epoch), and while it is
+  unreachable the keyholders sign under the restart floor alone.
 - Ethereum: mainnet preset only. No Phase 0 and Altair blocks, `BUILDER_REQUEST_AUTH`, builder
   bids or Heze. Builder registrations only under the approved registration policy; before Gloas it
   does not cover the fee recipient of a block the beacon node builds itself, and within the policy

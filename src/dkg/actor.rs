@@ -35,6 +35,10 @@ use super::{
     signing, wire,
 };
 use crate::{
+    anchor::{
+        SignedRecord,
+        keeper::{self, Keeper},
+    },
     eth::{
         duty::{DutyKind, ValidatorKey},
         horizon::{Horizon, RestartFloor},
@@ -60,6 +64,7 @@ use commonware_cryptography::{
     ed25519::{self, PrivateKey, PublicKey},
     transcript::{Summary, Transcript, Version},
 };
+use commonware_macros::select;
 use commonware_math::algebra::Random as _;
 use commonware_p2p::{Receiver, Recipients, Sender};
 use commonware_parallel::Sequential;
@@ -83,8 +88,16 @@ const RESUBMIT_BLOCKS: u64 = 8;
 pub enum Message {
     /// A ceremony changed in finalized state (started, gained a log, completed or failed).
     Ceremony(Ceremony),
-    /// A block was finalized: retransmit what has not been acknowledged yet.
-    Tick,
+    /// A block was finalized and applied (its height and digest): retransmit what has not been
+    /// acknowledged yet.
+    Tick {
+        height: u64,
+        digest: commonware_cryptography::sha256::Digest,
+    },
+    /// The outcome of an anchor record write (`anchor`): `held` if partials wait for it.
+    Anchored { outcome: Anchored, held: bool },
+    /// The executor confirmed this node's chain against the anchor's records.
+    AnchorConfirmed,
     /// A message from a peer on the DKG channel (the sender is authenticated by p2p).
     Peer {
         from: PublicKey,
@@ -157,6 +170,24 @@ pub struct Health {
     pub parked: usize,
     /// Completed ceremonies without a usable share on this node.
     pub unavailable: Vec<CeremonyId>,
+    /// The keyholder's anchor, if configured.
+    pub anchor: Option<AnchorStatus>,
+}
+
+/// A keyholder's anchor, as `/status` shows it (`anchor`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AnchorStatus {
+    /// `confirmed` (signing), `behind` (its chain does not hold what the records name yet) or
+    /// `degraded` (the anchor does not answer: the restart floor alone).
+    pub state: &'static str,
+    pub location: String,
+    pub generation: u64,
+    /// This node's latest record: its sequence, height and marks.
+    pub sequence: Option<u64>,
+    pub height: Option<u64>,
+    pub marks: crate::anchor::Marks,
+    /// The anchored marks read at start: no new duty at or below them.
+    pub anchored: crate::anchor::Marks,
 }
 
 /// State of this node's share of a ceremony.
@@ -360,7 +391,33 @@ struct KnownDuty {
     kind: DutyKind,
     period: u64,
     terms: Option<Terms>,
+    /// An attestation's source epoch.
+    source: Option<u64>,
     loaded: bool,
+}
+
+/// The outcome of an anchor record write.
+#[derive(Debug)]
+// One per record write, consumed at once: its size does not matter.
+#[allow(clippy::large_enum_variant)]
+pub enum Anchored {
+    Written(SignedRecord),
+    /// Another process wrote at this node's next place: a clone, or an older copy of it.
+    Taken(String),
+    Failed(String),
+}
+
+/// A partial computed and held until an anchor record covers its duty.
+// Held only while a record is written (2 s at most): their size does not matter.
+#[allow(clippy::large_enum_variant)]
+pub enum Held {
+    /// For this node's own coordinator.
+    Own(
+        oneshot::Sender<Result<PartialSignature<Variant>, Refusal>>,
+        PartialSignature<Variant>,
+    ),
+    /// For a peer's request: the reply to send.
+    Peer(PublicKey, sign_wire::Message),
 }
 
 pub struct Actor<
@@ -408,6 +465,13 @@ pub struct Actor<
     /// This process's restart floor (`eth::horizon`, audit L-1): no partial for a duty at or below
     /// it learned of since the start. None without a network (or with the test hook).
     restart_floor: Option<RestartFloor>,
+    /// This keyholder's anchor (`anchor`, docs/anchor.md), if configured: the records it writes
+    /// ahead of partials, the anchored marks and the gate it signs under.
+    anchor: Option<Keeper<Held>>,
+    /// How often an idle keyholder writes a heartbeat record.
+    anchor_heartbeat: std::time::Duration,
+    /// This actor's own mailbox, for the anchor writer's outcomes.
+    mailbox_sender: Option<mpsc::UnboundedSender<Message>>,
     /// The builder registration policy in force here: no partial for a registration it refuses.
     registration_policy: Option<RegistrationPolicy>,
     /// This node's time horizon: no partial for a duty beyond it.
@@ -508,12 +572,16 @@ impl<
                             kind: duty.kind,
                             period: duty.period,
                             terms: duty.terms,
+                            source: duty.source,
                             loaded: true,
                         },
                     )
                 })
                 .collect(),
             restart_floor,
+            anchor: None,
+            anchor_heartbeat: std::time::Duration::from_secs(600),
+            mailbox_sender: None,
             registration_policy: None,
             horizon,
             parked: Parked::default(),
@@ -532,6 +600,25 @@ impl<
         self
     }
 
+    /// This keyholder's anchor (`anchor`): `sender` is this actor's own mailbox.
+    pub fn with_anchor(
+        mut self,
+        anchor: Keeper<Held>,
+        heartbeat: std::time::Duration,
+        sender: mpsc::UnboundedSender<Message>,
+    ) -> Self {
+        info!(
+            confirmed = anchor.confirmed(),
+            degraded = anchor.degraded(),
+            anchored = ?anchor.anchored(),
+            "anchor: keyholder writes ahead of its partials (docs/anchor.md)"
+        );
+        self.anchor = Some(anchor);
+        self.anchor_heartbeat = heartbeat;
+        self.mailbox_sender = Some(sender);
+        self
+    }
+
     pub fn start(mut self) -> Handle<()> {
         spawn_cell!(self.context, self.run())
     }
@@ -543,7 +630,24 @@ impl<
         while let Some(message) = self.mailbox.recv().await {
             match message {
                 Message::Ceremony(ceremony) => self.update(ceremony).await,
-                Message::Tick => self.tick(),
+                Message::Tick { height, digest } => {
+                    self.tick();
+                    let now = crate::hooks::clock(self.context.current());
+                    let heartbeat = self.anchor_heartbeat;
+                    if let Some(anchor) = &mut self.anchor {
+                        anchor.applied(height, digest);
+                        if let Some(job) = anchor.due(now, heartbeat) {
+                            self.spawn_anchor_write(job, false);
+                        }
+                    }
+                }
+                Message::Anchored { outcome, held } => self.on_anchored(outcome, held),
+                Message::AnchorConfirmed => {
+                    if let Some(anchor) = &mut self.anchor {
+                        anchor.confirm();
+                        info!("anchor: this node's chain holds what the records name: signing");
+                    }
+                }
                 Message::Peer { from, message } => match message {
                     wire::Message::Dealing {
                         round,
@@ -570,6 +674,7 @@ impl<
                                 kind: duty.kind,
                                 period: duty.period,
                                 terms: duty.terms,
+                                source: duty.source,
                                 loaded,
                             },
                         );
@@ -590,9 +695,15 @@ impl<
                     authorization,
                     payload_hash,
                     response,
-                } => {
-                    let _ = response.send(self.partial(&ceremony, &authorization, &payload_hash));
-                }
+                } => match self.partial(&ceremony, &authorization, &payload_hash) {
+                    Ok(partial) => {
+                        let needed = self.anchor_needs(&authorization, &payload_hash);
+                        self.give(needed, Held::Own(response, partial));
+                    }
+                    Err(refusal) => {
+                        let _ = response.send(Err(refusal));
+                    }
+                },
                 Message::SignRequest { from, request } => self.on_sign_request(from, request),
                 Message::InstallShare { envelope, response } => {
                     let _ = response.send(self.install(&envelope).await);
@@ -615,6 +726,24 @@ impl<
                             })
                             .map(|(id, _)| id.clone())
                             .collect(),
+                        anchor: self.anchor.as_ref().map(|anchor| AnchorStatus {
+                            state: if anchor.degraded() {
+                                "degraded"
+                            } else if anchor.confirmed() {
+                                "confirmed"
+                            } else {
+                                "behind"
+                            },
+                            location: anchor.store().location().to_string(),
+                            generation: anchor.generation(),
+                            sequence: anchor.head().map(|head| head.record.sequence),
+                            height: anchor.head().map(|head| head.record.height),
+                            marks: anchor
+                                .head()
+                                .map(|head| head.record.marks)
+                                .unwrap_or_default(),
+                            anchored: anchor.anchored(),
+                        }),
                     });
                 }
             }
@@ -1213,6 +1342,10 @@ impl<
                 if authorization.payload_hash() != payload_hash {
                     return Err(Refusal::Conflict);
                 }
+                if let Some(why) = self.anchor.as_ref().and_then(Keeper::gate_refusal) {
+                    warn!(nonce, %why, "anchor: not signing");
+                    return Err(Refusal::BeyondHorizon);
+                }
                 // Sign what consensus authorized, as an Ethereum signing root.
                 Ok(signing::Message::Ethereum(*authorization.payload_hash()).partial_sign(share))
             }
@@ -1227,6 +1360,7 @@ impl<
                     kind,
                     period,
                     terms,
+                    source,
                     loaded,
                 } = *self
                     .duty_roots
@@ -1250,6 +1384,17 @@ impl<
                         floor_epoch = floor.epoch(),
                         "not signing a duty at or below this process's restart floor"
                     );
+                    return Err(Refusal::BeyondHorizon);
+                }
+                // Nothing new before this node's chain is confirmed against the anchor, and no
+                // block or attestation the anchored marks refuse (a surround vote included).
+                if !loaded
+                    && let Some(why) = self
+                        .anchor
+                        .as_ref()
+                        .and_then(|anchor| anchor.refusal(kind, period, source))
+                {
+                    warn!(?kind, period, ?source, %why, "anchor: not signing");
                     return Err(Refusal::BeyondHorizon);
                 }
                 // A registration, Gloas preferences or an envelope only while the policy in force
@@ -1308,6 +1453,11 @@ impl<
             Err(Refusal::NotParticipant)
         };
         let signed = result.is_ok();
+        let needed = if signed {
+            self.anchor_needs(&request.authorization, &request.payload_hash)
+        } else {
+            None
+        };
         let reply = match result {
             Ok(partial) => {
                 if self
@@ -1339,10 +1489,139 @@ impl<
                 }
             }
         };
-        self.signing
-            .send(Recipients::One(from), reply.encode(), false);
         if signed {
-            crate::hooks::crash_point("after-partial-send");
+            self.give(needed, Held::Peer(from, reply));
+        } else {
+            self.signing
+                .send(Recipients::One(from), reply.encode(), false);
+        }
+    }
+
+    /// What `authorization`'s duty needs this keyholder's anchor record to cover before its
+    /// partial is given: a new block's slot, a new attestation's source and target.
+    fn anchor_needs(
+        &self,
+        authorization: &AuthorizationRef,
+        payload_hash: &PayloadHash,
+    ) -> Option<crate::anchor::Marks> {
+        self.anchor.as_ref()?;
+        let AuthorizationRef::Duty { validator } = authorization else {
+            return None;
+        };
+        let known = self.duty_roots.get(&(*validator, *payload_hash))?;
+        if known.loaded {
+            return None;
+        }
+        keeper::needed(known.kind, known.period, known.source)
+    }
+
+    /// Give a computed partial now, or hold it until an anchor record covers `needed`.
+    fn give(&mut self, needed: Option<crate::anchor::Marks>, held: Held) {
+        let Some(anchor) = &mut self.anchor else {
+            self.deliver(held);
+            return;
+        };
+        match anchor.step(needed, held) {
+            (keeper::Step::Give, Some(held)) => self.deliver(held),
+            (keeper::Step::Hold(job), _) => {
+                if let Some(job) = job {
+                    self.spawn_anchor_write(job, true);
+                }
+            }
+            (keeper::Step::Give, None) => unreachable!("a given reply is returned"),
+        }
+    }
+
+    fn deliver(&mut self, held: Held) {
+        match held {
+            Held::Own(response, partial) => {
+                let _ = response.send(Ok(partial));
+            }
+            Held::Peer(from, reply) => {
+                self.signing
+                    .send(Recipients::One(from), reply.encode(), false);
+                crate::hooks::crash_point("after-partial-send");
+            }
+        }
+    }
+
+    /// Write the anchor record `job` asks for in a task of its own; its outcome comes back as
+    /// [Message::Anchored].
+    fn spawn_anchor_write(&mut self, job: keeper::Job, held: bool) {
+        let (Some(anchor), Some(sender)) = (&self.anchor, self.mailbox_sender.clone()) else {
+            return;
+        };
+        let (store, key, cluster, generation) = (
+            anchor.store(),
+            anchor.key(),
+            anchor.cluster(),
+            anchor.generation(),
+        );
+        self.context
+            .child("anchor")
+            .spawn(move |context| async move {
+                let now = crate::hooks::clock(context.current());
+                let outcome = select! {
+                    written = keeper::write(&store, &key, cluster, generation, job, now) => {
+                        match written {
+                            Ok(record) => Anchored::Written(record),
+                            Err(crate::anchor::AnchorError::Exists { path }) => Anchored::Taken(path),
+                            Err(err) => Anchored::Failed(err.to_string()),
+                        }
+                    },
+                    _ = context.sleep(keeper::WRITE_TIMEOUT) => {
+                        Anchored::Failed(format!("no answer within {:?}", keeper::WRITE_TIMEOUT))
+                    },
+                };
+                let _ = sender.send(Message::Anchored { outcome, held });
+            });
+    }
+
+    fn on_anchored(&mut self, outcome: Anchored, held: bool) {
+        let now = crate::hooks::clock(self.context.current());
+        let Some(anchor) = &mut self.anchor else {
+            return;
+        };
+        match outcome {
+            Anchored::Written(record) => {
+                debug!(
+                    sequence = record.record.sequence,
+                    height = record.record.height,
+                    marks = ?record.record.marks,
+                    "anchor: record written"
+                );
+                let (given, next) = anchor.written(record);
+                for held in given {
+                    self.deliver(held);
+                }
+                if let Some(job) = next {
+                    self.spawn_anchor_write(job, true);
+                }
+            }
+            Anchored::Taken(path) => {
+                error!(
+                    %path,
+                    "anchor: another process wrote at this node's next record: a clone of this \
+                     node, or an older copy of it, runs; stopping"
+                );
+                let _ = self.executor.send(executor::Message::Halt {
+                    reason: format!("another process writes this node's anchor records ({path})"),
+                });
+            }
+            Anchored::Failed(why) => {
+                warn!(
+                    %why,
+                    "anchor: record not written; degraded: signing under the restart floor alone \
+                     until the anchor answers again"
+                );
+                if held {
+                    for held in anchor.failed(now) {
+                        self.deliver(held);
+                    }
+                } else {
+                    anchor.due_failed(now);
+                }
+            }
         }
     }
 

@@ -38,9 +38,9 @@ clock.
 | Two or more voters faulty, or with clocks far ahead | **Possible** | Beyond the voting rule's assumption, as for any consensus rule. |
 
 Against a whole-network rollback the network claims what the restart floor gives (no double
-proposal, no double vote), not more: detecting the rollback, or refusing a crafted surround vote,
-needs slashing history outside the nodes ([proposed design](#proposal-an-independent-durable-anchor),
-not implemented).
+proposal, no double vote), not more, unless it runs with the WORM anchor: detecting the rollback,
+or refusing a crafted surround vote, needs slashing history outside the nodes
+([the WORM anchor](#the-worm-anchor), [anchor.md](anchor.md)).
 
 ## Rules
 
@@ -417,7 +417,7 @@ counts change together. That is the same class as a rollback.
 | Restart of every node | Read from disk, verified | Same decisions as before |
 | One node restored from an older backup (consensus journal kept) | A prefix; replayed from the finalized chain | Refuses unapplied roots; never decides from stale history alone: a duty it submits is decided by consensus |
 | One node restored from a healthy node's state | The healthy node's | Normal |
-| Every node rolled back (L-1) | **Lost** | A conflicting block or attestation of a slot or epoch before the restart is refused by every keyholder's restart floor; **a crafted surround vote is signed** |
+| Every node rolled back (L-1) | **Lost** | A conflicting block or attestation of a slot or epoch before the restart is refused by every keyholder's restart floor; without an anchor **a crafted surround vote is signed**; with the WORM anchor it is refused, and every node stops (exit status 77) |
 
 ## Whole-network rollback (L-1)
 
@@ -459,7 +459,8 @@ What the keyholders add needs no record at all: their clock and a rule they alre
 - **What it does not cover.** A surround vote: a client that crafts an attestation with an older
   source than a lost one and a target above the floor gets it signed (honest clients never send
   one; Lighthouse's own database refuses it too). The development `POST /sign`, which signs no
-  duty. Detection: the state stays rolled back, and a non-slashable duty may be signed twice.
+  duty. Detection: the state stays rolled back, and a non-slashable duty may be signed twice. The
+  WORM anchor covers these (below).
 - **Tests.** `floor::floor_1` (the reproducer's rollback with the floor, on the test chain's
   current slots: refused by every keyholder, later slots sign), `floor_2` (every node restarted:
   earlier authorizations sign again, the floor's slot and epoch do not, the next ones do),
@@ -469,47 +470,30 @@ Outside this system, the validator client may keep its own slashing database (Li
 `enable_web3signer_slashing_protection` for Web3Signer keys). That database is not rolled back with
 the signer nodes. It is defense in depth that this system neither controls nor checks.
 
-## Proposal: an independent durable anchor
+## The WORM anchor
 
-Not implemented. The goal is to detect a rollback of the signer network's slashing history, and to
-never sign a slashable duty that such a rollback could forget.
+Implemented, optional (`--anchor`, [anchor.md](anchor.md)). It keeps the part of the slashing
+history a whole-network rollback must not forget outside the nodes' rollback domain: an
+append-only log on S3, GCS or a directory, with retention the node operators cannot shorten.
 
-**Anchor.** An append-only log outside the nodes' failure and backup domains. Examples: a
-write-once object store with retention lock under another operator, a transparency log, or a
-contract on another chain. It holds signed checkpoints:
+- **Records.** Each keyholder keeps a chain of signed, create-only records: the latest block it
+  had applied and its **marks**, the cluster-wide highest block slot, attestation source and
+  target it may sign up to. It writes one before it gives a partial past its marks (in practice
+  once per epoch and once per proposal), and a heartbeat while blocks are applied.
+- **At start.** A node reads every node's latest record. The **anchored marks** (each the
+  second-highest across the nodes, so one faulty record does not count) refuse new blocks at or
+  below the anchored slot and attestations with a target at or below the anchored target or a
+  source below the anchored source: the surround vote the restart floor lets through. The node
+  signs nothing new until two of the three highest records lie on its chain.
+- **Detection.** When the records name other blocks at heights the node applied, or the network
+  finalizes below them, the node stops with exit status 77. Newer state is restored, or the
+  approvers acknowledge the rollback; the anchored marks then stay floors.
 
-```
-Checkpoint { network id, height, block digest, history root, watermarks }
-  history root: a Merkle root over the slashing records (key, slot / target, root)
-  watermarks:   per validator: highest proposal slot, highest source and target epochs
-  signature:    3-of-4 threshold signature (an internal domain), or 3 node ed25519 signatures
-```
-
-**Write-ahead rule.** The keyholder signs a slashable root only after a checkpoint covering the
-root's authorization height is durable in the anchor. In practice, a quorum of `k` of `m`
-independent anchors acknowledges it. Every signature that ever left the network is then
-reflected in the anchor, whatever happens to the nodes later.
-
-**Startup and periodic check.** A node reads the latest checkpoint and refuses to run (fail
-closed) when it is ahead of the local state:
-
-- a higher height whose digest the node cannot reach in its finalized chain;
-- or watermarks above the local history.
-
-After a whole-network rollback, every node therefore stops instead of re-deciding. Recovery then
-means bringing back the newer state, or importing the anchored watermarks. EIP-3076 import with
-its conditions after pruned history is the natural format: refuse everything at or below the
-watermarks.
-
-**Costs and open questions.**
-
-- One anchor write per block that authorizes slashable duties. The write is on the signing path:
-  latency, and availability (anchor down means no slashable signing). Non-slashable duties need
-  no anchoring.
-- The anchor's own rollback and equivocation resistance is the whole point. A single storage under
-  the same operator is not enough.
-- Who may write checkpoints, and how nodes authenticate the anchor's answers.
-- Bootstrap: an anchor must exist before the first validator duty.
+Compared with the proposal it replaces: records are per node and Ed25519-signed (no threshold
+signature, no Merkle root of the history), with cluster-wide watermarks instead of per-validator
+ones; one bucket rather than `k` of `m` anchors; and a failed write degrades the keyholder to the
+restart floor instead of stopping slashable signing. [anchor.md](anchor.md#limits) lists what
+that leaves open.
 
 ## Tests
 
@@ -526,4 +510,4 @@ watermarks.
 | EIP-3076: the official interchange tests (38 cases of `v5.3.0`, `tests/vectors/eip3076`); malformed and self-slashable files; the summary and digest; floors only rise and never contradict local records; other chain, unknown and DKG keys; missing roots; export conservative and re-importable; imports and exports at least as strict as a reference signer of the EIP's conditions (randomized, `INTERCHANGE_SEEDS=<n>`) | `eth::interchange::tests` (`tests/unit/eth/interchange.rs`) |
 | Imported keys in the state machine and on disk | `storage::tests::validator::imported` |
 | Imported history over HTTP on real processes: dry run, import, idempotence, another chain, self-slashable, floors refusing the previous signer's messages, export | `tests/e2e/import.rs` (E2E-IMP-1) |
-| Whole-network rollback | `eth2::e2e_eth_l1_whole_network_rollback_signs_a_double_proposal` (ignored, fails: without the floor); `floor::floor_1` to `floor_3` (with it) |
+| Whole-network rollback | `eth2::e2e_eth_l1_whole_network_rollback_signs_a_double_proposal` (ignored, fails: without the floor); `floor::floor_1` to `floor_3` (with it); `anchor::an_1` to `an_6` and `tests/unit/anchor.rs` (with the WORM anchor) |

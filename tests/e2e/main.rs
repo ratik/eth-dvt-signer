@@ -8,6 +8,7 @@
 
 mod admin;
 mod adversarial;
+mod anchor;
 mod bench;
 mod concurrency;
 mod crash;

@@ -526,7 +526,8 @@ async fn submission_readiness<E: Clock>(
         .send(executor::Message::Status { response })
         .map_err(|_| SignError::Stopped)?;
     let status = receiver.await.map_err(|_| SignError::Stopped)?;
-    Ok(Readiness::evaluate(status.progress, 0, context.current()))
+    Ok(Readiness::evaluate(status.progress, 0, context.current())
+        .with_anchor(status.anchor_behind, false))
 }
 
 async fn authorize(

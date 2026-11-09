@@ -204,6 +204,31 @@ index u8 ‖ 64-byte signature)`. The indices refer to the sorted approver set. 
 sorted by index, each index once, 1 to 8 of them. Only a protected command can be wrapped, and
 only once: a nested tag 15 is refused before it is read, so decoding cannot recurse.
 
+### Acknowledging a rollback (WORM anchor)
+
+When the anchor shows a whole-network rollback and the newer state is lost for good, the
+approvers sign an acknowledgment offline ([anchor.md](anchor.md#operating)). It is not a command:
+it goes to no node's API and takes no nonce (the lost state may have used any). A node reads it
+from the anchor, or writes it there when started with `--anchor-acknowledgment`.
+
+```sh
+mpc-admin anchor acknowledge --anchor s3://bucket/prefix --cluster 0x.. \
+    --approvers approvers.json --output acknowledgment.json
+mpc-admin show --command acknowledgment.json --approvers approvers.json
+mpc-admin sign --command acknowledgment.json --key approver.key --output acknowledgment-1.json
+```
+
+```text
+"eth-mpc-signer/anchor-acknowledgment/v1" ‖ cluster_id (32 bytes) ‖ generation (u64 BE)
+  ‖ height (u64 BE) ‖ block digest (32 bytes) ‖ marks (block slot, source, target: each a flag
+  byte, then a u64 BE if present)
+```
+
+Signed with the namespace `_ETH_MPC_SIGNER_ANCHOR_ACKNOWLEDGMENT`, so an approval of a command
+can never be taken for an acknowledgment, or the other way round. The document carries the fields,
+a description and the exact message, rebuilt and compared before signing and before use, as for a
+command. `sign` asks the approver to confirm that the newer state is lost.
+
 ## The nonce
 
 The replicated state holds the last administrative nonce applied (0 before the first). A
@@ -422,10 +447,13 @@ Still possible:
   the beacon node builds itself (the signer signs only its header).
 - **No rotation or revocation** of approver keys (it would change the cluster id).
 - **More than one faulty voter** breaks this as it breaks consensus.
-- **Whole-network rollback** (L-1) is not addressed for administration: a network restored from
-  an older snapshot forgets the nonces it applied, and a command signed for an old nonce becomes
-  valid again. (For duties, the keyholders' restart floor refuses double proposals and double
-  votes; it does not apply to protected commands.)
+- **Whole-network rollback** (L-1) without an anchor is not addressed for administration: a
+  network restored from an older snapshot forgets the nonces it applied, and a command signed for
+  an old nonce becomes valid again. (For duties, the keyholders' restart floor refuses double
+  proposals and double votes; it does not apply to protected commands.) With the WORM anchor
+  ([anchor.md](anchor.md)) the nodes stop instead (exit status 77): they resume on newer state, or
+  on the older one only with the approvers' acknowledgment below, after reconciling the commands
+  the lost state had applied.
 
 ## Tests
 

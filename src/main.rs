@@ -156,12 +156,47 @@ struct Args {
     /// keyholders, reconfiguration) is proposed, voted for or applied.
     #[arg(long)]
     approvers: Option<PathBuf>,
+
+    /// The WORM anchor (`docs/anchor.md`): `s3://bucket/prefix`, `gs://bucket/prefix` or
+    /// `file:///directory`, the same on every node, outside every node's data directory and
+    /// backups. Each keyholder writes a record there before it signs past its previous one; a
+    /// node reads them at start and stops (exit status 77) if they show its network was rolled
+    /// back. Credentials from the environment (`AWS_*`, `GOOGLE_*`). Needs `--approvers`.
+    #[arg(long, requires = "approvers")]
+    anchor: Option<String>,
+
+    /// How often an idle keyholder writes an anchor record while blocks are applied (seconds).
+    #[arg(long, default_value_t = 600)]
+    anchor_heartbeat_secs: u64,
+
+    /// The approvers' acknowledgment of a rollback the anchor showed (`mpc-admin anchor
+    /// acknowledge`, then `sign`; docs/anchor.md): checked, written to the anchor, and the node
+    /// continues in its generation, under its marks. Harmless to keep on later starts.
+    #[arg(long, requires = "anchor")]
+    anchor_acknowledgment: Option<PathBuf>,
+}
+
+/// The exit status of a start refusal: 77 for a rollback the anchor shows, 1 for anything else.
+fn start_exit(err: &engine::StartError) -> i32 {
+    match err {
+        engine::StartError::RolledBack(_) => eth_mpc_signer::anchor::EXIT_ROLLED_BACK,
+        _ => 1,
+    }
 }
 
 /// Load the approver file.
 fn load_approvers(path: &std::path::Path) -> Result<eth_mpc_signer::admin::Approvers, String> {
     let text = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
     eth_mpc_signer::admin::Approvers::from_json(&text)
+        .map_err(|err| format!("{}: {err}", path.display()))
+}
+
+/// Load an acknowledgment of a rollback (checked against the approvers at start).
+fn load_acknowledgment(
+    path: &std::path::Path,
+) -> Result<eth_mpc_signer::anchor::AcknowledgmentDocument, String> {
+    let text = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    eth_mpc_signer::anchor::AcknowledgmentDocument::from_json(&text)
         .map_err(|err| format!("{}: {err}", path.display()))
 }
 
@@ -271,6 +306,18 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let acknowledgment = match args
+        .anchor_acknowledgment
+        .as_deref()
+        .map(load_acknowledgment)
+    {
+        None => None,
+        Some(Ok(document)) => Some(document),
+        Some(Err(err)) => {
+            error!(%err, "refusing to start");
+            std::process::exit(1);
+        }
+    };
     let storage = args.data_dir.join(format!("node-{}", args.id));
     // The node directory holds private key shares (not encrypted): owner access only.
     std::fs::create_dir_all(&storage).expect("failed to create data directory");
@@ -315,6 +362,12 @@ fn main() {
                 approved_reshares: args.approved_reshares.clone(),
                 horizon,
                 administration: administration.clone(),
+                anchor: args.anchor.clone().map(|location| engine::AnchorConfig {
+                    location,
+                    options: Vec::new(),
+                    heartbeat: Duration::from_secs(args.anchor_heartbeat_secs.max(1)),
+                    acknowledgment: acknowledgment.clone(),
+                }),
             },
         )
         .await;
@@ -323,7 +376,7 @@ fn main() {
             Ok(opened) => opened,
             Err(err) => {
                 error!(%err, "refusing to start");
-                std::process::exit(1);
+                std::process::exit(start_exit(&err));
             }
         };
         let epoch = opened.epoch().clone();
@@ -364,7 +417,7 @@ fn main() {
             Ok(node) => node,
             Err(err) => {
                 error!(%err, "refusing to start");
-                std::process::exit(1);
+                std::process::exit(start_exit(&err));
             }
         };
 
@@ -402,6 +455,13 @@ fn main() {
             Some(Stop::Closed { height }) => {
                 warn!(height, "the consensus epoch was closed: exiting");
                 std::process::exit(engine::EXIT_CLOSED);
+            }
+            Some(Stop::RolledBack { height }) => {
+                error!(
+                    height,
+                    "the anchor shows this network was rolled back: exiting (docs/anchor.md)"
+                );
+                std::process::exit(eth_mpc_signer::anchor::EXIT_ROLLED_BACK);
             }
             None => {
                 error!(?result, "node stopped");

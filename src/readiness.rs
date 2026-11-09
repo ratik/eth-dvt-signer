@@ -46,12 +46,17 @@ pub enum Reason {
     NoRecentFinalization,
     /// A completed ceremony has no usable share on this node: it cannot sign for that key.
     ShareUnavailable,
+    /// This node's chain does not hold what the anchor's records name yet (`anchor`): it signs
+    /// nothing new until it does (a lagging node catches up; a rolled-back network stops).
+    AnchorBehind,
+    /// The anchor did not answer: this node signs under the restart floor alone (degraded).
+    AnchorUnavailable,
 }
 
 impl Reason {
     /// Whether this reason prevents submitting new authorizations.
     const fn blocks_submission(self) -> bool {
-        !matches!(self, Self::ShareUnavailable)
+        !matches!(self, Self::ShareUnavailable | Self::AnchorUnavailable)
     }
 }
 
@@ -121,6 +126,24 @@ impl Readiness {
             can_sign_authorized: true,
             reasons,
         }
+    }
+
+    /// The same, with the anchor's state (`anchor`): `behind` (not confirmed yet) makes the node
+    /// syncing, `unavailable` (degraded) makes it degraded.
+    pub fn with_anchor(mut self, behind: bool, unavailable: bool) -> Self {
+        if behind {
+            self.reasons.push(Reason::AnchorBehind);
+            self.state = State::Syncing;
+        }
+        if unavailable {
+            self.reasons.push(Reason::AnchorUnavailable);
+            if self.state == State::Ready {
+                self.state = State::Degraded;
+            }
+        }
+        self.can_submit_authorization =
+            !self.reasons.iter().any(|reason| reason.blocks_submission());
+        self
     }
 
     /// Why new authorizations are refused (empty if they are accepted).

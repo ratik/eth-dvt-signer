@@ -110,6 +110,9 @@ pub struct DutyAuthorization {
     /// Gloas proposer preferences, an envelope): a keyholder checks it against the policy in
     /// force before signing (`eth::registration`).
     pub terms: Option<Terms>,
+    /// An attestation's source epoch (its target is `period`): what the keyholder's anchor
+    /// record must cover (`anchor`).
+    pub source: Option<u64>,
 }
 
 /// The policy terms of an authorized Gloas duty the fee-recipient policy binds (proposer
@@ -1322,6 +1325,11 @@ impl Protection {
                     .filter(|bound| bound.kind == kind)
                     .map(|bound| bound.terms)
             },
+            source: (kind == DutyKind::Attestation)
+                .then(|| self.attestations.get(&(id, period)))
+                .flatten()
+                .filter(|attested| attested.signing_root == signing_root)
+                .map(|attested| attested.source),
         }
     }
 
