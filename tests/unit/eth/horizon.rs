@@ -440,3 +440,45 @@ fn gloas_duties_follow_their_slots() {
     assert_eq!(check(DutyKind::ProposerPreferences, 5 * 32), Ok(()));
     assert!(check(DutyKind::ProposerPreferences, 6 * 32).is_err());
 }
+
+/// L-1: a keyholder process's restart floor is the slot started at `start + VOTE`; it bounds new
+/// blocks, PTC votes and envelopes by slot and attestations by target epoch, nothing else.
+#[test]
+fn the_restart_floor() {
+    let horizon = horizon();
+    // 5 s into slot 100: 4 s later is still slot 100 (12-second slots); 9 s into it, slot 101.
+    let floor = horizon.restart_floor(at(100, 5)).unwrap();
+    assert_eq!(floor, RestartFloor { slot: 100 });
+    assert_eq!(floor.epoch(), 3);
+    assert_eq!(
+        horizon.restart_floor(at(100, 9)),
+        Some(RestartFloor { slot: 101 })
+    );
+    for kind in [
+        DutyKind::BlockProposal,
+        DutyKind::PayloadAttestation,
+        DutyKind::ExecutionPayloadEnvelope,
+    ] {
+        assert!(!floor.admits(kind, 3), "{kind:?}");
+        assert!(!floor.admits(kind, 100), "{kind:?}");
+        assert!(floor.admits(kind, 101), "{kind:?}");
+    }
+    assert!(!floor.admits(DutyKind::Attestation, 3));
+    assert!(floor.admits(DutyKind::Attestation, 4));
+    // Kinds no slashing or one-per-slot rule protects are not bounded.
+    for kind in DutyKind::ALL.into_iter().filter(|kind| {
+        !matches!(
+            kind,
+            DutyKind::BlockProposal
+                | DutyKind::Attestation
+                | DutyKind::PayloadAttestation
+                | DutyKind::ExecutionPayloadEnvelope
+        )
+    }) {
+        assert!(floor.admits(kind, 0), "{kind:?}");
+    }
+    // No floor without a network, before genesis, or for an unbounded horizon.
+    assert_eq!(Horizon::new(None).restart_floor(at(100, 0)), None);
+    assert_eq!(Horizon::unbounded().restart_floor(at(100, 0)), None);
+    assert_eq!(horizon.restart_floor(SystemTime::UNIX_EPOCH), None);
+}

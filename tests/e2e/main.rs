@@ -14,6 +14,7 @@ mod crash;
 mod eth2;
 mod exits;
 mod failures;
+mod floor;
 mod follower;
 mod forks;
 mod gloas;

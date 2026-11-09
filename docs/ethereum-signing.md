@@ -359,8 +359,11 @@ service, consensus timestamp or external clock is involved. What clock disagreem
 
 Two voters with wrong clocks can stall signing, but not corrupt the history. Two faulty voters
 plus a leader can get a far-future duty authorized: the horizon is a voting rule, and needs a
-correct quorum like every other one. A whole-network rollback (L-1) is a separate limitation; it
-is not solved here.
+correct quorum like every other one. A whole-network rollback (L-1) is a separate limitation,
+narrowed by the keyholders' restart floor, which the time horizon makes possible: since a keyholder
+signs only started slots and epochs, after its process starts it refuses new blocks and
+attestations of those it may have signed for before
+([slashing-protection.md](slashing-protection.md#the-restart-floor)).
 
 **Configuration** (every node, the same):
 

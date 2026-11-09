@@ -42,6 +42,20 @@
 //!
 //! The same places check a duty's `fork_info` against the network's pinned fork schedule
 //! ([`Horizon::fork`], `eth::network`, P0.3).
+//!
+//! **The restart floor** ([`RestartFloor`], audit L-1). A keyholder signs a block, an attestation,
+//! a PTC vote or an envelope only once its slot (an attestation: its target epoch) has started by
+//! its own clock, within [`Horizon::VOTE`]. So when its process starts, nothing it signed before
+//! can be later than the slot started at `start + VOTE`: that slot is its floor. For the rest of
+//! the process's life it gives no partial for a duty of one of these kinds at or below the floor
+//! (an attestation: a target at or below the floor's epoch) that it learns of after it started.
+//! Those it loaded at start, its state's own records, are signed as before: a state restored from
+//! older storage never holds a record that conflicts with one it lost, since it authorized the
+//! lost ones itself. A signature needs three of the four keyholders, so two quorums share one; if
+//! every node restarts on rolled-back storage (L-1), the shared keyholder refuses the conflicting
+//! duty, whatever the rolled-back state authorized, as long as its clock did not run backwards
+//! across its restart. The cost: a keyholder refuses the current epoch's new attestations and the
+//! restart slot's new blocks; the other keyholders sign them when only some nodes restart.
 
 pub use super::network::{Network, WrongFork};
 use super::{
@@ -75,6 +89,33 @@ pub enum Beyond {
     FutureSlot { slot: u64, latest: u64 },
     #[error("epoch {epoch} is too far ahead (at most {limit} now)")]
     FutureEpoch { epoch: u64, limit: u64 },
+}
+
+/// The restart floor of a keyholder process (module docs): the latest slot it may have signed for
+/// before it started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RestartFloor {
+    pub slot: u64,
+}
+
+impl RestartFloor {
+    /// The floor's epoch: attestations whose target is at or below it are refused.
+    pub const fn epoch(&self) -> u64 {
+        self.slot / SLOTS_PER_EPOCH
+    }
+
+    /// Whether a duty of `kind` with protection period `period` (`Protection::period`: a slot,
+    /// or an attestation's target epoch) learned of after the start is above the floor. The kinds
+    /// a slashing rule or a one-per-slot rule protects are bounded; every other kind passes.
+    pub const fn admits(&self, kind: DutyKind, period: u64) -> bool {
+        match kind {
+            DutyKind::BlockProposal
+            | DutyKind::PayloadAttestation
+            | DutyKind::ExecutionPayloadEnvelope => period > self.slot,
+            DutyKind::Attestation => period > self.epoch(),
+            _ => true,
+        }
+    }
 }
 
 /// This node's horizon: its network, if configured.
@@ -246,6 +287,17 @@ impl Horizon {
             }
         }
         Ok(())
+    }
+
+    /// The restart floor of a keyholder process that starts at `now`: the slot started at
+    /// `now + VOTE`. None without a network or before its genesis (nothing can have been signed),
+    /// or for an unbounded horizon (simulation tests).
+    pub fn restart_floor(&self, now: SystemTime) -> Option<RestartFloor> {
+        if self.unbounded {
+            return None;
+        }
+        let slot = self.network?.slot_at(now + Self::VOTE)?;
+        Some(RestartFloor { slot })
     }
 
     /// Check a duty's `fork_info` against this node's network (`eth::network`): refused without

@@ -28,6 +28,10 @@
 //!   skewed or jumping clock); nothing else reads it.
 //! - `ETH_MPC_SIGNER_NO_HORIZON=1`: the node's API and its blocks admit duties beyond the
 //!   horizon, as a faulty coordinator and leader would (its votes and partials still check it).
+//! - `ETH_MPC_SIGNER_NO_RESTART_FLOOR=<anything but 0>`: the keyholder has no restart floor
+//!   (`eth::horizon::RestartFloor`). The E2E harness sets it for every node unless a test sets it
+//!   to `0`: its chain's slots are long past, so a floor would refuse every new duty after any
+//!   restart; the floor's own tests run with it.
 //! - `ETH_MPC_SIGNER_INJECT_FILE=<path>`: as a leader, the node adds the transactions in `<path>`
 //!   (one hex-encoded transaction per line, read at every proposal) to every block it proposes,
 //!   unchecked, as a faulty leader would (its votes still check every block).
@@ -178,6 +182,11 @@ mod enabled {
         std::env::var("ETH_MPC_SIGNER_NO_HORIZON").is_ok()
     }
 
+    /// Whether this keyholder has no restart floor.
+    pub fn no_restart_floor() -> bool {
+        std::env::var("ETH_MPC_SIGNER_NO_RESTART_FLOOR").is_ok_and(|value| value != "0")
+    }
+
     /// The transactions a faulty leader adds to its blocks.
     pub fn injected() -> Vec<crate::types::Transaction> {
         use commonware_codec::DecodeExt as _;
@@ -243,6 +252,10 @@ mod enabled {
     }
 
     pub const fn no_horizon() -> bool {
+        false
+    }
+
+    pub const fn no_restart_floor() -> bool {
         false
     }
 

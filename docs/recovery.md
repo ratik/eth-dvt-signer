@@ -199,7 +199,7 @@ What readiness does not claim:
 | Restoring an old consensus journal | the node forgets votes cast after the backup; votes above its floor can be repeated differently (an equivocation, a Byzantine fault) | not detectable when the rest of the directory is consistent with it; peers that see an equivocation block the node at the P2P layer for an hour (audit L-7) |
 | Replacing a node's directory with another node's | another node's key share (partials rejected) and votes (equivocation for that identity) | not detected by this node |
 | Restoring several nodes from stale snapshots | two or more nodes without their votes exceed `f = 1` | safety no longer guaranteed by consensus |
-| Whole-network rollback | §7 | conflicting signatures (L-1) |
+| Whole-network rollback | §7 | conflicting signatures of the development `/sign`, a crafted surround vote (L-1); the restart floor refuses double proposals and double votes |
 
 ### Scenario summary
 
@@ -212,7 +212,8 @@ What readiness does not claim:
 | One offline peer | Yes | Yes | The restarting node is `ready` once consensus finalizes again with its votes; with a second node away, every node reports `no_recent_finalization`, new authorizations get `503 NOT_READY`, applied ones fail in bounded time |
 | Two nodes restarted together | Yes | Yes | Nothing is finalized while both are down. Once they are back, if they missed the certificate of the view the other two entered, consensus waits for the other two's next nullify retry (`timeout_retry`, 3 s), which carries it: 6.3 to 9.7 s measured after the restart in that case (audit L-14). Validator duties due meanwhile can be missed. Restart one node at a time, and wait for it to be `ready` |
 | Corrupted storage | The node does not run when the damage is detected (§2); a torn copy not yet acknowledged is replayed | Does not run | Exit status 1, storage left as is |
-| Whole-network rollback | **No** (L-1) | **No** | Undetectable, unsupported |
+| Whole-network rollback | **No** for the development `/sign` and crafted surround votes (L-1); blocks and attestations of slots and epochs before the restart: refused by the restart floor | **No** | Undetectable, unsupported |
+| Every node restarted at once (storage intact) | Yes; the restart floor refuses new duties of the current epoch (attestations) and slot (blocks) | Yes | Signs again from the next slot (blocks) and epoch (attestations) |
 
 ## 7. Whole-network rollback (L-1)
 
@@ -239,13 +240,29 @@ What would detect it, all outside this task:
 - or peers that are not rolled back: more nodes than the faulty threshold kept independent.
 
 The same holds for Ethereum slashing protection, which is now part of the replicated state
-([slashing-protection.md](slashing-protection.md)). It protects against every fault above
-except this one. An Ethereum validator is slashed for two conflicting signatures, whatever this
-system believes, and a rollback of every node forgets what was signed:
+([slashing-protection.md](slashing-protection.md)): the state alone protects against every fault
+above except this one. An Ethereum validator is slashed for two conflicting signatures, whatever
+this system believes, and a rollback of every node forgets what was signed:
 `eth2::e2e_eth_l1_whole_network_rollback_signs_a_double_proposal` reproduces a double proposal
-(ignored, failing). Protection against it needs slashing history outside the nodes' rollback
-domain. An anchor is designed in [slashing-protection.md](slashing-protection.md#proposal-an-independent-durable-anchor),
-not implemented. No local counter was added in its place.
+with the keyholders' restart floor switched off (ignored, failing).
+
+The **restart floor** narrows it without any record
+([slashing-protection.md](slashing-protection.md#the-restart-floor)). Every keyholder process
+refuses a new block, attestation, PTC vote or envelope of a slot (an attestation: an epoch) it may
+have signed for before it started, known from its clock and the time horizon it already keeps.
+After a whole-network rollback every process restarted, and any two quorums share a keyholder: no
+double proposal or double vote is signed (`floor::floor_1`). It does not detect the rollback, and
+it does not refuse a surround vote a client crafts; that needs slashing history outside the nodes'
+rollback domain, an anchor designed in
+[slashing-protection.md](slashing-protection.md#proposal-an-independent-durable-anchor), not
+implemented. No local counter was added.
+
+**Restarting nodes with the floor.** Restart one node at a time where you can: the other three
+keyholders sign, and nothing is missed. When every node restarts at once (an R3 reconfiguration,
+a simultaneous upgrade, a power loss), the validators lose the current epoch's attestations whose
+slots were still ahead, and a proposal only in the slot or two of the restart; from the next epoch
+on everything signs. A node logs its floor at start (`restart floor`), and each refusal (`not
+signing a duty at or below this process's restart floor`). There is no switch to skip it.
 
 ## 8. Other limits addressed here
 

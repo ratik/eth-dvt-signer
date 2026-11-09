@@ -37,7 +37,7 @@ use super::{
 use crate::{
     eth::{
         duty::{DutyKind, ValidatorKey},
-        horizon::Horizon,
+        horizon::{Horizon, RestartFloor},
         registration::{Policy as RegistrationPolicy, Refusal as RegistrationRefusal, Terms},
         types::Root,
     },
@@ -352,6 +352,17 @@ struct Session {
     acks: BTreeMap<PublicKey, PlayerAck<PublicKey>>,
 }
 
+/// An authorized duty root a keyholder knows: the duty's kind and protection period, a
+/// policy-bound duty's terms, and whether it was loaded at start (beyond the restart floor's
+/// reach) rather than learned of since.
+#[derive(Clone, Copy, Debug)]
+struct KnownDuty {
+    kind: DutyKind,
+    period: u64,
+    terms: Option<Terms>,
+    loaded: bool,
+}
+
 pub struct Actor<
     E: CryptoRng + Spawner + Context,
     S: Sender<PublicKey = PublicKey>,
@@ -391,8 +402,12 @@ pub struct Actor<
     validators: HashMap<ValidatorKey, u64>,
     /// Validator duty signing roots committed on this node (their slashing records), by key.
     /// Authorized duty roots of validator keys, with each duty's kind and protection period (and
-    /// a registration's terms).
-    duty_roots: HashMap<(ValidatorKey, Root), (DutyKind, u64, Option<Terms>)>,
+    /// a policy-bound duty's terms), and whether it was loaded at start (beyond the restart
+    /// floor's reach) rather than learned of since.
+    duty_roots: HashMap<(ValidatorKey, Root), KnownDuty>,
+    /// This process's restart floor (`eth::horizon`, audit L-1): no partial for a duty at or below
+    /// it learned of since the start. None without a network (or with the test hook).
+    restart_floor: Option<RestartFloor>,
     /// The builder registration policy in force here: no partial for a registration it refuses.
     registration_policy: Option<RegistrationPolicy>,
     /// This node's time horizon: no partial for a duty beyond it.
@@ -445,6 +460,22 @@ impl<
         {
             advance(&mut validators, key, round);
         }
+        let switched_off = crate::hooks::no_restart_floor();
+        let restart_floor = if switched_off {
+            None
+        } else {
+            horizon.restart_floor(crate::hooks::clock(context.current()))
+        };
+        match restart_floor {
+            Some(floor) => info!(
+                slot = floor.slot,
+                epoch = floor.epoch(),
+                "restart floor: no new partial for a block, PTC vote or envelope at or below this \
+                 slot, or for an attestation with a target at or below this epoch (L-1)"
+            ),
+            None if switched_off => warn!("no restart floor: switched off (test hook)"),
+            None => info!("no restart floor (no Ethereum network, or before its genesis)"),
+        }
         Self {
             context: ContextCell::new(context),
             me: signer.public_key(),
@@ -473,10 +504,16 @@ impl<
                 .map(|duty| {
                     (
                         (duty.validator, duty.signing_root),
-                        (duty.kind, duty.period, duty.terms),
+                        KnownDuty {
+                            kind: duty.kind,
+                            period: duty.period,
+                            terms: duty.terms,
+                            loaded: true,
+                        },
                     )
                 })
                 .collect(),
+            restart_floor,
             registration_policy: None,
             horizon,
             parked: Parked::default(),
@@ -522,9 +559,19 @@ impl<
                 Message::AuthorizedDuties(duties) => {
                     for duty in duties {
                         advance(&mut self.validators, duty.validator, duty.round);
+                        // A retry of a root loaded at start stays loaded.
+                        let loaded = self
+                            .duty_roots
+                            .get(&(duty.validator, duty.signing_root))
+                            .is_some_and(|known| known.loaded);
                         self.duty_roots.insert(
                             (duty.validator, duty.signing_root),
-                            (duty.kind, duty.period, duty.terms),
+                            KnownDuty {
+                                kind: duty.kind,
+                                period: duty.period,
+                                terms: duty.terms,
+                                loaded,
+                            },
                         );
                     }
                     self.release_parked();
@@ -1176,13 +1223,33 @@ impl<
                 if self.validators.get(validator) != Some(&round) {
                     return Err(Refusal::NotAuthorized);
                 }
-                let &(kind, period, terms) = self
+                let KnownDuty {
+                    kind,
+                    period,
+                    terms,
+                    loaded,
+                } = *self
                     .duty_roots
                     .get(&(*validator, *payload_hash))
                     .ok_or(Refusal::NotAuthorized)?;
                 let now = crate::hooks::clock(self.context.current());
                 if let Err(beyond) = self.horizon.authorized(kind, period, now, Horizon::VOTE) {
                     warn!(?kind, period, %beyond, "not signing a duty beyond this node's horizon");
+                    return Err(Refusal::BeyondHorizon);
+                }
+                // Not a new duty of a slot (an attestation: an epoch) this process may have signed
+                // for before it started (L-1); the peer is told as for the horizon, for good.
+                if !loaded
+                    && let Some(floor) = self.restart_floor
+                    && !floor.admits(kind, period)
+                {
+                    warn!(
+                        ?kind,
+                        period,
+                        floor_slot = floor.slot,
+                        floor_epoch = floor.epoch(),
+                        "not signing a duty at or below this process's restart floor"
+                    );
                     return Err(Refusal::BeyondHorizon);
                 }
                 // A registration, Gloas preferences or an envelope only while the policy in force

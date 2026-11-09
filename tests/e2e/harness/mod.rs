@@ -358,6 +358,10 @@ impl TestNetwork {
                     .unwrap_or_else(|_| "info,eth_mpc_signer=debug".into()),
             )
             .env("ETH_MPC_SIGNER_EXIT_ON_STDIN_EOF", "1")
+            // The test chain's slots are long past (1-second slots from the Unix epoch): a
+            // restart floor would refuse every new duty after any restart. Off unless a test
+            // sets it to `0` (`tests/e2e/floor.rs`; hooks.rs).
+            .env("ETH_MPC_SIGNER_NO_RESTART_FLOOR", "1")
             .envs(nodes[id].env.iter().cloned())
             .stdin(Stdio::piped())
             .stdout(Stdio::from(log.try_clone().unwrap()))

@@ -685,9 +685,12 @@ Signing an existing authorization costs one p2p round trip and four pairings.
 - The time horizon trusts each node's system clock: one wrong clock costs that node's votes, two or
   more far ahead could let a far-future duty through (audit L-24). No trusted time source.
 - A whole-network rollback (every node restored to older storage) forgets slashing history and
-  signs a conflicting duty (a double proposal is reproduced). It cannot be detected without state
-  outside the nodes. An anchor design is proposed, not implemented
-  ([docs/slashing-protection.md](docs/slashing-protection.md)).
+  cannot be detected without state outside the nodes. The keyholders' restart floor keeps it from
+  signing a double proposal or a double vote (each refuses new duties of the slot and epoch it may
+  have signed for before its process started); a surround vote a client crafts, and the
+  development `POST /sign`, are not covered. The floor costs the current epoch's attestations when
+  every node restarts at once (an R3 reconfiguration), nothing when one does. An anchor design is
+  proposed, not implemented ([docs/slashing-protection.md](docs/slashing-protection.md#the-restart-floor)).
 - Ethereum: mainnet preset only. No Phase 0 and Altair blocks, `BUILDER_REQUEST_AUTH`, builder
   bids or Heze. Builder registrations only under the approved registration policy; before Gloas it
   does not cover the fee recipient of a block the beacon node builds itself, and within the policy

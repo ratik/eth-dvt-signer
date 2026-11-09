@@ -15,8 +15,9 @@ destroy copies of the key.
 
 **Not production-ready**, like the rest of the network ([ethereum-signing.md](ethereum-signing.md)):
 the node API has no authentication and binds to `127.0.0.1`, the committee is fixed (4 nodes,
-threshold 3), and the whole-network rollback limitation L-1 is open and applies to imported keys
-unchanged ([slashing-protection.md](slashing-protection.md#whole-network-rollback-l-1)).
+threshold 3), and the whole-network rollback limitation L-1 applies to imported keys unchanged:
+narrowed by the keyholders' restart floor, not solved
+([slashing-protection.md](slashing-protection.md#whole-network-rollback-l-1)).
 
 ## DKG and trusted dealer
 
@@ -264,8 +265,10 @@ elsewhere.
 
 ## Limitations
 
-- **L-1 stays open.** A rollback of every node's storage loses the imported floors along with the
-  rest of the history, and the network can then sign a slashable duty, exactly as for a DKG key.
+- **L-1 stays open, narrowed.** A rollback of every node's storage loses the imported floors along
+  with the rest of the history, exactly as for a DKG key. The keyholders' restart floor still
+  refuses a double proposal or a double vote of a slot or epoch before the restart; a crafted
+  surround vote is not refused.
 - **The secret existed in full** (above). Zeroization is best effort: the buffers holding the
   password, the derived key, the decrypted secret and plaintext shares are `Zeroizing`; copies made
   by the libraries (commonware's scalar and polynomial types), the operating system or swap are not

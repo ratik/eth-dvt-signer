@@ -422,9 +422,10 @@ Still possible:
   the beacon node builds itself (the signer signs only its header).
 - **No rotation or revocation** of approver keys (it would change the cluster id).
 - **More than one faulty voter** breaks this as it breaks consensus.
-- **Whole-network rollback** (L-1) is not addressed: a network restored from an older snapshot
-  forgets the nonces it applied, and a command signed for an old nonce becomes valid again. This
-  is not solved here.
+- **Whole-network rollback** (L-1) is not addressed for administration: a network restored from
+  an older snapshot forgets the nonces it applied, and a command signed for an old nonce becomes
+  valid again. (For duties, the keyholders' restart floor refuses double proposals and double
+  votes; it does not apply to protected commands.)
 
 ## Tests
 

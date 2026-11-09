@@ -7,7 +7,7 @@ sign each duty after consensus authorized it under slashing protection.
 
 **Not production-ready.** This is a development environment: test-only keys and funds, no
 authentication, one beacon node, and L-1 (whole-network rollback, [slashing-protection.md](slashing-protection.md))
-is unresolved.
+is narrowed by the restart floor, not resolved.
 
 ## Architecture
 
@@ -614,6 +614,26 @@ beacon committees (`compute_ptc`), so once per epoch at most (here, one vote per
 builder ran: the run shows self-built Gloas blocks only; proposer preferences were signed and
 published, but no builder bid on them.
 
+### Restart floor (run N)
+
+Run N (`20261109T142310Z`), `IT_RUN=run-r3` with the keyholders' restart floor
+([slashing-protection.md](slashing-protection.md#the-restart-floor)): the same scenario as run H
+(R2, then the R3 reconfiguration while Lighthouse signs, C stopped for an epoch, D back with its
+old data), to measure what the floor costs on a real client. Exit 0.
+
+| | Run N |
+| --- | --- |
+| The R3 switch | every voter stopped (status 75) and restarted at 14:51:25, in slot 386 (epoch 12); every restarted keyholder's floor: slot 386, epoch 12; epoch 1 finalized its first block 7.9 s after the first stop |
+| What the floor refused | both validators' attestations of epoch 12 (slots 390 and 403, 20 s and 72 s after the switch): `503`, every keyholder refusing its partial (`not signing a duty at or below this process's restart floor`, period 12). The block of slot 407 in the same epoch signed and is canonical |
+| Restarts of one node | C (stopped for an epoch) and E (started as a follower) refused their partials for their own floor's epoch (3 refusals); the other keyholders signed: nothing failed |
+| Whole active period | epochs 11 to 19: every attestation with a correct target and head except epoch 12; 10 of 10 proposals canonical; 11 blocks signed for Lighthouse, all canonical |
+| Failed requests around the switch | the 2 attestations above, and 11 sync committee requests of the migrated validator during the pause itself (8 selection proofs, 2 messages, 1 contribution), as in run J without the floor (7) |
+| Security checks | all passed |
+
+Without the floor (runs H and J) no attestation failed at the switch. With it, an R3 switch costs
+each validator the attestation of the switch's epoch if its slot comes after the switch: here,
+both. From the next epoch on everything signed.
+
 ## Troubleshooting
 
 - **`kurtosis run` fails.** Read `logs/kurtosis-run.log`. A Starlark `fail` names the parameter (for
@@ -631,7 +651,8 @@ published, but no builder bid on them.
 
 - **Not production-ready.** Development node keys, test funds, no authentication, a single beacon
   node.
-- **L-1 is unresolved.** A rollback of every signer node loses slashing history.
+- **L-1 is narrowed, not resolved.** A rollback of every signer node loses slashing history; the
+  keyholders' restart floor keeps it from signing a double proposal or a double vote.
 - **No resharing or mixed-version clusters.** The migrated validator's previous signer is
   stopped by the scenario; that no other copy of its keystore signs is assumed, as on any network
   ([key-import.md](key-import.md#assumptions)).

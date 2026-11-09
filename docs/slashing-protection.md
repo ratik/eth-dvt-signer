@@ -18,7 +18,7 @@ What this protects against, and what it does not:
 | An imported key's previous signer, stopped before its complete history was exported | No | The imported floors refuse everything at or below its latest block and attestation ([below](#imported-history-eip-3076)). |
 | An imported key's previous signer still running, or a copy of the key used elsewhere | **Yes** | Outside this network: its signatures are not in this network's records. The activation acknowledgment is the operator's statement, not a check ([key-import.md](key-import.md#assumptions)). |
 | An imported history that is incomplete (exported before the stop, or from the wrong signer) | **Possible** | The network protects against what the history contains, nothing more. |
-| **Every node rolled back** to storage from before a duty (L-1) | **Yes** | Nothing in the network remembers the duty. Not detected (below). |
+| **Every node rolled back** to storage from before a duty (L-1) | **No** for a double proposal or a double vote; **yes** for a surround vote a client crafts | Nothing in the network remembers the duty, and it is not detected; but every keyholder's restart floor refuses a new block or attestation of a slot or epoch it may have signed for before it started ([below](#the-restart-floor)). An honest client never sends a surround vote; the development `POST /sign` has no floor. |
 | **History rewritten consistently** by someone with write access to the storage of 2 or more nodes | **Yes** | The same as a rollback: beyond the fault model. |
 | More than `f` Byzantine nodes | Possible | Beyond consensus' assumptions. |
 
@@ -37,9 +37,10 @@ clock.
 | One node's clock wrong (behind, ahead, jumping) | No | Only that node's admissions and votes change; it may refuse current duties until its clock is fixed. |
 | Two or more voters faulty, or with clocks far ahead | **Possible** | Beyond the voting rule's assumption, as for any consensus rule. |
 
-The network makes no claim of protection against whole-network rollback: that needs slashing
-history outside the nodes ([proposed design](#proposal-an-independent-durable-anchor), not
-implemented).
+Against a whole-network rollback the network claims what the restart floor gives (no double
+proposal, no double vote), not more: detecting the rollback, or refusing a crafted surround vote,
+needs slashing history outside the nodes ([proposed design](#proposal-an-independent-durable-anchor),
+not implemented).
 
 ## Rules
 
@@ -416,17 +417,53 @@ counts change together. That is the same class as a rollback.
 | Restart of every node | Read from disk, verified | Same decisions as before |
 | One node restored from an older backup (consensus journal kept) | A prefix; replayed from the finalized chain | Refuses unapplied roots; never decides from stale history alone: a duty it submits is decided by consensus |
 | One node restored from a healthy node's state | The healthy node's | Normal |
-| Every node rolled back (L-1) | **Lost** | **A conflicting duty is signed** |
+| Every node rolled back (L-1) | **Lost** | A conflicting block or attestation of a slot or epoch before the restart is refused by every keyholder's restart floor; **a crafted surround vote is signed** |
 
 ## Whole-network rollback (L-1)
 
-If every node's storage is restored to a point before a duty was authorized, the network
-authorizes and signs a conflicting duty. `eth2::e2e_eth_l1_whole_network_rollback_signs_a_double_proposal`
-reproduces a double proposal. It is `#[ignore]` and fails, and must not be changed to pass. The
-reasons are those of [recovery.md](recovery.md) §7. Every record of the duty (state, blocks,
-consensus journals) is rolled back together, and a counter or watermark in the same directory, or
-on the same machine under the same backup system, is rolled back with it. This repository adds no
-such counter: it would claim a protection it does not give.
+If every node's storage is restored to a point before a duty was authorized, the replicated state
+authorizes a conflicting duty. `eth2::e2e_eth_l1_whole_network_rollback_signs_a_double_proposal`
+reproduces a double proposal with the keyholders' restart floor switched off (the E2E harness's
+default): it shows what the state alone does. It is `#[ignore]` and fails, and must not be changed
+to pass. The reasons are those of [recovery.md](recovery.md) §7. Every record of the duty (state,
+blocks, consensus journals) is rolled back together, and a counter or watermark in the same
+directory, or on the same machine under the same backup system, is rolled back with it. This
+repository adds no such counter: it would claim a protection it does not give.
+
+### The restart floor
+
+What the keyholders add needs no record at all: their clock and a rule they already keep
+(`eth::horizon::RestartFloor`).
+
+- **The rule they keep.** A keyholder gives a partial for a block, an attestation, a PTC vote or
+  an envelope only once its slot (an attestation: its target epoch) has started by its own clock,
+  within 4 s (the time horizon). So whatever it signed before its process started is of a slot no
+  later than the one started at `start + 4 s`: its **floor**.
+- **The floor.** For the rest of the process's life, it gives no partial for a new duty of these
+  kinds at or below its floor (an attestation: a target at or below the floor's epoch). Duties it
+  loaded at start, its state's records, are signed as before: a state restored from older storage
+  never holds a record that conflicts with one it lost, since it authorized the lost ones itself.
+- **Why it holds.** A signature needs 3 of the 4 keyholders, so the quorum that signed a duty and
+  any quorum that would sign a conflicting one share a keyholder. After a whole-network rollback
+  every process restarted, so that keyholder has a floor at or above the duty's slot, and refuses.
+  It needs only that each node's clock does not run backwards across its own restart; the nodes'
+  clocks may disagree.
+- **What it costs.** One node restarting costs nothing: the other three sign. Every node
+  restarting at once (an R3 reconfiguration, a simultaneous upgrade, a power loss) costs, for each
+  validator, the current epoch's attestation if its slot was still ahead, and a proposal only in
+  the slot or two of the restart: at most 6.4 minutes of attestations on mainnet, against 2 to 3
+  epochs for a doppelganger wait. Measured on the devnet (run N): an R3 switch cost both
+  validators the attestation of the switch's epoch, nothing else
+  ([ethereum-devnet.md](ethereum-devnet.md#restart-floor-run-n)). No flag switches it off: a
+  rollback looks exactly like a planned restart.
+- **What it does not cover.** A surround vote: a client that crafts an attestation with an older
+  source than a lost one and a target above the floor gets it signed (honest clients never send
+  one; Lighthouse's own database refuses it too). The development `POST /sign`, which signs no
+  duty. Detection: the state stays rolled back, and a non-slashable duty may be signed twice.
+- **Tests.** `floor::floor_1` (the reproducer's rollback with the floor, on the test chain's
+  current slots: refused by every keyholder, later slots sign), `floor_2` (every node restarted:
+  earlier authorizations sign again, the floor's slot and epoch do not, the next ones do),
+  `floor_3` (one node restarted: nothing waits), `eth::horizon::tests::the_restart_floor`.
 
 Outside this system, the validator client may keep its own slashing database (Lighthouse has
 `enable_web3signer_slashing_protection` for Web3Signer keys). That database is not rolled back with
@@ -489,4 +526,4 @@ watermarks.
 | EIP-3076: the official interchange tests (38 cases of `v5.3.0`, `tests/vectors/eip3076`); malformed and self-slashable files; the summary and digest; floors only rise and never contradict local records; other chain, unknown and DKG keys; missing roots; export conservative and re-importable; imports and exports at least as strict as a reference signer of the EIP's conditions (randomized, `INTERCHANGE_SEEDS=<n>`) | `eth::interchange::tests` (`tests/unit/eth/interchange.rs`) |
 | Imported keys in the state machine and on disk | `storage::tests::validator::imported` |
 | Imported history over HTTP on real processes: dry run, import, idempotence, another chain, self-slashable, floors refusing the previous signer's messages, export | `tests/e2e/import.rs` (E2E-IMP-1) |
-| Whole-network rollback | `eth2::e2e_eth_l1_whole_network_rollback_signs_a_double_proposal` (ignored, fails) |
+| Whole-network rollback | `eth2::e2e_eth_l1_whole_network_rollback_signs_a_double_proposal` (ignored, fails: without the floor); `floor::floor_1` to `floor_3` (with it) |

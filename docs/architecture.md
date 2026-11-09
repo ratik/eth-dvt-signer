@@ -139,6 +139,10 @@ failover proxy (development)  ──>  4 eth-mpc-signer nodes (this repository)
    rules of the replicated state); preferences and envelopes under the registration policy. An
    envelope enters consensus as a summary with its root; the pinned schedule gates Gloas
    ([ethereum-signing.md](ethereum-signing.md#gloas)).
+13. Done: the restart floor (L-1 narrowed). A keyholder process refuses new blocks, attestations,
+   PTC votes and envelopes of the slot (attestations: the epoch) it may have signed for before it
+   started, so a whole-network rollback signs no double proposal or double vote; no record, no
+   switch ([slashing-protection.md](slashing-protection.md#the-restart-floor)).
 
 ## Anvil
 
