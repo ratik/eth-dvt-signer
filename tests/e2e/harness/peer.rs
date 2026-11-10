@@ -71,7 +71,7 @@ impl FakePeer {
                 let mut shares = Vec::new();
                 if !share_rounds.is_empty() {
                     let secrets =
-                        Secrets::init(context.child("secrets"), "registry-secrets".into())
+                        Secrets::init(context.child("secrets"), "registry-secrets".into(), None)
                             .await
                             .expect("open secret store");
                     for round in share_rounds {

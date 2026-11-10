@@ -1,3 +1,6 @@
 target/
 data/
 .env
+
+# A GCP project's own values for integration/tee/gcp (kept in $IT_HOME, see project.env.example).
+project.env

@@ -82,6 +82,7 @@ use std::{
     os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     process::ExitCode,
+    sync::Arc,
     thread::sleep,
     time::{Duration, Instant},
 };
@@ -94,6 +95,20 @@ struct Args {
     #[arg(long, value_delimiter = ',')]
     nodes: Vec<String>,
 
+    /// The client certificate (PEM chain) for nodes given as `https://host:port`: their mTLS API
+    /// (docs/tee.md).
+    #[arg(long, requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+
+    /// Its private key (PKCS#8, PEM).
+    #[arg(long, requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+
+    /// The node CAs `https://` nodes are checked against (PEM; `attest --certificates` writes
+    /// them). `attest` checks the node's attested key instead.
+    #[arg(long)]
+    tls_node_ca: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -104,6 +119,27 @@ struct Args {
 enum Command {
     /// Each node's consensus epoch, height, role and administrative nonce.
     Status,
+    /// Check every node's attestation (`GET /attestation` with a fresh nonce) against a policy:
+    /// a measured image on a TDX Confidential VM holds its keys (docs/tee.md). Writes the committee
+    /// file `mpc-keytool split` takes, with the evidence, and the node CAs clients pin.
+    Attest {
+        /// The policy (JSON): issuer, audience, hardware, debug state, allowed measurements.
+        #[arg(long)]
+        policy: PathBuf,
+        /// The issuer's key set (JWKS, JSON); default: Google Cloud Attestation's, fetched.
+        #[arg(long)]
+        jwks: Option<PathBuf>,
+        /// Accept nodes without a sealed vault (no evidence): listed, and written without it.
+        #[arg(long)]
+        allow_unattested: bool,
+        /// Write the committee (`mpc-keytool split --committee`) here (a new file).
+        #[arg(long)]
+        committee: Option<PathBuf>,
+        /// Write every node's CA certificate here (a new file; `--tls-node-ca`, validator
+        /// clients).
+        #[arg(long)]
+        certificates: Option<PathBuf>,
+    },
     /// Offline: create a new approver key (owner-only file) and print its public key. Never
     /// overwrites a file.
     ApproverKey {
@@ -285,7 +321,20 @@ const POLL: Duration = Duration::from_secs(1);
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    let nodes: Vec<Node> = match args.nodes.iter().map(|node| Node::new(node)).collect() {
+    let attesting = matches!(args.command, Command::Attest { .. });
+    let tls = match tls_client(&args, attesting) {
+        Ok(tls) => tls,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let nodes: Vec<Node> = match args
+        .nodes
+        .iter()
+        .map(|node| Node::new(node, tls.clone()))
+        .collect()
+    {
         Ok(nodes) => nodes,
         Err(err) => {
             eprintln!("error: {err}");
@@ -301,6 +350,22 @@ fn main() -> ExitCode {
     };
     let result = match args.command {
         Command::Status => online(&nodes).and_then(|()| status(&nodes)),
+        Command::Attest {
+            policy,
+            jwks,
+            allow_unattested,
+            committee,
+            certificates,
+        } => online(&nodes).and_then(|()| {
+            attest(
+                &nodes,
+                &policy,
+                jwks.as_deref(),
+                allow_unattested,
+                committee.as_deref(),
+                certificates.as_deref(),
+            )
+        }),
         Command::ApproverKey { output } => approver_key(&output),
         Command::ApproverPublicKey { key } => {
             load_key(&key).map(|key| println!("{}", format_key(&key.public_key())))
@@ -833,6 +898,11 @@ fn submit(nodes: &[Node], paths: &[PathBuf], output: Option<&Path>) -> Result<()
 struct Node {
     name: String,
     addr: SocketAddr,
+    /// For an `https://` node: the client configuration and the server name it is checked under.
+    tls: Option<(
+        Arc<rustls::ClientConfig>,
+        rustls::pki_types::ServerName<'static>,
+    )>,
 }
 
 /// What a node says about its consensus epoch.
@@ -851,16 +921,35 @@ struct View {
 }
 
 impl Node {
-    fn new(spec: &str) -> Result<Self, String> {
-        let address = spec.strip_prefix("http://").unwrap_or(spec);
+    fn new(spec: &str, tls: Option<Arc<rustls::ClientConfig>>) -> Result<Self, String> {
+        let (address, secure) = match spec.strip_prefix("https://") {
+            Some(address) => (address, true),
+            None => (spec.strip_prefix("http://").unwrap_or(spec), false),
+        };
         let addr = address
             .to_socket_addrs()
             .ok()
             .and_then(|mut addrs| addrs.next())
             .ok_or_else(|| format!("{spec} is not host:port"))?;
+        let tls = match (secure, tls) {
+            (false, _) => None,
+            (true, None) => {
+                return Err(format!(
+                    "{spec}: an https node needs --tls-cert and --tls-key"
+                ));
+            }
+            (true, Some(config)) => {
+                let host = address.rsplit_once(':').map_or(address, |(host, _)| host);
+                let host = host.trim_start_matches('[').trim_end_matches(']');
+                let name = rustls::pki_types::ServerName::try_from(host.to_string())
+                    .map_err(|_| format!("{spec}: not a server name"))?;
+                Some((config, name))
+            }
+        };
         Ok(Self {
             name: address.to_string(),
             addr,
+            tls,
         })
     }
 
@@ -875,20 +964,52 @@ impl Node {
         body: Option<&Value>,
         timeout: Duration,
     ) -> io::Result<(u16, Value)> {
+        self.exchange(method, path, body, timeout)
+            .map(|(status, value, _)| (status, value))
+    }
+
+    /// One request: status, body, and for an `https://` node the server's certificate (DER).
+    fn exchange(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        timeout: Duration,
+    ) -> io::Result<(u16, Value, Option<Vec<u8>>)> {
         let body = body.map(Value::to_string).unwrap_or_default();
         let mut stream = TcpStream::connect_timeout(&self.addr, Duration::from_secs(2))?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(TIMEOUT))?;
-        write!(
-            stream,
+        let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\
              Content-Type: application/json\r\nAccept: application/json\r\n\
              Content-Length: {}\r\n\r\n{body}",
             self.addr,
             body.len()
-        )?;
+        );
         let mut raw = Vec::new();
-        stream.read_to_end(&mut raw)?;
+        let mut leaf = None;
+        match &self.tls {
+            None => {
+                stream.write_all(request.as_bytes())?;
+                stream.read_to_end(&mut raw)?;
+            }
+            Some((config, name)) => {
+                let mut connection = rustls::ClientConnection::new(config.clone(), name.clone())
+                    .map_err(io::Error::other)?;
+                let mut tls = rustls::Stream::new(&mut connection, &mut stream);
+                tls.write_all(request.as_bytes())?;
+                match tls.read_to_end(&mut raw) {
+                    Ok(_) => {}
+                    Err(err) if err.kind() == io::ErrorKind::UnexpectedEof && !raw.is_empty() => {}
+                    Err(err) => return Err(err),
+                }
+                leaf = connection
+                    .peer_certificates()
+                    .and_then(|chain| chain.first())
+                    .map(|certificate| certificate.as_ref().to_vec());
+            }
+        }
         let text = String::from_utf8_lossy(&raw);
         let invalid = |what: &str| io::Error::new(io::ErrorKind::InvalidData, what.to_string());
         let (head, body) = text
@@ -911,6 +1032,7 @@ impl Node {
         Ok((
             status,
             serde_json::from_str(&body).unwrap_or(Value::String(body)),
+            leaf,
         ))
     }
 
@@ -1764,5 +1886,257 @@ fn anchor_acknowledge(
         "draft: {} (each approver signs it offline: mpc-admin sign)",
         output.display()
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// TEE nodes (docs/tee.md): the mTLS API and attestation.
+
+/// Accepts any server certificate whose key signs the handshake: for `attest`, which then
+/// requires the key to be the one the node's attestation names.
+#[derive(Debug)]
+struct AttestedLater(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AttestedLater {
+    fn verify_server_cert(
+        &self,
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &rustls::pki_types::CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            certificate,
+            signature,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &rustls::pki_types::CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            certificate,
+            signature,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// The client of `https://` nodes: the operator's certificate, and the node CAs of
+/// `--tls-node-ca` (or, for `attest`, the attested key checked after each answer).
+fn tls_client(args: &Args, attesting: bool) -> Result<Option<Arc<rustls::ClientConfig>>, String> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
+    let (Some(certificate), Some(key)) = (&args.tls_cert, &args.tls_key) else {
+        return Ok(None);
+    };
+    if !args.nodes.iter().any(|node| node.starts_with("https://")) {
+        return Ok(None);
+    }
+    let read =
+        |path: &Path| std::fs::read(path).map_err(|err| format!("{}: {err}", path.display()));
+    let chain = CertificateDer::pem_slice_iter(&read(certificate)?)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("{}: {err}", certificate.display()))?;
+    let key = PrivateKeyDer::from_pem_slice(&read(key)?)
+        .map_err(|err| format!("{}: {err}", key.display()))?;
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|err| err.to_string())?;
+    let builder = match (&args.tls_node_ca, attesting) {
+        (_, true) => builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AttestedLater(provider))),
+        (Some(path), false) => {
+            let mut roots = rustls::RootCertStore::empty();
+            for certificate in CertificateDer::pem_slice_iter(&read(path)?) {
+                roots
+                    .add(certificate.map_err(|err| format!("{}: {err}", path.display()))?)
+                    .map_err(|err| format!("{}: {err}", path.display()))?;
+            }
+            builder.with_root_certificates(roots)
+        }
+        (None, false) => {
+            return Err(
+                "https nodes need --tls-node-ca (`mpc-admin attest --certificates` writes it)"
+                    .into(),
+            );
+        }
+    };
+    builder
+        .with_client_auth_cert(chain, key)
+        .map(|config| Some(Arc::new(config)))
+        .map_err(|err| format!("client certificate: {err}"))
+}
+
+/// Create `path` with `contents`; never replaces a file.
+fn write_new_file(path: &Path, contents: &str) -> Result<(), String> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(contents.as_bytes()))
+        .map_err(|err| format!("{}: {err}", path.display()))
+}
+
+/// The last certificate of a PEM chain (the node CA), as PEM.
+fn last_certificate(chain: &str) -> Option<String> {
+    const END: &str = "-----END CERTIFICATE-----";
+    let blocks: Vec<&str> = chain.split_inclusive(END).collect();
+    blocks
+        .iter()
+        .rev()
+        .find(|block| block.contains(END))
+        .map(|block| format!("{}\n", block.trim()))
+}
+
+fn attest(
+    nodes: &[Node],
+    policy: &Path,
+    jwks: Option<&Path>,
+    allow_unattested: bool,
+    committee: Option<&Path>,
+    certificates: Option<&Path>,
+) -> Result<(), String> {
+    use eth_mpc_signer::attestation::{
+        Statement,
+        verify::{Jwks, Policy, fetch_google_jwks, verify},
+    };
+    use rand_core::Rng as _;
+    let read = |path: &Path| {
+        std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))
+    };
+    let policy =
+        Policy::from_json(&read(policy)?).map_err(|err| format!("{}: {err}", policy.display()))?;
+    let jwks = match jwks {
+        Some(path) => Jwks::from_json(&read(path)?)?,
+        None => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| err.to_string())?
+            .block_on(fetch_google_jwks())?,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|err| err.to_string())?
+        .as_secs();
+    let mut members = Vec::new();
+    let mut cas = String::new();
+    let mut failures = Vec::new();
+    for node in nodes {
+        let mut nonce = [0u8; 32];
+        UnwrapErr(rand::rngs::SysRng).fill_bytes(&mut nonce);
+        let path = format!("/attestation?nonce=0x{}", hex::encode(nonce));
+        let answer = node
+            .exchange("GET", &path, None, SUBMIT_TIMEOUT)
+            .map_err(|err| err.to_string())
+            .and_then(|(status, body, leaf)| match status {
+                200 => serde_json::from_value::<Statement>(body)
+                    .map(|statement| (statement, leaf))
+                    .map_err(|err| format!("attestation: {err}")),
+                _ => Err(format!("{status}: {body}")),
+            });
+        let (statement, leaf) = match answer {
+            Ok(answer) => answer,
+            Err(err) => {
+                failures.push(format!("{}: {err}", node.name));
+                continue;
+            }
+        };
+        let checked = match &statement.evidence {
+            None if allow_unattested => Ok(None),
+            None => Err(format!(
+                "no evidence (vault {}): pass --allow-unattested to accept it",
+                statement.vault
+            )),
+            Some(evidence) => verify(evidence, &policy, &jwks, &nonce, now).map(Some),
+        }
+        .and_then(|verified| {
+            // Over mTLS, the key that answered must be the attested one.
+            match (&node.tls, &verified) {
+                (Some(_), Some(_))
+                    if !leaf
+                        .as_deref()
+                        .is_some_and(|leaf| statement.keys.serves(leaf)) =>
+                {
+                    Err("the TLS key that answered is not the attested one".to_string())
+                }
+                _ => Ok(verified),
+            }
+        });
+        match checked {
+            Ok(verified) => {
+                match &verified {
+                    Some(verified) => println!(
+                        "{}: node {} attested ({}, instance {}, rtmr1 {}…, rtmr2 {}…), identity {}",
+                        node.name,
+                        statement.index,
+                        statement.vault,
+                        verified.instance.as_deref().unwrap_or("?"),
+                        &verified.rtmr1[..verified.rtmr1.len().min(12)],
+                        &verified.rtmr2[..verified.rtmr2.len().min(12)],
+                        statement.keys.identity
+                    ),
+                    None => println!(
+                        "{}: node {} NOT attested ({}), identity {}",
+                        node.name, statement.index, statement.vault, statement.keys.identity
+                    ),
+                }
+                if let Some(share_key) = &statement.keys.share_encryption_key {
+                    members.push(json!({
+                        "identity": statement.keys.identity,
+                        "share_encryption_key": share_key,
+                        "evidence": statement.evidence,
+                    }));
+                }
+                // Only an attested node's CA is vouched for.
+                if verified.is_some()
+                    && let Some(ca) = statement
+                        .tls_certificate
+                        .as_deref()
+                        .and_then(last_certificate)
+                {
+                    cas.push_str(&ca);
+                }
+            }
+            Err(err) => failures.push(format!("{}: node {}: {err}", node.name, statement.index)),
+        }
+    }
+    if !failures.is_empty() {
+        return Err(format!("refused:\n  {}", failures.join("\n  ")));
+    }
+    if let Some(path) = committee {
+        write_new_file(
+            path,
+            &(serde_json::to_string_pretty(&json!({"participants": members}))
+                .map_err(|err| err.to_string())?
+                + "\n"),
+        )?;
+        println!("committee: {}", path.display());
+    }
+    if let Some(path) = certificates {
+        write_new_file(path, &cas)?;
+        println!("node CAs: {}", path.display());
+    }
     Ok(())
 }

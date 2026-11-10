@@ -17,6 +17,10 @@ use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519::PublicKey;
 use commonware_utils::{TryCollect as _, ordered::Set};
 use eth_mpc_signer::{
+    attestation::{
+        Evidence,
+        verify::{Jwks, Policy, verify},
+    },
     dkg::{CeremonyId, PROTOCOL_VERSION},
     import::{
         dealer, eip2335, envelope, hex0x,
@@ -71,6 +75,14 @@ enum Command {
         /// Directory to create for `manifest.json` and `node-<index>.enc`.
         #[arg(long)]
         output: PathBuf,
+        /// Encrypt only to keys a sealed node attested (docs/tee.md): every member of the
+        /// committee must carry evidence (`mpc-admin attest --committee`) that verifies against
+        /// this policy and names its exact identity and share-encryption key.
+        #[arg(long, requires = "jwks")]
+        attestation_policy: Option<PathBuf>,
+        /// The attestation issuer's key set (JWKS, JSON) for `--attestation-policy`.
+        #[arg(long, requires = "attestation_policy")]
+        jwks: Option<PathBuf>,
     },
     /// Check a manifest and print what it describes.
     Inspect {
@@ -93,6 +105,61 @@ struct CommitteeMember {
     identity: String,
     /// X25519 share-encryption public key (`mpc-keytool share-key`).
     share_encryption_key: String,
+    /// A sealed node's attestation of both keys (`mpc-admin attest`).
+    #[serde(default)]
+    evidence: Option<Evidence>,
+}
+
+/// What `--attestation-policy` checks each member's evidence against.
+struct Attestation {
+    policy: Policy,
+    jwks: Jwks,
+}
+
+impl Attestation {
+    fn load(policy: &Path, jwks: &Path) -> Result<Self, String> {
+        let read = |path: &Path| {
+            std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))
+        };
+        Ok(Self {
+            policy: Policy::from_json(&read(policy)?)
+                .map_err(|err| format!("{}: {err}", policy.display()))?,
+            jwks: Jwks::from_json(&read(jwks)?)?,
+        })
+    }
+
+    /// The member's evidence verifies and names exactly its identity and share-encryption key.
+    fn check(&self, member: &CommitteeMember) -> Result<(), String> {
+        let evidence = member
+            .evidence
+            .as_ref()
+            .ok_or_else(|| format!("{} has no attestation evidence", member.identity))?;
+        let nonce = if evidence.nonce.is_empty() {
+            Vec::new()
+        } else {
+            unhex(&evidence.nonce).ok_or("evidence: nonce is not hex")?
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|err| err.to_string())?
+            .as_secs();
+        let verified = verify(evidence, &self.policy, &self.jwks, &nonce, now)
+            .map_err(|err| format!("{}: {err}", member.identity))?;
+        let same = |a: &str, b: &str| unhex(a).is_some() && unhex(a) == unhex(b);
+        if !same(&verified.keys.identity, &member.identity)
+            || !verified
+                .keys
+                .share_encryption_key
+                .as_deref()
+                .is_some_and(|key| same(key, &member.share_encryption_key))
+        {
+            return Err(format!(
+                "{}: the evidence attests other keys than the committee names",
+                member.identity
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn main() -> ExitCode {
@@ -122,13 +189,22 @@ fn run(command: Command) -> Result<(), String> {
             committee,
             ceremony_id,
             output,
-        } => split(
-            &keystore,
-            password_file.as_deref(),
-            &committee,
-            ceremony_id,
-            &output,
-        ),
+            attestation_policy,
+            jwks,
+        } => {
+            let attestation = match (attestation_policy, jwks) {
+                (Some(policy), Some(jwks)) => Some(Attestation::load(&policy, &jwks)?),
+                _ => None,
+            };
+            split(
+                &keystore,
+                password_file.as_deref(),
+                &committee,
+                attestation.as_ref(),
+                ceremony_id,
+                &output,
+            )
+        }
         Command::Inspect { manifest } => {
             let manifest = read_manifest(&manifest)?;
             let committee = manifest.participants().map_err(|err| err.to_string())?;
@@ -147,11 +223,13 @@ fn split(
     keystore: &Path,
     password_file: Option<&Path>,
     committee: &Path,
+    attestation: Option<&Attestation>,
     ceremony_id: String,
     output: &Path,
 ) -> Result<(), String> {
     let ceremony = CeremonyId::new(ceremony_id).map_err(|err| err.to_string())?;
-    let members = read_committee(committee)?;
+    // Before the keystore is even read: no share is made for keys that are not attested.
+    let members = read_committee(committee, attestation)?;
     let identities: Set<PublicKey> = members
         .keys()
         .cloned()
@@ -247,11 +325,17 @@ fn split(
     Ok(())
 }
 
-fn read_committee(path: &Path) -> Result<BTreeMap<PublicKey, [u8; 32]>, String> {
+fn read_committee(
+    path: &Path,
+    attestation: Option<&Attestation>,
+) -> Result<BTreeMap<PublicKey, [u8; 32]>, String> {
     let text = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
     let file: CommitteeFile = serde_json::from_str(&text).map_err(|err| err.to_string())?;
     let mut members = BTreeMap::new();
     for member in file.participants {
+        if let Some(attestation) = attestation {
+            attestation.check(&member)?;
+        }
         let identity = unhex(&member.identity)
             .and_then(|bytes| PublicKey::decode(bytes.as_slice()).ok())
             .ok_or_else(|| format!("invalid identity {}", member.identity))?;

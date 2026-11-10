@@ -59,6 +59,47 @@ pub fn request_typed(
     parse(&raw)
 }
 
+/// Like [request_typed], over TLS with `config` (the node's CA pinned, a client certificate if
+/// any). Returns the status, the body, and the server's leaf certificate (DER).
+pub fn request_tls(
+    addr: SocketAddr,
+    config: std::sync::Arc<rustls::ClientConfig>,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    timeout: Duration,
+) -> io::Result<(u16, String, Vec<u8>)> {
+    let mut tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+    tcp.set_read_timeout(Some(timeout))?;
+    tcp.set_write_timeout(Some(timeout))?;
+    let name = rustls::pki_types::ServerName::IpAddress(addr.ip().into());
+    let mut connection = rustls::ClientConnection::new(config, name)
+        .map_err(|err| io::Error::other(err.to_string()))?;
+    let mut stream = rustls::Stream::new(&mut connection, &mut tcp);
+    let body = body.unwrap_or("");
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nAccept: application/json\r\n\
+         Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    )?;
+    let mut raw = Vec::new();
+    match stream.read_to_end(&mut raw) {
+        Ok(_) => {}
+        // A server that closes without `close_notify` after a complete answer.
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof && !raw.is_empty() => {}
+        Err(err) => return Err(err),
+    }
+    let leaf = connection
+        .peer_certificates()
+        .and_then(|chain| chain.first())
+        .map(|certificate| certificate.as_ref().to_vec())
+        .unwrap_or_default();
+    let (status, _, body) = parse(&raw)?;
+    Ok((status, body, leaf))
+}
+
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_string())
 }

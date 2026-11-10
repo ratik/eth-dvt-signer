@@ -43,9 +43,11 @@ A real Lighthouse v8.3.2 validator client has run against it on a local proof-of
 (Kurtosis), as a validator whose key exists only as the network's shares
 ([docs/ethereum-devnet.md](docs/ethereum-devnet.md)).
 
-**Not production-ready**: no client authentication for signing (loopback only; protected
-operations need approvers' signatures), development node keys, no independent audit, and slashing
-history that a rollback of every node would lose ([Limitations](#limitations-next-steps)).
+**Not production-ready**: no client roles or rate limits (the plain API is loopback only; the
+mTLS API admits any certificate of the operator's CA; protected operations need approvers'
+signatures), no independent audit, and slashing history that a rollback of every node would lose
+([Limitations](#limitations-next-steps)). Nodes run with development keys unless they are given
+real identities (`--peers`), optionally sealed in a TEE ([docs/tee.md](docs/tee.md)).
 
 Design notes: [docs/architecture.md](docs/architecture.md) (signing, E2E harness, Ethereum
 integration), [docs/security-review.md](docs/security-review.md) and the adversarial audit
@@ -352,7 +354,10 @@ Node `i` serves p2p on `127.0.0.1:300i` and HTTP on `127.0.0.1:808i`. Data is in
 `cargo run --release -- --id 0`.
 
 Development keys come from the node index (`ed25519::PrivateKey::from_seed(i)`). Do not use them
-outside a local network.
+outside a local network. Real identities: `eth-mpc-signer identity` makes each node's keys in its
+vault (`--vault plain`, or sealed in a TEE with `--vault gcp-tdx`), and every node starts with the
+same peers file (`--peers`); `--https-listen` and `--client-ca` serve the API over mTLS
+([docs/tee.md](docs/tee.md)).
 
 Every node needs the same two settings:
 
@@ -621,9 +626,9 @@ E2E suite three times, the L-1 reproducer, every fuzz target for 30 s; logs in
 IT_HOME=~/eth-mpc-it ./integration/ethereum/scripts/env.sh validate 3
 ```
 
-Fuzzing (`fuzz/`, one target per input a peer, an API client, the anchor or the disk gives a node;
-a pinned nightly installed under `$IT_HOME`, never used for the signer itself), here every target
-for an hour, four at once:
+Fuzzing (`fuzz/`, one target per input a peer, an API client, the anchor, the disk or an operator's
+tool gives a node; a pinned nightly installed under `$IT_HOME`, never used for the signer itself),
+here every target for an hour, four at once:
 
 ```bash
 IT_HOME=~/eth-mpc-it ./integration/ethereum/scripts/env.sh fuzz all 3600 4
@@ -645,7 +650,8 @@ traffic, limits, lifecycle, corrupted storage) and the recovery scenarios R1-R6 
 [docs/recovery.md](docs/recovery.md) (readiness after restarts, rollbacks, a lagging node,
 inconsistent storage, an offline peer), and the WORM anchor's `anchor::an_1` to `an_6`
 ([docs/anchor.md](docs/anchor.md#tests); `tests/anchor_protocol.rs` checks the S3 and GCS
-requests against an in-process fake). E2E-1 to E2E-9: cold start to a blst-verified signature,
+requests against an in-process fake), and the sealed vault's TEE-1 to TEE-5 (`tee.rs`, against a
+fake of Google's attestation, STS and KMS; [docs/tee.md](docs/tee.md#tests)). E2E-1 to E2E-9: cold start to a blst-verified signature,
 idempotency, conflicting requests, one node offline, coordinator crash (after authorization and
 after 2 partials, through test hooks), full network restart, unauthorized p2p signing requests and
 byzantine partial signatures (from a scripted peer that takes a stopped node's identity on the real
@@ -697,8 +703,8 @@ Signing an existing authorization costs one p2p round trip and four pairings.
 
 ## Limitations (next steps)
 
-- Static validator set, development keys, **no client authentication or rate limiting** for
-  signing: anyone who can reach the HTTP port can have duties authorized and signed (within
+- Static validator set, **no client authentication or rate limiting** for signing on the plain
+  API (the mTLS API, `--https-listen`, admits the operator CA's clients, without roles): anyone who can reach the HTTP port can have duties authorized and signed (within
   slashing protection and the time horizon), and can burn a validator's slot or epoch with a duty
   for the wrong block or fork. The HTTP API therefore binds to `127.0.0.1` only. Protected
   operations need the approvers' offline signatures; a threshold of compromised approver keys can
@@ -755,10 +761,10 @@ Signing an existing authorization costs one p2p round trip and four pairings.
   - Liveness: every participant must be online, and a single non-cooperating player can make a
     ceremony fail; safety is not affected. Like every Feldman-Desmedt DKG, the key is not
     guaranteed to be uniformly random (bias of a few bits), and timing assumes synchrony.
-  - Shares are not encrypted at rest (only directory permissions); `src/dkg/secrets.rs` is the place
-    for encryption or an HSM.
+  - Shares are encrypted at rest only in a sealed vault (`--vault gcp-tdx`, a TDX Confidential VM,
+    [docs/tee.md](docs/tee.md)); in a plain vault, only directory permissions protect them.
   - A node whose share is lost (both store copies) cannot recover it; run a new ceremony.
-- Not production-ready: no independent audit, development keys, slashing history inside the
+- Not production-ready: no independent audit, development keys by default, slashing history inside the
   rollback domain of the nodes, no rate limits on DKG or signing traffic beyond the p2p quotas.
 - The mempool is not persisted: requests not yet in a block are lost if their node crashes.
 - Two nodes restarted together can stall consensus for seconds after they are back (6.3 to 9.7 s

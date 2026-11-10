@@ -1,10 +1,14 @@
-//! Run one node of a local eth-mpc-signer network (BLS DKG and threshold signing).
+//! Run one node of an eth-mpc-signer network (BLS DKG and threshold signing).
 //!
-//! Node `i` listens for peers on `127.0.0.1:<p2p-port + i>` and for clients on
-//! `127.0.0.1:<http-port + i>`. Keys are derived from the node index, which is only suitable for
-//! local development. The HTTP API is bound to loopback on purpose: it has no authentication and
-//! must not be exposed to a network. Validator duties go through slashing protection; the raw
-//! signing API, which has none, exists only in builds with the `dev-api` feature.
+//! Without `--peers`, node `i` is a development node: its key is derived from the node index, it
+//! listens for peers on `127.0.0.1:<p2p-port + i>`, and it suits local networks and tests only.
+//! With `--peers`, it uses the identity in its vault (`eth-mpc-signer identity` makes it; sealed in
+//! a TEE with `--vault gcp-tdx`, docs/tee.md) and the addresses of the peers file.
+//!
+//! Clients reach the node on `127.0.0.1:<http-port + i>`. This plain HTTP API is bound to loopback
+//! on purpose: it has no authentication and must not be exposed to a network. Validator duties go
+//! through slashing protection; the raw signing API, which has none, exists only in builds with
+//! the `dev-api` feature.
 //!
 //! ```sh
 //! cargo run --release -- --id 0
@@ -28,11 +32,15 @@ use commonware_utils::{
     union,
 };
 use eth_mpc_signer::{
+    attestation::{Attester, Keys, Statement},
     engine::{self, Channels},
     eth::horizon::{Horizon, Network},
     executor::Stop,
+    import::envelope::ShareKey,
+    peers::Peers,
     rpc,
     signer::coordinator,
+    vault::{self, Vault, gcp},
 };
 use std::{
     io::IsTerminal as _,
@@ -45,12 +53,134 @@ use std::{
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+/// `eth-mpc-signer identity`: initialize this node's vault (its identity, share-encryption key and
+/// TLS key, generated inside it) and print its keys as JSON, with the platform's attestation for a
+/// sealed vault. Run once, before the first start with `--peers`; later runs print the same keys.
 #[derive(Parser)]
-#[command(about = "Run a node of eth-mpc-signer (BLS DKG and threshold signing)")]
-struct Args {
-    /// Index of this node; also the seed of its (development) key.
+#[command(name = "eth-mpc-signer identity")]
+struct IdentityArgs {
+    /// Index of this node.
     #[arg(long)]
     id: u64,
+
+    /// Directory holding the data of every node (`<data-dir>/node-<id>`).
+    #[arg(long, default_value = "data")]
+    data_dir: PathBuf,
+
+    /// Names of the mTLS listener's certificate (IP addresses or DNS names clients use), made
+    /// with the vault; later runs keep the first ones.
+    #[arg(long = "tls-san", default_values_t = ["localhost".to_string(), "127.0.0.1".to_string()])]
+    tls_names: Vec<String>,
+
+    #[command(flatten)]
+    vault: VaultArgs,
+}
+
+/// Where the node's keys live (docs/tee.md).
+#[derive(clap::Args, Clone)]
+struct VaultArgs {
+    /// `plain`: owner-only files in `<node-dir>/vault`. `gcp-tdx`: sealed, under a data key that
+    /// Cloud KMS releases to an attested image on a Confidential VM (Intel TDX); needs `--peers`
+    /// and the `--gcp-*` flags.
+    #[arg(long, default_value = "plain")]
+    vault: String,
+
+    /// This node's Cloud KMS key: `projects/<p>/locations/<l>/keyRings/<r>/cryptoKeys/<k>`.
+    #[arg(long)]
+    gcp_kms_key: Option<String>,
+
+    /// The Workload Identity provider that admits attested VMs:
+    /// `projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>`.
+    #[arg(long)]
+    gcp_wif_provider: Option<String>,
+
+    /// The audience of the tokens `GET /attestation` returns (clients check it).
+    #[arg(long, default_value = "eth-mpc-signer")]
+    attestation_audience: String,
+
+    /// The go-tpm-tools CLI that fetches attestation tokens, when the node runs it itself (as
+    /// root).
+    #[arg(long, default_value = "gotpm")]
+    gotpm: String,
+
+    /// The image's root-only token helper (`tee-token`) instead of running `gotpm`:
+    /// `/run/eth-mpc-signer/token.sock` on the VM image.
+    #[arg(long)]
+    gcp_token_socket: Option<PathBuf>,
+
+    /// Tests only: a fake attestation issuer instead of `gotpm`.
+    #[arg(long, hide = true)]
+    gcp_token_url: Option<String>,
+
+    #[arg(long, hide = true, default_value = gcp::Config::STS)]
+    gcp_sts_endpoint: String,
+
+    #[arg(long, hide = true, default_value = gcp::Config::KMS)]
+    gcp_kms_endpoint: String,
+}
+
+impl VaultArgs {
+    fn kind(&self) -> Result<vault::Kind, String> {
+        match self.vault.as_str() {
+            "plain" => Ok(vault::Kind::Plain),
+            "gcp-tdx" => Ok(vault::Kind::Gcp(gcp::Config {
+                kms_key: self
+                    .gcp_kms_key
+                    .clone()
+                    .ok_or("--vault gcp-tdx needs --gcp-kms-key")?,
+                wif_provider: self
+                    .gcp_wif_provider
+                    .clone()
+                    .ok_or("--vault gcp-tdx needs --gcp-wif-provider")?,
+                attestation_audience: self.attestation_audience.clone(),
+                token: match (&self.gcp_token_url, &self.gcp_token_socket) {
+                    (Some(url), _) => gcp::TokenSource::Url(url.clone()),
+                    (None, Some(socket)) => gcp::TokenSource::Socket(socket.clone()),
+                    (None, None) => gcp::TokenSource::Gotpm(self.gotpm.clone()),
+                },
+                sts_endpoint: self.gcp_sts_endpoint.clone(),
+                kms_endpoint: self.gcp_kms_endpoint.clone(),
+            })),
+            other => Err(format!("unknown vault {other} (plain, gcp-tdx)")),
+        }
+    }
+}
+
+#[derive(Parser)]
+#[command(
+    about = "Run a node of eth-mpc-signer (BLS DKG and threshold signing)",
+    after_help = "`eth-mpc-signer identity --help`: initialize the node's vault and print its keys."
+)]
+struct Args {
+    /// Index of this node; without `--peers`, also the seed of its (development) key.
+    #[arg(long)]
+    id: u64,
+
+    /// The peers file (every node's identity and p2p address, in index order; `src/peers.rs`).
+    /// With it the node runs with the identity in its vault (`eth-mpc-signer identity`); without
+    /// it, with development keys on loopback.
+    #[arg(long)]
+    peers: Option<PathBuf>,
+
+    /// Address the p2p listener binds (default: this node's address in the peers file).
+    #[arg(long, requires = "peers")]
+    p2p_listen: Option<SocketAddr>,
+
+    /// Also serve the API over mTLS on this address: TLS 1.3, with the key and certificate made in
+    /// the vault (`identity`), to clients with a certificate from `--client-ca` (docs/tee.md).
+    #[arg(long, requires_all = ["peers", "client_ca"])]
+    https_listen: Option<SocketAddr>,
+
+    /// The CA certificates (PEM) the mTLS listener accepts client certificates from.
+    #[arg(long, requires = "https_listen")]
+    client_ca: Option<PathBuf>,
+
+    /// Serve no plain HTTP API on loopback: the mTLS listener only.
+    #[arg(long, requires = "https_listen")]
+    no_http: bool,
+
+    #[command(flatten)]
+    vault: VaultArgs,
 
     /// Number of consensus voters of epoch 0 (the original committee): nodes `0..participants`.
     /// A later epoch's committee is in the replicated state (R3, `docs/reconfiguration.md`).
@@ -216,37 +346,200 @@ fn load_share_key(
         .map_err(|err| format!("{}: {err}", path.display()))
 }
 
+/// Refuse to start: log why and exit with status 1.
+fn refuse(err: impl std::fmt::Display) -> ! {
+    error!(%err, "refusing to start");
+    std::process::exit(1);
+}
+
+/// The node's vault directory.
+fn vault_dir(data_dir: &std::path::Path, id: u64) -> PathBuf {
+    data_dir.join(format!("node-{id}")).join("vault")
+}
+
+/// `eth-mpc-signer identity`: prints the node's [Statement].
+fn identity(args: IdentityArgs) -> ! {
+    let kind = args.vault.kind().unwrap_or_else(|err| refuse(err));
+    let runtime = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let result: Result<Statement, String> = runtime.block_on(async {
+        let node = args.data_dir.join(format!("node-{}", args.id));
+        std::fs::create_dir_all(&node).map_err(|err| format!("{}: {err}", node.display()))?;
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o700))
+            .map_err(|err| format!("{}: {err}", node.display()))?;
+        let vault = Vault::open(&vault_dir(&args.data_dir, args.id), &kind, true)
+            .await
+            .map_err(|err| err.to_string())?;
+        let identity = vault.identity(true).map_err(|err| err.to_string())?;
+        let share_key = vault
+            .share_key(true)
+            .map_err(|err| err.to_string())?
+            .expect("created");
+        let (tls_key, tls_chain) = vault
+            .tls(Some(&args.tls_names))
+            .map_err(|err| err.to_string())?
+            .expect("created");
+        let spki = eth_mpc_signer::tls::spki(&tls_key)?;
+        let keys = Keys::new(
+            &identity.public_key(),
+            Some(share_key.public()),
+            Some(&spki),
+        );
+        Attester::new(args.id, kind.name(), keys, Some(tls_chain), Some(vault))
+            .statement(&[])
+            .await
+    });
+    match result {
+        Ok(output) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&output).expect("serializable")
+            );
+            std::process::exit(0);
+        }
+        Err(err) => refuse(err),
+    }
+}
+
+/// The node's keys, from its vault (`--peers`) or derived from its index (development).
+struct NodeKeys {
+    signer: PrivateKey,
+    share_key: Option<ShareKey>,
+    /// The mTLS listener's key (PKCS#8) and certificate chain (PEM).
+    tls: Option<vault::Tls>,
+    cipher: Option<vault::Cipher>,
+    vault: Option<Vault>,
+}
+
+async fn node_keys(args: &Args, kind: &vault::Kind, peers: Option<&Peers>) -> NodeKeys {
+    let file_share_key = args
+        .share_encryption_key
+        .as_deref()
+        .map(load_share_key)
+        .transpose()
+        .unwrap_or_else(|err| refuse(err));
+    let Some(peers) = peers else {
+        return NodeKeys {
+            signer: PrivateKey::from_seed(args.id),
+            share_key: file_share_key,
+            tls: None,
+            cipher: None,
+            vault: None,
+        };
+    };
+    let vault = Vault::open(&vault_dir(&args.data_dir, args.id), kind, false)
+        .await
+        .unwrap_or_else(|err| refuse(err));
+    let signer = vault.identity(false).unwrap_or_else(|err| refuse(err));
+    let (expected, _) = peers.get(args.id).expect("checked against the node count");
+    if &signer.public_key() != expected {
+        refuse(format!(
+            "this node's identity {} is not node {}'s in the peers file ({})",
+            eth_mpc_signer::admin::format_key(&signer.public_key()),
+            args.id,
+            eth_mpc_signer::admin::format_key(expected),
+        ));
+    }
+    let share_key = match file_share_key {
+        Some(key) => Some(key),
+        None => vault.share_key(false).unwrap_or_else(|err| refuse(err)),
+    };
+    let tls = vault.tls(None).unwrap_or_else(|err| refuse(err));
+    if args.https_listen.is_some() && tls.is_none() {
+        refuse("--https-listen: the vault has no TLS key (run `eth-mpc-signer identity`)");
+    }
+    NodeKeys {
+        signer,
+        share_key,
+        tls,
+        cipher: vault.cipher(),
+        vault: Some(vault),
+    }
+}
+
 fn main() {
-    let args = Args::parse();
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    if argv.get(1).is_some_and(|arg| arg == "identity") {
+        // Its JSON alone on stdout.
+        tracing_subscriber::fmt()
+            .with_env_filter(filter())
+            .with_writer(std::io::stderr)
+            .init();
+        identity(IdentityArgs::parse_from(argv.iter().skip(1)));
+    }
+    let args = Args::parse_from(argv);
+    tracing_subscriber::fmt()
+        .with_env_filter(filter())
+        .with_ansi(std::io::stdout().is_terminal())
+        .init();
     eth_mpc_signer::hooks::exit_on_stdin_eof();
     assert!(
         args.id < args.participants + args.followers,
         "id must be below participants + followers"
     );
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .with_ansi(std::io::stdout().is_terminal())
-        .init();
+    let kind = args.vault.kind().unwrap_or_else(|err| refuse(err));
+    if kind.is_sealed() {
+        // A sealed node's keys never exist outside it, and the flags meant for an operator with
+        // a shell are refused (docs/tee.md, recovery).
+        if args.peers.is_none() {
+            refuse("a sealed vault needs real identities (--peers)");
+        }
+        if args.share_encryption_key.is_some() {
+            refuse(
+                "a sealed node makes its share-encryption key in its vault: drop --share-encryption-key",
+            );
+        }
+        if args.allow_missing_consensus_journal || args.close_epoch_at.is_some() {
+            refuse(
+                "--allow-missing-consensus-journal and --close-epoch-at are refused with a sealed \
+                 vault (docs/tee.md, recovery)",
+            );
+        }
+    }
 
-    let address = |index: u64| {
-        let port = args.p2p_port + u16::try_from(index).expect("too many participants");
-        SocketAddr::from((Ipv4Addr::LOCALHOST, port))
-    };
-    let signer = PrivateKey::from_seed(args.id);
     let nodes = args.participants + args.followers;
-    let peers = |indices: std::ops::Range<u64>| -> Map<PublicKey, Address> {
+    let peers = args.peers.as_deref().map(|path| {
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|err| refuse(format!("{}: {err}", path.display())));
+        let peers = Peers::from_json(&text)
+            .unwrap_or_else(|err| refuse(format!("{}: {err}", path.display())));
+        if peers.len() as u64 != nodes {
+            refuse(format!(
+                "{} names {} nodes, not participants + followers = {nodes}",
+                path.display(),
+                peers.len()
+            ));
+        }
+        peers
+    });
+    let address = |index: u64| -> SocketAddr {
+        match &peers {
+            Some(peers) => peers.get(index).expect("checked").1,
+            None => {
+                let port = args.p2p_port + u16::try_from(index).expect("too many participants");
+                SocketAddr::from((Ipv4Addr::LOCALHOST, port))
+            }
+        }
+    };
+    let key = |index: u64| -> PublicKey {
+        match &peers {
+            Some(peers) => peers.get(index).expect("checked").0.clone(),
+            None => PrivateKey::from_seed(index).public_key(),
+        }
+    };
+    let range = |indices: std::ops::Range<u64>| -> Map<PublicKey, Address> {
         indices
-            .map(|index| {
-                let key = PrivateKey::from_seed(index).public_key();
-                (key, address(index).into())
-            })
+            .map(|index| (key(index), address(index).into()))
             .try_collect()
             .expect("unique keys")
     };
-    let everyone = peers(0..nodes);
-    let participants: Set<PublicKey> = peers(0..args.participants).keys().clone();
-    let followers: Set<PublicKey> = peers(args.participants..nodes).keys().clone();
-    let listen = address(args.id);
+    let everyone = range(0..nodes);
+    let participants: Set<PublicKey> = range(0..args.participants).keys().clone();
+    let followers: Set<PublicKey> = range(args.participants..nodes).keys().clone();
+    let listen = args.p2p_listen.unwrap_or_else(|| address(args.id));
     let http = SocketAddr::from((
         Ipv4Addr::LOCALHOST,
         args.http_port + u16::try_from(args.id).expect("id too large"),
@@ -274,19 +567,6 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let share_key = match args
-        .share_encryption_key
-        .as_deref()
-        .map(load_share_key)
-        .transpose()
-    {
-        Ok(share_key) => share_key,
-        Err(err) => {
-            error!(%err, "refusing to start");
-            std::process::exit(1);
-        }
-    };
-    let share_key_public = share_key.as_ref().map(|key| *key.public());
     let administration = match args.approvers.as_deref().map(load_approvers).transpose() {
         // Approvals are bound to the network too (P0.3).
         Ok(Some(approvers)) => Some(eth_mpc_signer::admin::Administration::with_network(
@@ -319,14 +599,63 @@ fn main() {
         }
     };
     let storage = args.data_dir.join(format!("node-{}", args.id));
-    // The node directory holds private key shares (not encrypted): owner access only.
+    // The node directory holds private key shares (encrypted only in a sealed vault): owner
+    // access only.
     std::fs::create_dir_all(&storage).expect("failed to create data directory");
     std::fs::set_permissions(&storage, std::fs::Permissions::from_mode(0o700))
         .expect("failed to restrict data directory permissions");
 
     let runtime = tokio::Runner::new(tokio::Config::new().with_storage_directory(&storage));
     runtime.start(|context| async move {
-        info!(id = args.id, key = ?signer.public_key(), %listen, %http, storage = %storage.display(), "starting node");
+        let NodeKeys {
+            signer,
+            share_key,
+            tls,
+            cipher,
+            vault,
+        } = node_keys(&args, &kind, peers.as_ref()).await;
+        let share_key_public = share_key.as_ref().map(|key| *key.public());
+        let tls_spki = tls
+            .as_ref()
+            .map(|(key, _)| eth_mpc_signer::tls::spki(key))
+            .transpose()
+            .unwrap_or_else(|err| refuse(err));
+        // The mTLS listener's configuration, checked before anything starts.
+        let https = match (args.https_listen, &tls, &args.client_ca) {
+            (Some(address), Some((key, chain)), Some(client_ca)) => {
+                let client_ca = std::fs::read_to_string(client_ca)
+                    .unwrap_or_else(|err| refuse(format!("{}: {err}", client_ca.display())));
+                let config = eth_mpc_signer::tls::server_config(key, chain, &client_ca)
+                    .unwrap_or_else(|err| refuse(err));
+                Some((address, config))
+            }
+            _ => None,
+        };
+        let attester = std::sync::Arc::new(Attester::new(
+            args.id,
+            if peers.is_some() {
+                kind.name()
+            } else {
+                "development"
+            },
+            Keys::new(
+                &signer.public_key(),
+                share_key_public.as_ref(),
+                tls_spki.as_deref(),
+            ),
+            tls.map(|(_, chain)| chain),
+            vault,
+        ));
+        info!(
+            id = args.id,
+            key = ?signer.public_key(),
+            vault = kind.name(),
+            development_key = peers.is_none(),
+            %listen,
+            %http,
+            storage = %storage.display(),
+            "starting node"
+        );
 
         let p2p = lookup::Config::local(
             signer.clone(),
@@ -359,6 +688,7 @@ fn main() {
                 },
                 allow_missing_consensus_journal: args.allow_missing_consensus_journal,
                 share_key,
+                secrets_cipher: cipher,
                 approved_reshares: args.approved_reshares.clone(),
                 horizon,
                 administration: administration.clone(),
@@ -388,8 +718,10 @@ fn main() {
             .iter_pairs()
             .map(|(key, address)| (key.clone(), address.clone()))
             .partition(|(key, _)| epoch.committee.position(key).is_some());
-        let voters: Map<PublicKey, Address> = voters.into_iter().try_collect().expect("unique keys");
-        let others: Map<PublicKey, Address> = others.into_iter().try_collect().expect("unique keys");
+        let voters: Map<PublicKey, Address> =
+            voters.into_iter().try_collect().expect("unique keys");
+        let others: Map<PublicKey, Address> =
+            others.into_iter().try_collect().expect("unique keys");
         oracle.track(epoch.epoch, AddressableTrackedPeers::new(voters, others));
 
         let quota = Quota::per_second(NZU32!(1_000));
@@ -407,7 +739,9 @@ fn main() {
         for neighbor in engine::neighbor_epochs(epoch.epoch) {
             for channel in engine::consensus_channels(neighbor) {
                 let (_, receiver) = network.register(channel, quota);
-                context.child("drain").spawn(move |_| engine::drain(receiver));
+                context
+                    .child("drain")
+                    .spawn(move |_| engine::drain(receiver));
             }
         }
         let network_handle = network.start();
@@ -421,9 +755,6 @@ fn main() {
             }
         };
 
-        let listener = ::tokio::net::TcpListener::bind(http)
-            .await
-            .expect("failed to bind HTTP listener");
         let router = rpc::router(
             node.client,
             node.dkg,
@@ -435,21 +766,43 @@ fn main() {
                 share_key: share_key_public,
                 horizon,
                 administration,
+                attester: Some(attester),
             },
         );
-        let rpc_handle = context.child("rpc").spawn(move |_| async move {
-            if let Err(err) = axum::serve(listener, router).await {
-                error!(?err, "HTTP server failed");
-            }
-        });
+        let mut handles = vec![network_handle, node.handle];
+        if !args.no_http {
+            let listener = ::tokio::net::TcpListener::bind(http)
+                .await
+                .expect("failed to bind HTTP listener");
+            let router = router.clone();
+            handles.push(context.child("rpc").spawn(move |_| async move {
+                if let Err(err) = axum::serve(listener, router).await {
+                    error!(?err, "HTTP server failed");
+                }
+            }));
+        }
+        if let Some((address, config)) = https {
+            let listener = eth_mpc_signer::tls::Listener::bind(address, config)
+                .await
+                .unwrap_or_else(|err| refuse(format!("--https-listen {address}: {err}")));
+            info!(%address, "serving the API over mTLS");
+            handles.push(context.child("rpc_tls").spawn(move |_| async move {
+                if let Err(err) = axum::serve(listener, router).await {
+                    error!(?err, "mTLS server failed");
+                }
+            }));
+        }
 
         // A node stops on its own only when its consensus epoch ended: whatever else ended, it is a
         // failure.
         let stopped = node.stopped.clone();
-        let result = Handle::select([network_handle, node.handle, rpc_handle]).await;
+        let result = Handle::select(handles).await;
         match stopped.get() {
             Some(Stop::Reconfigured { epoch, height }) => {
-                info!(epoch, height, "the consensus epoch ended: exiting to restart in the next one");
+                info!(
+                    epoch,
+                    height, "the consensus epoch ended: exiting to restart in the next one"
+                );
                 std::process::exit(engine::EXIT_RECONFIGURED);
             }
             Some(Stop::Closed { height }) => {

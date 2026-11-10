@@ -10,6 +10,7 @@
 //! - Synchronization: [TestNetwork::wait_until] polls observable state with a deadline; nothing
 //!   relies on fixed sleeps.
 
+pub mod gcp;
 pub mod http;
 pub mod peer;
 
@@ -74,7 +75,7 @@ pub fn approvers_json() -> String {
 }
 
 /// The binary built for this test run (with the `test-hooks` feature).
-const BINARY: &str = env!("CARGO_BIN_EXE_eth-mpc-signer");
+pub const BINARY: &str = env!("CARGO_BIN_EXE_eth-mpc-signer");
 
 /// Seconds a coordinator waits for partial signatures (short, so failures fail fast).
 pub const SIGNING_TIMEOUT_SECS: u64 = 5;
@@ -155,7 +156,7 @@ pub struct TestNetwork {
     _slot: Slot,
 }
 
-/// Ports per reserved block (p2p ports first, then HTTP ports).
+/// Ports per reserved block (p2p ports first, then HTTP ports, then mTLS ports).
 const BLOCK: u16 = 32;
 
 /// Directory of port-block lock files shared by every test process on this machine.
@@ -182,7 +183,7 @@ impl Ports {
     /// over), then a check that every port is free. Other programs may still race for a port;
     /// test processes cannot.
     pub fn reserve(n: usize) -> Self {
-        assert!(2 * n as u16 <= BLOCK);
+        assert!(3 * n as u16 <= BLOCK);
         fs::create_dir_all(locks()).unwrap();
         let seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -215,7 +216,7 @@ impl Ports {
                     continue;
                 }
             }
-            let free = (0..2 * n as u16)
+            let free = (0..3 * n as u16)
                 .all(|offset| TcpListener::bind((Ipv4Addr::LOCALHOST, base + offset)).is_ok());
             if free {
                 return Self { base, lock };
@@ -632,6 +633,23 @@ impl TestNetwork {
 
     pub fn p2p_addr(&self, id: usize) -> SocketAddr {
         SocketAddr::from((Ipv4Addr::LOCALHOST, self.p2p_base + id as u16))
+    }
+
+    /// The address of node `id`'s mTLS listener, when it is given `--https-listen` with it.
+    pub fn https_addr(&self, id: usize) -> SocketAddr {
+        let n = self.len() as u16;
+        SocketAddr::from((Ipv4Addr::LOCALHOST, self.p2p_base + 2 * n + id as u16))
+    }
+
+    /// The directory every node's `--data-dir` points to.
+    pub fn data_root(&self) -> PathBuf {
+        self.dir.join("data")
+    }
+
+    /// Replace node `id`'s own arguments (kept for its later starts); takes effect at its next
+    /// start.
+    pub fn set_node_args(&self, id: usize, args: Vec<String>) {
+        self.nodes.lock().unwrap()[id].args = args;
     }
 
     /// Storage directory of node `id`.

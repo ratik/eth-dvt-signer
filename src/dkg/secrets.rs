@@ -15,15 +15,21 @@
 //!   polynomial before use. For an imported key, the share the node opened from its envelope and
 //!   verified against the registered commitments (`import`), stored the same way.
 //!
-//! Nothing here is encrypted at rest: protection relies on the data directory's permissions.
-//! Encryption, an HSM or a TEE would replace this module without changing the protocol code.
+//! With a plain vault nothing here is encrypted at rest: protection relies on the data directory's
+//! permissions. With a sealed vault (`crate::vault`, docs/tee.md), every value is encrypted with
+//! the vault's cipher, bound to its partition and key, and decrypted once at start; a value in the
+//! clear, or one that does not open, stops the node.
 
 use super::{
     CeremonyId, MAX_PARTICIPANTS, Variant,
     ceremony::{Ceremony, Origin},
 };
+use crate::vault::Cipher;
 use bytes::{Buf, BufMut};
-use commonware_codec::{EncodeSize, Error as CodecError, Read, ReadExt as _, Write, varint::UInt};
+use commonware_codec::{
+    DecodeExt as _, Encode as _, EncodeSize, Error as CodecError, Read, ReadExt as _, Write,
+    varint::UInt,
+};
 use commonware_cryptography::{
     bls12381::{
         dkg::feldman_desmedt::{DealerPrivMsg, DealerPubMsg, Output},
@@ -44,6 +50,7 @@ use commonware_utils::{
     ordered::{Quorum as _, Set},
     sequence::prefixed_u64::U64 as Key,
 };
+use std::collections::BTreeMap;
 
 const SEED_PREFIX: u8 = 0;
 const DEALINGS_PREFIX: u8 = 1;
@@ -306,50 +313,170 @@ impl EncodeSize for Value {
     }
 }
 
+/// The tag of a sealed value: none of [Value]'s tags.
+const SEALED_TAG: u8 = 0xe5;
+/// The largest sealed value read back (a round's dealings are the largest values).
+const MAX_SEALED: usize = 64 << 20;
+/// Associated data of a sealed value: this domain, the partition and the key.
+const SEALED_DOMAIN: &[u8] = b"eth-mpc-signer/secrets/v1/";
+
+/// What the store holds under a [Key]: a [Value] in the clear (plain vault, encoded exactly as
+/// before sealing existed), or sealed with the vault's cipher.
+#[derive(Clone)]
+enum Stored {
+    Clear(Value),
+    Sealed(Vec<u8>),
+}
+
+impl Write for Stored {
+    fn write(&self, buf: &mut impl BufMut) {
+        match self {
+            Self::Clear(value) => value.write(buf),
+            Self::Sealed(bytes) => {
+                SEALED_TAG.write(buf);
+                UInt(bytes.len() as u32).write(buf);
+                buf.put_slice(bytes);
+            }
+        }
+    }
+}
+
+impl Read for Stored {
+    type Cfg = ();
+
+    fn read_cfg(buf: &mut impl Buf, _: &()) -> Result<Self, CodecError> {
+        if buf.chunk().first() != Some(&SEALED_TAG) {
+            return Value::read(buf).map(Self::Clear);
+        }
+        u8::read(buf)?;
+        let len: u32 = UInt::read(buf)?.into();
+        let len = len as usize;
+        if len > MAX_SEALED {
+            return Err(CodecError::Invalid("Stored", "sealed value too large"));
+        }
+        if buf.remaining() < len {
+            return Err(CodecError::EndOfBuffer);
+        }
+        let mut bytes = vec![0u8; len];
+        buf.copy_to_slice(&mut bytes);
+        Ok(Self::Sealed(bytes))
+    }
+}
+
+impl EncodeSize for Stored {
+    fn encode_size(&self) -> usize {
+        match self {
+            Self::Clear(value) => value.encode_size(),
+            Self::Sealed(bytes) => 1 + UInt(bytes.len() as u32).encode_size() + bytes.len(),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("secret store: {0}")]
     Storage(#[from] metadata::Error),
     #[error("a share for round {0} is already stored")]
     ShareExists(u64),
+    #[error("secret store: sealed values, but the node has no sealed vault (docs/tee.md)")]
+    SealedWithoutVault,
+    #[error(
+        "secret store: a value in the clear in a sealed node's store (secrets made before sealing \
+         cannot be sealed after the fact)"
+    )]
+    ClearInSealedStore,
+    #[error(
+        "secret store: a sealed value does not open (modified, moved to another key, or another \
+         vault's)"
+    )]
+    Open,
 }
 
 /// Secret material of this node, durably stored.
 pub struct Secrets<E: Context> {
     // `Metadata::sync` consumes the store, so it is temporarily taken out while syncing.
-    metadata: Option<Metadata<E, Key, Value>>,
+    metadata: Option<Metadata<E, Key, Stored>>,
+    /// Every value, in the clear (decrypted once at start for a sealed store).
+    values: BTreeMap<Key, Value>,
+    /// The vault's cipher: values are sealed with it.
+    cipher: Option<Cipher>,
+    partition: String,
+}
+
+/// One change of a [Secrets::commit].
+enum Change {
+    Put(Key, Value),
+    Remove(Key),
 }
 
 impl<E: Context> Secrets<E> {
-    /// Open (or create) the store in `partition`. Fails if no intact copy can be read.
-    pub async fn init(context: E, partition: String) -> Result<Self, Error> {
-        let metadata = Metadata::init(
+    /// Open (or create) the store in `partition`. Fails if no intact copy can be read, or if a
+    /// value does not open with `cipher` (or is sealed while `cipher` is `None`, or in the clear
+    /// while it is not).
+    pub async fn init(
+        context: E,
+        partition: String,
+        cipher: Option<Cipher>,
+    ) -> Result<Self, Error> {
+        let metadata: Metadata<E, Key, Stored> = Metadata::init(
             context,
             Config {
-                partition,
+                partition: partition.clone(),
                 codec_config: (),
             },
         )
         .await?;
+        let mut values = BTreeMap::new();
+        for key in metadata.keys() {
+            let value = match (metadata.get(key).expect("listed"), &cipher) {
+                (Stored::Clear(value), None) => value.clone(),
+                (Stored::Clear(_), Some(_)) => return Err(Error::ClearInSealedStore),
+                (Stored::Sealed(_), None) => return Err(Error::SealedWithoutVault),
+                (Stored::Sealed(bytes), Some(cipher)) => {
+                    let plaintext = cipher
+                        .open(&sealed_aad(&partition, key), bytes)
+                        .ok_or(Error::Open)?;
+                    Value::decode(plaintext.as_slice()).map_err(|_| Error::Open)?
+                }
+            };
+            values.insert(key.clone(), value);
+        }
         Ok(Self {
             metadata: Some(metadata),
+            values,
+            cipher,
+            partition,
         })
     }
 
     fn get(&self, key: Key) -> Option<&Value> {
-        self.metadata
-            .as_ref()
-            .expect("metadata is present")
-            .get(&key)
+        self.values.get(&key)
     }
 
-    /// Apply `update` and make it durable before returning.
-    async fn commit(
-        &mut self,
-        update: impl FnOnce(&mut Metadata<E, Key, Value>),
-    ) -> Result<(), Error> {
+    /// Apply `changes` and make them durable before returning.
+    async fn commit(&mut self, changes: Vec<Change>) -> Result<(), Error> {
         let mut metadata = self.metadata.take().expect("metadata is present");
-        update(&mut metadata);
+        for change in changes {
+            match change {
+                Change::Put(key, value) => {
+                    let stored = match &self.cipher {
+                        None => Stored::Clear(value.clone()),
+                        Some(cipher) => {
+                            let plaintext = zeroize::Zeroizing::new(value.encode().to_vec());
+                            Stored::Sealed(
+                                cipher.seal(&sealed_aad(&self.partition, &key), &plaintext),
+                            )
+                        }
+                    };
+                    metadata.put(key.clone(), stored);
+                    self.values.insert(key, value);
+                }
+                Change::Remove(key) => {
+                    metadata.remove(&key);
+                    self.values.remove(&key);
+                }
+            }
+        }
         self.metadata = Some(metadata.sync().await?);
         Ok(())
     }
@@ -362,9 +489,10 @@ impl<E: Context> Secrets<E> {
     }
 
     pub async fn put_seed(&mut self, round: u64, seed: Summary) -> Result<(), Error> {
-        self.commit(|metadata| {
-            metadata.put(Key::new(SEED_PREFIX, round), Value::Seed(seed));
-        })
+        self.commit(vec![Change::Put(
+            Key::new(SEED_PREFIX, round),
+            Value::Seed(seed),
+        )])
         .await
     }
 
@@ -379,9 +507,10 @@ impl<E: Context> Secrets<E> {
         let mut dealings = self.dealings(round);
         dealings.retain(|(dealer, ..)| *dealer != dealing.0);
         dealings.push(dealing);
-        self.commit(|metadata| {
-            metadata.put(Key::new(DEALINGS_PREFIX, round), Value::Dealings(dealings));
-        })
+        self.commit(vec![Change::Put(
+            Key::new(DEALINGS_PREFIX, round),
+            Value::Dealings(dealings),
+        )])
         .await
     }
 
@@ -394,9 +523,7 @@ impl<E: Context> Secrets<E> {
 
     /// Rounds of every stored share.
     pub fn share_rounds(&self) -> Vec<u64> {
-        self.metadata
-            .as_ref()
-            .expect("metadata is present")
+        self.values
             .keys()
             .filter(|key| key.prefix() == SHARE_PREFIX)
             .map(|key| key.value())
@@ -410,11 +537,11 @@ impl<E: Context> Secrets<E> {
         if self.share(round).is_some() {
             return Err(Error::ShareExists(round));
         }
-        self.commit(|metadata| {
-            metadata.remove(&Key::new(SEED_PREFIX, round));
-            metadata.remove(&Key::new(DEALINGS_PREFIX, round));
-            metadata.put(Key::new(SHARE_PREFIX, round), Value::Share(Box::new(share)));
-        })
+        self.commit(vec![
+            Change::Remove(Key::new(SEED_PREFIX, round)),
+            Change::Remove(Key::new(DEALINGS_PREFIX, round)),
+            Change::Put(Key::new(SHARE_PREFIX, round), Value::Share(Box::new(share))),
+        ])
         .await
     }
 
@@ -430,11 +557,11 @@ impl<E: Context> Secrets<E> {
             return Ok(());
         }
         for _ in 0..2 {
-            self.commit(|metadata| {
-                metadata.remove(&Key::new(SEED_PREFIX, round));
-                metadata.remove(&Key::new(DEALINGS_PREFIX, round));
-                metadata.remove(&Key::new(SHARE_PREFIX, round));
-            })
+            self.commit(vec![
+                Change::Remove(Key::new(SEED_PREFIX, round)),
+                Change::Remove(Key::new(DEALINGS_PREFIX, round)),
+                Change::Remove(Key::new(SHARE_PREFIX, round)),
+            ])
             .await?;
         }
         Ok(())
@@ -445,18 +572,27 @@ impl<E: Context> Secrets<E> {
         if self.seed(round).is_none() && self.dealings(round).is_empty() {
             return Ok(());
         }
-        self.commit(|metadata| {
-            metadata.remove(&Key::new(SEED_PREFIX, round));
-            metadata.remove(&Key::new(DEALINGS_PREFIX, round));
-        })
+        self.commit(vec![
+            Change::Remove(Key::new(SEED_PREFIX, round)),
+            Change::Remove(Key::new(DEALINGS_PREFIX, round)),
+        ])
         .await
     }
+}
+
+/// The associated data of the value under `key` in `partition`.
+fn sealed_aad(partition: &str, key: &Key) -> Vec<u8> {
+    let mut aad = SEALED_DOMAIN.to_vec();
+    UInt(partition.len() as u32).write(&mut aad);
+    aad.extend_from_slice(partition.as_bytes());
+    key.write(&mut aad);
+    aad
 }
 
 /// Fuzzing (`crate::fuzzing`): a stored secret's bytes, if they decode, round-trip.
 #[cfg(any(test, feature = "fuzzing"))]
 pub(crate) fn fuzz_value(bytes: &[u8]) {
-    crate::fuzzing::round_trip::<Value>(bytes);
+    crate::fuzzing::round_trip::<Stored>(bytes);
 }
 
 #[cfg(test)]

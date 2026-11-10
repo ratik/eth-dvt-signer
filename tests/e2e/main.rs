@@ -33,6 +33,7 @@ mod replace;
 mod reshare;
 mod rollback;
 mod signing;
+mod tee;
 
 /// Ceremony every scenario signs with.
 pub const KEY: &str = "validator-001";

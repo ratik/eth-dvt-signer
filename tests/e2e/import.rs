@@ -16,14 +16,14 @@ use std::{
 };
 
 /// The EIP-2335 test vector (tests/fixtures/eip2335): its key is the one imported.
-const PASSWORD: &str = "𝔱𝔢𝔰𝔱𝔭𝔞𝔰𝔰𝔴𝔬𝔯𝔡🔑";
+pub(crate) const PASSWORD: &str = "𝔱𝔢𝔰𝔱𝔭𝔞𝔰𝔰𝔴𝔬𝔯𝔡🔑";
 const SECRET: &str = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
 pub(crate) const PUBKEY: &str = "0x9612d7a727c9d0a22e185a1c768478dfe919cada9266988cb32359c11f2b7b27f4ae4040902382ae2910c15e2b420d07";
 pub(crate) const CEREMONY: &str = "imported-validator";
 
 pub(crate) const ACKNOWLEDGED: &str = r#"{"previous_signer_stopped": true, "no_other_active_signer": true, "history_exported_after_stop": true, "automatic_restart_disabled": true}"#;
 
-fn write_secret(path: &Path, contents: &[u8]) {
+pub(crate) fn write_secret(path: &Path, contents: &[u8]) {
     use std::io::Write as _;
     let mut file = std::fs::OpenOptions::new()
         .write(true)

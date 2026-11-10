@@ -735,7 +735,7 @@ fn interrupted_share_write_is_never_used() {
         // Node 2 crashed halfway through writing its share: the secret store falls back to its
         // previous complete state, which holds the acknowledged dealings but no share.
         tear_newest_copy(&context, "node-2-secrets").await;
-        let secrets = Secrets::init(context.child("inspect"), "node-2-secrets".into())
+        let secrets = Secrets::init(context.child("inspect"), "node-2-secrets".into(), None)
             .await
             .unwrap();
         assert!(secrets.share(0).is_none(), "the torn write held the share");

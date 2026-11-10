@@ -166,6 +166,8 @@ pub struct Config<B, P> {
     pub allow_missing_consensus_journal: bool,
     /// This node's share-encryption key, to install shares of imported keys (`import`).
     pub share_key: Option<crate::import::envelope::ShareKey>,
+    /// The sealed vault's cipher (`vault`, docs/tee.md): `registry-secrets` is encrypted with it.
+    pub secrets_cipher: Option<crate::vault::Cipher>,
     /// The operator's approvals of reshares to new keyholders (`dkg::approval`), if any.
     pub approved_reshares: Option<std::path::PathBuf>,
     /// The Ethereum network whose clock bounds the duties this node admits and signs
@@ -633,7 +635,12 @@ where
     store.administer(config.administration.clone());
     // A secret store that cannot be read is fatal: the node must not run with lost or
     // inconsistent shares.
-    let secrets = Secrets::init(context.child("secrets"), format!("{prefix}-secrets")).await?;
+    let secrets = Secrets::init(
+        context.child("secrets"),
+        format!("{prefix}-secrets"),
+        config.secrets_cipher.clone(),
+    )
+    .await?;
     // The anchor's records (`anchor`): read before anything runs; without an answer, the node
     // starts degraded and warns (signing under the restart floor alone).
     let anchor = match &config.anchor {

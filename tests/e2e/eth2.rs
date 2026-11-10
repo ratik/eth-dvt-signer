@@ -158,7 +158,7 @@ pub(crate) fn activation(network: &TestNetwork, node: usize, key: &str) -> Optio
 }
 
 /// Activate `key` for [CHAIN] through node `via` and wait until every node has applied it.
-fn activate_everywhere(network: &TestNetwork, via: usize, key: &str) -> Value {
+pub(crate) fn activate_everywhere(network: &TestNetwork, via: usize, key: &str) -> Value {
     let (status, activated) = activate(network, via, key, CHAIN);
     assert_eq!(status, 200, "{activated}");
     assert_eq!(activated["status"], "active", "{activated}");

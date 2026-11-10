@@ -94,6 +94,13 @@ From `GET /identity` of each node, which also gives its `participant_index`. The
 members as the network does; the manifest is refused at registration unless they are exactly the
 network's committee.
 
+For sealed nodes ([tee.md](tee.md)), `mpc-admin attest --committee committee.json` writes this file
+with each member's attestation evidence (`"evidence"`). `mpc-keytool split --attestation-policy
+policy.json --jwks jwks.json` then encrypts only to keys an image the policy allows attested. It
+refuses before the keystore is read if a member has no evidence, if the evidence fails the policy
+(signature, freshness, TDX, debug state, measurements), or if it attests other keys than the
+member's.
+
 ### Share-encryption key (`mpc-keytool share-key --out FILE`)
 
 One X25519 key pair per node, used for nothing else. The file holds the secret key

@@ -17,7 +17,14 @@ latencies); with
 `--requests DIR`, each signing request body is kept for the security checks (duty data only,
 nothing secret).
 
+An `https://` backend is a sealed node's mTLS API (docs/tee.md): the proxy presents the
+operator's client certificate (`--tls-cert`, `--tls-key`) and pins that node's attested CA
+(`--ca URL=FILE`), over TLS 1.3, and keeps its connections open between requests, as a validator
+client's HTTP pool does. With one such backend, the proxy is a loopback bridge to that node.
+
 Usage: proxy.py --listen 127.0.0.1:47200 --backend http://127.0.0.1:47100 ... --log FILE
+       proxy.py --listen 127.0.0.1:47100 --backend https://IP:8443 --ca https://IP:8443=CA.pem
+                --tls-cert client.pem --tls-key client-key.pem --log FILE
 """
 
 import argparse
@@ -26,6 +33,7 @@ import http.server
 import json
 import os
 import socket
+import ssl
 import threading
 import time
 import urllib.parse
@@ -36,10 +44,33 @@ RETRIED_STATUSES = {502, 503, 504}
 
 
 class Backends:
-    def __init__(self, urls):
+    def __init__(self, urls, tls=None):
         self.urls = urls
         self.down_until = {url: 0.0 for url in urls}
         self.lock = threading.Lock()
+        # url -> SSL context (https backends); url -> idle connections.
+        self.tls = tls or {}
+        self.idle = {url: [] for url in urls}
+
+    def connection(self, url, fresh=False):
+        """A connection to `url` and whether it is reused: an idle one of an https backend
+        (unless `fresh`), or a new one (http backends: a new one each time)."""
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme != "https":
+            return http.client.HTTPConnection(parsed.hostname, parsed.port,
+                                              timeout=ATTEMPT_TIMEOUT), False
+        with self.lock:
+            if self.idle[url] and not fresh:
+                return self.idle[url].pop(), True
+        return http.client.HTTPSConnection(parsed.hostname, parsed.port, timeout=ATTEMPT_TIMEOUT,
+                                           context=self.tls[url]), False
+
+    def release(self, url, connection, reusable):
+        if reusable and urllib.parse.urlsplit(url).scheme == "https":
+            with self.lock:
+                self.idle[url].append(connection)
+        else:
+            connection.close()
 
     def order(self):
         """Nodes that answered recently first, in preference order, then the others."""
@@ -130,16 +161,23 @@ def make_handler(backends, log_path, requests_dir):
             attempts = []
             answer = None
             for url in backends.order():
-                parsed = urllib.parse.urlsplit(url)
                 attempt_started = time.monotonic()
                 try:
-                    connection = http.client.HTTPConnection(
-                        parsed.hostname, parsed.port, timeout=ATTEMPT_TIMEOUT)
-                    connection.request(self.command, self.path, body=body, headers=headers)
-                    response = connection.getresponse()
-                    data = response.read()
+                    # A kept connection the node closed meanwhile fails at once: one new one then
+                    # (not after a timeout).
+                    for fresh in (False, True):
+                        connection, reused = backends.connection(url, fresh)
+                        try:
+                            connection.request(self.command, self.path, body=body, headers=headers)
+                            response = connection.getresponse()
+                            data = response.read()
+                            break
+                        except (OSError, http.client.HTTPException) as error:
+                            connection.close()
+                            if not reused or isinstance(error, socket.timeout):
+                                raise
                     content_type = response.getheader("Content-Type", "")
-                    connection.close()
+                    backends.release(url, connection, not response.will_close)
                 except (OSError, http.client.HTTPException, socket.timeout) as error:
                     backends.mark(url, False)
                     attempts.append({"backend": url, "error": type(error).__name__,
@@ -184,14 +222,30 @@ def main():
     parser.add_argument("--backend", action="append", required=True)
     parser.add_argument("--log", required=True)
     parser.add_argument("--requests")
+    parser.add_argument("--tls-cert", help="the operator's client certificate (https backends)")
+    parser.add_argument("--tls-key", help="its private key")
+    parser.add_argument("--ca", action="append", default=[],
+                        help="URL=FILE: the CA an https backend's certificate must chain to")
     args = parser.parse_args()
     host, port = args.listen.rsplit(":", 1)
     if host not in ("127.0.0.1", "localhost", "::1"):
         raise SystemExit("the development proxy listens on loopback only")
     if args.requests:
         os.makedirs(args.requests, exist_ok=True)
+    cas = dict(entry.split("=", 1) for entry in args.ca)
+    tls = {}
+    for url in args.backend:
+        if urllib.parse.urlsplit(url).scheme != "https":
+            continue
+        if url not in cas or not args.tls_cert or not args.tls_key:
+            raise SystemExit(f"{url}: an https backend needs --ca {url}=FILE, --tls-cert and --tls-key")
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.minimum_version = ssl.TLSVersion.TLSv1_3
+        context.load_verify_locations(cafile=cas[url])
+        context.load_cert_chain(args.tls_cert, args.tls_key)
+        tls[url] = context
     server = http.server.ThreadingHTTPServer(
-        (host, int(port)), make_handler(Backends(args.backend), args.log, args.requests))
+        (host, int(port)), make_handler(Backends(args.backend, tls), args.log, args.requests))
     server.daemon_threads = True
     server.serve_forever()
 

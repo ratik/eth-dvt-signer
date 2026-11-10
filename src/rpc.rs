@@ -142,7 +142,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{MethodRouter, get, post},
@@ -368,6 +368,8 @@ pub struct Options {
     pub horizon: Horizon,
     /// The approvers of protected requests (`admin`), if configured.
     pub administration: Option<Administration>,
+    /// Answers `GET /attestation` (`attestation`, docs/tee.md).
+    pub attester: Option<std::sync::Arc<crate::attestation::Attester>>,
 }
 
 /// Largest EIP-3076 interchange accepted (a full history of years of attestations).
@@ -417,6 +419,7 @@ pub fn router(
         .route("/validators/reshare/abort", post(abort_resharing))
         .route("/validators/reshare/{ceremony_id}", get(reshare_status))
         .route("/identity", get(identity))
+        .route("/attestation", get(attestation))
         .route("/keys/import", post(register_import))
         .route("/keys/import/share", post(install_share))
         .route("/keys/import/{ceremony_id}", get(import_status))
@@ -2019,6 +2022,43 @@ async fn identity(State(api): State<Api>) -> Json<IdentityResponse> {
             .options
             .share_key
             .map(|key| format!("0x{}", hex::encode(key))),
+    })
+}
+
+#[derive(Deserialize)]
+struct AttestationQuery {
+    /// The client's nonce, hex (`0x` optional), at most `attestation::MAX_NONCE` bytes.
+    nonce: Option<String>,
+}
+
+/// `GET /attestation?nonce=<hex>`: the node's keys and, for a sealed vault, its platform's
+/// evidence over them and the nonce (docs/tee.md). A plain or development node answers its keys
+/// with no evidence.
+async fn attestation(
+    State(api): State<Api>,
+    Query(query): Query<AttestationQuery>,
+) -> Result<Json<crate::attestation::Statement>, ApiError> {
+    let attester = api.options.attester.as_ref().ok_or((
+        StatusCode::NOT_FOUND,
+        "this node has no attester".to_string(),
+    ))?;
+    let nonce = match &query.nonce {
+        None => Vec::new(),
+        Some(nonce) => crate::import::unhex(nonce)
+            .filter(|bytes| bytes.len() <= crate::attestation::MAX_NONCE)
+            .ok_or((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "nonce: at most {} bytes of hex",
+                    crate::attestation::MAX_NONCE
+                ),
+            ))?,
+    };
+    attester.statement(&nonce).await.map(Json).map_err(|err| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("attestation: {err}"),
+        )
     })
 }
 

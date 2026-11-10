@@ -265,3 +265,73 @@ fn write_seeds() {
         );
     }
 }
+
+/// Write the seeds of the TEE inputs (`cargo test --lib write_tee_seeds -- --ignored`): a peers
+/// file, and attestation statements with a token (signed by a test issuer the target's key set
+/// does not hold) and without.
+#[test]
+#[ignore]
+fn write_tee_seeds() {
+    use crate::attestation::{
+        Evidence, GCP_TDX, Keys, Statement,
+        testing::{Issuer, Vm},
+    };
+    let peers = crate::peers::Peers::new(
+        committee()
+            .iter()
+            .enumerate()
+            .map(|(index, key)| {
+                (
+                    key.clone(),
+                    std::net::SocketAddr::from(([10, 0, 0, index as u8 + 2], 3000)),
+                )
+            })
+            .collect(),
+    )
+    .unwrap();
+    seed("peers", "four-nodes", peers.to_json().as_bytes());
+
+    let keys = Keys::new(
+        &PrivateKey::from_seed(0).public_key(),
+        Some(&[7u8; 32]),
+        Some(b"spki"),
+    );
+    let issuer = Issuer::new("k");
+    let nonce = hex::encode(keys.binding(b""));
+    let token = issuer.sign(&issuer.claims(
+        &Vm::new("mpc-tee-0"),
+        "eth-mpc-signer",
+        &[nonce],
+        1_800_000_000,
+    ));
+    let statement = Statement {
+        index: 0,
+        vault: GCP_TDX.into(),
+        keys: keys.clone(),
+        tls_certificate: Some(crate::tls::make(&["127.0.0.1".into()]).unwrap().chain),
+        evidence: Some(Evidence {
+            platform: GCP_TDX.into(),
+            keys: keys.clone(),
+            nonce: String::new(),
+            token: token.clone(),
+        }),
+    };
+    seed(
+        "attestation",
+        "sealed-statement",
+        serde_json::to_string_pretty(&statement).unwrap().as_bytes(),
+    );
+    seed(
+        "attestation",
+        "plain-statement",
+        serde_json::to_string(&Statement {
+            vault: "plain".into(),
+            evidence: None,
+            tls_certificate: None,
+            ..statement
+        })
+        .unwrap()
+        .as_bytes(),
+    );
+    seed("attestation", "token", token.as_bytes());
+}

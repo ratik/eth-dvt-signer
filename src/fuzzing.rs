@@ -8,8 +8,8 @@
 //! - what is stored (state values, epoch records, secrets) round-trips: a decoded value's encoding
 //!   decodes to the same value (legacy layouts are read and rewritten in the current one);
 //! - what is parsed (Web3Signer requests, EIP-3076 interchanges, signed commands, anchor records
-//!   and acknowledgments, import manifests) yields values every later step accepts without
-//!   panicking.
+//!   and acknowledgments, import manifests, peers files, attestation statements and tokens)
+//!   yields values every later step accepts without panicking.
 //!
 //! The fuzz targets (`fuzz/fuzz_targets`) call these, and `tests/fuzz_regressions.rs` replays every
 //! input a campaign found (`fuzz/regressions/<target>`) through them on stable Rust.
@@ -192,6 +192,61 @@ pub fn manifest(bytes: &[u8]) {
     }
 }
 
+/// A peers file (`--peers`): what parses writes back to a file that parses to the same peers.
+pub fn peers(bytes: &[u8]) {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return;
+    };
+    if let Ok(peers) = crate::peers::Peers::from_json(text) {
+        let again = crate::peers::Peers::from_json(&peers.to_json()).expect("its own file parses");
+        assert_eq!(again, peers);
+    }
+}
+
+/// An attestation statement (`GET /attestation`, `mpc-admin attest`, `mpc-keytool split`), and
+/// the same bytes as a bare token: checked against a policy and a key set without panicking, and
+/// never accepted (no token here is signed by the key set's key).
+pub fn attestation(bytes: &[u8]) {
+    use crate::attestation::{
+        Statement,
+        verify::{Jwk, Jwks, Policy, verify, verify_jwt},
+    };
+    let jwks = Jwks {
+        keys: vec![Jwk {
+            kid: "k".into(),
+            kty: "RSA".into(),
+            // A 2048-bit modulus of 0xc5 bytes and exponent 65537: no fuzzer forges its signatures.
+            n: "xcXF".repeat(86),
+            e: "AQAB".into(),
+            alg: Some("RS256".into()),
+        }],
+    };
+    let policy = Policy {
+        issuer: crate::attestation::verify::GOOGLE_ISSUER.into(),
+        audience: "eth-mpc-signer".into(),
+        hwmodel: "GCP_INTEL_TDX".into(),
+        dbgstat: "disabled-since-boot".into(),
+        rtmr1: vec!["00".into()],
+        rtmr2: vec!["00".into()],
+        project_number: None,
+        max_age_seconds: 600,
+    };
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return;
+    };
+    assert!(
+        verify_jwt(text, &jwks).is_err(),
+        "an unsigned token verified"
+    );
+    if let Ok(statement) = serde_json::from_str::<Statement>(text)
+        && let Some(evidence) = &statement.evidence
+    {
+        let _ = statement.keys.binding(b"nonce");
+        let _ = statement.keys.serves(text.as_bytes());
+        assert!(verify(evidence, &policy, &jwks, b"", 1_800_000_000).is_err());
+    }
+}
+
 /// A fuzz target's entry point: panics if `bytes` break a property.
 pub type Target = fn(&[u8]);
 
@@ -208,6 +263,8 @@ pub const TARGETS: &[(&str, Target)] = &[
     ("acknowledgment", acknowledgment),
     ("state_value", state_value),
     ("manifest", manifest),
+    ("peers", peers),
+    ("attestation", attestation),
 ];
 
 #[cfg(test)]

@@ -63,7 +63,7 @@ fn share_is_written_once_and_verified() {
         );
         assert_eq!(tampered.verify(&me, &ceremony), Err(Inconsistent::Share));
 
-        let mut secrets = Secrets::init(context.child("a"), PARTITION.into())
+        let mut secrets = Secrets::init(context.child("a"), PARTITION.into(), None)
             .await
             .unwrap();
         secrets
@@ -78,7 +78,7 @@ fn share_is_written_once_and_verified() {
         ));
         drop(secrets);
 
-        let secrets = Secrets::init(context.child("b"), PARTITION.into())
+        let secrets = Secrets::init(context.child("b"), PARTITION.into(), None)
             .await
             .unwrap();
         assert_eq!(secrets.share(0), Some(&key_share));
@@ -91,7 +91,7 @@ fn interrupted_write_never_exposes_a_partial_share() {
         let (_, key_share) = completed(&mut context);
         let seed = Summary::random(&mut context);
 
-        let mut secrets = Secrets::init(context.child("a"), PARTITION.into())
+        let mut secrets = Secrets::init(context.child("a"), PARTITION.into(), None)
             .await
             .unwrap();
         secrets.put_seed(0, seed).await.unwrap();
@@ -106,7 +106,7 @@ fn interrupted_write_never_exposes_a_partial_share() {
         blob.sync().await.unwrap();
 
         // The previous complete state comes back: the seed, no share at all.
-        let secrets = Secrets::init(context.child("b"), PARTITION.into())
+        let secrets = Secrets::init(context.child("b"), PARTITION.into(), None)
             .await
             .unwrap();
         assert!(secrets.share(0).is_none());
@@ -128,7 +128,7 @@ fn interrupted_write_never_exposes_a_partial_share() {
             blob.sync().await.unwrap();
         }
         assert!(
-            Secrets::init(context.child("c"), PARTITION.into())
+            Secrets::init(context.child("c"), PARTITION.into(), None)
                 .await
                 .is_err()
         );
@@ -150,4 +150,117 @@ async fn newest_copy(context: &deterministic::Context) -> &'static [u8] {
         }
     }
     newest.1
+}
+
+/// Every byte of `partition`'s copies.
+async fn stored_bytes(context: &deterministic::Context, partition: &str) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for name in [b"left".as_slice(), b"right"] {
+        let (blob, len) = context.open(partition, name).await.unwrap();
+        let read = blob
+            .read_at(0, len as usize, Default::default())
+            .await
+            .unwrap();
+        bytes.extend_from_slice(read.coalesce().as_ref());
+    }
+    bytes
+}
+
+#[test]
+fn a_sealed_store_holds_no_share_in_the_clear_and_opens_only_with_its_cipher() {
+    deterministic::Runner::default().start(|mut context| async move {
+        let (_, key_share) = completed(&mut context);
+        let seed = Summary::random(&mut context);
+        let cipher = || Some(Cipher::for_tests([3u8; 32]));
+
+        let mut secrets = Secrets::init(context.child("a"), PARTITION.into(), cipher())
+            .await
+            .unwrap();
+        secrets.put_seed(1, seed).await.unwrap();
+        secrets.put_share(key_share.clone()).await.unwrap();
+        drop(secrets);
+
+        // Neither the share's secret scalar nor the seed is on disk in the clear.
+        let disk = stored_bytes(&context, PARTITION).await;
+        let scalar = key_share.share.private.encode();
+        assert!(
+            !disk
+                .windows(scalar.len())
+                .any(|window| window == scalar.as_ref())
+        );
+        let seed_bytes = seed.encode();
+        assert!(
+            !disk
+                .windows(seed_bytes.len())
+                .any(|window| window == seed_bytes.as_ref())
+        );
+
+        // Reopened with the cipher, the values come back.
+        let secrets = Secrets::init(context.child("b"), PARTITION.into(), cipher())
+            .await
+            .unwrap();
+        assert_eq!(secrets.share(0), Some(&key_share));
+        assert_eq!(secrets.seed(1), Some(seed));
+        assert_eq!(secrets.share_rounds(), vec![0]);
+        drop(secrets);
+
+        // Without a sealed vault, or with another vault's cipher, the node does not start.
+        assert!(matches!(
+            Secrets::init(context.child("c"), PARTITION.into(), None).await,
+            Err(Error::SealedWithoutVault)
+        ));
+        assert!(matches!(
+            Secrets::init(
+                context.child("d"),
+                PARTITION.into(),
+                Some(Cipher::for_tests([4u8; 32]))
+            )
+            .await,
+            Err(Error::Open)
+        ));
+        // A sealed value moved to another partition does not open there (the associated data
+        // names the partition and key).
+        let (_, len) = context.open(PARTITION, b"left").await.unwrap();
+        for name in [b"left".as_slice(), b"right"] {
+            let (from, len) = context.open(PARTITION, name).await.unwrap();
+            let bytes = from
+                .read_at(0, len as usize, Default::default())
+                .await
+                .unwrap()
+                .coalesce();
+            let (to, _) = context.open("elsewhere", name).await.unwrap();
+            to.write_at(0, bytes.as_ref().to_vec(), Default::default())
+                .await
+                .unwrap();
+            to.sync().await.unwrap();
+        }
+        assert!(len > 0);
+        assert!(matches!(
+            Secrets::init(context.child("e"), "elsewhere".into(), cipher()).await,
+            Err(Error::Open)
+        ));
+    });
+}
+
+#[test]
+fn a_plain_store_is_refused_by_a_sealed_node() {
+    deterministic::Runner::default().start(|mut context| async move {
+        let mut secrets = Secrets::init(context.child("a"), PARTITION.into(), None)
+            .await
+            .unwrap();
+        secrets
+            .put_seed(0, Summary::random(&mut context))
+            .await
+            .unwrap();
+        drop(secrets);
+        assert!(matches!(
+            Secrets::init(
+                context.child("b"),
+                PARTITION.into(),
+                Some(Cipher::for_tests([3u8; 32]))
+            )
+            .await,
+            Err(Error::ClearInSealedStore)
+        ));
+    });
 }

@@ -248,6 +248,7 @@ pub async fn start_network_with(
                 signing: coordinator::Config::default(),
                 allow_missing_consensus_journal: false,
                 share_key: None,
+                secrets_cipher: None,
                 approved_reshares: None,
                 // Simulated time starts at the Unix epoch, and these tests name several chains:
                 // the horizon has its own unit and end-to-end tests.

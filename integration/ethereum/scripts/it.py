@@ -2817,6 +2817,134 @@ def run_gloas(after=6):
     return report(chain)
 
 
+# ---------------------------------------------------------------------------------------------
+# Sealed signers on GCP Confidential VMs (integration/tee/gcp/run-validator.sh)
+
+# The local signers' timeouts (`signer_start`), for the sealed nodes too.
+GCP_SIGNER_ARGS = ["--signing-timeout", "2", "--authorization-timeout", "4"]
+
+
+def gcp_prepare(directory):
+    """Before the sealed nodes boot (`gcp.sh up`): the devnet, and in `directory` the nodes'
+    devnet flags (`chain-args`, one per line: its clock, identity and fork schedule, and the local
+    signers' timeouts) and the approver set (`approvers.json`)."""
+    global FOLLOWERS
+    FOLLOWERS = 0
+    os.makedirs(f"{WORK}/logs", exist_ok=True)
+    pull_images()
+    devnet_up()
+    chain = Chain()
+    log(f"devnet: {chain.seconds_per_slot} s slots, {chain.slots_per_epoch} slots per epoch, "
+        f"genesis fork version {chain.genesis_fork_version}")
+    os.makedirs(directory, exist_ok=True)
+    with open(f"{directory}/chain-args", "w") as file:
+        file.write("\n".join(network_args() + GCP_SIGNER_ARGS) + "\n")
+    shutil.copyfile(approvers_file(), f"{directory}/approvers.json")
+    own(directory)
+    log(f"gcp: devnet flags and approvers in {directory}")
+
+
+def bridges_start(directory):
+    """One loopback bridge per sealed node (`proxy.py` with that node alone): its mTLS API with
+    the operator's client certificate and its attested CA pinned, at the HTTP port a local signer
+    has (`node_url`). The driver, `mpc-admin` and the failover proxy reach the sealed nodes as
+    they reach local ones."""
+    cluster = json.loads(read(f"{directory}/nodes.json"))
+    bridges_stop()
+    for node in cluster["nodes"]:
+        index = node["index"]
+        args = [sys.executable, f"{HERE}/scripts/proxy.py",
+                "--listen", f"127.0.0.1:{HTTP_BASE + index}", "--backend", node["url"],
+                "--ca", f"{node['url']}={node['ca']}", "--tls-cert", cluster["client_cert"],
+                "--tls-key", cluster["client_key"], "--log", f"{WORK}/logs/bridge-{index}.jsonl"]
+        with open(f"{WORK}/logs/bridge-{index}.log", "a") as out:
+            process = subprocess.Popen(args, stdout=out, stderr=subprocess.STDOUT,
+                                       start_new_session=True)
+        with open(f"{WORK}/bridge-{index}.pid", "w") as file:
+            file.write(str(process.pid))
+    for node in range(NODES):
+        wait(f"sealed node {node} ready through its bridge", "environment", 120, 1,
+             lambda node=node: ready(node))
+    log(f"signers: {NODES} sealed nodes on GCP ready ({', '.join(n['url'] for n in cluster['nodes'])})")
+
+
+def bridges_stop():
+    for node in range(NODES):
+        try:
+            with open(f"{WORK}/bridge-{node}.pid") as file:
+                os.kill(int(file.read()), 15)
+        except (FileNotFoundError, ProcessLookupError, ValueError):
+            pass
+
+
+def gcp_latency():
+    """Where the time of each signature Lighthouse obtained went: end to end (the failover
+    proxy), the round trip to the sealed node that answered (its bridge: the network, TLS and the
+    node), and the coordinator's own time (`signed validator duty ... total_ms`); the network's
+    share is the round trip less the coordinator's time. The driver's status reads through the
+    bridges time the network and TLS alone. Saved as `gcp.json`."""
+    proxy = {r["signing_root"]: r for r in proxy_records()
+             if r.get("type") and r.get("status") == 200 and r.get("signing_root")}
+    trips, probes = {}, []
+    for node in range(NODES):
+        for line in read(f"{WORK}/logs/bridge-{node}.jsonl").splitlines():
+            record = json.loads(line)
+            if record.get("type") and record.get("status") == 200 and record.get("signing_root"):
+                trips[record["signing_root"]] = record["attempts"][-1]["ms"]
+            elif record["method"] == "GET" and record.get("status") == 200:
+                # The driver's status reads: the network and TLS without a signature.
+                probes.append(record["attempts"][-1]["ms"])
+    coordinator = {r["signing_root"]: float(r["total_ms"]) for r in signer_records()
+                   if r["ok"] and r.get("signing_root") and r.get("total_ms")}
+    roots = [root for root in proxy if root in trips and root in coordinator]
+    result = {
+        "end_to_end_ms": percentiles([proxy[root]["ms"] for root in proxy]),
+        "round_trip_ms": percentiles([trips[root] for root in proxy if root in trips]),
+        "coordinator_ms": percentiles([coordinator[root] for root in proxy if root in coordinator]),
+        "network_ms": percentiles([trips[root] - coordinator[root] for root in roots]),
+        "status_read_ms": percentiles(probes),
+        "by_type": {kind: percentiles([r["ms"] for r in proxy.values() if r["type"] == kind])
+                    for kind in sorted({r["type"] for r in proxy.values()})},
+    }
+    save("gcp.json", result)
+    for name in ("end_to_end_ms", "round_trip_ms", "coordinator_ms", "network_ms", "status_read_ms"):
+        value = result[name]
+        log(f"gcp latency {name}: " + (f"p50 {value['p50']}, p95 {value['p95']}, "
+                                       f"max {value['max']} (n = {value['n']})" if value["n"] else "none"))
+    return result
+
+
+def run_gcp(directory, observed=10):
+    """Lighthouse's validator client on the devnet, signed by four sealed nodes on GCP
+    Confidential VMs (booted by `gcp.sh up` after `gcp-prepare`): the DKG key's lifecycle as in
+    `run`, then `observed` epochs of duties, the report, and the latency split (`gcp.json`)."""
+    global FOLLOWERS
+    FOLLOWERS = 0
+    os.makedirs(f"{WORK}/logs", exist_ok=True)
+    chain = Chain()
+    bridges_start(directory)
+    key = dkg()
+    activation = activate(key, chain)
+    deposit(key, chain)
+    proxy_start()
+    vc_start(key)
+    index, activation_epoch = wait_active(key, chain)
+    recorder = Recorder(index, activation_epoch, chain)
+    recorder.start()
+    save("validator.json", {"public_key": key, "index": index, "activation_epoch": activation_epoch,
+                            "mpc_activation_height": activation["activated_at"],
+                            "genesis_validators_root": chain.genesis_validators_root})
+    chain.wait_epoch(activation_epoch)
+    scenario("baseline", lambda: observe("baseline", index, observed, chain))
+    collect_evidence()
+    recorder.stop()
+    # The nodes' logs come from their serial consoles, copied every 15 s: let the copy catch up.
+    time.sleep(45)
+    result = report(chain)
+    gcp_latency()
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -2825,6 +2953,11 @@ def main():
     sub.add_parser("run-r3")
     sub.add_parser("run-mev")
     sub.add_parser("run-gloas")
+    gcp_prepare_parser = sub.add_parser("gcp-prepare")
+    gcp_prepare_parser.add_argument("directory")
+    run_gcp_parser = sub.add_parser("run-gcp")
+    run_gcp_parser.add_argument("directory")
+    run_gcp_parser.add_argument("--epochs", type=int, default=10)
     devnet = sub.add_parser("devnet")
     devnet.add_argument("action", choices=["up", "down"])
     signers = sub.add_parser("signers")
@@ -2845,6 +2978,10 @@ def main():
             run_mev()
         elif args.command == "run-gloas":
             run_gloas()
+        elif args.command == "gcp-prepare":
+            gcp_prepare(args.directory)
+        elif args.command == "run-gcp":
+            run_gcp(args.directory, args.epochs)
         elif args.command == "devnet":
             devnet_up() if args.action == "up" else devnet_down()
         elif args.command == "signers":
@@ -2854,6 +2991,7 @@ def main():
         elif args.command == "stop":
             vc_stop()
             proxy_stop()
+            bridges_stop()
             signers_stop()
             devnet_down()
     except Failure as failure:
