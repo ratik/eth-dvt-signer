@@ -1,0 +1,159 @@
+#!/bin/bash
+# The node configuration: a few small files, read once per boot into /run/eth-mpc-signer/config.
+#
+#   args  the node's command-line flags, one argument per line (blank lines and lines starting
+#         with `#` are skipped). `--data-dir` is set by the image (/var/lib/mpc), never here.
+#   ...   any other file a flag names, as /run/eth-mpc-signer/config/<name> (peers, client CA,
+#         approvers; `ssh-authorized-keys` for the debug image). Names: [a-z0-9][a-z0-9-]*.
+#
+# Sources, in order: a disk with a file system labeled MPC-CONFIG holding the files (QEMU), or GCE
+# instance metadata, attribute `mpc-<name>` for file <name>.
+#
+# The configuration's digest is SHA-384 over its manifest, the `sha384sum`-style lines
+# "<hex sha384>  <name>" of its files in byte order of the names. On a TDX guest it is extended
+# into RTMR3 before the node starts, so the attestation shows which configuration the node runs
+# with; a TDX guest without a way to extend RTMR3 does not start the node.
+set -euo pipefail
+
+run=/run/eth-mpc-signer
+config="$run/config"
+log() { echo "eth-mpc-config: $*"; }
+fail() {
+	log "error: $*"
+	exit 1
+}
+
+metadata=http://169.254.169.254/computeMetadata/v1/instance/attributes
+
+from_disk() {
+	local device="$1" mnt="$run/config-disk" options=ro,nodev,nosuid,noexec file name
+	# FAT keeps short names in upper case.
+	[ "$(blkid -o value -s TYPE "$device")" != vfat ] || options="$options,shortname=lower"
+	mkdir -p "$mnt"
+	mount -o "$options" "$device" "$mnt"
+	for file in "$mnt"/*; do
+		[ -e "$file" ] || continue
+		name="${file##*/}"
+		[ -f "$file" ] || {
+			umount "$mnt"
+			fail "$name on the configuration disk is not a regular file"
+		}
+		cp "$file" "$staging/$name"
+	done
+	umount "$mnt"
+}
+
+from_metadata() {
+	local keys key
+	keys="$(curl -sf --max-time 5 -H 'Metadata-Flavor: Google' "$metadata/")" || return 1
+	for key in $keys; do
+		case "$key" in
+		mpc-*)
+			[[ "${key#mpc-}" =~ ^[a-z0-9][a-z0-9-]*$ ]] || fail "metadata attribute $key: use [a-z0-9-]"
+			curl -sf --max-time 5 -H 'Metadata-Flavor: Google' -o "$staging/${key#mpc-}" \
+				"$metadata/$key" || fail "cannot read instance metadata attribute $key"
+			;;
+		esac
+	done
+}
+
+rm -rf "$run/config.staging"
+staging="$run/config.staging"
+install -d -m 0755 "$run"
+install -d -m 0750 -g mpc "$staging"
+
+mapfile -t disks < <(blkid -c /dev/null -t LABEL=MPC-CONFIG -o device 2>/dev/null || true)
+if [ "${#disks[@]}" -gt 1 ]; then
+	fail "several configuration disks (${disks[*]})"
+elif [ "${#disks[@]}" -eq 1 ]; then
+	log "reading the configuration disk ${disks[0]}"
+	from_disk "${disks[0]}"
+else
+	for attempt in $(seq 1 30); do
+		if from_metadata; then
+			log "read the configuration from instance metadata"
+			break
+		fi
+		[ "$attempt" -lt 30 ] || fail "no configuration: no MPC-CONFIG disk and no instance metadata"
+		sleep 2
+	done
+fi
+
+shopt -s dotglob
+for file in "$staging"/*; do
+	[ -e "$file" ] || continue
+	name="${file##*/}"
+	[[ "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]] || fail "configuration file name $name: use [a-z0-9-]"
+	[ "$(stat -c %s "$file")" -le 1048576 ] || fail "configuration file $name exceeds 1 MiB"
+	chown root:mpc "$file"
+	chmod 0640 "$file"
+done
+[ -f "$staging/args" ] || fail "no args file in the configuration"
+
+# The node's argv, NUL-separated, for `start`.
+args=()
+while IFS= read -r line || [ -n "$line" ]; do
+	case "$line" in '' | '#'*) continue ;; esac
+	[[ "$line" != *$'\r'* ]] || fail "args: carriage return in a line"
+	case "$line" in
+	--data-dir | --data-dir=*) fail "args: --data-dir is set by the image" ;;
+	esac
+	args+=("$line")
+done <"$staging/args"
+
+# The digest the attestation carries (RTMR3).
+manifest="$(cd "$staging" && LC_ALL=C find . -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort |
+	while IFS= read -r name; do sha384sum -- "$name"; done)"
+digest="$(printf '%s\n' "$manifest" | sha384sum | cut -d' ' -f1)"
+printf '%s\n' "$manifest" | while IFS= read -r line; do log "file $line"; done
+log "configuration digest (sha384 of the manifest above) $digest"
+
+rtmr=
+for candidate in /sys/class/misc/tdx_guest/measurements/rtmr3:sha384 \
+	/sys/devices/virtual/misc/tdx_guest/measurements/rtmr3:sha384; do
+	if [ -e "$candidate" ]; then
+		rtmr="$candidate"
+		break
+	fi
+done
+if [ -n "$rtmr" ]; then
+	# The attribute takes the 48 raw bytes to extend with.
+	printf "$(printf '%s' "$digest" | sed 's/../\\x&/g')" | dd of="$rtmr" bs=48 count=1 \
+		iflag=fullblock status=none
+	log "RTMR3 extended with the configuration digest; RTMR3 is now $(od -An -v -tx1 "$rtmr" | tr -d ' \n')"
+elif grep -qw tdx_guest /proc/cpuinfo; then
+	fail "TDX guest without an RTMR3 interface (tdx_guest measurements, Linux 6.16 or later): not starting the node with an unmeasured configuration"
+else
+	tsm=absent
+	[ -d /sys/kernel/config/tsm ] && tsm=present
+	log "not a TDX guest (configfs-tsm $tsm): RTMR3 not extended"
+fi
+
+[ "${#args[@]}" -gt 0 ] || fail "args: no argument"
+printf '%s\0' "${args[@]}" >"$run/argv"
+chown root:mpc "$run/argv"
+chmod 0640 "$run/argv"
+
+# A node with development keys (no --peers) has no secret: its API is bridged to port 9000
+# (eth-mpc-http-bridge.socket). Its HTTP port is --http-port (8080) plus its --id.
+rm -f "$run/http-bridge.env"
+peers=no id= http_port=8080
+for ((i = 0; i < ${#args[@]}; i++)); do
+	case "${args[i]}" in
+	--peers | --peers=*) peers=yes ;;
+	--id) id="${args[i + 1]:-}" ;;
+	--id=*) id="${args[i]#--id=}" ;;
+	--http-port) http_port="${args[i + 1]:-}" ;;
+	--http-port=*) http_port="${args[i]#--http-port=}" ;;
+	esac
+done
+if [ "$peers" = no ]; then
+	[[ "$id" =~ ^[0-9]+$ && "$http_port" =~ ^[0-9]+$ ]] || fail "args: --id and --http-port must be numbers"
+	port=$((http_port + id))
+	[ "$port" -ne 9000 ] || fail "args: the node's HTTP port is 9000, the bridge's"
+	echo "MPC_HTTP_TARGET=127.0.0.1:$port" >"$run/http-bridge.env"
+	log "development keys (no --peers): HTTP API 127.0.0.1:$port bridged to port 9000"
+fi
+
+rm -rf "$config"
+mv "$staging" "$config"

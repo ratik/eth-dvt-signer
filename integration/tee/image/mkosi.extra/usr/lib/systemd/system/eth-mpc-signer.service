@@ -1,0 +1,32 @@
+[Unit]
+Description=eth-mpc-signer node
+Requires=eth-mpc-config.service
+After=eth-mpc-config.service network-online.target
+Wants=network-online.target
+RequiresMountsFor=/var/lib/mpc
+
+[Service]
+Type=exec
+User=mpc
+Group=mpc
+ExecStart=/usr/lib/eth-mpc-signer/start
+Restart=on-failure
+RestartSec=5
+# 77: the anchor shows a rollback; restarting changes nothing (docs/anchor.md).
+RestartPreventExitStatus=77
+LimitNOFILE=65536
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/mpc
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

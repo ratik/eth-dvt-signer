@@ -8,8 +8,8 @@
 #   binds inside that container only: no other container shares its network, and nothing is
 #   published on the host. Nothing else on the host is touched.
 #
-# Usage: env.sh tools|build|validate [RUNS]|fuzz TARGET|all [SECONDS] [PARALLEL]|cargo ARGS...|up|
-#        exec CMD...|status|down
+# Usage: env.sh tools|build|validate [RUNS]|fuzz TARGET|all [SECONDS] [PARALLEL]|cargo ARGS...|
+#        tee-qemu [NODES]|up|exec CMD...|status|down
 #   IT_HOME   work directory on the host (default: ~/eth-mpc-it): bin/, target/, runs/, validation/
 set -euo pipefail
 
@@ -154,6 +154,83 @@ cargo_image() {
 		-w /it/src "$RUST_IMAGE" cargo "$@"
 }
 
+tee_qemu() {
+	# The node's closed VM image (integration/tee/README.md) on this host's KVM: the tools image
+	# (pinned in integration/tee/versions.env), the default-features signer in RUST_IMAGE, the
+	# release image built twice (both must be equal: reproducibility) and the debug image once,
+	# then NODES release VMs and one debug VM booted and checked. Logs and measurements in
+	# IT_HOME/tee/runs/<time>/. The image builds run as root in a container with CAP_SYS_ADMIN
+	# (mkosi's namespaces) and no devices; the VMs run as the host user with /dev/kvm only, and
+	# no network beyond QEMU's user-mode one. TEE_REPRO=0 skips the second build.
+	local nodes="${1:-4}" tools name run status=0
+	# shellcheck source=../../tee/versions.env
+	source "$repo/integration/tee/versions.env"
+	tools="eth-mpc-tee-tools:$(cat "$repo/integration/tee/tools/Dockerfile" \
+		"$repo/integration/tee/versions.env" | sha256sum | cut -c1-12)"
+	if ! docker image inspect "$tools" >/dev/null 2>&1; then
+		log "building $tools"
+		docker build -q -t "$tools" --build-arg BASE="$TEE_TOOLS_BASE" \
+			--build-arg SNAPSHOT="$TEE_SNAPSHOT" --build-arg MKOSI_VERSION="$TEE_MKOSI_VERSION" \
+			"$repo/integration/tee/tools" >/dev/null
+	fi
+	name="$(date -u +%Y%m%dT%H%M%SZ)"
+	run="$IT_HOME/tee/runs/$name"
+	mkdir -p "$run" "$IT_HOME/tee/target" "$IT_HOME/tee/cache" "$IT_HOME/cargo-home"
+	log "TEE image run: logs in $run"
+	# The signer, default features (no test hooks, no dev API). The second build compiles from
+	# scratch into a throwaway volume at the same path, so equal binaries mean a reproducible one.
+	local target
+	for target in a b; do
+		[ "$target" = a ] || [ "${TEE_REPRO:-1}" = 1 ] || continue
+		local volume=(-v "$IT_HOME/tee/target:/it/tee/target")
+		[ "$target" = a ] ||
+			volume=(--tmpfs "/it/tee/target:rw,exec,size=16g,uid=$(id -u),gid=$(id -g)")
+		log "building the signer ($target) in $RUST_IMAGE"
+		docker run --rm -u "$(id -u):$(id -g)" -v "$IT_HOME/cargo-home:/it/cargo-home" \
+			"${volume[@]}" -v "$repo:/it/src:ro" -v "$run:/it/out" \
+			-e CARGO_HOME=/it/cargo-home -w /it/src "$RUST_IMAGE" sh -c "
+				cargo build --locked --release --bin eth-mpc-signer --target-dir /it/tee/target &&
+				cp /it/tee/target/release/eth-mpc-signer /it/out/eth-mpc-signer-$target" \
+			>"$run/cargo-$target.log" 2>&1 || {
+			tail -n 30 "$run/cargo-$target.log" >&2
+			log "the signer build failed: $run/cargo-$target.log"
+			return 1
+		}
+	done
+	local builds=(release-a debug)
+	[ "${TEE_REPRO:-1}" != 1 ] || builds=(release-a release-b debug)
+	local build
+	for build in "${builds[@]}"; do
+		local binary=/it/out/eth-mpc-signer-a
+		[ "$build" != release-b ] || binary=/it/out/eth-mpc-signer-b
+		docker run --rm --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+			--security-opt seccomp=unconfined \
+			-v "$IT_HOME/tee/cache:/it/tee/cache" -v "$run:/it/out" -v "$repo:/it/src:ro" \
+			-e TEE_SNAPSHOT="$TEE_SNAPSHOT" -e TEE_SOURCE_DATE_EPOCH="$TEE_SOURCE_DATE_EPOCH" \
+			-e BINARY="$binary" \
+			-e OWNER="$(id -u):$(id -g)" "$tools" \
+			bash /it/src/integration/tee/qemu.sh build "${build%-*}" "/it/out/$build" || return 1
+	done
+	if [ "${TEE_REPRO:-1}" = 1 ]; then
+		log "comparing the two release builds"
+		docker run --rm -v "$run:/it/out" -v "$repo:/it/src:ro" -e OWNER="$(id -u):$(id -g)" \
+			"$tools" bash /it/src/integration/tee/qemu.sh compare /it/out/release-a \
+			/it/out/release-b | tee "$run/reproducibility" || status=1
+	fi
+	# The host's user database read-only: ssh (the debug VM's control check) needs the user.
+	docker run --rm -u "$(id -u):$(id -g)" --network none --device /dev/kvm \
+		--group-add "$(stat -c %g /dev/kvm)" -v /etc/passwd:/etc/passwd:ro \
+		-v /etc/group:/etc/group:ro -e HOME=/it/out -v "$run:/it/out" -v "$repo:/it/src:ro" "$tools" \
+		bash /it/src/integration/tee/qemu.sh test /it/out/release-a /it/out/debug /it/out \
+		"$nodes" || status=1
+	for build in release-a debug; do
+		sed -n -E "s/^(binary\.sha256|uki\.sha384|uki\.authenticode-sha384|roothash) /${build%-a} \1 /p" \
+			"$run/$build/measurements"
+	done | tee "$run/expected-measurements"
+	[ "$status" -eq 0 ] && log "TEE image run passed: $run" || log "TEE image run FAILED: $run"
+	return "$status"
+}
+
 up() {
 	if docker inspect "$DIND" >/dev/null 2>&1; then
 		log "$DIND already exists"
@@ -207,6 +284,7 @@ cargo)
 	mkdir -p "$IT_HOME/tmp"
 	cargo_image "$@"
 	;;
+tee-qemu) tee_qemu "${2:-4}" ;;
 up) up ;;
 exec)
 	shift
@@ -219,7 +297,7 @@ status)
 	;;
 down) down ;;
 *)
-	echo "usage: $0 tools|build|validate [RUNS]|fuzz TARGET|all [SECONDS] [PARALLEL]|cargo ARGS...|up|exec CMD...|status|down" >&2
+	echo "usage: $0 tools|build|validate [RUNS]|fuzz TARGET|all [SECONDS] [PARALLEL]|cargo ARGS...|tee-qemu [NODES]|up|exec CMD...|status|down" >&2
 	exit 2
 	;;
 esac

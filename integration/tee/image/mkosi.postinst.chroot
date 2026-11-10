@@ -1,0 +1,27 @@
+#!/bin/sh
+# Runs in the image after the packages and mkosi.extra are installed (mkosi.conf). Units are
+# enabled by the presets in mkosi.extra; this script masks what a closed image must not run.
+set -eu
+
+# Read-only root: no first-boot prompts, no ESP mounted (the UKI stays as measured).
+systemctl mask systemd-firstboot.service systemd-machine-id-commit.service \
+	efi.automount efi.mount boot.automount boot.mount
+ln -sf ../run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+
+case " ${PROFILES:-} " in
+*" debug "*)
+	# The debug image keeps a root shell on the serial console (autologin, see its extra
+	# tree) and an SSH server; its host key is made at boot, never baked into the image.
+	rm -f /etc/ssh/ssh_host_*
+	;;
+*)
+	# No login on any console and no rescue or debug shell, whatever the command line says.
+	systemctl mask getty.target getty@.service serial-getty@.service console-getty.service \
+		container-getty@.service autovt@.service emergency.service rescue.service \
+		debug-shell.service
+	if [ -e /usr/sbin/sshd ] || [ -e /usr/bin/google_guest_agent ]; then
+		echo "the release image must have no SSH server and no Google guest agent" >&2
+		exit 1
+	fi
+	;;
+esac

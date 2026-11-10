@@ -1,0 +1,12 @@
+[Unit]
+Description=HTTP API bridge of a node with development keys
+Requires=eth-mpc-http-bridge.socket
+After=eth-mpc-http-bridge.socket
+
+[Service]
+EnvironmentFile=/run/eth-mpc-signer/http-bridge.env
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd ${MPC_HTTP_TARGET}
+DynamicUser=yes
+PrivateTmp=yes
+ProtectHome=yes
+NoNewPrivileges=yes

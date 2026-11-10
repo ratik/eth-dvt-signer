@@ -1,0 +1,11 @@
+#!/bin/sh
+# The release initrd offers no login and no shell on any console, even when the boot fails.
+set -eu
+case " ${PROFILES:-} " in
+*" debug "*) ;;
+*)
+	systemctl mask getty.target getty@.service serial-getty@.service console-getty.service \
+		container-getty@.service autovt@.service emergency.service rescue.service \
+		debug-shell.service
+	;;
+esac

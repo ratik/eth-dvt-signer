@@ -1,0 +1,6 @@
+#!/bin/bash
+# The node, with the arguments of its configuration (written NUL-separated by `config`) and the
+# image's data directory: the data disk.
+set -euo pipefail
+mapfile -d '' -t args </run/eth-mpc-signer/argv
+exec /usr/bin/eth-mpc-signer --data-dir /var/lib/mpc "${args[@]}"

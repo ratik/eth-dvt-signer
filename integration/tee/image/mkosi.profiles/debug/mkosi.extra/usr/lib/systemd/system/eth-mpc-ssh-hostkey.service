@@ -1,0 +1,11 @@
+[Unit]
+Description=SSH host key of the debug image (made at boot, never part of the image)
+Before=ssh.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'install -d -m 0700 /run/sshd-keys && { [ -e /run/sshd-keys/ssh_host_ed25519_key ] || ssh-keygen -q -t ed25519 -N "" -f /run/sshd-keys/ssh_host_ed25519_key; }'
+
+[Install]
+WantedBy=ssh.service

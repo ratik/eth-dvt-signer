@@ -1,0 +1,11 @@
+[Unit]
+Description=Read the node configuration and measure it into RTMR3
+Documentation=file:/usr/lib/eth-mpc-signer/config
+# The configuration disk needs no network; instance metadata does.
+Wants=network-online.target
+After=network-online.target systemd-udev-trigger.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/eth-mpc-signer/config

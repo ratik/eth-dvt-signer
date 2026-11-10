@@ -1,0 +1,69 @@
+#!/bin/bash
+# The node's data disk: a second disk holding one ext4 file system labeled `mpc-data`, mounted at
+# /var/lib/mpc by var-lib-mpc.mount. On first boot the disk is blank and is formatted here. Any
+# doubt (two labeled file systems, two blank disks, none at all) stops the boot of the node: it
+# never starts on an empty directory while its real state may exist elsewhere.
+set -euo pipefail
+
+label=mpc-data
+marker=.mpc-data-disk
+log() { echo "eth-mpc-data: $*"; }
+fail() {
+	log "error: $*"
+	exit 1
+}
+
+labeled() { blkid -c /dev/null -t "LABEL=$label" -o device 2>/dev/null || true; }
+
+# Whole, writable disks of at least 1 GiB without any partition table or file system signature.
+blank_disks() {
+	local name type ro size status
+	while read -r name type ro size; do
+		[ "$type" = disk ] && [ "$ro" = 0 ] && [ "$size" -ge $((1 << 30)) ] || continue
+		[ "$(lsblk -nro NAME "$name" | wc -l)" -eq 1 ] || continue
+		status=0
+		blkid -p "$name" >/dev/null 2>&1 || status=$?
+		# 2: blkid found nothing on it.
+		[ "$status" -eq 2 ] && echo "$name"
+	done < <(lsblk -dnbpo NAME,TYPE,RO,SIZE)
+}
+
+# Disks may appear a little after udev starts (and later still on a cloud VM).
+devices=()
+blank=()
+for _ in $(seq 1 60); do
+	udevadm settle --timeout=5 || true
+	mapfile -t devices < <(labeled)
+	[ "${#devices[@]}" -eq 0 ] || break
+	mapfile -t blank < <(blank_disks)
+	[ "${#blank[@]}" -eq 0 ] || break
+	sleep 1
+done
+
+if [ "${#devices[@]}" -gt 1 ]; then
+	fail "several file systems labeled $label (${devices[*]}): refusing to guess"
+elif [ "${#devices[@]}" -eq 1 ]; then
+	device="${devices[0]}"
+	status=0
+	e2fsck -p "$device" || status=$?
+	[ "$status" -lt 4 ] || fail "$device: e2fsck exit status $status"
+	log "data disk $device: existing file system $(blkid -o value -s UUID "$device"), e2fsck status $status"
+elif [ "${#blank[@]}" -eq 1 ]; then
+	device="${blank[0]}"
+	log "data disk $device: blank, formatting (first boot)"
+	mkfs.ext4 -q -L "$label" -m 0 -E "root_owner=$(id -u mpc):$(id -g mpc)" "$device"
+	# Record the first boot on the disk itself, outside the node's directory.
+	staging=/run/eth-mpc-signer/format
+	mkdir -p "$staging"
+	mount -t ext4 -o nodev,nosuid,noexec "$device" "$staging"
+	chmod 0700 "$staging"
+	printf 'formatted %s boot %s\n' "$(date -u +%FT%TZ)" "$(cat /proc/sys/kernel/random/boot_id)" \
+		>"$staging/$marker"
+	umount "$staging"
+	udevadm trigger --settle "$device"
+	log "data disk $device: formatted, file system $(blkid -o value -s UUID "$device")"
+elif [ "${#blank[@]}" -gt 1 ]; then
+	fail "several blank disks (${blank[*]}): refusing to guess which is the data disk"
+else
+	fail "no data disk: neither a file system labeled $label nor a blank disk"
+fi

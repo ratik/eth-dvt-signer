@@ -1,0 +1,18 @@
+# A node with development keys (no --peers: its keys are public, it holds nothing secret)
+# serves its plain HTTP API on loopback only. This bridge makes that API reachable on port 9000
+# for the QEMU harness. A node with real identities is never bridged: it serves its API over
+# mTLS (--https-listen). Remove once every image node runs with --peers.
+[Unit]
+Description=HTTP API bridge of a node with development keys
+DefaultDependencies=no
+Requires=eth-mpc-config.service
+After=eth-mpc-config.service
+ConditionPathExists=/run/eth-mpc-signer/http-bridge.env
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Socket]
+ListenStream=9000
+
+[Install]
+WantedBy=eth-mpc-signer.service

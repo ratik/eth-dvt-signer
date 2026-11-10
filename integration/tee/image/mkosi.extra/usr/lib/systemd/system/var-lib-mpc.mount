@@ -1,0 +1,10 @@
+[Unit]
+Description=The node's data disk
+Requires=eth-mpc-data.service
+After=eth-mpc-data.service
+
+[Mount]
+What=/dev/disk/by-label/mpc-data
+Where=/var/lib/mpc
+Type=ext4
+Options=nodev,nosuid,noexec,noatime

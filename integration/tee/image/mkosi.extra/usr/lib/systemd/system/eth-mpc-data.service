@@ -1,0 +1,14 @@
+[Unit]
+Description=Find (or format, on first boot) the node's data disk
+Documentation=file:/usr/lib/eth-mpc-signer/data-disk
+DefaultDependencies=no
+After=systemd-udevd.service systemd-udev-trigger.service
+Wants=systemd-udev-trigger.service
+Before=var-lib-mpc.mount
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/eth-mpc-signer/data-disk
