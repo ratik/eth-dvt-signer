@@ -1,6 +1,14 @@
 #!/bin/bash
 # The node, with the arguments of its configuration (written NUL-separated by `config`) and the
-# image's data directory: the data disk.
+# image's data directory: the data disk. With `identity` first, the vault's statement instead:
+# printed on the console in one line, base64 with its SHA-256, between markers a reader of the
+# serial port can find (the only way out of a release image).
 set -euo pipefail
 mapfile -d '' -t args </run/eth-mpc-signer/argv
+if [ "${args[0]}" = identity ]; then
+	statement="$(/usr/bin/eth-mpc-signer identity --data-dir /var/lib/mpc "${args[@]:1}")"
+	printf 'eth-mpc-identity: %s sha256 %s\n' "$(printf '%s' "$statement" | base64 -w0)" \
+		"$(printf '%s' "$statement" | sha256sum | cut -d' ' -f1)"
+	exit 0
+fi
 exec /usr/bin/eth-mpc-signer --data-dir /var/lib/mpc "${args[@]}"

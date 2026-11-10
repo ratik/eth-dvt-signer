@@ -3,6 +3,8 @@
 #
 #   args  the node's command-line flags, one argument per line (blank lines and lines starting
 #         with `#` are skipped). `--data-dir` is set by the image (/var/lib/mpc), never here.
+#         A first argument `identity` runs `eth-mpc-signer identity` instead of the node: it
+#         makes the vault and prints its statement on the console (`start`).
 #   ...   any other file a flag names, as /run/eth-mpc-signer/config/<name> (peers, client CA,
 #         approvers; `ssh-authorized-keys` for the debug image). Names: [a-z0-9][a-z0-9-]*.
 #
@@ -135,8 +137,15 @@ chown root:mpc "$run/argv"
 chmod 0640 "$run/argv"
 
 # A node with development keys (no --peers) has no secret: its API is bridged to port 9000
-# (eth-mpc-http-bridge.socket). Its HTTP port is --http-port (8080) plus its --id.
+# (eth-mpc-http-bridge.socket). Its HTTP port is --http-port (8080) plus its --id. A sealed node
+# needs --peers and serves its API over mTLS only; `identity` serves none.
 rm -f "$run/http-bridge.env"
+if [ "${args[0]}" = identity ]; then
+	log "identity: the vault's statement goes to the console"
+	rm -rf "$config"
+	mv "$staging" "$config"
+	exit 0
+fi
 peers=no id= http_port=8080
 for ((i = 0; i < ${#args[@]}; i++)); do
 	case "${args[i]}" in

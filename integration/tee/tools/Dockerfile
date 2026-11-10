@@ -16,5 +16,5 @@ RUN rm -f /etc/apt/sources.list.d/* && \
 		systemd systemd-repart systemd-ukify systemd-boot-efi udev kmod cpio zstd xz-utils \
 		erofs-utils dosfstools mtools cryptsetup-bin e2fsprogs fdisk util-linux \
 		qemu-system-x86 qemu-utils ovmf \
-		python3 python3-pefile curl openssh-client && \
+		python3 python3-pefile curl openssh-client openssl && \
 	rm -rf /var/lib/apt/lists/*

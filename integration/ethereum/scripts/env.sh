@@ -158,7 +158,9 @@ tee_qemu() {
 	# The node's closed VM image (integration/tee/README.md) on this host's KVM: the tools image
 	# (pinned in integration/tee/versions.env), the default-features signer in RUST_IMAGE, the
 	# release image built twice (both must be equal: reproducibility) and the debug image once,
-	# then NODES release VMs and one debug VM booted and checked. Logs and measurements in
+	# and on the host `tee-fake-gcp`, `mpc-admin` and `mpc-keytool` with test-hooks. Then NODES
+	# release VMs make their sealed vaults and run as one sealed cluster against the fake of
+	# Google's attestation, STS and KMS, with a debug and a tampered VM. Logs and measurements in
 	# IT_HOME/tee/runs/<time>/. The image builds run as root in a container with CAP_SYS_ADMIN
 	# (mkosi's namespaces) and no devices; the VMs run as the host user with /dev/kvm only, and
 	# no network beyond QEMU's user-mode one. TEE_REPRO=0 skips the second build.
@@ -197,6 +199,21 @@ tee_qemu() {
 			return 1
 		}
 	done
+	# The host's tools: the fake of Google's services (tests only) and the operator's tools.
+	log "building tee-fake-gcp, mpc-admin and mpc-keytool (test-hooks) in $RUST_IMAGE"
+	mkdir -p "$IT_HOME/tee/target-hooks" "$run/host-bin"
+	docker run --rm -u "$(id -u):$(id -g)" -v "$IT_HOME/cargo-home:/it/cargo-home" \
+		-v "$IT_HOME/tee/target-hooks:/it/tee/target" -v "$repo:/it/src:ro" -v "$run:/it/out" \
+		-e CARGO_HOME=/it/cargo-home -w /it/src "$RUST_IMAGE" sh -c "
+			cargo build --locked --release --features test-hooks --bin tee-fake-gcp \
+				--bin mpc-admin --bin mpc-keytool --target-dir /it/tee/target &&
+			cp /it/tee/target/release/tee-fake-gcp /it/tee/target/release/mpc-admin \
+				/it/tee/target/release/mpc-keytool /it/out/host-bin/" \
+		>"$run/cargo-host.log" 2>&1 || {
+		tail -n 30 "$run/cargo-host.log" >&2
+		log "the host tools build failed: $run/cargo-host.log"
+		return 1
+	}
 	local builds=(release-a debug)
 	[ "${TEE_REPRO:-1}" != 1 ] || builds=(release-a release-b debug)
 	local build
@@ -220,7 +237,8 @@ tee_qemu() {
 	# The host's user database read-only: ssh (the debug VM's control check) needs the user.
 	docker run --rm -u "$(id -u):$(id -g)" --network none --device /dev/kvm \
 		--group-add "$(stat -c %g /dev/kvm)" -v /etc/passwd:/etc/passwd:ro \
-		-v /etc/group:/etc/group:ro -e HOME=/it/out -v "$run:/it/out" -v "$repo:/it/src:ro" "$tools" \
+		-v /etc/group:/etc/group:ro -e HOME=/it/out -e HOSTBIN=/it/out/host-bin \
+		-v "$run:/it/out" -v "$repo:/it/src:ro" "$tools" \
 		bash /it/src/integration/tee/qemu.sh test /it/out/release-a /it/out/debug /it/out \
 		"$nodes" || status=1
 	for build in release-a debug; do

@@ -1,17 +1,17 @@
 # The node's closed VM image (TEE, stage 2)
 
 A node can run inside a GCP Confidential VM on Intel TDX with this image (plan: stage 2 of
-"keys sealed in a TEE"). This directory builds the image and boots it under QEMU/KVM on the test
-server, with no TDX and no GCP. The node is the current one: development keys from `--id`, p2p
-and HTTP on loopback. The sealed vault, `identity`, `--peers` and mTLS come later.
+"keys sealed in a TEE", docs/tee.md). This directory builds the image and boots it under QEMU/KVM
+on the test server, with no TDX and no GCP. Four VMs run the signer's sealed vault (`gcp-tdx`)
+against `tee-fake-gcp`, a fake of Google's attestation, STS and KMS, as one cluster with the mTLS
+API.
 
 ## Run
 
 On the test server (`IT_HOME`, default `~/eth-mpc-it`):
 
 ```bash
-integration/ethereum/scripts/env.sh tee-qemu        # 4 release VMs, 1 debug VM, 1 tampered VM
-integration/ethereum/scripts/env.sh tee-qemu 1      # 1 release VM, 1 debug VM, 1 tampered VM
+integration/ethereum/scripts/env.sh tee-qemu        # 4 sealed VMs, 1 debug VM, 1 tampered VM
 TEE_REPRO=0 integration/ethereum/scripts/env.sh tee-qemu   # skip the second build
 ```
 
@@ -23,45 +23,68 @@ Each run writes `IT_HOME/tee/runs/<time>/`:
 | `expected-measurements` | the UKI SHA-384, its Authenticode SHA-384 and the verity root hash of both profiles |
 | `reproducibility` | the two release builds compared |
 | `release-a/`, `release-b/`, `debug/` | `image/` (disk, UKI, initrd, package manifest), `measurements`, `mkosi.log` |
-| `vm<i>/` | `serial.log` (the whole console), the configuration disk's files, data disk snapshots |
-| `cargo-a.log`, `cargo-b.log` | the two signer builds |
+| `vm<i>/` | `serial.log` (every boot's console), each configuration (`config-<name>/`, its image and digest), data disk snapshots, probes |
+| `statements/` | each VM's vault statement, as read from its console, and its TLS chain |
+| `gcp/`, `gcp.log` | the fake's policy, key set, vault flags per VM, and its log |
+| `operator/`, `approvers/`, `admin/` | the operator CA and client certificate, three approver keys, `mpc-admin`'s committee, node CAs and commands |
+| `peers.json`, `duties.log` | the cluster's peers file; every duty request and answer |
+| `cargo-a.log`, `cargo-b.log`, `cargo-host.log` | the two signer builds, the host tools' build |
 
-A run takes 10 to 30 minutes, depending on the host's load: two signer builds, three image builds
-(about 2 minutes each with a warm package cache) and about 3 minutes of VMs. The package cache
-(`IT_HOME/tee/cache`) and the signer's target directory (`IT_HOME/tee/target`) are kept between
-runs.
+A run takes 15 to 40 minutes, depending on the host's load: two signer builds and the host tools'
+build, three image builds (about 2 minutes each with a warm package cache) and about 10 minutes of
+VMs. The package cache (`IT_HOME/tee/cache`) and the target directories (`IT_HOME/tee/target`,
+`target-hooks`) are kept between runs.
 
 ## What `tee-qemu` does
 
 1. **Tools.** It builds `eth-mpc-tee-tools:<hash>` from `tools/Dockerfile`: Debian trixie, every
-   package from one snapshot, mkosi 25.3, systemd 257 (repart, ukify, stub), QEMU 10, OVMF.
+   package from one snapshot, mkosi 25.3, systemd 257 (repart, ukify, stub), QEMU 10, OVMF, OpenSSL.
 2. **Signer.** It builds `eth-mpc-signer` with default features in `RUST_IMAGE`, twice: into the
-   kept target directory, then from scratch into a tmpfs at the same path.
+   kept target directory, then from scratch into a tmpfs at the same path. On the host it builds
+   `tee-fake-gcp`, `mpc-admin` and `mpc-keytool` with `test-hooks`.
 3. **Images.** It builds the release image twice (one from each signer) and the debug image once.
    mkosi runs as root in a container with `CAP_SYS_ADMIN` (its namespaces), without devices or
    loop devices (`RepartOffline=yes`).
 4. **Reproducibility.** `qemu.sh compare` compares the two release builds: the signer, the UKI
    (SHA-384, Authenticode), the verity root hash, the GPT and the whole disk. On a difference it
    names the differing UKI sections, partitions and root files.
-5. **VMs.** As the host user, with `/dev/kvm`, `--network none` and QEMU's user-mode network, it
-   boots N release VMs, one debug VM and one tampered VM (OVMF, virtio disks). This signer binds
-   p2p to loopback,
-   so each VM runs a network of one node (`--id=0 --participants=1`), which finalizes blocks on
-   its own. The harness then checks:
-   - every node answers `/upcheck`;
-   - each data disk was formatted on first boot, and the configuration digest in the console
-     matches the one the harness computed;
-   - without TDX, RTMR3 is skipped with a log line;
-   - the release VM has no shell and no login prompt on its serial console, and nothing answers
-     on port 22;
-   - the debug VM, as a control, gives a root shell on its console and accepts an SSH login;
-   - the tampered VM boots the release image with one altered 4 KiB block in its root partition.
-     dm-verity refuses the root, the boot stops in the initrd, and the console offers no shell and
-     no login prompt;
-   - VM 1 finalizes blocks, powers down and boots again on the same disks. Its data disk is found
-     and not formatted again. The node resumes at least at its height before the reboot and
-     finalizes past it. Its file system and node directory, consensus journal included, keep their
-     UUID and inodes.
+5. **VMs.** As the host user, with `/dev/kvm`, `--network none` and QEMU's user-mode network
+   (OVMF, virtio disks). `tee-fake-gcp` runs in the same container; the VMs reach it at
+   `10.0.2.2`, QEMU's address of the host. The harness makes the operator's CA and client
+   certificate (OpenSSL) and three approver keys (`mpc-admin approver-key`, any two approve).
+   - **Boot 1 (vaults).** Each of the 4 release VMs runs `identity` with its vault flags from the
+     fake: the vault is sealed, and the statement goes to the serial console, where the harness
+     reads it. The debug VM makes a plain vault the same way. The tampered VM boots the release
+     image with one altered 4 KiB block in its root partition. Checks:
+     - every statement arrives intact, and the release VMs' are sealed (`gcp-tdx`) with evidence;
+     - every data disk was formatted on first boot, and the configuration digest in the console
+       matches the harness's; without TDX, RTMR3 is skipped with a log line;
+     - the release VM has no shell and no login prompt on its serial console, and nothing answers
+       on port 22; the debug VM, as a control, gives a root shell and accepts an SSH login;
+     - on the tampered VM, dm-verity refuses the root, the boot stops in the initrd, and the
+       console offers no shell and no login prompt.
+   - **Boot 2 (the sealed cluster).** The peers file names each attested identity at
+     `10.0.2.2:<VM i's forwarded p2p port>`; inbound p2p comes from `10.0.2.2` too. Each VM runs
+     the node with `--peers`, `--p2p-listen 0.0.0.0:3000`, `--https-listen 0.0.0.0:8443
+     --client-ca --no-http`, `--approvers` and the E2E tests' test chain (genesis 0, 1-second
+     slots). Checks:
+     - every node unseals its vault and answers `/upcheck` over mTLS;
+     - `mpc-admin attest` verifies every node's fresh evidence and the TLS key that answered;
+     - a validator DKG completes and every node stores its share;
+     - activation: `mpc-admin draft activate`, two approvers' `sign`, `submit`; the key is active
+       on every node, and an attestation duty is signed over mTLS (200, a BLS signature);
+     - VM 1 powers down and boots again on the same disks: it unseals, resumes at least at its
+       height, finalizes past it, still stores its share and signs a duty. Its file system and node
+       directory, consensus journal included, keep their UUID and inodes;
+     - the fake reports another RTMR1 for VM 3 (another image) and VM 3 reboots: STS refuses its
+       token (the provider's condition), so KMS never releases its data key, and the node refuses
+       to start, while the other three sign a duty. Back on the release image's RTMR1, its next
+       service restart unseals and it serves again;
+     - duties are attestations of the test chain's current epoch (Fulu), signed once that epoch is
+       above every signer's restart floor (audit L-1, logged at start): the image's signer has no
+       test hooks, so the floor holds;
+     - after power-off, each data disk's `vault/share-key` (read with `debugfs`) holds no
+       `secret_key` in the clear, and neither does the rest of the disk.
 
 ## The image (`image/`)
 
@@ -93,15 +116,16 @@ runs.
 | `eth-mpc-data.service` | Finds the data disk: the ext4 file system labeled `mpc-data`. On first boot it formats the one blank disk (≥ 1 GiB, no signature). Two candidates or none stop the node. |
 | `var-lib-mpc.mount` | Mounts the data disk at `/var/lib/mpc` (`nodev,nosuid,noexec`). The node's directory is `/var/lib/mpc/node-<id>`. |
 | `eth-mpc-config.service` | Reads the configuration and logs its files and digest. On TDX it extends RTMR3 with the digest. |
-| `eth-mpc-signer.service` | Runs the node as user `mpc` with the configured flags and `--data-dir /var/lib/mpc`. It restarts on failure, except on exit 77 (rollback). |
-| `eth-mpc-http-bridge.socket` | Only for a node with development keys (no `--peers`). It bridges the loopback HTTP API to port 9000 for the harness. Remove it once nodes run with `--peers`; real nodes serve the API over mTLS. |
+| `eth-mpc-signer.service` | Runs the node as user `mpc` with the configured flags and `--data-dir /var/lib/mpc`. It restarts on failure, every 5 s, except on exit 77 (rollback). With `identity` as the first argument it runs `eth-mpc-signer identity` instead and prints the statement on the console: `eth-mpc-identity: <base64> sha256 <hex>`. |
+| `eth-mpc-http-bridge.socket` | Only for a node with development keys (no `--peers`, nothing secret): it bridges the loopback HTTP API to port 9000. Unused since the harness runs sealed nodes (mTLS); it can go. |
 
 ### Configuration
 
 The configuration is a set of small files:
 
 - `args`: the node's flags, one argument per line. Blank lines and `#` lines are skipped.
-  `--data-dir` is the image's and is refused.
+  `--data-dir` is the image's and is refused. `identity` as the first line makes the vault
+  instead of running the node (the flags of `eth-mpc-signer identity` follow).
 - any file a flag names, at `/run/eth-mpc-signer/config/<name>`: the peers file, the client CA,
   the approvers. Names match `[a-z0-9][a-z0-9-]*`, each at most 1 MiB.
 
@@ -130,18 +154,18 @@ for each VM to `measurements`. The configuration is attested this way but not pa
 The full RTMR1 and RTMR2 values also depend on the firmware's own events. They are confirmed
 against the event log of the first GCP token (stage 3).
 
-Measurements of the run of 2026-11-10 (`20261110T135725Z`; signer from commit `e5aebc1`, default
-features):
+Measurements of the run of 2026-11-10 (`20261110T144010Z`; the signer of the working tree with
+stage 1 (sealed vault, mTLS), not yet committed; default features):
 
 ```
-release binary.sha256           ad814426023b37bdfdd9ce37ee31c0b15c9aa6a441ae1ae80bbcca762aeedc7f
-release uki.sha384              3ca052b59919f63ee775f0d714406736cffe119c1ac04ad0ea5547564e631d8e365aed6694c6745168ae02c643ff3883
-release uki.authenticode-sha384 9b035f195f659a1bcc00c5956ed810d55ab8c90d1bc35b7ba22abd0506c43e02e0177f3206980642afe00eaea592d7f4
-release roothash                11bfd0541af684b65f381d4fa3b8e6ab5ce10612c62958284e1381babd5bed11
-release gpt-event.sha384        a26957d33b3522bf92fcb675252ed2e3bde758d3a26e2ad816af18f5490153f35c6d0c52e8b06231864589b3fe92030d
-debug   uki.sha384              acac3f602c39e0b2f7b10e76e3f1e236e7e1442c578352c34b75528b36e7ad6573a9ef9e11f0054e8f52d3409974b898
-debug   uki.authenticode-sha384 59793b8d04e197c957be728fa45456aa2b0975a83be7d2f43b9c00ebe244fba3bff37b8c70957325d5f401700e88b795
-debug   roothash                7f5829024165f09e2ceaa93eeab1e2da309f1fe96e1f08b1ce0c0e346ebd70d8
+release binary.sha256           5c8c157e62aeaf8aec292541a7f99ee0fc764a22b226b00ce89544b7b603985b
+release uki.sha384              88c96740f18a3a06159eb765f076a05f2dfb03f800e2316fd128320928edc765179de5ab37c580472c9b623231a81c05
+release uki.authenticode-sha384 08acd3fb8cb6ffe363f35a3ec0294d1ce840869418e03e9786f8c803f63f71cd2c90d96611e4bc14add716fc84c123e0
+release roothash                e399b025a21f8087a28a2dadf80afa37f6c61ed916e9d9e9d356aed038799111
+release gpt-event.sha384        09c4057398b2062de8aa6a90b8b616d07a9a7b55e23ebfaf5d9a72f0bce0c97a7947711be6443dc7e996de18615febc3
+debug   uki.sha384              4ac41241a26715d21755fe471dc883d65cf3a1683ceaf4ae3f1794e745b811606097dc5a02930fdfbfdcecd0ab273843
+debug   uki.authenticode-sha384 2916329307a8386a7b20a8b22ff7795199e9180b41fde685649b60f568dda01fd4e5b8c7708c0fae4788c7f7866cbf72
+debug   roothash                c6b040f105262995bdf1610583e810ab0320ad0f30cd2146c6c39475f9c8e7ae
 ```
 
 `lib/measure.py`'s Authenticode hash was checked against the signature of Debian's signed kernel
@@ -152,8 +176,8 @@ They change with every change to the signer, the image configuration or the snap
 ## Reproducibility
 
 The two release builds of the run above are identical, the whole disk image included
-(`reproducibility`). The second signer was compiled from scratch (356 crates, in a tmpfs at the
-same path) and is identical too. What makes it so:
+(`reproducibility`); so were those of the earlier runs. The second signer is compiled from scratch
+each run (in a tmpfs at the same path) and is identical too. What makes it so:
 
 - **Pinned inputs.** Every package comes from one Debian snapshot, and so do the tools, which run
   in a container pinned by digest. The signer is built `--locked` in the pinned Rust image, at the
