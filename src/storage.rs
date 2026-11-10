@@ -1489,6 +1489,12 @@ impl<E: Context> Store<E> {
     }
 }
 
+/// Fuzzing (`crate::fuzzing`): a stored value's bytes, if they decode, round-trip.
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) fn fuzz_value(bytes: &[u8]) {
+    crate::fuzzing::round_trip::<Value>(bytes);
+}
+
 #[cfg(test)]
 #[path = "../tests/unit/storage.rs"]
 mod tests;

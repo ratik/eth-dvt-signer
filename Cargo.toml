@@ -5,6 +5,8 @@ edition = "2024"
 rust-version = "1.95.0"
 description = "Ethereum MPC signer built on commonware: BLS12-381 DKG and consensus-authorized threshold signing"
 publish = false
+# The fuzz targets are a crate of their own (nightly, `cargo fuzz`).
+exclude = ["fuzz"]
 
 [features]
 # Fault injection for the real-process end-to-end tests (see `src/hooks.rs`). Never enable it in
@@ -13,6 +15,9 @@ test-hooks = ["dev-api"]
 # The raw signing API (`POST /sign`, `GET /authorizations`) for development and tests: signs any
 # payload with a development key. Never enable it in a deployment.
 dev-api = []
+# Fuzzing entry points (`src/fuzzing.rs`) for the `fuzz/` crate and `tests/fuzz_regressions.rs`.
+# Never enable it in a deployment.
+fuzzing = []
 
 [dependencies]
 commonware-actor = "2026.9.0"

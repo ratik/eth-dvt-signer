@@ -8,7 +8,8 @@
 #   binds inside that container only: no other container shares its network, and nothing is
 #   published on the host. Nothing else on the host is touched.
 #
-# Usage: env.sh tools|build|validate [RUNS]|cargo ARGS...|up|exec CMD...|status|down
+# Usage: env.sh tools|build|validate [RUNS]|fuzz TARGET|all [SECONDS] [PARALLEL]|cargo ARGS...|up|
+#        exec CMD...|status|down
 #   IT_HOME   work directory on the host (default: ~/eth-mpc-it): bin/, target/, runs/, validation/
 set -euo pipefail
 
@@ -51,24 +52,69 @@ build() {
 		--bin eth-mpc-signer --bin mpc-keytool --bin mpc-admin --target-dir /it/target
 }
 
+fuzz_tools() {
+	# The pinned nightly and cargo-fuzz for the fuzz targets only, under IT_HOME (once): the
+	# signer itself is built and tested with RUST_IMAGE's stable toolchain.
+	if [ -x "$IT_HOME/cargo-home-fuzz/bin/cargo-fuzz" ] &&
+		"$IT_HOME/cargo-home-fuzz/bin/cargo-fuzz" --version | grep -qx "cargo-fuzz $CARGO_FUZZ_VERSION" &&
+		[ -d "$IT_HOME/rustup-fuzz/toolchains/$FUZZ_TOOLCHAIN-x86_64-unknown-linux-gnu" ]; then
+		return
+	fi
+	mkdir -p "$IT_HOME/rustup-fuzz" "$IT_HOME/cargo-home-fuzz"
+	log "installing $FUZZ_TOOLCHAIN and cargo-fuzz $CARGO_FUZZ_VERSION under $IT_HOME"
+	docker run --rm -u "$(id -u):$(id -g)" -v "$IT_HOME:/it" \
+		-e RUSTUP_HOME=/it/rustup-fuzz -e CARGO_HOME=/it/cargo-home-fuzz "$RUST_IMAGE" sh -c "
+			/usr/local/cargo/bin/rustup toolchain install $FUZZ_TOOLCHAIN --profile minimal &&
+			/usr/local/cargo/bin/rustup run $FUZZ_TOOLCHAIN cargo install cargo-fuzz \
+				--version $CARGO_FUZZ_VERSION --locked"
+}
+
+fuzz_targets() {
+	sed -n 's/^name = "\(.*\)"$/\1/p' "$repo/fuzz/Cargo.toml" | grep -vx eth-mpc-signer-fuzz
+}
+
+fuzz() {
+	# Coverage-guided fuzzing of what peers, API clients, the anchor and the disk give a node
+	# (`fuzz/`, `src/fuzzing.rs`): TARGET, or every one, for SECONDS each, PARALLEL at once.
+	# Logs and findings in IT_HOME/validation/fuzz-<time>/; the corpus grows in
+	# IT_HOME/fuzz-corpus/. A finding goes to fuzz/regressions/<target>/ once fixed.
+	local which="${1:?usage: env.sh fuzz TARGET|all [SECONDS] [PARALLEL]}" seconds="${2:-60}"
+	local parallel="${3:-4}" name targets
+	fuzz_tools
+	if [ "$which" = all ]; then targets="$(fuzz_targets)"; else targets="$which"; fi
+	name="fuzz-$(date -u +%Y%m%dT%H%M%SZ)"
+	mkdir -p "$IT_HOME/validation/$name" "$IT_HOME/fuzz-corpus" "$IT_HOME/target-fuzz"
+	log "fuzzing for $seconds s per target, $parallel at once: logs in $IT_HOME/validation/$name"
+	# shellcheck disable=SC2086
+	docker run --rm -u "$(id -u):$(id -g)" -v "$IT_HOME:/it" -v "$repo:/it/src:ro" \
+		-e FUZZ_TOOLCHAIN="$FUZZ_TOOLCHAIN" -w /it/src "$RUST_IMAGE" \
+		bash integration/ethereum/scripts/fuzz.sh "/it/validation/$name" "$seconds" "$parallel" \
+		$targets
+}
+
 validate() {
 	# Every check of the repository, in the pinned Rust image: formatting, lints (all features and
 	# default), `cargo test`, the E2E suite RUNS times, and the L-1 reproducer (ignored by default,
 	# expected to fail). Its own target directory, so the integration's signer binary is never
 	# replaced; do not run it during an integration run (CPU load delays duties). The image has no
 	# rustfmt or clippy: they are added inside the throwaway container, which runs as root for
-	# that and gives the files back to the host user.
+	# that and gives the files back to the host user. Last, every fuzz target for 30 s
+	# (`fuzz-smoke`, the pinned nightly of `fuzz_tools`).
 	local runs="${1:-3}" name
+	fuzz_tools
 	name="$(date -u +%Y%m%dT%H%M%SZ)"
 	# TMPDIR on the host: a failed E2E test keeps its network directory (node logs, storage).
-	mkdir -p "$IT_HOME/validation/$name/tmp" "$IT_HOME/target-test" "$IT_HOME/cargo-home"
+	mkdir -p "$IT_HOME/validation/$name/tmp" "$IT_HOME/target-test" "$IT_HOME/cargo-home" \
+		"$IT_HOME/target-fuzz" "$IT_HOME/fuzz-corpus"
 	log "validating in $RUST_IMAGE: logs in $IT_HOME/validation/$name"
 	docker run --rm -v "$IT_HOME:/it" -v "$repo:/it/src:ro" \
 		-e CARGO_HOME=/it/cargo-home -e CARGO_TARGET_DIR=/it/target-test \
 		-e TMPDIR="/it/validation/$name/tmp" \
 		-e RUNS="$runs" -e OUT="/it/validation/$name" -e OWNER="$(id -u):$(id -g)" \
+		-e FUZZ_TOOLCHAIN="$FUZZ_TOOLCHAIN" -e FUZZ_TARGETS="$(fuzz_targets | tr '\n' ' ')" \
 		-w /it/src "$RUST_IMAGE" bash -c '
-			trap "chown -R \$OWNER /it/cargo-home /it/target-test \$OUT" EXIT
+			trap "chown -R \$OWNER /it/cargo-home /it/target-test /it/cargo-home-fuzz \
+				/it/target-fuzz /it/fuzz-corpus \$OUT" EXIT
 			failed=0
 			step() { # step NAME EXPECTED COMMAND...: EXPECTED is pass or fail
 				local name="$1" expected="$2"; shift 2
@@ -89,6 +135,9 @@ validate() {
 			done
 			step l1-reproducer fail cargo test --locked --features test-hooks --test e2e \
 				eth2::e2e_eth_l1 -- --ignored
+			# shellcheck disable=SC2086
+			step fuzz-smoke pass bash integration/ethereum/scripts/fuzz.sh "$OUT/fuzz" 30 4 \
+				$FUZZ_TARGETS
 			for log in "$OUT"/*.txt; do
 				[ "$log" = "$OUT/summary.txt" ] || grep -H "^test result" "$log" || true
 			done >>"$OUT/summary.txt"
@@ -149,6 +198,10 @@ case "${1:-}" in
 tools) tools ;;
 build) build ;;
 validate) validate "${2:-3}" ;;
+fuzz)
+	shift
+	fuzz "$@"
+	;;
 cargo)
 	shift
 	mkdir -p "$IT_HOME/tmp"
@@ -166,7 +219,7 @@ status)
 	;;
 down) down ;;
 *)
-	echo "usage: $0 tools|build|validate [RUNS]|cargo ARGS...|up|exec CMD...|status|down" >&2
+	echo "usage: $0 tools|build|validate [RUNS]|fuzz TARGET|all [SECONDS] [PARALLEL]|cargo ARGS...|up|exec CMD...|status|down" >&2
 	exit 2
 	;;
 esac

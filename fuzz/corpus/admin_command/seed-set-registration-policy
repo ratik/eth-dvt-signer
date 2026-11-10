@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "cluster_id": "0x937d407b11e6e7b93068adfab25f425389abae4055a0b31f93e12ab608783be7",
+  "operation": "set-registration-policy",
+  "nonce": 4,
+  "request": {
+    "fee_recipients": [
+      "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ],
+    "gas_limit_max": 60000000,
+    "gas_limit_min": 30000000,
+    "max_age_seconds": 3600,
+    "max_future_seconds": 30
+  },
+  "description": "set the builder registration policy (digest 0x2b344789ef1f2a81d7d7f146e07683c67d06411c90c6a7c645685841211a6584): fee recipients 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; gas limit 30000000 to 60000000; timestamps at most 30 s ahead and 3600 s behind the clock. Every builder registration signed from now on must meet it; any other is refused. From Gloas on it also decides on proposer preferences (fee recipient, target gas limit) and on the envelopes of self-built payloads (fee recipient)",
+  "message": "0x937d407b11e6e7b93068adfab25f425389abae4055a0b31f93e12ab608783be700011000000000000000040000003501aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000001c9c3800000000003938700000000000000001e0000000000000e10",
+  "approvals": [
+    {
+      "approver": "0xf5b1e11f7772fded9e4fe5399decfd844936bad0acdeedfd8972088a0b517ae7",
+      "signature": "0xb7baf35c266c1388e4940ab531cc716fe33e5ce3af346ea06408d97aaa1b3de6ba9fa014ce1b901ef48ec2c4d8f1a84fe93594ecd2e45616c321b4bf30c8dd02"
+    }
+  ]
+}

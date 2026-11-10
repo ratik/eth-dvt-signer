@@ -9,6 +9,10 @@ pub mod engine;
 pub mod epochs;
 pub mod eth;
 pub mod executor;
+/// Fuzzing entry points (`fuzz/`): never in a deployment.
+#[cfg(any(test, feature = "fuzzing"))]
+#[doc(hidden)]
+pub mod fuzzing;
 pub mod hooks;
 pub mod import;
 pub mod readiness;

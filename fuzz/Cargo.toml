@@ -1,0 +1,101 @@
+# Coverage-guided fuzz targets (`cargo fuzz`, nightly): one per input a peer, an API client, the
+# anchor or the disk can give a node. The properties live in `src/fuzzing.rs`; inputs a campaign
+# finds go to `regressions/<target>`, which `tests/fuzz_regressions.rs` replays on stable Rust.
+# Run them with `integration/ethereum/scripts/env.sh fuzz <target|all> <seconds>`.
+
+[package]
+name = "eth-mpc-signer-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+eth-mpc-signer = { path = "..", features = ["fuzzing"] }
+
+# Not a member of the signer's build.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "transaction"
+path = "fuzz_targets/transaction.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block"
+path = "fuzz_targets/block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signer_wire"
+path = "fuzz_targets/signer_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dkg_wire"
+path = "fuzz_targets/dkg_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "web3signer"
+path = "fuzz_targets/web3signer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "interchange"
+path = "fuzz_targets/interchange.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "admin_command"
+path = "fuzz_targets/admin_command.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "anchor_record"
+path = "fuzz_targets/anchor_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "acknowledgment"
+path = "fuzz_targets/acknowledgment.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "state_value"
+path = "fuzz_targets/state_value.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false

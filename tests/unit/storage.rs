@@ -1453,7 +1453,7 @@ mod validator {
 
     /// Imported keys: registration, acknowledged shares, history and the activation barriers,
     /// through blocks and a restart.
-    mod imported {
+    pub(super) mod imported {
         use super::*;
         use crate::{
             dkg::{
@@ -1473,7 +1473,7 @@ mod validator {
         use rand::{SeedableRng as _, rngs::StdRng};
 
         /// A manifest for the key `seed`, split among `committee`.
-        pub(super) fn manifest(ceremony: &str, committee: &Set<PublicKey>, seed: u64) -> Manifest {
+        pub(crate) fn manifest(ceremony: &str, committee: &Set<PublicKey>, seed: u64) -> Manifest {
             let secret = Private::new(Scalar::from_u64(seed + 1000));
             let split =
                 dealer::split(&secret, committee, &mut StdRng::seed_from_u64(seed)).unwrap();
@@ -1500,7 +1500,7 @@ mod validator {
             tx(Command::RegisterImportedKey(Box::new(manifest.clone())))
         }
 
-        pub(super) fn history(
+        pub(crate) fn history(
             key: ValidatorKey,
             genesis: u8,
             slot: u64,
@@ -1527,7 +1527,7 @@ mod validator {
             })))
         }
 
-        pub(super) fn activate_imported(
+        pub(crate) fn activate_imported(
             key: ValidatorKey,
             genesis: u8,
             acknowledgment: Acknowledgment,
@@ -1539,7 +1539,7 @@ mod validator {
             })
         }
 
-        pub(super) const ACKNOWLEDGED: Acknowledgment = Acknowledgment {
+        pub(crate) const ACKNOWLEDGED: Acknowledgment = Acknowledgment {
             previous_signer_stopped: true,
             no_other_active_signer: true,
             history_exported_after_stop: true,
@@ -1673,6 +1673,107 @@ mod validator {
                     .unwrap();
             }
             key
+        }
+
+        /// Write the fuzz seeds of what only this module builds (`cargo test --lib
+        /// write_fuzz_seeds -- --ignored`): every value of two state partitions (a DKG validator
+        /// and an imported one, each with duties), their epoch records, the import manifest, and
+        /// the transactions that built them (`crate::fuzzing`).
+        #[test]
+        #[ignore]
+        fn write_fuzz_seeds() {
+            use commonware_codec::Encode as _;
+            use commonware_cryptography::Signer as _;
+            fn seed(target: &str, name: &str, bytes: &[u8]) {
+                let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("fuzz/corpus")
+                    .join(target);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join(format!("seed-{name}")), bytes).unwrap();
+            }
+            deterministic::Runner::default().start(|mut context| async move {
+                let signers = signers();
+                let committee = committee(&signers);
+                let block = Sha256::hash(&[b"block"]);
+                let mut dkg = Store::init(context.child("dkg"), "dkg", committee.clone())
+                    .await
+                    .unwrap();
+                let key = super::complete_validator(&mut context, &mut dkg, &signers).await;
+                let duties = |key| {
+                    vec![
+                        activate(key, 9),
+                        submit(&propose(key, 10, 1)),
+                        submit(&attestation(key, 1, 2)),
+                        submit(&attestation(key, 2, 3)),
+                    ]
+                };
+                dkg.apply_block(3, &block, &duties(key), &mut context)
+                    .await
+                    .unwrap();
+                let mut imported =
+                    Store::init(context.child("imported"), "imported", committee.clone())
+                        .await
+                        .unwrap();
+                let imported_key = activated(&mut context, &mut imported, &signers).await;
+                let transactions = duties(imported_key)[1..].to_vec();
+                imported
+                    .apply_block(5, &block, &transactions, &mut context)
+                    .await
+                    .unwrap();
+                drop((dkg, imported));
+
+                for prefix in ["dkg", "imported"] {
+                    let metadata = Metadata::<_, Key, Value>::init(
+                        context.child("read"),
+                        Config {
+                            partition: format!("{prefix}-state"),
+                            codec_config: (),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    for (index, key) in metadata.keys().enumerate() {
+                        let mut bytes = vec![0u8];
+                        bytes.extend_from_slice(&metadata.get(key).unwrap().encode());
+                        seed("state_value", &format!("{prefix}-{index}"), &bytes);
+                    }
+                }
+                // A later epoch (epoch 0 is never stored).
+                let record = crate::epochs::EpochRecord {
+                    epoch: 1,
+                    change: Some((
+                        committee.iter().next().unwrap().clone(),
+                        signers[0].public_key(),
+                    )),
+                    committee: committee.clone(),
+                    boundary: 5,
+                    boundary_digest: block,
+                };
+                let mut bytes = vec![1u8];
+                bytes.extend_from_slice(&record.encode());
+                seed("state_value", "epoch-1", &bytes);
+                let manifest = manifest("imported", &committee, 1);
+                seed("manifest", "imported", &manifest.encode());
+                for (index, transaction) in [
+                    register(&manifest),
+                    history(manifest.validator, 9, 100, 10, 11),
+                    activate_imported(manifest.validator, 9, ACKNOWLEDGED),
+                    tx(Command::ShareReady(Box::new(ReadyAck::sign(
+                        &signers[0],
+                        0,
+                        manifest.digest(),
+                    )))),
+                ]
+                .iter()
+                .enumerate()
+                {
+                    seed(
+                        "transaction",
+                        &format!("import-{index}"),
+                        &transaction.encode(),
+                    );
+                }
+            });
         }
 
         #[test]
@@ -3060,3 +3161,6 @@ fn a_finalized_reconfiguration_with_company_stops_the_node() {
             .await;
     });
 }
+
+#[path = "storage_model.rs"]
+mod model;

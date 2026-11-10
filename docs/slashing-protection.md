@@ -404,7 +404,12 @@ be behind the finalized blocks the node acknowledged, and every share must have 
 damaged copy of the state is saved to `registry-diagnostics` before the store opens.
 
 The counts detect lost or extra records. They do not detect a consistent rewrite, where records and
-counts change together. That is the same class as a rollback.
+counts change together. That is the same class as a rollback. Nor do they detect one record's
+content rewritten in agreement with its neighbours: the hostile-storage test
+(`storage::tests::model`) removes, mutates, copies and duplicates single entries; every removal and
+duplication of a record stops the start, while a lowered attestation source can start and then
+accept a surround vote that was refused (audit L-30). One such node is tolerated: a signature
+needs three keyholders, and the other three refuse.
 
 ## Crashes and recovery
 

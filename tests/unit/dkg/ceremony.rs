@@ -1268,3 +1268,97 @@ pub(crate) mod reshare {
         }
     }
 }
+
+/// Write the fuzz seeds of the DKG and signing channels (`crate::fuzzing`; `cargo test --lib
+/// dkg::ceremony::tests::write_fuzz_seeds -- --ignored`): a dealing and an acknowledgement as a
+/// dealer and a player exchange them, a partial signature, and a dealer log as consensus carries it.
+#[test]
+#[ignore]
+fn write_fuzz_seeds() {
+    use crate::{
+        dkg::wire::Message as Dkg,
+        signer::wire::{Message as Signing, Request},
+        types::{Command, Transaction},
+    };
+    use commonware_codec::Encode as _;
+    fn seed(target: &str, name: &str, bytes: &[u8]) {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fuzz/corpus")
+            .join(target);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("seed-{name}")), bytes).unwrap();
+    }
+    deterministic::Runner::default().start(|mut context| async move {
+        let signers = signers();
+        let mut ceremonies = Ceremonies::new(committee(&signers));
+        let id = CeremonyId::new("validator-001").unwrap();
+        ceremonies.start(
+            config("validator-001", &signers),
+            1,
+            &Sha256::hash(&[b"b1"]),
+        );
+        let ceremony = ceremonies.get(&id).unwrap().clone();
+        let info = ceremony.info();
+
+        // A dealing and its acknowledgement.
+        let (_, commitment, dealings) =
+            Dealer::start::<Faults>(&mut context, info.clone(), signers[0].clone(), None).unwrap();
+        let mut player = Player::new(info, signers[1].clone()).unwrap();
+        let (_, share) = dealings
+            .into_iter()
+            .find(|(player, _)| *player == signers[1].public_key())
+            .unwrap();
+        seed(
+            "dkg_wire",
+            "dealing",
+            &Dkg::Dealing {
+                round: 0,
+                commitment: commitment.clone(),
+                share: share.clone(),
+            }
+            .encode(),
+        );
+        let ack = player
+            .dealer_message::<Faults>(signers[0].public_key(), commitment, share)
+            .unwrap()
+            .unwrap();
+        seed("dkg_wire", "ack", &Dkg::Ack { round: 0, ack }.encode());
+
+        // The completed ceremony: its dealer logs, and a keyholder's partial signature.
+        let (players, logs) = deal(&mut context, &ceremony, &signers, &[]);
+        for (index, log) in logs.iter().enumerate() {
+            let transaction = Transaction {
+                id: index as u64,
+                command: Command::DealerLog {
+                    round: 0,
+                    log: Box::new(log.clone()),
+                },
+            };
+            seed(
+                "transaction",
+                &format!("dealer-log-{index}"),
+                &transaction.encode(),
+            );
+        }
+        for log in logs {
+            ceremonies.record(0, log).unwrap();
+        }
+        ceremonies.advance(3, &mut context);
+        let ceremony = ceremonies.iter().next().unwrap().clone();
+        let player = players.into_iter().next().unwrap();
+        let (_, share) = player
+            .finalize::<Faults, ed25519::Batch>(&mut context, ceremony.logs(), &Sequential)
+            .unwrap();
+        let key_share = KeyShare::new(&ceremony, share);
+        let request = Request::duty(id, [0x11; 48], [7; 32]);
+        seed(
+            "signer_wire",
+            "partial",
+            &Signing::Partial {
+                request: request.id,
+                partial: Message::Ethereum([7; 32]).partial_sign(&key_share.share),
+            }
+            .encode(),
+        );
+    });
+}

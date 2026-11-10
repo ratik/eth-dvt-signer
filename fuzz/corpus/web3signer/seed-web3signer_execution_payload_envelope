@@ -1,0 +1,47 @@
+{
+  "type": "EXECUTION_PAYLOAD_ENVELOPE",
+  "fork_info": {
+    "fork": {
+      "previous_version": "0x00000001",
+      "current_version": "0x00000001",
+      "epoch": "1"
+    },
+    "genesis_validators_root": "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673"
+  },
+  "execution_payload_envelope": {
+    "version": "GLOAS",
+    "data": {
+      "payload": {
+        "parent_hash": "0x367cbd40ac7318427aadb97345a91fa2e965daf3158d7f1846f1306305f41bef",
+        "fee_recipient": "0x6fdfab408c56b6105a76eff5c0435d09fc6ed7a9",
+        "state_root": "0xfd18cf40cc907a739be483f1ca0ee23ad65cdd3df23205eabc6d660a75d1f54e",
+        "receipts_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "logs_bloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "prev_randao": "0x100814c335d0ced5014cfa9d2e375e6d9b4e197381f8ce8af0473200fdc917fd",
+        "block_number": "1",
+        "gas_limit": "30000000",
+        "gas_used": "0",
+        "timestamp": "1",
+        "extra_data": "0x",
+        "base_fee_per_gas": "1",
+        "block_hash": "0xa759d8029a69d4fdd8b3996086e9722983977e4efc1f12f4098ea3d93e868a6b",
+        "transactions": [],
+        "withdrawals": [],
+        "blob_gas_used": "0",
+        "excess_blob_gas": "0",
+        "block_access_list": "0x",
+        "slot_number": "1"
+      },
+      "execution_requests": {
+        "deposits": [],
+        "withdrawals": [],
+        "consolidations": [],
+        "builder_deposits": [],
+        "builder_exits": []
+      },
+      "builder_index": "1",
+      "beacon_block_root": "0x235bc3400c2839fd856a524871200bd5e362db615fc4565e1870ed9a2a936464",
+      "parent_beacon_block_root": "0x367cbd40ac7318427aadb97345a91fa2e965daf3158d7f1846f1306305f41bef"
+    }
+  }
+}

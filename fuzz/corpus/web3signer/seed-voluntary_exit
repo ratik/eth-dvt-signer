@@ -1,0 +1,1 @@
+{"type":"VOLUNTARY_EXIT","fork_info":{"fork":{"previous_version":"0x03000000","current_version":"0x03000000","epoch":"411402"},"genesis_validators_root":"0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673"},"signingRoot":"0x4524690b96f16c2bd23ae71f90f21104f3c318b911e963858f70a6245b8f28f0","voluntary_exit":{"epoch":"411402","validator_index":"7"}}

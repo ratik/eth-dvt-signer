@@ -1,0 +1,24 @@
+{
+  "kind": "anchor-acknowledgment",
+  "cluster_id": "0x937d407b11e6e7b93068adfab25f425389abae4055a0b31f93e12ab608783be7",
+  "generation": 1,
+  "height": 120,
+  "digest": "0x496aca80e4d8f29fb8e8cd816c3afb48d3f103970b3a2ee1600c08ca67326dee",
+  "marks": {
+    "block_slot": 900,
+    "source": 27,
+    "target": null
+  },
+  "description": "acknowledge a rollback: the cluster continues in anchor generation 1, giving up the state at height 120 (block 0x496aca80e4d8f29fb8e8cd816c3afb48d3f103970b3a2ee1600c08ca67326dee); no block at or below slot 900, no attestation with a target at or below epoch none or a source below epoch 27",
+  "message": "0x6574682d6d70632d7369676e65722f616e63686f722d61636b6e6f776c6564676d656e742f7631937d407b11e6e7b93068adfab25f425389abae4055a0b31f93e12ab608783be700000000000000010000000000000078496aca80e4d8f29fb8e8cd816c3afb48d3f103970b3a2ee1600c08ca67326dee01000000000000038401000000000000001b00",
+  "approvals": [
+    {
+      "approver": "0xcfc33e3df5de38b1a8a5c8435c58f5b9213f61b87acb080a8e043a49fbd424ff",
+      "signature": "0xb8eeb377001f5f9a9a5a6eb9278424f54c232e4bd2ffbe05643e345ba76556cec72e1b2b9a82798c5bcb97a96a336b0d200e2b7dd8653580b08ebfb20a8a1d0b"
+    },
+    {
+      "approver": "0xe0611ba8b9aeae66de1f0742307d0cbddad0c7ed2a91e50005578b34052885bf",
+      "signature": "0xf42a32e8664985196d7289aef19b3c5b8828c3f7565d6aa5ef03d87bb10aaa82f01484192581ec0b6f2cac097fc6bf62dfdf77a350dad8caacf94b8a2191ce0a"
+    }
+  ]
+}

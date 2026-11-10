@@ -614,11 +614,25 @@ IT_HOME=~/eth-mpc-it ./integration/ethereum/scripts/run.sh
 ```
 
 Every check below, in the same pinned Rust image on the same host (fmt, clippy, `cargo test`, the
-E2E suite three times, the L-1 reproducer; logs in `$IT_HOME/validation/`):
+E2E suite three times, the L-1 reproducer, every fuzz target for 30 s; logs in
+`$IT_HOME/validation/`):
 
 ```bash
 IT_HOME=~/eth-mpc-it ./integration/ethereum/scripts/env.sh validate 3
 ```
+
+Fuzzing (`fuzz/`, one target per input a peer, an API client, the anchor or the disk gives a node;
+a pinned nightly installed under `$IT_HOME`, never used for the signer itself), here every target
+for an hour, four at once:
+
+```bash
+IT_HOME=~/eth-mpc-it ./integration/ethereum/scripts/env.sh fuzz all 3600 4
+```
+
+`cargo test` also runs a model test of the replicated state (random duty blocks against an
+independent reference of the slashing rules, a replica reopened at random heights; `MODEL_SEEDS`),
+hostile storage (single edits of the state partition; `HOSTILE_SEEDS`), and every checked-in fuzz
+seed and regression ([docs/audit.md](docs/audit.md), "Fuzzing, a model test and hostile storage").
 
 `tests/e2e` (real processes): E2E-1 to E2E-9 below, E2E-ETH-1 to E2E-ETH-10 (`eth2.rs`: every
 duty through the Web3Signer API, activation, slashing refusals, concurrent conflicts, a full
