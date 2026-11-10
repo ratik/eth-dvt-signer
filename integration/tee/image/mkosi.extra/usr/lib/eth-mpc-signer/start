@@ -1,14 +1,35 @@
 #!/bin/bash
 # The node, with the arguments of its configuration (written NUL-separated by `config`) and the
-# image's data directory: the data disk. With `identity` first, the vault's statement instead:
-# printed on the console in one line, base64 with its SHA-256, between markers a reader of the
-# serial port can find (the only way out of a release image).
+# image's data directory: the data disk. The first argument may instead name a mode whose output
+# goes to the console, the only way out of a release image:
+# - `identity`: the vault's statement, `eth-mpc-identity: <base64> sha256 <hex>`;
+# - `measure`: an attestation token from the token helper (audience `measure`, no nonce),
+#   `EMS-MEASURE-TOKEN <jwt>` (or `EMS-MEASURE-TOKEN-ERROR <the helper's answer>`); `config`
+#   printed the event log. The service then idles.
 set -euo pipefail
 mapfile -d '' -t args </run/eth-mpc-signer/argv
-if [ "${args[0]}" = identity ]; then
+case "${args[0]}" in
+identity)
 	statement="$(/usr/bin/eth-mpc-signer identity --data-dir /var/lib/mpc "${args[@]:1}")"
-	printf 'eth-mpc-identity: %s sha256 %s\n' "$(printf '%s' "$statement" | base64 -w0)" \
-		"$(printf '%s' "$statement" | sha256sum | cut -d' ' -f1)"
+	line="eth-mpc-identity: $(printf '%s' "$statement" | base64 -w0) sha256 $(printf '%s' "$statement" | sha256sum | cut -d' ' -f1)"
+	# Twice: a reader takes the first copy whose SHA-256 holds.
+	echo "$line"
+	sleep 1
+	echo "$line"
 	exit 0
-fi
+	;;
+measure)
+	answer="$(printf '{"audience": "measure", "nonces": []}\n' |
+		nc -N -U /run/eth-mpc-signer/token.sock 2>&1 | tr -d '\r' | head -c 65536)" || true
+	if [[ "$answer" =~ ^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]; then
+		# Twice, as the statement: a JWT's signature tells a whole copy.
+		echo "EMS-MEASURE-TOKEN $answer"
+		sleep 1
+		echo "EMS-MEASURE-TOKEN $answer"
+	else
+		echo "EMS-MEASURE-TOKEN-ERROR $(printf '%s' "$answer" | tr '\n' ' ' | head -c 2000)"
+	fi
+	exec sleep infinity
+	;;
+esac
 exec /usr/bin/eth-mpc-signer --data-dir /var/lib/mpc "${args[@]}"

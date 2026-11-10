@@ -1,0 +1,15 @@
+# The token helper: the one thing the node (user mpc) asks root for. A TDX report needs root
+# (configfs-tsm, the vTPM); the node gets an attestation token and nothing else (tee-token).
+[Unit]
+Description=Attestation token helper for the node
+
+[Socket]
+ListenStream=/run/eth-mpc-signer/token.sock
+Accept=yes
+SocketUser=root
+SocketGroup=mpc
+SocketMode=0660
+MaxConnections=16
+
+[Install]
+WantedBy=sockets.target

@@ -8,6 +8,14 @@ systemctl mask systemd-firstboot.service systemd-machine-id-commit.service \
 	efi.automount efi.mount boot.automount boot.mount
 ln -sf ../run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 
+# systemd's TPM policy units: nothing here uses them (the node's attestation is the TDX quote,
+# the vTPM serves gotpm only), and on GCE's vTPM they fail ("TPM device not usable") or report
+# missing TPM2 support on every boot.
+for unit in /usr/lib/systemd/system/systemd-pcrlock-*.service \
+	/usr/lib/systemd/system/systemd-tpm2-setup*.service; do
+	[ ! -e "$unit" ] || systemctl mask "${unit##*/}"
+done
+
 case " ${PROFILES:-} " in
 *" debug "*)
 	# The debug image keeps a root shell on the serial console (autologin, see its extra

@@ -4,7 +4,9 @@
 #   args  the node's command-line flags, one argument per line (blank lines and lines starting
 #         with `#` are skipped). `--data-dir` is set by the image (/var/lib/mpc), never here.
 #         A first argument `identity` runs `eth-mpc-signer identity` instead of the node: it
-#         makes the vault and prints its statement on the console (`start`).
+#         makes the vault and prints its statement on the console (`start`). `measure` prints
+#         the platform's measurements instead (the first boot on GCP, README): here the CCEL
+#         ACPI table and its event log, which only root reads; `start` adds a token.
 #   ...   any other file a flag names, as /run/eth-mpc-signer/config/<name> (peers, client CA,
 #         approvers; `ssh-authorized-keys` for the debug image). Names: [a-z0-9][a-z0-9-]*.
 #
@@ -110,6 +112,14 @@ digest="$(printf '%s\n' "$manifest" | sha384sum | cut -d' ' -f1)"
 printf '%s\n' "$manifest" | while IFS= read -r line; do log "file $line"; done
 log "configuration digest (sha384 of the manifest above) $digest"
 
+# On TDX the measurement registers come with the tdx_guest driver (Linux 6.16 or later:
+# /sys/class/misc/tdx_guest/measurements/rtmr<N>:sha384, write to extend).
+tdx=no
+if grep -qw tdx_guest /proc/cpuinfo; then
+	tdx=yes
+	modprobe -q tdx_guest || log "modprobe tdx_guest failed"
+	udevadm settle --timeout=10 || true
+fi
 rtmr=
 for candidate in /sys/class/misc/tdx_guest/measurements/rtmr3:sha384 \
 	/sys/devices/virtual/misc/tdx_guest/measurements/rtmr3:sha384; do
@@ -123,7 +133,7 @@ if [ -n "$rtmr" ]; then
 	printf "$(printf '%s' "$digest" | sed 's/../\\x&/g')" | dd of="$rtmr" bs=48 count=1 \
 		iflag=fullblock status=none
 	log "RTMR3 extended with the configuration digest; RTMR3 is now $(od -An -v -tx1 "$rtmr" | tr -d ' \n')"
-elif grep -qw tdx_guest /proc/cpuinfo; then
+elif [ "$tdx" = yes ]; then
 	fail "TDX guest without an RTMR3 interface (tdx_guest measurements, Linux 6.16 or later): not starting the node with an unmeasured configuration"
 else
 	tsm=absent
@@ -142,6 +152,42 @@ chmod 0640 "$run/argv"
 rm -f "$run/http-bridge.env"
 if [ "${args[0]}" = identity ]; then
 	log "identity: the vault's statement goes to the console"
+	rm -rf "$config"
+	mv "$staging" "$config"
+	exit 0
+fi
+if [ "${args[0]}" = measure ]; then
+	# The CCEL ACPI table and the event log it points to, each as one console line
+	# `EMS-MEASURE-<CCEL|EVENTLOG> <base64>` (the log without the 0xFF filling the unused rest of
+	# its area), then `EMS-MEASURE-<...>-SHA256 <hex> <bytes>`; the vTPM's event log the same way
+	# (`EMS-MEASURE-TPMLOG`; GRUB and systemd-stub measure into both). The lines go straight to
+	# /dev/console, the serial port: journald splits lines over 48 KiB, and the tty writes one
+	# write() whole; the kernel's console messages pause meanwhile. lib/measure.py replays them.
+	console_file() {
+		local tag="$1" file="$2" trim="$3" data="$run/measure-${1#EMS-MEASURE-}"
+		if [ ! -r "$file" ]; then
+			log "measure: $file absent"
+			echo "$tag-ABSENT $file"
+			return
+		fi
+		if [ "$trim" = yes ] && command -v perl >/dev/null; then
+			perl -0777 -pe 's/\xff+\z//' "$file" >"$data"
+		else
+			cat "$file" >"$data"
+		fi
+		{
+			printf '%s ' "$tag"
+			base64 -w0 "$data"
+			printf '\n'
+		} >"$data.line"
+		dmesg --console-off || true
+		dd if="$data.line" of=/dev/console bs=64M status=none
+		dmesg --console-on || true
+		echo "$tag-SHA256 $(sha256sum "$data" | cut -d' ' -f1) $(stat -c %s "$data")"
+	}
+	console_file EMS-MEASURE-CCEL /sys/firmware/acpi/tables/CCEL no
+	console_file EMS-MEASURE-EVENTLOG /sys/firmware/acpi/tables/data/CCEL yes
+	console_file EMS-MEASURE-TPMLOG /sys/kernel/security/tpm0/binary_bios_measurements no
 	rm -rf "$config"
 	mv "$staging" "$config"
 	exit 0

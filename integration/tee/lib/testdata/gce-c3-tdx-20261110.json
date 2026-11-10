@@ -1,0 +1,42 @@
+{
+  "eventlog": "gce-c3-tdx-20261110.eventlog",
+  "source": "GCE c3 TDX VM in europe-west4-a, 2026-11-10, measure mode: release image of run 20261110T172647Z (UKI as BOOTX64.EFI, no GRUB), CCEL event log as the console printed it",
+  "google_verdict": "no GRUB measurements found",
+  "gpt_event": "af1b0779624a0bd2fde50547abe4ca744e8cd16c1348d1a5da645cfb63ecb57841600dc39e882a15d294ef50fbd61ccc",
+  "applications": [
+    [
+      "UKI",
+      "d8ed8824f2b0af81dd3887c85e28cf9572752ab680b60d98515806d37d7781912d4aef568cf29cfdba35cf06348c1772"
+    ],
+    [
+      "kernel",
+      "d6fbb31804b3c28be755b3f2dd0ae934ac113f92b61012e24494a5ca7b68a2f263f197bff8c842207ccdcccdb7d764c4"
+    ]
+  ],
+  "stub_sections": [
+    [
+      ".linux",
+      "cb22606d5ed49ad56f13d87154ead3fe920fc7f09d0834c49c9ced0740e7a502cc99dd26ca84222a570c2b335e1753b4"
+    ],
+    [
+      ".osrel",
+      "5ce9d84239e6ae54b2ce42d18b54f2e528579065c8e9423712dba9ad0de0188b4cce17374fb0b870e1eed10b34731540"
+    ],
+    [
+      ".cmdline",
+      "11a028cc1fa7d70dc9e19d786ac1edc58870168cced2e05252df44eb922a5f76d470784071690790a2f7a238823846ab"
+    ],
+    [
+      ".initrd",
+      "59b1bae406c23d6fe430108e6199feac7f723391a289c31ae3d9ee7529931f7755c66cd8989e0282a17166aa2634cc88"
+    ],
+    [
+      ".uname",
+      "639dcf90b8fff0e4e7d0cf2856dd687f433bf734ed90835e45493572f312e3ad76b556d844eeac6cd4413bcc4046b7e0"
+    ],
+    [
+      ".sbat",
+      "054191c566aee049752ee67c7622bcc835369c18b3a2387a2c4aa043bf189417d25391a5ac239878b4b1b05ed7d18437"
+    ]
+  ]
+}

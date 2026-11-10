@@ -158,7 +158,8 @@ tee_qemu() {
 	# The node's closed VM image (integration/tee/README.md) on this host's KVM: the tools image
 	# (pinned in integration/tee/versions.env), the default-features signer in RUST_IMAGE, the
 	# release image built twice (both must be equal: reproducibility) and the debug image once,
-	# and on the host `tee-fake-gcp`, `mpc-admin` and `mpc-keytool` with test-hooks. Then NODES
+	# each with GCE's `disk.tar.gz`, gotpm built in the tools image (TEE_GOTPM=0: none), and on
+	# the host `tee-fake-gcp`, `mpc-admin` and `mpc-keytool` with test-hooks. Then NODES
 	# release VMs make their sealed vaults and run as one sealed cluster against the fake of
 	# Google's attestation, STS and KMS, with a debug and a tampered VM. Logs and measurements in
 	# IT_HOME/tee/runs/<time>/. The image builds run as root in a container with CAP_SYS_ADMIN
@@ -173,15 +174,20 @@ tee_qemu() {
 		log "building $tools"
 		docker build -q -t "$tools" --build-arg BASE="$TEE_TOOLS_BASE" \
 			--build-arg SNAPSHOT="$TEE_SNAPSHOT" --build-arg MKOSI_VERSION="$TEE_MKOSI_VERSION" \
-			"$repo/integration/tee/tools" >/dev/null
+			--build-arg GO_PACKAGE="$TEE_GO_PACKAGE" "$repo/integration/tee/tools" >/dev/null
 	fi
 	name="$(date -u +%Y%m%dT%H%M%SZ)"
 	run="$IT_HOME/tee/runs/$name"
 	mkdir -p "$run" "$IT_HOME/tee/target" "$IT_HOME/tee/cache" "$IT_HOME/cargo-home"
 	log "TEE image run: logs in $run"
-	# The signer, default features (no test hooks, no dev API). The second build compiles from
-	# scratch into a throwaway volume at the same path, so equal binaries mean a reproducible one.
-	local target
+	# The signer and its token helper (`tee-token`, run by root on the image), default features
+	# (no test hooks, no dev API). The second build compiles from scratch into a throwaway volume
+	# at the same path, so equal binaries mean reproducible ones.
+	local target bins=(--bin eth-mpc-signer) copies="eth-mpc-signer"
+	if [ -f "$repo/src/bin/tee-token.rs" ]; then
+		bins+=(--bin tee-token)
+		copies+=" tee-token"
+	fi
 	for target in a b; do
 		[ "$target" = a ] || [ "${TEE_REPRO:-1}" = 1 ] || continue
 		local volume=(-v "$IT_HOME/tee/target:/it/tee/target")
@@ -191,8 +197,10 @@ tee_qemu() {
 		docker run --rm -u "$(id -u):$(id -g)" -v "$IT_HOME/cargo-home:/it/cargo-home" \
 			"${volume[@]}" -v "$repo:/it/src:ro" -v "$run:/it/out" \
 			-e CARGO_HOME=/it/cargo-home -w /it/src "$RUST_IMAGE" sh -c "
-				cargo build --locked --release --bin eth-mpc-signer --target-dir /it/tee/target &&
-				cp /it/tee/target/release/eth-mpc-signer /it/out/eth-mpc-signer-$target" \
+				cargo build --locked --release ${bins[*]} --target-dir /it/tee/target &&
+				for bin in $copies; do
+					cp /it/tee/target/release/\$bin /it/out/\$bin-$target || exit 1
+				done" \
 			>"$run/cargo-$target.log" 2>&1 || {
 			tail -n 30 "$run/cargo-$target.log" >&2
 			log "the signer build failed: $run/cargo-$target.log"
@@ -214,17 +222,38 @@ tee_qemu() {
 		log "the host tools build failed: $run/cargo-host.log"
 		return 1
 	}
+	# go-tpm-tools' gotpm (the GCE attestation token), twice in the tools image when reproducing:
+	# a pinned commit, Debian's Go, modules checked against go.sum. TEE_GOTPM=0: none (QEMU needs
+	# none; the image then gets no token on GCE).
+	if [ "${TEE_GOTPM:-1}" = 1 ]; then
+		mkdir -p "$IT_HOME/tee/go"
+		for target in a b; do
+			[ "$target" = a ] || [ "${TEE_REPRO:-1}" = 1 ] || continue
+			log "building gotpm ($target) at $TEE_GOTPM_COMMIT"
+			docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$IT_HOME/tee/go:/it/go" \
+				-v "$repo:/it/src:ro" -v "$run:/it/out" \
+				-e TEE_GOTPM_REPOSITORY="$TEE_GOTPM_REPOSITORY" -e TEE_GOTPM_COMMIT="$TEE_GOTPM_COMMIT" \
+				"$tools" bash /it/src/integration/tee/qemu.sh gotpm "/it/out/gotpm-$target" \
+				>"$run/gotpm-$target.log" 2>&1 || {
+				tail -n 30 "$run/gotpm-$target.log" >&2
+				log "the gotpm build failed: $run/gotpm-$target.log"
+				return 1
+			}
+		done
+	fi
 	local builds=(release-a debug)
 	[ "${TEE_REPRO:-1}" != 1 ] || builds=(release-a release-b debug)
 	local build
 	for build in "${builds[@]}"; do
-		local binary=/it/out/eth-mpc-signer-a
-		[ "$build" != release-b ] || binary=/it/out/eth-mpc-signer-b
+		local which=a helpers=()
+		[ "$build" != release-b ] || which=b
+		[ ! -f "$run/tee-token-$which" ] || helpers+=(-e TOKEN_BINARY="/it/out/tee-token-$which")
+		[ ! -f "$run/gotpm-$which" ] || helpers+=(-e GOTPM_BINARY="/it/out/gotpm-$which")
 		docker run --rm --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
 			--security-opt seccomp=unconfined \
 			-v "$IT_HOME/tee/cache:/it/tee/cache" -v "$run:/it/out" -v "$repo:/it/src:ro" \
 			-e TEE_SNAPSHOT="$TEE_SNAPSHOT" -e TEE_SOURCE_DATE_EPOCH="$TEE_SOURCE_DATE_EPOCH" \
-			-e BINARY="$binary" \
+			-e BINARY="/it/out/eth-mpc-signer-$which" "${helpers[@]}" \
 			-e OWNER="$(id -u):$(id -g)" "$tools" \
 			bash /it/src/integration/tee/qemu.sh build "${build%-*}" "/it/out/$build" || return 1
 	done
@@ -241,10 +270,13 @@ tee_qemu() {
 		-v "$run:/it/out" -v "$repo:/it/src:ro" "$tools" \
 		bash /it/src/integration/tee/qemu.sh test /it/out/release-a /it/out/debug /it/out \
 		"$nodes" || status=1
-	for build in release-a debug; do
-		sed -n -E "s/^(binary\.sha256|uki\.sha384|uki\.authenticode-sha384|roothash) /${build%-a} \1 /p" \
-			"$run/$build/measurements"
-	done | tee "$run/expected-measurements"
+	{
+		for build in release-a debug; do
+			sed -n -E "s/^(binary\.sha256|tee-token\.sha256|gotpm\.sha256|uki\.sha384|uki\.authenticode-sha384|grub\.authenticode-sha384|kernel\.authenticode-sha384|roothash|gpt-event\.sha384|gce\.rtmr1|gce\.rtmr2|disk\.tar\.gz\.sha256) /${build%-a} \1 /p" \
+				"$run/$build/measurements"
+		done
+		echo "GCE image: <build>/image/disk.tar.gz, guest OS features UEFI_COMPATIBLE,TDX_CAPABLE,GVNIC"
+	} | tee "$run/expected-measurements"
 	[ "$status" -eq 0 ] && log "TEE image run passed: $run" || log "TEE image run FAILED: $run"
 	return "$status"
 }

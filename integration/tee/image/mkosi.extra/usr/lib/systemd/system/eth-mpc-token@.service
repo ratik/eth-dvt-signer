@@ -1,0 +1,21 @@
+[Unit]
+Description=Attestation token for the node (gotpm, one connection)
+
+[Service]
+ExecStart=/usr/bin/tee-token --gotpm /usr/lib/eth-mpc-signer/gotpm
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+TimeoutStartSec=120
+# Root for the TDX report and the vTPM; nothing it needs beyond them and the network (the GCE
+# metadata server, Google Cloud Attestation).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native

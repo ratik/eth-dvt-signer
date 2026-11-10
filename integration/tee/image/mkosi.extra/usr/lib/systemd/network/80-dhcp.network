@@ -3,3 +3,7 @@ Type=ether
 
 [Network]
 DHCP=yes
+
+[DHCPv4]
+# GCE's VPC MTU (1460) comes with the lease.
+UseMTU=yes

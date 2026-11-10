@@ -3,6 +3,7 @@
 # (integration/tee/README.md). Runs inside the tools container (tools/Dockerfile); `env.sh
 # tee-qemu` starts each step in its own container:
 #
+#   qemu.sh gotpm OUT             go-tpm-tools' gotpm at TEE_GOTPM_COMMIT, reproducibly (network)
 #   qemu.sh build PROFILE OUT     as root (mkosi): image of PROFILE (release or debug) in OUT, with
 #                                 the node binary BINARY and its measurements in OUT/measurements
 #   qemu.sh compare A B           as root: two builds of one profile; exit 1 if they differ, with
@@ -14,6 +15,7 @@
 #                                 the lock-down checks, a tampered VM that of dm-verity. Logs in RUN
 #
 # Environment: TEE_SNAPSHOT, TEE_SOURCE_DATE_EPOCH (versions.env), BINARY (the node binary),
+# TOKEN_BINARY and GOTPM_BINARY (tee-token and gotpm, for `build`),
 # OWNER (uid:gid the build outputs are given back to), HOSTBIN (tee-fake-gcp and mpc-admin built
 # with test-hooks, for `test`).
 set -euo pipefail
@@ -25,6 +27,30 @@ log() { printf '%s tee: %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 die() {
 	log "error: $*"
 	exit 1
+}
+
+# gotpm OUT: go-tpm-tools' gotpm at TEE_GOTPM_COMMIT, built reproducibly: Debian's Go (no toolchain
+# download), modules checked against go.sum and the checksum database, no cgo, and no paths, build
+# id or VCS data in the binary. Needs the network (git, the Go module proxy); modules are cached in
+# /it/go.
+gotpm() {
+	local out="$1" src cache
+	: "${TEE_GOTPM_REPOSITORY:?}" "${TEE_GOTPM_COMMIT:?}"
+	src="$(mktemp -d)"
+	cache="$(mktemp -d)"
+	git init -q "$src"
+	git -C "$src" fetch -q --depth 1 "$TEE_GOTPM_REPOSITORY" "$TEE_GOTPM_COMMIT"
+	git -C "$src" -c advice.detachedHead=false checkout -q FETCH_HEAD
+	[ "$(git -C "$src" rev-parse HEAD)" = "$TEE_GOTPM_COMMIT" ] || die "not commit $TEE_GOTPM_COMMIT"
+	(
+		cd "$src/cmd"
+		export GOTOOLCHAIN=local CGO_ENABLED=0 GOFLAGS="-mod=readonly -trimpath -buildvcs=false" \
+			GOPATH=/it/go GOMODCACHE=/it/go/mod GOCACHE="$cache" GOPROXY=https://proxy.golang.org \
+			GOSUMDB=sum.golang.org
+		/usr/lib/go-1.26/bin/go version
+		/usr/lib/go-1.26/bin/go build -ldflags='-s -w -buildid=' -o "$out" ./gotpm
+	)
+	log "gotpm $TEE_GOTPM_COMMIT: $(sha256sum "$out" | cut -d' ' -f1)"
 }
 
 build() {
@@ -40,25 +66,34 @@ build() {
 	cat >"$sandbox/etc/apt/sources.list.d/mkosi.sources" <<EOF
 Types: deb
 URIs: http://snapshot.debian.org/archive/debian/$TEE_SNAPSHOT
-Suites: bookworm bookworm-updates bookworm-backports
+Suites: trixie trixie-updates trixie-backports
 Components: main
 Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
 
 Types: deb
 URIs: http://snapshot.debian.org/archive/debian-security/$TEE_SNAPSHOT
-Suites: bookworm-security
+Suites: trixie-security
 Components: main
 Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
 EOF
 	printf 'Acquire::Retries "5";\nAcquire::http::Timeout "60";\n' \
 		>"$sandbox/etc/apt/apt.conf.d/80retries"
 
-	# The node binary, and the UKI stub: systemd-stub 257 of the tools (same snapshot) instead of
-	# bookworm's 252, which does not measure into the TDX RTMRs (README).
+	# The node binary, its token helper and gotpm (README: without them, no GCE token).
 	extra="$out/extra"
 	install -D -m 0755 "$BINARY" "$extra/usr/bin/eth-mpc-signer"
-	install -D -m 0644 /usr/lib/systemd/boot/efi/linuxx64.efi.stub \
-		"$extra/usr/lib/systemd/boot/efi/linuxx64.efi.stub"
+	if [ -n "${TOKEN_BINARY:-}" ]; then
+		install -D -m 0755 "$TOKEN_BINARY" "$extra/usr/bin/tee-token"
+	else
+		log "warning: no tee-token (TOKEN_BINARY): the image gets no attestation token on GCE"
+	fi
+	if [ -n "${GOTPM_BINARY:-}" ]; then
+		install -D -m 0755 "$GOTPM_BINARY" "$extra/usr/lib/eth-mpc-signer/gotpm"
+	else
+		log "warning: no gotpm (GOTPM_BINARY): the image gets no attestation token on GCE"
+	fi
+	# GRUB, for the ESP (mkosi.repart/00-esp.conf); /efi is not in the root partition.
+	grub_efi "$extra/efi/grub"
 
 	log "building the $profile image in $out"
 	local profiles=()
@@ -72,34 +107,90 @@ EOF
 		tail -n 60 "$out/mkosi.log" >&2
 		die "mkosi failed: $out/mkosi.log"
 	}
+	gce_disk "$out/image"
 	measure "$out"
 }
 
+# grub_efi DIR: the boot loader (README "Boot"): DIR/BOOTX64.EFI, built with grub-mkimage from
+# Debian's grub-efi-amd64-bin (the tools image's, so the snapshot's), and DIR/grub.cfg. The
+# binary holds its modules and image/grub/early.cfg. Its prefix has no device, so GRUB takes the
+# partition it booted from: normal mode runs that ESP's /EFI/BOOT/grub.cfg, and paths there are
+# on the ESP. Modules: `tpm` measures (only with a TPM present, then into the CC registers too),
+# `normal` runs grub.cfg as measured commands, `chain` with the firmware's LoadImage (no
+# `peimage`, which would load the UKI itself, unmeasured by the firmware). grub-mkimage writes
+# a fixed PE timestamp, so the binary is reproducible.
+grub_efi() {
+	local dir="$1"
+	mkdir -p "$dir"
+	# The rescue parser that runs the embedded configuration knows no comments.
+	sed '/^[[:space:]]*#/d; /^[[:space:]]*$/d' "$here/image/grub/early.cfg" >"$dir/early.cfg"
+	grub-mkimage --format=x86_64-efi --directory=/usr/lib/grub/x86_64-efi --prefix=/EFI/BOOT \
+		--config="$dir/early.cfg" --disable-shim-lock --output="$dir/BOOTX64.EFI" \
+		normal tpm chain part_gpt fat reboot || die "grub-mkimage failed"
+	install -m 0644 "$here/image/grub/grub.cfg" "$dir/grub.cfg"
+}
+
+# gce_disk DIR: DIR/disk.raw, the image as GCE imports it: a whole number of GiB (GCE's rule),
+# with the backup GPT moved to the new end, and DIR/disk.tar.gz holding it (GNU tar, `oldgnu`
+# format, sparse, GCE's format), both deterministic. The VMs here boot this disk too.
+gce_disk() {
+	local dir="$1" size
+	cp --sparse=always "$dir/eth-mpc-signer.raw" "$dir/disk.raw"
+	size="$(stat -c %s "$dir/disk.raw")"
+	truncate -s $((((size + (1 << 30) - 1) >> 30) << 30)) "$dir/disk.raw"
+	sfdisk --quiet --relocate gpt-bak-std "$dir/disk.raw"
+	sfdisk --quiet --verify "$dir/disk.raw" >/dev/null || die "$dir/disk.raw: GPT does not verify"
+	tar --format=oldgnu -S --mtime="@$TEE_SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner \
+		-C "$dir" -cf - disk.raw | gzip -n -6 >"$dir/disk.tar.gz"
+}
+
 measure() {
-	local out="$1" disk uki
-	disk="$out/image/eth-mpc-signer.raw"
+	local out="$1" disk uki file esp="$out/esp"
+	disk="$out/image/disk.raw"
 	uki="$out/image/eth-mpc-signer.efi"
 	[ -f "$disk" ] && [ -f "$uki" ] || die "no image or UKI in $out/image"
+	# The boot chain as the disk holds it: GRUB, its configuration and the UKI from the ESP.
+	mkdir -p "$esp"
+	python3 "$lib/measure.py" extract "$disk" esp "$esp/esp.img"
+	export MTOOLS_SKIP_CHECK=1
+	mdir -/ -b -i "$esp/esp.img" ::/ | LC_ALL=C sort >"$esp/files"
+	for file in EFI/BOOT/BOOTX64.EFI:grub.efi EFI/BOOT/grub.cfg:grub.cfg \
+		EFI/Linux/eth-mpc-signer.efi:uki.efi; do
+		mcopy -n -o -i "$esp/esp.img" "::/${file%%:*}" "$esp/${file#*:}" ||
+			die "no /${file%%:*} on the ESP of $disk"
+	done
+	cmp -s "$esp/uki.efi" "$uki" || die "the ESP's UKI is not $uki"
+	cmp -s "$esp/grub.cfg" "$here/image/grub/grub.cfg" || die "the ESP's grub.cfg is not image/grub/grub.cfg"
 	{
 		echo "binary.sha256 $(sha256sum "$out/extra/usr/bin/eth-mpc-signer" | cut -d' ' -f1)"
+		for file in usr/bin/tee-token usr/lib/eth-mpc-signer/gotpm; do
+			[ ! -f "$out/extra/$file" ] ||
+				echo "${file##*/}.sha256 $(sha256sum "$out/extra/$file" | cut -d' ' -f1)"
+		done
 		python3 "$lib/measure.py" uki "$uki"
 		python3 "$lib/measure.py" gpt "$disk"
+		python3 "$lib/measure.py" boot "$disk" "$esp/grub.efi" "$esp/grub.cfg" "$uki"
+		sed 's/^/esp.file /' "$esp/files"
 		echo "disk.sha256 $(sha256sum "$disk" | cut -d' ' -f1)"
+		echo "disk.tar.gz.sha256 $(sha256sum "$out/image/disk.tar.gz" | cut -d' ' -f1)"
 	} >"$out/measurements"
 	log "measurements of $out:"
-	grep -E '^(binary|uki\.(sha384|authenticode|kernel)|roothash|gpt-event|disk)' \
+	grep -E '^(binary|tee-token|gotpm|uki\.(sha384|authenticode|kernel)|grub\.(authenticode|cmd)|roothash|gpt-event|gce\.|esp\.file|disk)' \
 		"$out/measurements" >&2
 }
 
 compare() {
 	local a="$1" b="$2" status=0 key
 	[ -z "${OWNER:-}" ] || trap "chown -R '$OWNER' '$a' '$b'" EXIT
-	for key in binary.sha256 uki.sha384 uki.authenticode-sha384 roothash gpt-event.sha384 \
-		disk.sha256; do
+	for key in binary.sha256 tee-token.sha256 gotpm.sha256 uki.sha384 uki.authenticode-sha384 \
+		grub.sha384 grub.authenticode-sha384 roothash gpt-event.sha384 gce.rtmr1 gce.rtmr2 \
+		disk.sha256 disk.tar.gz.sha256; do
 		local va vb
 		va="$(sed -n "s/^$key //p" "$a/measurements")"
 		vb="$(sed -n "s/^$key //p" "$b/measurements")"
-		if [ -n "$va" ] && [ "$va" = "$vb" ]; then
+		if [ -z "$va" ] && [ -z "$vb" ] && [[ "$key" =~ ^(tee-token|gotpm) ]]; then
+			echo "absent $key"
+		elif [ -n "$va" ] && [ "$va" = "$vb" ]; then
 			echo "same $key $va"
 		else
 			echo "DIFFERENT $key $va / $vb"
@@ -112,8 +203,8 @@ compare() {
 		sed 's/^/uki sections: /' || true
 	local part
 	for part in esp root root-verity; do
-		python3 "$lib/measure.py" extract "$a/image/eth-mpc-signer.raw" "$part" "$a/$part.img"
-		python3 "$lib/measure.py" extract "$b/image/eth-mpc-signer.raw" "$part" "$b/$part.img"
+		python3 "$lib/measure.py" extract "$a/image/disk.raw" "$part" "$a/$part.img"
+		python3 "$lib/measure.py" extract "$b/image/disk.raw" "$part" "$b/$part.img"
 		cmp -s "$a/$part.img" "$b/$part.img" && echo "same partition $part" ||
 			echo "DIFFERENT partition $part"
 	done
@@ -158,9 +249,9 @@ print(value if isinstance(value, str) else "" if value is None else json.dumps(v
 # vm_disks INDEX IMAGE-DIR: the VM's OS disk (an overlay of the image), a blank 2 GiB data disk
 # and its firmware variables.
 vm_disks() {
-	local dir="$run/vm$1"
+	local dir="$run/vm$1" backing="${3:-$2/image/disk.raw}"
 	mkdir -p "$dir"
-	qemu-img create -q -f qcow2 -F raw -b "$2/image/eth-mpc-signer.raw" "$dir/os.qcow2"
+	qemu-img create -q -f qcow2 -F raw -b "$backing" "$dir/os.qcow2"
 	truncate -s 2G "$dir/data.raw"
 	cp /usr/share/OVMF/OVMF_VARS_4M.fd "$dir/vars.fd"
 }
@@ -185,11 +276,28 @@ vm_config() {
 	echo "$name" >"$dir/config.current"
 }
 
+# vm_tpm INDEX: VM INDEX gets a TPM 2.0 (swtpm, SHA-256 and SHA-384 banks), as GCE's vTPM: GRUB and
+# systemd-stub then measure into it, and the measure mode prints its event log.
+vm_tpm() {
+	local dir="$run/vm$1/tpm"
+	mkdir -p "$dir/state"
+	swtpm_setup --tpm2 --tpmstate "$dir/state" --pcr-banks sha256,sha384 --overwrite \
+		>"$dir/setup.log" 2>&1 || die "swtpm_setup failed: $dir/setup.log"
+}
+
 vm_start() {
-	local index="$1" dir="$run/vm$1"
+	local index="$1" dir="$run/vm$1" tpm=()
 	rm -f "$dir/console.sock" "$dir/monitor.sock"
 	echo "=== boot $(date -u +%FT%TZ) with configuration $(cat "$dir/config.current")" >>"$dir/serial.log"
-	qemu-system-x86_64 -name "vm$index" -machine q35,accel=kvm -cpu host -smp 2 -m 1536 \
+	if [ -d "$dir/tpm" ]; then
+		rm -f "$dir/tpm/sock"
+		swtpm socket --tpm2 --tpmstate "dir=$dir/tpm/state" --ctrl "type=unixio,path=$dir/tpm/sock" \
+			--log "file=$dir/tpm/swtpm.log" --terminate --daemon || die "swtpm failed: $dir/tpm/swtpm.log"
+		for _ in $(seq 50); do [ -S "$dir/tpm/sock" ] && break; sleep 0.1; done
+		tpm=(-chardev "socket,id=chrtpm,path=$dir/tpm/sock" -tpmdev emulator,id=tpm0,chardev=chrtpm
+			-device tpm-crb,tpmdev=tpm0)
+	fi
+	qemu-system-x86_64 -name "vm$index" -machine q35,accel=kvm -cpu host -smp 2 -m 1536 "${tpm[@]}" \
 		-nodefaults -no-user-config -display none \
 		-drive if=pflash,format=raw,unit=0,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
 		-drive "if=pflash,format=raw,unit=1,file=$dir/vars.fd" \
@@ -297,13 +405,17 @@ data_snapshot() {
 # the SHA-256 printed with it, as statements/INDEX.json, and its TLS chain as INDEX.chain.pem.
 statement() {
 	local index="$1" line encoded sum
-	line="$(serial_boot "$index" | tr -d '\r' | grep -a -o 'eth-mpc-identity: [A-Za-z0-9+/=]* sha256 [0-9a-f]*' | tail -n 1)"
-	[ -n "$line" ] || return 1
-	encoded="$(echo "$line" | cut -d' ' -f2)"
-	sum="$(echo "$line" | cut -d' ' -f4)"
-	echo "$encoded" | base64 -d >"$run/statements/$index.json" || return 1
-	[ "$(sha256sum <"$run/statements/$index.json" | cut -d' ' -f1)" = "$sum" ] || return 1
-	jget tls_certificate <"$run/statements/$index.json" >"$run/statements/$index.chain.pem"
+	while IFS= read -r line; do
+		encoded="$(echo "$line" | cut -d' ' -f2)"
+		sum="$(echo "$line" | cut -d' ' -f4)"
+		echo "$encoded" | base64 -d >"$run/statements/$index.json" 2>/dev/null || continue
+		if [ "$(sha256sum <"$run/statements/$index.json" | cut -d' ' -f1)" = "$sum" ]; then
+			jget tls_certificate <"$run/statements/$index.json" >"$run/statements/$index.chain.pem"
+			return 0
+		fi
+	done < <(serial_boot "$index" | tr -d '\r' |
+		grep -a -o 'eth-mpc-identity: [A-Za-z0-9+/=]* sha256 [0-9a-f]*')
+	return 1
 }
 
 check() {
@@ -328,6 +440,52 @@ ssh_login() {
 			root@127.0.0.1 'echo ssh-$((40+2)); ls /var/lib/mpc' \
 			>>"$run/vm$1/ssh-probe.txt" 2>&1 &&
 		grep -q '^ssh-42$' "$run/vm$1/ssh-probe.txt"
+}
+# The measure mode's console line survives at any length: on the debug VM, `config`'s own
+# console_file writes 100 kB (twice journald's line limit) to /dev/console, and the serial log
+# holds the one line whole (its SHA-256 as the VM computed it).
+console_line_whole() {
+	local index="$1" out="$run/vm$1/console-line"
+	ssh -i "$run/ssh/id_ed25519" -p "$(ssh_port "$index")" -o StrictHostKeyChecking=no \
+		-o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=10 root@127.0.0.1 '
+		set -e
+		log() { echo "$*"; }
+		run=/run/eth-mpc-signer
+		eval "$(sed -n "/^\tconsole_file() {/,/^\t}/p" /usr/lib/eth-mpc-signer/config)"
+		head -c 100000 /dev/urandom >/run/console-line.bin
+		console_file EMS-MEASURE-EVENTLOG /run/console-line.bin no' >"$out.ssh" 2>&1 || return 1
+	sleep 3
+	python3 - "$run/vm$index/serial.log" "$out.ssh" <<'PY'
+import base64, hashlib, re, sys
+serial = open(sys.argv[1], "rb").read().decode("utf-8", "replace").replace("\r", "")
+lines = [l for l in serial.split("\n") if l.startswith("EMS-MEASURE-EVENTLOG ")]
+want = re.search(r"EMS-MEASURE-EVENTLOG-SHA256 ([0-9a-f]{64}) 100000", open(sys.argv[2]).read())
+data = base64.b64decode(lines[-1].split(" ", 1)[1].strip()) if lines else b""
+sys.exit(0 if want and hashlib.sha256(data).hexdigest() == want.group(1) else 1)
+PY
+}
+# The kernel of debug VM INDEX runs the UKI's own command line: GRUB chainloads it with no
+# arguments, so systemd-stub takes its .cmdline section.
+kernel_cmdline_is_uki() {
+	local index="$1" measurements="$2"
+	ssh -i "$run/ssh/id_ed25519" -p "$(ssh_port "$index")" -o StrictHostKeyChecking=no \
+		-o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=10 root@127.0.0.1 \
+		cat /proc/cmdline >"$run/vm$index/proc-cmdline" 2>"$run/vm$index/proc-cmdline.ssh" || return 1
+	[ "$(tr -d '\n' <"$run/vm$index/proc-cmdline")" = "$(sed -n 's/^uki\.cmdline //p' "$measurements")" ]
+}
+# GRUB whose grub.cfg does not boot: normal mode's command line asks for a login (superusers,
+# early.cfg) nobody has, so the console has no GRUB shell.
+grub_locked() {
+	local index="$1"
+	wait_serial "$index" 'Enter username' 120 || return 1
+	sleep 2
+	no_shell "$index" && ! tr -d '\r' <"$run/vm$index/serial.log" | grep -aqE 'grub> *$'
+}
+no_grub_error() { ! tr -d '\r' <"$run/vm$1/serial.log" | grep -aqE '^(error: |Unknown command)'; }
+# The ESP holds GRUB, its configuration and the UKI, and nothing else.
+esp_files() {
+	[ "$(sed -n 's/^esp\.file //p' "$1" | grep -v '/$' | tr '\n' ' ')" = \
+		"::/EFI/BOOT/BOOTX64.EFI ::/EFI/BOOT/grub.cfg ::/EFI/Linux/eth-mpc-signer.efi " ]
 }
 no_answer() { [ "$(api_status "$1" GET /upcheck)" = 000 ]; }
 # Every entry of the node directory before the reboot (inode and name), among them the consensus
@@ -506,10 +664,23 @@ test_vms() {
 	vm_config "$tampered" identity identity --id=0
 	qemu-io -f qcow2 -c "write -q -P 0x5a $offset 4k" "$run/vm$tampered/os.qcow2" >/dev/null
 	vm_start "$tampered"
-	log "boot 1: $cluster release VMs make their vaults; debug VM $control, tampered VM $tampered; consoles in $run/vm*/serial.log"
+	# And a release VM in measure mode (the first boot on GCP), with a TPM (swtpm) as GCE's vTPM:
+	# GRUB and systemd-stub measure into it, and its event log reaches the console. With no TDX
+	# or metadata server here, the token helper (root, through its socket) answers gotpm's error.
+	local measuring=$((cluster + 2))
+	vm_disks "$measuring" "$release"
+	vm_config "$measuring" measure measure
+	vm_tpm "$measuring"
+	vm_start "$measuring"
+	log "boot 1: $cluster release VMs make their vaults; debug VM $control, tampered VM $tampered, measuring VM $measuring; consoles in $run/vm*/serial.log"
 	for ((i = 0; i <= control; i++)); do
-		wait_serial "$i" 'eth-mpc-identity: ' 300 && statement "$i" ||
-			die "VM $i printed no valid statement: $run/vm$i/serial.log"
+		wait_serial "$i" 'eth-mpc-identity: ' 300 || die "VM $i printed no statement: $run/vm$i/serial.log"
+		# Its second copy comes a second later.
+		for _ in 1 2 3 4 5 6 7 8 9 10; do
+			! statement "$i" || break
+			sleep 1
+		done
+		statement "$i" || die "VM $i printed no intact statement: $run/vm$i/serial.log"
 	done
 	check "boot 1: every VM printed its vault statement on the console ($((cluster + 1)) VMs)" true
 	for ((i = 0; i < cluster; i++)); do
@@ -527,8 +698,13 @@ test_vms() {
 	check "release VM 0: no shell on the serial console" no_shell 0
 	check "release VM 0: no login prompt on the serial console" no_login_prompt 0
 	check "release VM 0: nothing answers on port 22" no_ssh 0
+	check "release VM 0: GRUB printed no error on the console" no_grub_error 0
 	check "debug VM $control: root shell on the serial console (control)" shell "$control"
 	check "debug VM $control: SSH login with the configured key (control)" ssh_login "$control"
+	check "debug VM $control: a 100 kB measure line reaches the serial console whole" \
+		console_line_whole "$control"
+	check "debug VM $control: GRUB booted the UKI with its own command line (/proc/cmdline)" \
+		kernel_cmdline_is_uki "$control" "$debug/measurements"
 	vm_stop "$control"
 
 	# The tampered VM: the initrd finds no usable root (90 s device timeout) and stops there, with
@@ -542,6 +718,43 @@ test_vms() {
 	check "tampered VM $tampered: no login prompt on the serial console" no_login_prompt "$tampered"
 	check "tampered VM $tampered: no statement" bash -c "! grep -aq 'eth-mpc-identity: ' '$run/vm$tampered/serial.log'"
 	vm_quit "$tampered"
+
+	# The measure mode: the token helper's answer and the event log's absence reach the console.
+	check "measuring VM $measuring: the token helper answered through its socket (console)" \
+		wait_serial "$measuring" 'EMS-MEASURE-TOKEN-ERROR error: ' 120
+	check "measuring VM $measuring: no CCEL table here, said so on the console" \
+		wait_serial "$measuring" 'EMS-MEASURE-EVENTLOG-ABSENT' 10
+	serial_boot "$measuring" | tr -d '\r' | grep -a 'EMS-MEASURE' | cut -c1-300 >"$run/vm$measuring/measure.txt" || true
+	vm_stop "$measuring"
+	# The TPM's log, as TDVF would map it to the RTMRs: RTMR2's events are exactly the predicted
+	# ones (GRUB's file and commands, the UKI file, systemd-stub's sections), Google's GRUB rule
+	# holds, and PCR 4 has GRUB, the UKI and the kernel. GRUB and the stub measure the same events
+	# into the CC registers on GCE.
+	serial_boot "$measuring" >"$run/vm$measuring/serial.boot"
+	python3 "$lib/measure.py" console "$run/vm$measuring/serial.boot" "$run/vm$measuring/measure" \
+		>/dev/null 2>"$run/vm$measuring/measure.log" || true
+	check "measuring VM $measuring: the TPM's event log reached the console whole (SHA-256)" \
+		test -s "$run/vm$measuring/measure/tpmlog.bin"
+	check "measuring VM $measuring: the TPM log has GRUB and the stub's events as predicted, and Google's GRUB rule holds" \
+		python3 "$lib/measure.py" tpm-replay --eventlog "$run/vm$measuring/measure/tpmlog.bin" \
+		--expected "$release/measurements" >"$run/vm$measuring/tpm-replay.json"
+	check "release image: the ESP holds GRUB, grub.cfg and the UKI only" esp_files "$release/measurements"
+
+	# GRUB's lock: a copy of the release disk whose grub.cfg does not boot.
+	local locked=$((cluster + 3)) esp_offset
+	esp_offset="$(sed -n 's/^partition esp .* offset=\([0-9]*\) .*/\1/p' "$release/measurements")"
+	mkdir -p "$run/vm$locked"
+	cp --sparse=always "$release/image/disk.raw" "$run/vm$locked/os.raw"
+	printf '# eth-mpc-test: this grub.cfg does not boot\n' >"$run/vm$locked/grub.cfg"
+	MTOOLS_SKIP_CHECK=1 mcopy -o -i "$run/vm$locked/os.raw@@$esp_offset" "$run/vm$locked/grub.cfg" \
+		::/EFI/BOOT/grub.cfg
+	vm_disks "$locked" "$release" "$run/vm$locked/os.raw"
+	vm_config "$locked" identity identity --id=0
+	vm_start "$locked"
+	check "GRUB VM $locked (grub.cfg does not boot): a login nobody has, no GRUB shell" grub_locked "$locked"
+	vm_quit "$locked"
+	check "measure.py: the replay accepts the predicted boot, refuses each tampering, and agrees with the real GCE log" \
+		python3 "$lib/measure.py" selftest "$release/measurements" >"$run/replay-selftest.txt"
 
 	# Boot 2: the sealed cluster. The peers file names every node's attested identity at the
 	# address the other VMs reach it (10.0.2.2, QEMU's host, and its forwarded p2p port); inbound
@@ -668,6 +881,7 @@ print(s.get("public_key", "") if s.get("status") == "completed" else "")' 2>/dev
 }
 
 case "${1:-}" in
+gotpm) gotpm "$2" ;;
 build) build "$2" "$3" ;;
 compare) compare "$2" "$3" ;;
 test)
