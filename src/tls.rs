@@ -12,14 +12,19 @@
 //! Handshakes run in their own tasks, at most [MAX_HANDSHAKES] at once, each for at most
 //! [HANDSHAKE_TIMEOUT]: a slow or silent client delays nobody else.
 
+use crate::attestation::Keys;
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose, PublicKeyData as _,
 };
 use rustls::{
-    RootCertStore, ServerConfig,
-    crypto::aws_lc_rs,
-    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject as _},
+    ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    crypto::{CryptoProvider, aws_lc_rs},
+    pki_types::{
+        CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime,
+        pem::PemObject as _,
+    },
     server::WebPkiClientVerifier,
 };
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
@@ -107,6 +112,17 @@ pub fn server_config(
     chain: &str,
     client_ca: &str,
 ) -> Result<Arc<ServerConfig>, String> {
+    server_config_versions(key, chain, client_ca, false)
+}
+
+/// [server_config], also offering TLS 1.2 with `tls12` (Teku speaks only TLS 1.2 to an external
+/// signer; rustls offers it with ECDHE key exchange and AEAD ciphers only).
+pub fn server_config_versions(
+    key: &[u8],
+    chain: &str,
+    client_ca: &str,
+    tls12: bool,
+) -> Result<Arc<ServerConfig>, String> {
     let provider = Arc::new(aws_lc_rs::default_provider());
     let mut roots = RootCertStore::empty();
     for certificate in certificates(client_ca)? {
@@ -117,8 +133,13 @@ pub fn server_config(
     let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone())
         .build()
         .map_err(|err| format!("client CA: {err}"))?;
+    let versions: &[&rustls::SupportedProtocolVersion] = if tls12 {
+        &[&rustls::version::TLS13, &rustls::version::TLS12]
+    } else {
+        &[&rustls::version::TLS13]
+    };
     let config = ServerConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
+        .with_protocol_versions(versions)
         .map_err(|err| err.to_string())?
         .with_client_cert_verifier(verifier)
         .with_single_cert(
@@ -127,6 +148,158 @@ pub fn server_config(
         )
         .map_err(|err| format!("server certificate: {err}"))?;
     Ok(Arc::new(config))
+}
+
+/// A client's TLS configuration: TLS 1.3, the server checked by `verifier`, and the client
+/// certificate `chain` with its `key` (PEM files' contents).
+pub fn client_config(
+    chain: &[u8],
+    key: &[u8],
+    verifier: Arc<dyn ServerCertVerifier>,
+) -> Result<ClientConfig, String> {
+    let chain = CertificateDer::pem_slice_iter(chain)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("client certificate: {err}"))?;
+    let key = PrivateKeyDer::from_pem_slice(key).map_err(|err| format!("client key: {err}"))?;
+    ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|err| err.to_string())?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(chain, key)
+        .map_err(|err| format!("client certificate: {err}"))
+}
+
+/// Accepts any server certificate whose key signs the handshake. For a client that checks the key
+/// after the answer, against a node's attestation (`Keys::serves`): `mpc-admin attest`, and the
+/// gateway's attestation requests.
+#[derive(Debug)]
+pub struct AnyServerKey(Arc<CryptoProvider>);
+
+impl AnyServerKey {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self(Arc::new(aws_lc_rs::default_provider())))
+    }
+}
+
+/// Accepts only the server key a node's attestation names ([AttestedServerKey::pin]); none before.
+/// The gateway's connections to a sealed node, once its attestation verified.
+#[derive(Debug)]
+pub struct AttestedServerKey {
+    provider: Arc<CryptoProvider>,
+    keys: std::sync::RwLock<Option<Keys>>,
+}
+
+impl AttestedServerKey {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            provider: Arc::new(aws_lc_rs::default_provider()),
+            keys: std::sync::RwLock::new(None),
+        })
+    }
+
+    /// From now on, only the TLS key `keys` attest.
+    pub fn pin(&self, keys: Keys) {
+        *self
+            .keys
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(keys);
+    }
+}
+
+/// The handshake's signature, checked with `provider`: the server holds its certificate's key.
+fn handshake_signatures(provider: &CryptoProvider) -> &rustls::crypto::WebPkiSupportedAlgorithms {
+    &provider.signature_verification_algorithms
+}
+
+macro_rules! handshake_checks {
+    () => {
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            certificate: &CertificateDer<'_>,
+            signature: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                certificate,
+                signature,
+                handshake_signatures(self.provider()),
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            certificate: &CertificateDer<'_>,
+            signature: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                certificate,
+                signature,
+                handshake_signatures(self.provider()),
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            handshake_signatures(self.provider()).supported_schemes()
+        }
+    };
+}
+
+impl AnyServerKey {
+    fn provider(&self) -> &CryptoProvider {
+        &self.0
+    }
+}
+
+impl AttestedServerKey {
+    fn provider(&self) -> &CryptoProvider {
+        &self.provider
+    }
+}
+
+impl ServerCertVerifier for AnyServerKey {
+    fn verify_server_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    handshake_checks!();
+}
+
+impl ServerCertVerifier for AttestedServerKey {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let keys = self
+            .keys
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match keys.as_ref() {
+            Some(keys) if keys.serves(end_entity.as_ref()) => Ok(ServerCertVerified::assertion()),
+            Some(_) => Err(rustls::Error::General(
+                "the server's key is not the attested one".into(),
+            )),
+            None => Err(rustls::Error::General(
+                "the server is not attested yet".into(),
+            )),
+        }
+    }
+
+    handshake_checks!();
 }
 
 /// Accepted TLS connections, for `axum::serve`.

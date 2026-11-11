@@ -2008,6 +2008,7 @@ dependencies = [
  "hpke",
  "object_store",
  "pbkdf2",
+ "prometheus-client",
  "rand 0.10.3",
  "rand_core 0.10.1",
  "rcgen",

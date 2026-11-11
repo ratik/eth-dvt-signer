@@ -9,8 +9,9 @@
 //! decides whether a duty may be signed.
 
 use super::{
-    duty::{AggregateAndProof, Duty, Fork, ForkInfo, ValidatorKey},
+    duty::{AggregateAndProof, Duty, DutyRequest, Fork, ForkInfo, ValidatorKey},
     gloas::{ExecutionPayloadEnvelope, PayloadAttestationData, ProposerPreferences},
+    network::Network,
     types::{
         AggregateAndProofElectra, AggregateAndProofPhase0, AttestationData, BeaconBlockHeader,
         ContributionAndProof, DepositMessage, Root, SyncAggregatorSelectionData,
@@ -40,6 +41,71 @@ pub enum ParseError {
     Invalid(String),
     #[error("unsupported: {0}")]
     Unsupported(String),
+}
+
+/// Why a signing request does not name a duty to sign.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RequestError {
+    #[error(transparent)]
+    Parse(#[from] ParseError),
+    #[error("the registration's pubkey is not the validator key of the path")]
+    RegistrationKey,
+    /// A registration carries no fork: only a pinned network gives its domain.
+    #[error("no Ethereum network is pinned")]
+    NoNetwork,
+}
+
+/// The duty `POST /api/v1/eth2/sign/{identifier}` with `body` asks the network to sign, under
+/// `network` (the pinned chain, if any), and the client's signing root. The node's API and the
+/// gateway (`mpc-gateway`) read a request the same way:
+/// - a builder registration carries no fork: its domain is the network's genesis fork version
+///   with a zero root (`Network::fork_info`), and its key must be the path's;
+/// - an aggregate is rooted in its epoch's form (progressive from Gloas on), which the request
+///   does not tell: the pinned schedule does (`Network::resolve`).
+pub fn duty_request(
+    identifier: &str,
+    body: &[u8],
+    network: Option<&Network>,
+) -> Result<(DutyRequest, Option<Root>), RequestError> {
+    let validator = parse_identifier(identifier)?;
+    let request = parse_request(body)?;
+    let mut fork = request.fork;
+    if let Some(registration) = request.duty.registration() {
+        if registration.pubkey != validator {
+            return Err(RequestError::RegistrationKey);
+        }
+        fork = network
+            .ok_or(RequestError::NoNetwork)?
+            .fork_info(&request.duty);
+    }
+    let duty = match network {
+        Some(network) => network.resolve(request.duty),
+        None => request.duty,
+    };
+    Ok((
+        DutyRequest {
+            validator,
+            fork,
+            duty,
+        },
+        request.signing_root,
+    ))
+}
+
+/// Whether `signature` (96 bytes, compressed G2) is the validator key's signature of `root`
+/// (BLS12-381 min-pk, the Ethereum ciphersuite).
+pub fn verify_signature(key: &ValidatorKey, root: &Root, signature: &[u8]) -> bool {
+    use crate::dkg::{GroupKey, signing};
+    use commonware_codec::DecodeExt as _;
+    let (Ok(key), Ok(signature)) = (
+        GroupKey::decode(key.as_slice()),
+        signing::Signature::decode(signature),
+    ) else {
+        return false;
+    };
+    signing::Message::Ethereum(*root)
+        .verify(&key, &signature)
+        .is_ok()
 }
 
 /// A parsed signing request.

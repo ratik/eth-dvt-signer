@@ -147,8 +147,15 @@ impl Attestation {
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|err| err.to_string())?
             .as_secs();
-        let verified = verify(evidence, &self.policy, &self.jwks, &nonce, now, member.index)
-            .map_err(|err| format!("{}: {err}", member.identity))?;
+        let verified = verify(
+            evidence,
+            &self.policy,
+            &self.jwks,
+            &nonce,
+            now,
+            member.index,
+        )
+        .map_err(|err| format!("{}: {err}", member.identity))?;
         let same = |a: &str, b: &str| unhex(a).is_some() && unhex(a) == unhex(b);
         if !same(&verified.keys.identity, &member.identity)
             || !verified

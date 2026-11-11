@@ -20,17 +20,19 @@ is narrowed by the restart floor, not resolved.
  │                 │ beacon API (loopback port published by Kurtosis)                      │
  │   Lighthouse VC v8.3.2: one `web3signer` validator, the DKG key, no keystore            │
  │                 │ POST /api/v1/eth2/sign/{key}                                          │
- │   failover proxy 127.0.0.1:47200 (scripts/proxy.py)                                     │
- │                 │ the first available node                                              │
+ │   mpc-gateway 127.0.0.1:47200 (docs/gateway.md)                                         │
+ │                 │ hedged failover; each signature checked before it is returned          │
  │   signer nodes 0..3: HTTP 127.0.0.1:47100-47103, p2p 47000-47003                        │
  │     coordinator ─ consensus (authorization, slashing protection) ─ 3 of 4 partials      │
  └─────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 Everything that talks to the signer stays on loopback: the signer's HTTP API keeps its
-loopback-only binding, and no integration listener was added. The signers, the proxy and the
+loopback-only binding, and no integration listener was added. The signers, the gateway and the
 validator client run with the network of the isolated environment, where Kurtosis publishes the
-beacon and execution APIs on loopback.
+beacon and execution APIs on loopback. (Runs before 2026-11-11 signed through the development
+failover proxy, `scripts/proxy.py`, which the gateway replaced; their results below say "the
+proxy".)
 
 Why an isolated environment: Kurtosis 1.22.2's engine publishes its API (it creates containers) on
 `0.0.0.0`, with no option to change it, and Docker's published ports bypass a host firewall. On a
@@ -61,7 +63,7 @@ shared or public host, the whole integration therefore runs inside one Docker-in
    `1 + MAX_SEED_LOOKAHEAD` epochs after its eligibility is finalized. Expect about 12 epochs
    (about 26 minutes with 4 s slots).
 6. **Duties.** Lighthouse's validator client has one `validator_definitions.yml` entry of
-   `type: web3signer`, pointing at the proxy (`request_timeout_ms: 12000`, its default). It signs
+   `type: web3signer`, pointing at the gateway (`request_timeout_ms: 12000`, its default). It signs
    attestations, aggregation selection proofs and aggregates, RANDAO reveals and blocks through the
    MPC network. Its own slashing database stays enabled, as defense in depth.
 
@@ -197,8 +199,9 @@ evidence per epoch), `scenarios.json`, `security.json`, `deposit.json`, `validat
 migration's `migration.json`, `migrated.jsonl` (the migrated validator's epochs),
 `migration-history.json` and `migration-export.json` (the interchanges), `migration/` (the devnet
 keystore's copy and password, the committee, the manifest and envelopes: test keys, mode `0700`), and
-`logs/` (each signer node, the proxy as JSON lines, the validator client, `kurtosis run`), and the
-signing requests the proxy forwarded (`requests/`, duty data only).
+`logs/` (each signer node, the gateway's requests as JSON lines, `gateway.jsonl`, the validator
+client, `kurtosis run`), and the signing requests the gateway forwarded (`requests/`, duty data
+only).
 
 ## Fault scenarios
 
@@ -206,22 +209,33 @@ signing requests the proxy forwarded (`requests/`, duty data only).
 | -------- | ------------ | --------------- |
 | Baseline | 4 nodes | attestations in the beacon state (target and head flags, rewards) for 3 epochs; a proposal canonical |
 | One keyholder offline | node 2 stopped for 3 epochs, then restarted | duties continue with 3 of 4; node 2 ready and at the same height again (recovery time) |
-| Coordinator failure | node 0, the proxy's first choice, stopped for 3 epochs | the proxy fails over to node 1; duties continue |
-| In-flight failure | node 0 restarted with the `authorized` crash point, re-armed (up to 3 crashes) until a crash follows a new authorization: one node 0 itself submitted, which consensus then accepted | node 0 dies after the authorization, before answering; the proxy retries on another node, which returns the signature of the same authorization; the duty is accepted at exactly one height |
+| Coordinator failure | node 0, the gateway's first choice, stopped for 3 epochs, once node 2 (restarted just before) is past its restart floor's epoch | the gateway fails over to node 1; duties continue |
+| In-flight failure | node 0 restarted with the `authorized` crash point, re-armed (up to 3 crashes) until a crash follows a new authorization: one node 0 itself submitted, which consensus then accepted | node 0 dies after the authorization, before answering; the gateway retries on another node, which returns the signature of the same authorization; the duty is accepted at exactly one height |
 | Migration | a genesis validator moves from Lighthouse's local keystore to the MPC network ([below](#migration-of-a-genesis-validator)), then node 2 is stopped for 2 epochs | the key's duties before, during and after; the same public key; the imported history refuses the previous signer's messages; 3 keyholders keep signing |
 | Resharing | both MPC validator keys (the DKG key, then the migrated imported key) get a new share generation while Lighthouse signs ([resharing.md](resharing.md)), then node 2 is stopped for an epoch | the same keys; every verification share and the generation ids changed; every node switched and the old shares retired; signatures with the old generation while the new one is prepared and with the new one after; duties in the beacon state; interruptions, retries, latency before and after; node 2 back with the new generation |
 | Replacing a lost keyholder (`run-r2`) | the genesis validator migrated into the network (observed on it from then on); node 3 (D) stopped for good; node 4 (E) started as a non-voting follower; the migrated key and the DKG key reshared by nodes 0, 1, 2 to nodes 0, 1, 2, 4 ([resharing.md](resharing.md#r2-replacing-a-lost-keyholder)) while Lighthouse signs; then node 2's partial signatures switched off for an epoch | duties with D lost; E's catching up; the same key, new verification shares and generation; every keyholder switched; with node 2's partials off, every signature combines E's share (coordinator logs); duties in the beacon state, latency, failures and retries throughout; the security checks with D still offline |
 | Replacing a lost consensus voter (`run-r3`, after `run-r2`'s scenario) | `mpc-admin replace-node --old 3 --new 4`: the committee A, B, C finalizes the block ending epoch 0; nodes 0, 1, 2, 4 stop (status 75) and are restarted in epoch 1 (A, B, C, E); then node 2 stopped for an epoch; then node 3 (D) started with its old data, and caught up with `mpc-admin resume` | every node's epoch, committee and boundary; the signing pause around the switch (Lighthouse requests, failures, retries, latency); with node 2 stopped, A, B and E finalize and sign (signer sets in the coordinators' logs); D stays in epoch 0 without disturbing epoch 1, then follows it as a non-voter; duties in the beacon state throughout; the security checks |
 
-The proxy retries only on a connection failure, `502`, `503` or `504`, never on `4xx`. That is
-safe because the state machine decides each duty once: an identical retry is `AlreadyAccepted`
-and returns the same signature, and a conflict is refused whoever coordinates it.
+A scenario stops a node, or switches off its partials, only once every other keyholder is past
+its restart floor's epoch (`floors_passed` in `it.py`, read from the nodes' logs).
+- **Why.** A restarted keyholder refuses new attestations of that epoch
+  ([slashing-protection.md](slashing-protection.md#the-restart-floor)), and with one node away
+  each of the other three must sign.
+- **Without it.** Coordinator failure stopped node 0 in the epoch node 2 had restarted in, at the
+  end of the node-offline scenario. That epoch's attestation was missed (epoch 20 in the gateway's
+  first runs): two faults at once, not the one the scenario tests.
+
+The gateway retries only on a connection failure, a timeout, `502`, `503` or `504`, or a
+signature that does not verify, never on `4xx`. It also asks the next node when one has not
+answered after a second (hedging). That is safe because the state machine decides each duty once:
+an identical retry is `AlreadyAccepted` and returns the same signature, and a conflict is refused
+whoever coordinates it.
 
 Security checks on the live devnet, after the scenarios. Each one takes a request Lighthouse sent,
-kept by the proxy:
+kept by the gateway:
 
 - the same attestation again returns the same signature;
-- the attestation with another block root is refused (`412 double_vote`), through the proxy and
+- the attestation with another block root is refused (`412 double_vote`), through the gateway and
   directly on node 2;
 - the block with another body root is refused (`412 double_proposal`);
 - the development `/sign` refuses the validator key (`403`);
@@ -282,15 +296,15 @@ A duty counts as done only on beacon-chain evidence, never because the signer re
   last complete one, gaps between scenario windows included (restarts, waits). It also checks the
   block at every slot for which Lighthouse obtained a block signature: canonical, proposed by the
   validator, finalized.
-- **The in-flight failure.** For each request the proxy retried after node 0's crash, the report
+- **The in-flight failure.** For each request the gateway retried after node 0's crash, the report
   gives the attempts. It also gives the heights at which consensus accepted the duty, from every
   node's log, and the nodes that signed. The scenario fails unless the retry got `200` and the duty
   was accepted at exactly one height.
 
 Correlation: each signer node logs `signed validator duty` and `validator duty not signed` with the
 validator, duty type, slot, epoch, signing root, authorization height, coordinator and phase
-timings. The proxy logs each request with its client's `User-Agent`, type, slot, signing root,
-attempts (node, status, latency) and result. The security checks send their own `User-Agent`, so
+timings. The gateway logs each request with its client's `User-Agent`, type, slot, signing root,
+attempts (node, status, latency, hedged, a signature that did not verify) and result. The security checks send their own `User-Agent`, so
 the report counts Lighthouse's requests apart from theirs.
 
 ## Results
@@ -634,6 +648,42 @@ Without the floor (runs H and J) no attestation failed at the switch. With it, a
 each validator the attestation of the switch's epoch if its slot comes after the switch: here,
 both. From the next epoch on everything signed.
 
+### Through the gateway (runs O to U)
+
+Runs O to U (2026-11-11): `mpc-gateway` ([gateway.md](gateway.md)) in place of the failover proxy,
+in front of the local signers (`--allow-unattested`), in every mode. Every run: exit 0, every
+security check passed, no signature failed the gateway's check. The rows are the DKG validator's
+whole active period; the latency is every signing request through the gateway.
+
+| Run | Directory | Mode | Attested epochs | Proposals canonical | Requests | p50 / p95 ms |
+| --- | --- | --- | --- | --- | --- | --- |
+| O | `20261111T114102Z` | `run` | 25 of 26 (epoch 20 missed) | 21 of 22 (slot 772 late) | 2 731 | 292 / 546 |
+| P | `20261111T130730Z` | `run-mev` | 7 of 7 | 14 of 14 | 64 | 271 / 579 |
+| Q | `20261111T135320Z` | `run` | 25 of 26 (epoch 20 missed) | 27 of 27 | 2 759 | 290 / 532 |
+| R | `20261111T151948Z` | `run-gloas` | 11 of 11 | 10 of 10 | 101 | 259 / 437 |
+| S | `20261111T161350Z` | `run-r2` | 2 of 2 | 1 of 1 | 2 408 | 301 / 581 |
+| T | `20261111T164832Z` | `run-r3` | 8 of 9 (epoch 12, the R3 switch) | 9 of 9 | 3 713 | 295 / 555 |
+| U | `20261111T173820Z` | `run`, restart floors waited out | 27 of 27 | 21 of 21 | 2 747 | 292 / 540 |
+
+- **Epoch 20 (runs O and Q).** Two faults at once, not the gateway:
+  - node 2 restarted at the end of node-offline, so its restart floor was epoch 20;
+  - coordinator failure stopped node 0 six seconds later, in the same epoch;
+  - two keyholders were left of the three a signature needs.
+
+  The scenarios now wait out the other keyholders' floors ([above](#fault-scenarios)). In run U,
+  coordinator failure waited from 18:23:07 for epoch 21, and nothing was missed.
+- **Epoch 12 (run T).** The restart floor's cost at an R3 switch, as in run N: every keyholder
+  restarts in that epoch.
+- **Late blocks.** The blocks of slot 772 (run O) and slot 1217 (run Q) were signed but not
+  canonical. In both, the nodes signed late, not the gateway: consensus was slow during a
+  failover (L-16) in run O, and node 0 took 1.15 s during resharing in run Q.
+- **Retries.** The gateway retried where the scenarios expect it: the in-flight crash, the
+  stopped coordinator and the R3 switch. At the R3 switch, 8 requests of the migrated validator
+  failed during the pause, as in run N.
+- **Latency.** The latency is the nodes' (runs B to D through the proxy: p50 234 to 262 ms). The
+  gateway's own share (signing root, signature check) was 4.3 ms p50 on GCP
+  ([tee.md](tee.md#on-gcp-integrationteegcp)).
+
 ## Troubleshooting
 
 - **`kurtosis run` fails.** Read `logs/kurtosis-run.log`. A Starlark `fail` names the parameter (for
@@ -644,7 +694,8 @@ both. From the next epoch on everything signed.
   finalize, the genesis validators are not attesting.
 - **Lighthouse does not enable the validator.** `logs/vc.log`: the definition file, the testnet
   directory (`network-artifact`), the beacon node URL.
-- **Signing errors.** `logs/proxy.jsonl` (attempt per node), then `logs/signer-*.log`
+- **Signing errors.** `logs/gateway.jsonl` (attempt per node) and `logs/gateway.log`, then
+  `logs/signer-*.log`
   (`validator duty not signed` with the error).
 
 ## Limitations

@@ -118,7 +118,7 @@ use crate::{
         horizon::{Beyond, Horizon},
         network::{NetworkJson, WrongFork},
         registration::Refusal as RegistrationRefusal,
-        web3signer::{parse_identifier, parse_request},
+        web3signer::{self, parse_identifier},
     },
     executor::{Client, Status, Stopped},
     readiness::{Readiness, Reason, State as ReadinessState},
@@ -802,56 +802,41 @@ async fn eth2_sign(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let parsed = parse_identifier(&identifier)
-        .and_then(|validator| parse_request(&body).map(|request| (validator, request)));
-    let (validator, request) = match parsed {
+    // The duty, as the gateway reads it too (`web3signer::duty_request`): a registration's fork
+    // and an aggregate's form come from the pinned network.
+    let (duty, signing_root) = match web3signer::duty_request(
+        &identifier,
+        &body,
+        api.options.horizon.network().as_ref(),
+    ) {
         Ok(parsed) => parsed,
+        Err(web3signer::RequestError::NoNetwork) => {
+            return fork_error(WrongFork::NotConfigured);
+        }
         Err(err) => return eth2_error(StatusCode::BAD_REQUEST, err.to_string()),
     };
-    if matches!(request.duty, Duty::Deposit(_)) && !api.options.deposit_signing {
+    if matches!(duty.duty, Duty::Deposit(_)) && !api.options.deposit_signing {
         return eth2_error(
             StatusCode::BAD_REQUEST,
             "deposit signing is disabled on this node (--enable-deposit-signing)".into(),
         );
     }
-    // A builder registration carries no fork: its domain is the network's genesis fork version
-    // with a zero root, put in here (`Network::fork_info`), and its key must be the path's.
-    let mut fork = request.fork;
-    if let Some(registration) = request.duty.registration() {
-        if registration.pubkey != validator {
-            return eth2_error(
-                StatusCode::BAD_REQUEST,
-                "the registration's pubkey is not the validator key of the path".into(),
-            );
-        }
-        match api.options.horizon.network() {
-            Some(network) => fork = network.fork_info(&request.duty),
-            None => return fork_error(WrongFork::NotConfigured),
-        }
-    }
-    // An aggregate is rooted in its epoch's form (progressive from Gloas on), which the request
-    // does not tell: the pinned schedule does (`Network::resolve`; voters check it).
-    let duty = DutyRequest {
-        validator,
-        fork,
-        duty: match api.options.horizon.network() {
-            Some(network) => network.resolve(request.duty),
-            None => request.duty,
-        },
-    };
     let endorsement = match approve_duty(&api, &duty, &body).await {
         Ok(endorsement) => endorsement,
         Err((status, error)) => return eth2_error(status, error),
     };
     let result = tokio::time::timeout(
         SIGN_TIMEOUT,
-        api.signer
-            .sign_duty(duty, request.signing_root, endorsement),
+        api.signer.sign_duty(duty, signing_root, endorsement),
     )
     .await;
     let error = match result {
         Ok(Ok(signed)) => {
-            let signature = format!("0x{}", hex::encode(signed.signature.encode()));
+            let mut signature = signed.signature.encode().to_vec();
+            if crate::hooks::corrupt_signature() {
+                signature[10] ^= 1;
+            }
+            let signature = format!("0x{}", hex::encode(signature));
             return if accepts_json(&headers) {
                 Json(serde_json::json!({ "signature": signature })).into_response()
             } else {

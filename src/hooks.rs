@@ -34,6 +34,9 @@
 //!   (`eth::horizon::RestartFloor`). The E2E harness sets it for every node unless a test sets it
 //!   to `0`: its chain's slots are long past, so a floor would refuse every new duty after any
 //!   restart; the floor's own tests run with it.
+//! - `ETH_MPC_SIGNER_CORRUPT_SIGNATURE_FILE=<path>`: while `<path>` exists, the node's Web3Signer
+//!   API returns every signature it obtained with one byte flipped, as a faulty coordinator would
+//!   (the gateway must not pass it on).
 //! - `ETH_MPC_SIGNER_INJECT_FILE=<path>`: as a leader, the node adds the transactions in `<path>`
 //!   (one hex-encoded transaction per line, read at every proposal) to every block it proposes,
 //!   unchecked, as a faulty leader would (its votes still check every block).
@@ -157,6 +160,12 @@ mod enabled {
         std::env::var("ETH_MPC_SIGNER_NO_PARTIALS_FILE").is_ok_and(|path| Path::new(&path).exists())
     }
 
+    /// Whether the Web3Signer API must return a corrupted signature right now.
+    pub fn corrupt_signature() -> bool {
+        std::env::var("ETH_MPC_SIGNER_CORRUPT_SIGNATURE_FILE")
+            .is_ok_and(|path| Path::new(&path).exists())
+    }
+
     /// Whether a leader must build on a block that ends the epoch.
     pub fn propose_past_terminal() -> bool {
         std::env::var("ETH_MPC_SIGNER_PROPOSE_PAST_TERMINAL").is_ok()
@@ -244,6 +253,10 @@ mod enabled {
     }
 
     pub const fn drop_first_gossip() -> bool {
+        false
+    }
+
+    pub const fn corrupt_signature() -> bool {
         false
     }
 

@@ -167,8 +167,16 @@ fn a_pinned_configuration_is_checked_per_node() {
     let ours = pinned(&[(0, &"c0".repeat(48)), (1, &"c1".repeat(48))]);
     assert_eq!(check(&ours, Some(0)).unwrap().rtmr3, vm.rtmr3);
     // Another node's configuration, an index the policy does not name, an unknown index.
-    assert!(check(&ours, Some(1)).unwrap_err().contains("another configuration"));
-    assert!(check(&ours, Some(2)).unwrap_err().contains("no configuration"));
+    assert!(
+        check(&ours, Some(1))
+            .unwrap_err()
+            .contains("another configuration")
+    );
+    assert!(
+        check(&ours, Some(2))
+            .unwrap_err()
+            .contains("no configuration")
+    );
     assert!(check(&ours, None).is_err());
     // Another configuration than the one written for it (a rewritten instance metadata).
     assert!(check(&pinned(&[(0, &"d0".repeat(48))]), Some(0)).is_err());
@@ -183,7 +191,10 @@ fn a_pinned_configuration_is_checked_per_node() {
         )
     };
     let parsed = Policy::from_json(&text(r#"{"0": ["aa"], "3": ["bb", "cc"]}"#)).unwrap();
-    assert_eq!(parsed.rtmr3.unwrap()[&3], vec!["bb".to_string(), "cc".to_string()]);
+    assert_eq!(
+        parsed.rtmr3.unwrap()[&3],
+        vec!["bb".to_string(), "cc".to_string()]
+    );
     assert!(Policy::from_json(&text(r#"{"0": []}"#)).is_err());
     assert!(Policy::from_json(&text(r#"{"zero": ["aa"]}"#)).is_err());
 }

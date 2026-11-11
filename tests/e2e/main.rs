@@ -18,6 +18,7 @@ mod failures;
 mod floor;
 mod follower;
 mod forks;
+mod gateway;
 mod gloas;
 mod harness;
 mod horizon;

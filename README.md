@@ -39,6 +39,11 @@ A 4-node threshold signer built on [commonware](https://github.com/commonwarexyz
   `(ceremony_id, nonce) -> payload_hash` once, through consensus, and returns the threshold
   signature of any 32-byte payload (see [Signing](#signing)).
 
+A validator client signs through `mpc-gateway` ([docs/gateway.md](docs/gateway.md)): one
+Web3Signer endpoint for the network. It sends each request to an attested node, hedges to the next
+when one is slow, and returns a signature only once it verifies against the validator key and the
+signing root the gateway computes itself.
+
 A real Lighthouse v8.3.2 validator client has run against it on a local proof-of-stake devnet
 (Kurtosis), as a validator whose key exists only as the network's shares
 ([docs/ethereum-devnet.md](docs/ethereum-devnet.md)).
@@ -415,6 +420,15 @@ curl -s localhost:8082/api/v1/eth2/sign/0xa1b2.. -H 'content-type: application/j
   -H 'accept: application/json' -d @tests/fixtures/web3signer/attestation.json
 # {"signature":"0x8f3e..(96 bytes)"}
 # the conflicting attestation: 412 {"error":"..","refusal":{"reason":"double_vote","target":0}}
+```
+
+A validator client signs through the gateway rather than one node
+([docs/gateway.md](docs/gateway.md)):
+
+```bash
+mpc-gateway --nodes http://127.0.0.1:8080,http://127.0.0.1:8081,http://127.0.0.1:8082,http://127.0.0.1:8083 \
+  --allow-unattested --eth-network hoodi --listen 127.0.0.1:9000 --metrics-listen 127.0.0.1:9001
+# Lighthouse: a `web3signer` validator definition with url http://127.0.0.1:9000
 ```
 
 | `POST /api/v1/eth2/sign/{key}` | HTTP |

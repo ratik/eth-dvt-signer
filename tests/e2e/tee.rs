@@ -32,17 +32,17 @@ use std::{
 const VALIDATOR: &str = "validator-tee";
 
 /// The operator's CA and one client certificate it issued.
-struct Operator {
-    ca_path: PathBuf,
-    chain: Vec<CertificateDer<'static>>,
-    key: Vec<u8>,
+pub(crate) struct Operator {
+    pub(crate) ca_path: PathBuf,
+    pub(crate) chain: Vec<CertificateDer<'static>>,
+    pub(crate) key: Vec<u8>,
     /// The client certificate and key as PEM files (`mpc-admin --tls-cert/--tls-key`).
-    cert_path: PathBuf,
-    key_path: PathBuf,
+    pub(crate) cert_path: PathBuf,
+    pub(crate) key_path: PathBuf,
 }
 
 impl Operator {
-    fn new(dir: &Path) -> Self {
+    pub(crate) fn new(dir: &Path) -> Self {
         let ca_key = KeyPair::generate().unwrap();
         let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
         ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -118,15 +118,17 @@ fn identity(network: &TestNetwork, id: usize, vault: &[String]) -> Statement {
 /// A network of real identities: node `i` sealed on the fake platform if `sealed(i)`, in a plain
 /// vault otherwise; every node also serves the mTLS API.
 fn network(sealed: impl Fn(usize) -> bool) -> (TestNetwork, FakeGcp, Operator, Vec<Statement>) {
+    network_with(sealed, |_| Vec::new())
+}
+
+/// Like [network], node `i` with the extra environment `env(i)` (test hooks).
+pub(crate) fn network_with(
+    sealed: impl Fn(usize) -> bool,
+    env: impl Fn(usize) -> Vec<(String, String)>,
+) -> (TestNetwork, FakeGcp, Operator, Vec<Statement>) {
     let gcp = FakeGcp::start(NODES);
-    let network = TestNetwork::start_with_followers(
-        NODES,
-        0,
-        Vec::new(),
-        |_| Vec::new(),
-        |_| Vec::new(),
-        |_| false,
-    );
+    let network =
+        TestNetwork::start_with_followers(NODES, 0, Vec::new(), |_| Vec::new(), env, |_| false);
     let vault = |id: usize| -> Vec<String> {
         if sealed(id) {
             gcp.vault_args(id)
@@ -195,7 +197,7 @@ fn sign_tls(
 }
 
 /// A validator key made by DKG and activated.
-fn validator(network: &TestNetwork) -> String {
+pub(crate) fn validator(network: &TestNetwork) -> String {
     network.start_validator_dkg(0, VALIDATOR);
     let key = network.wait_for_dkg(VALIDATOR, &network.all());
     activate_everywhere(network, 0, &key);

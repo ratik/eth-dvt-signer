@@ -41,15 +41,15 @@ tools() {
 build() {
 	# The signer with `test-hooks` (deterministic crash points for the in-flight scenario; it
 	# includes `dev-api`, whose `/sign` refuses validator keys), and the offline `mpc-keytool`
-	# (the migration scenario) and `mpc-admin` (the reconfiguration scenario), built in a pinned
-	# Rust image.
+	# (the migration scenario), `mpc-admin` (the reconfiguration scenario) and `mpc-gateway` (what
+	# Lighthouse signs through), built in a pinned Rust image.
 	mkdir -p "$IT_HOME/target" "$IT_HOME/cargo-home"
 	log "building the signer in $RUST_IMAGE"
 	docker run --rm -u "$(id -u):$(id -g)" \
 		-v "$IT_HOME:/it" -v "$repo:/it/src:ro" \
 		-e CARGO_HOME=/it/cargo-home -w /it/src \
 		"$RUST_IMAGE" cargo build --locked --release --features test-hooks \
-		--bin eth-mpc-signer --bin mpc-keytool --bin mpc-admin --target-dir /it/target
+		--bin eth-mpc-signer --bin mpc-keytool --bin mpc-admin --bin mpc-gateway --target-dir /it/target
 }
 
 fuzz_tools() {

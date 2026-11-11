@@ -399,7 +399,7 @@ up | logs | down)
 	up) validator_up "$2" "$3" ;;
 	logs) validator_logs "$2" "$3" ;;
 	down)
-		run="${3:-}"
+		run="${2:-}"
 		[ -n "$run" ] && [ -d "$run" ] || die "down DIR: the directory of \`up\`"
 		[ ! -s "$run/run-label" ] || RUN_VALUE="$(cat "$run/run-label")"
 		cluster_teardown

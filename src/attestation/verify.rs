@@ -69,7 +69,9 @@ impl Policy {
             .flatten()
             .find(|(_, allowed)| allowed.is_empty())
         {
-            return Err(format!("the policy allows no configuration (rtmr3) for node {node}"));
+            return Err(format!(
+                "the policy allows no configuration (rtmr3) for node {node}"
+            ));
         }
         Ok(policy)
     }

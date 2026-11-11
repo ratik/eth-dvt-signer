@@ -32,6 +32,83 @@ use commonware_cryptography::{Hasher as _, Sha256, sha256::Digest};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
+/// The network's command-line flags, shared by the node and the gateway (`mpc-gateway`).
+#[derive(Clone, Debug, Default, clap::Args)]
+pub struct NetworkArgs {
+    /// The Ethereum network whose clock bounds the duties this node admits and signs, and whose
+    /// fork schedule their `fork_info` must follow (`mainnet` or `hoodi`): no duty for a slot
+    /// that has not started, or an epoch too far ahead, or under another fork's domain
+    /// (`docs/ethereum-signing.md`, time horizon and fork schedule). Without a network (this
+    /// flag, or the `--eth-genesis-*` and `--eth-fork-schedule` flags of another one) the node
+    /// signs no duty.
+    #[arg(long, conflicts_with = "eth_genesis_time")]
+    pub eth_network: Option<String>,
+
+    /// Another network's genesis time (unix seconds), with `--eth-seconds-per-slot`,
+    /// `--eth-genesis-validators-root` and `--eth-fork-schedule`: a devnet.
+    #[arg(
+        long,
+        requires_all = ["eth_seconds_per_slot", "eth_genesis_validators_root", "eth_fork_schedule"]
+    )]
+    pub eth_genesis_time: Option<u64>,
+
+    #[arg(long, requires = "eth_genesis_time")]
+    pub eth_seconds_per_slot: Option<u64>,
+
+    #[arg(long, requires = "eth_genesis_time")]
+    pub eth_genesis_validators_root: Option<String>,
+
+    /// Another network's fork schedule: `phase0=0x<version>@0,altair=0x<version>@<epoch>,...`,
+    /// every fork it has scheduled, in order (`phase0` to `gloas`).
+    #[arg(long, requires = "eth_genesis_time")]
+    pub eth_fork_schedule: Option<String>,
+
+    /// Another network's slots per epoch: only the mainnet preset's 32 is supported.
+    #[arg(long, requires = "eth_genesis_time", default_value_t = 32)]
+    pub eth_slots_per_epoch: u64,
+}
+
+impl NetworkArgs {
+    /// The network these flags name, if any.
+    pub fn network(&self) -> Result<Option<Network>, String> {
+        if let Some(name) = &self.eth_network {
+            return Network::named(name)
+                .map(Some)
+                .ok_or(format!("unknown Ethereum network {name} (mainnet, hoodi)"));
+        }
+        let Some(genesis_time) = self.eth_genesis_time else {
+            return Ok(None);
+        };
+        let seconds_per_slot = self
+            .eth_seconds_per_slot
+            .filter(|seconds| *seconds > 0)
+            .ok_or("--eth-seconds-per-slot must be above 0")?;
+        let root = self.eth_genesis_validators_root.as_deref().unwrap_or("");
+        let genesis_validators_root = hex::decode(root.strip_prefix("0x").unwrap_or(root))
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or("--eth-genesis-validators-root must be 32 bytes of hex")?;
+        let schedule = self
+            .eth_fork_schedule
+            .as_deref()
+            .ok_or("another network needs its fork schedule (--eth-fork-schedule)")?;
+        let forks = Network::parse_schedule(schedule)
+            .map_err(|err| format!("--eth-fork-schedule: {err}"))?;
+        let network = Network {
+            genesis_time,
+            seconds_per_slot,
+            slots_per_epoch: self.eth_slots_per_epoch,
+            genesis_validators_root,
+            // Read once, for the life of the process.
+            forks: Vec::leak(forks),
+        };
+        network
+            .validate()
+            .map_err(|err| format!("--eth-fork-schedule: {err}"))?;
+        Ok(Some(network))
+    }
+}
+
 /// The forks this signer knows, in the order they activate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

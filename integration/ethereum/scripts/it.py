@@ -2,8 +2,8 @@
 """The Ethereum devnet integration of the MPC signer (docs/ethereum-devnet.md).
 
 Runs inside the isolated environment (`scripts/env.sh`): Kurtosis and the devnet, the four signer
-nodes (containers on that environment's loopback), the failover proxy and Lighthouse's validator
-client. Python standard library only.
+nodes (containers on that environment's loopback), the gateway (`mpc-gateway`) and Lighthouse's
+validator client. Python standard library only.
 
 Every wait is bounded and fails with its stage, so a failed run says where it failed:
 environment, dkg, activation, deposit, lighthouse, signing, beacon or timeout. Success is never
@@ -42,6 +42,7 @@ KURTOSIS = f"{IT}/bin/kurtosis"
 SIGNER = f"{IT}/target/release/eth-mpc-signer"
 KEYTOOL = f"{IT}/target/release/mpc-keytool"
 ADMIN = f"{IT}/target/release/mpc-admin"
+GATEWAY = f"{IT}/target/release/mpc-gateway"
 HERE = f"{SRC}/integration/ethereum"
 NETWORK_ARGS = f"{HERE}/kurtosis/network.yaml"
 # `run-mev`: the same devnet with a Flashbots relay, builder and mev-boost.
@@ -71,6 +72,7 @@ WITHHELD = 2
 P2P_BASE = 47000
 HTTP_BASE = 47100
 PROXY_PORT = 47200
+GATEWAY_METRICS_PORT = 47202
 VC_METRICS_PORT = 47301
 CEREMONY = "validator-devnet"
 # The `User-Agent` of the security checks' signing requests: the report keeps them apart from
@@ -481,6 +483,36 @@ def height(node):
     return value["height"] if status == 200 else None
 
 
+def restart_floor(node):
+    """The epoch of node `node`'s restart floor since its latest start (its log), or None. Until
+    that epoch ends, the node gives no partial for a new attestation of it, nor for a new block of
+    its floor's slot or before (docs/slashing-protection.md, the restart floor)."""
+    floor = None
+    for line in read(f"{WORK}/logs/signer-{node}.log").splitlines():
+        if "restart floor: no new partial" in line:
+            match = re.search(r"\bepoch=(\d+)", line)
+            floor = int(match.group(1)) if match else None
+        elif "no restart floor" in line:
+            floor = None
+    return floor
+
+
+def floors_passed(chain, away, label):
+    """Wait until every keyholder but `away` (the nodes about to be stopped or silenced) is past
+    its restart floor's epoch. A signature needs three of the four keyholders: with one away, each
+    of the others must sign, and one still in its floor's epoch refuses that epoch's new
+    attestations. The duty would then be missed for two faults at once (a restart, then a stop),
+    not for the one the scenario tests."""
+    floors = {node: restart_floor(node) for node in range(NODES + FOLLOWERS) if node not in away}
+    latest = max((floor for floor in floors.values() if floor is not None), default=None)
+    if latest is None or chain.epoch() > latest:
+        return
+    nodes = sorted(node for node, floor in floors.items() if floor == latest)
+    log(f"{label}: waiting for epoch {latest + 1}: node(s) {nodes} refuse new attestations of "
+        f"epoch {latest} (restart floor)")
+    chain.wait_epoch(latest + 1)
+
+
 def signers_start():
     workdir("logs")
     workdir("signers")
@@ -616,34 +648,49 @@ def deposit(key, chain):
 
 
 # ---------------------------------------------------------------------------------------------
-# Proxy and Lighthouse validator client
+# Gateway and Lighthouse validator client
 
 
-def proxy_start():
-    proxy_stop()
-    args = [sys.executable, f"{HERE}/scripts/proxy.py", "--listen", f"127.0.0.1:{PROXY_PORT}",
-            "--log", f"{WORK}/logs/proxy.jsonl", "--requests", f"{WORK}/requests"]
-    for node in range(NODES):
-        args += ["--backend", node_url(node)]
-    with open(f"{WORK}/logs/proxy.log", "a") as out:
-        process = subprocess.Popen(args, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
-    with open(f"{WORK}/proxy.pid", "w") as file:
-        file.write(str(process.pid))
-    wait("the proxy", "environment", 20, 0.5,
+def gateway_start(gcp=None):
+    """`mpc-gateway` (docs/gateway.md) at the address Lighthouse signs through (`PROXY_PORT`), in
+    the runtime image on the host network, as the signers run: hedged failover over the nodes,
+    each signature checked against the root it computes under the devnet's chain
+    (`network_args()`), its request log (`logs/gateway.jsonl`, the report's) and the signing
+    requests' bodies (`requests/`, the security checks').
+    - Local signers (`http://`, development keys): `--allow-unattested`.
+    - Sealed nodes on GCP (`gcp`: the directory of `gcp.sh up`, its `nodes.json` and `policy.json`):
+      their mTLS API directly, the operator's certificate, each node's attestation checked
+      against the run's policy (Google's key set, fetched: the system's CAs are mounted)."""
+    gateway_stop()
+    args = [GATEWAY, "--listen", f"127.0.0.1:{PROXY_PORT}",
+            "--metrics-listen", f"127.0.0.1:{GATEWAY_METRICS_PORT}",
+            "--request-log", f"{WORK}/logs/gateway.jsonl", "--requests", f"{WORK}/requests",
+            *network_args()]
+    if gcp:
+        cluster = json.loads(read(f"{gcp}/nodes.json"))
+        args += ["--nodes", ",".join(node["url"] for node in cluster["nodes"]),
+                 "--tls-cert", cluster["client_cert"], "--tls-key", cluster["client_key"],
+                 "--policy", f"{gcp}/policy.json"]
+    else:
+        args += ["--nodes", ",".join(node_url(node) for node in range(NODES)), "--allow-unattested"]
+    command = " ".join(args) + f" >> {WORK}/logs/gateway.log 2>&1"
+    run(["docker", "rm", "-f", "it-gateway"], check=False)
+    run(["docker", "run", "-d", "--name", "it-gateway", "--network", "host", "--user", f"{UID}:{GID}",
+         "-v", f"{IT}:{IT}", "-v", "/etc/ssl/certs:/etc/ssl/certs:ro", "-e", "RUST_LOG=info",
+         VERSIONS["RUNTIME_IMAGE"], "sh", "-c", f"exec {command}"])
+    wait("the gateway", "environment", 120, 0.5,
          lambda: http("GET", f"http://127.0.0.1:{PROXY_PORT}/upcheck", timeout=3)[0] == 200)
+    log(f"gateway: serving Lighthouse on 127.0.0.1:{PROXY_PORT} ({'sealed nodes on GCP' if gcp else 'local signers'})")
 
 
-def proxy_stop():
-    try:
-        with open(f"{WORK}/proxy.pid") as file:
-            os.kill(int(file.read()), 15)
-    except (FileNotFoundError, ProcessLookupError, ValueError):
-        pass
+def gateway_stop():
+    run(["docker", "stop", "-t", "5", "it-gateway"], check=False)
+    run(["docker", "rm", "-f", "it-gateway"], check=False)
 
 
 def vc_start(key, *more, builder=False, image=None):
     """Lighthouse's validator client with remote-signer validators only: the DKG key (and, after
-    the migration, the migrated key), signed by the MPC network through the proxy. Its own
+    the migration, the migrated key), signed by the MPC network through the gateway. Its own
     slashing database is kept across restarts. No keystore exists in it. With `builder`, it
     registers its validators with the builder network (`VALIDATOR_REGISTRATION`, signed by the MPC
     network under the registration policy) and prefers builder blocks."""
@@ -886,6 +933,7 @@ def converged(nodes):
 
 def node_offline(index, chain, observed=3):
     def body():
+        floors_passed(chain, {2}, "node-offline")
         signer_stop(2)
         stopped = time.time()
         wait("nodes 0, 1, 3 ready", "signing", 60, 1, lambda: all(ready(n) for n in (0, 1, 3)))
@@ -902,7 +950,10 @@ def node_offline(index, chain, observed=3):
 
 
 def coordinator_failover(index, chain, observed=3):
+    """Node 0 stops for `observed` epochs. It stops only once node 2, restarted by node-offline
+    just before, is past its restart floor's epoch (`floors_passed`)."""
     def body():
+        floors_passed(chain, {0}, "coordinator-failover")
         signer_stop(0)
         stopped = time.time()
         observe("coordinator-failover", index, observed, chain)
@@ -917,8 +968,8 @@ def coordinator_failover(index, chain, observed=3):
 
 
 def inflight_retry(index, chain, crashes=3):
-    """Node 0 (the proxy's first choice) crashes right after a duty's authorization, before
-    returning the signature: the deterministic `authorized` crash point. The proxy retries on
+    """Node 0 (the gateway's first choice) crashes right after a duty's authorization, before
+    returning the signature: the deterministic `authorized` crash point. The gateway retries on
     node 1, which must return the signature of the same authorization.
 
     The crash point follows either a new authorization (node 0 submitted the duty and consensus
@@ -1179,6 +1230,7 @@ def migration(chain, dkg_key, key, index, observed=3, offline=2):
         observe("migration", index, observed, chain)
         refusals = migrated_refusals(key, blocks, attestations, chain)
         if offline:
+            floors_passed(chain, {2}, "migration")
             signer_stop(2)
             observe("migration-node-offline", index, offline, chain)
             signer_start(2)
@@ -1214,7 +1266,7 @@ ACKNOWLEDGED = {"previous_signer_stopped": True, "no_other_active_signer": True,
 
 
 def migrated_refusals(key, blocks, attestations, chain):
-    """What the previous signer's history forbids, asked through the proxy: a block at the
+    """What the previous signer's history forbids, asked through the gateway: a block at the
     latest imported slot, an attestation at the latest imported target, one with a source below
     the latest imported source."""
     proxy = f"http://127.0.0.1:{PROXY_PORT}"
@@ -1268,8 +1320,13 @@ def jsonl(name):
 
 
 def proxy_records():
+    """Every request Lighthouse and the checks sent: the gateway's log, or the development proxy's
+    in a run from before the gateway."""
     records = []
-    for line in read(f"{WORK}/logs/proxy.jsonl").splitlines():
+    path = f"{WORK}/logs/gateway.jsonl"
+    if not os.path.exists(path):
+        path = f"{WORK}/logs/proxy.jsonl"
+    for line in read(path).splitlines():
         try:
             records.append(json.loads(line))
         except ValueError:
@@ -1342,6 +1399,7 @@ def resharing(chain, key, index, migrated_key, observed=2, offline=1):
             if imported["public_key"] != migrated_key:
                 raise Failure("reshare", "the migrated key changed")
         observe("resharing", index, observed, chain)
+        floors_passed(chain, {2}, "resharing")
         signer_stop(2)
         stopped = time.time()
         observe("resharing-node-offline", index, offline, chain)
@@ -1424,6 +1482,7 @@ def replacement(chain, keys, index, observed=2):
     signatures are switched off for an epoch: every signature needs E's share. The consensus
     committee stays A, B, C, D throughout. `index` is the validator observed."""
     def body():
+        floors_passed(chain, {REPLACED}, "replacement")
         signer_stop(REPLACED)
         lost = time.time()
         log(f"replacement: node {REPLACED} (D) stopped for good")
@@ -1446,6 +1505,7 @@ def replacement(chain, keys, index, observed=2):
                                                                      "switched"))
         e_index, c_index = first["e_index"], first["c_index"]
         observe("replacement", index, observed, chain)
+        floors_passed(chain, {REPLACED, WITHHELD}, "replacement")
         with open(no_partials(WITHHELD), "w"):
             pass
         withheld = time.time()
@@ -1525,6 +1585,7 @@ def reconfiguration(chain, key, index, observed=2):
         observe("reconfiguration", index, observed, chain)
         heights = {node: height(node) for node in voters}
 
+        floors_passed(chain, {REPLACED, WITHHELD}, "reconfiguration")
         signer_stop(WITHHELD)
         without_c = time.time()
         log("reconfiguration: C stopped: A, B and E are epoch 1's quorum")
@@ -1563,7 +1624,7 @@ def reconfiguration(chain, key, index, observed=2):
 
 
 def recorded(kind, key=None):
-    """The latest signing request of `kind` that the MPC network signed (kept by the proxy), for
+    """The latest signing request of `kind` that the MPC network signed (kept by the gateway), for
     the validator `key` if given."""
     directory = f"{WORK}/requests"
     for name in sorted(os.listdir(directory), reverse=True):
@@ -1835,7 +1896,7 @@ def report(chain=None):
                      f"{signed_blocks['canonical']}, finalized {signed_blocks['finalized']}, not canonical "
                      f"{signed_blocks['not_canonical_slots']}")
     lines.append("")
-    lines.append("| Scenario | Requests | HTTP errors | Proxy retries | End-to-end p50/p95 ms (n) | "
+    lines.append("| Scenario | Requests | HTTP errors | Gateway retries | End-to-end p50/p95 ms (n) | "
                  "Authorization p50/p95 ms (n) | Missed attestations | Proposals | Recovery s |")
     lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for name, s in per_scenario.items():
@@ -1848,7 +1909,7 @@ def report(chain=None):
     lines.append("")
     lines.append("Lighthouse's signing requests (the security checks' are not counted):")
     lines.append("")
-    lines.append("| Duty type | Requested | Signed | Retried by the proxy |")
+    lines.append("| Duty type | Requested | Signed | Retried by the gateway |")
     lines.append("| --- | --- | --- | --- |")
     for kind, entry in sorted(by_type.items()):
         lines.append(f"| {kind} | {entry['requested']} | {entry['signed']} | {entry['retried']} |")
@@ -2126,10 +2187,10 @@ def reconfiguration_lines(r):
              f"- submit to the first stop {p['submit_to_first_stop']} s; every voter stopped within "
              f"{p['stops_spread']} s; first stop to epoch 1's first block {p['first_stop_to_first_epoch_1_block']} s",
              f"- Lighthouse during the switch: {d['requests']} requests, {d['failed']} failed, "
-             f"{d['retried']} retried by the proxy, slowest {d['max_ms']} ms",
+             f"{d['retried']} retried by the gateway, slowest {d['max_ms']} ms",
              f"- without C, signer sets {r['signer_sets_without_c']}; D came back in epoch {r['d_stale_epoch']} "
              f"and followed epoch 1 after `mpc-admin resume`",
-             f"- Lighthouse requests failed: {r['lighthouse_requests_failed']}, retried by the proxy: "
+             f"- Lighthouse requests failed: {r['lighthouse_requests_failed']}, retried by the gateway: "
              f"{r['lighthouse_requests_retried_by_proxy']}"]
     lines += [f"- latency end to end p50/p95 ms (n), {label}: {ms(q)}" for label, q in r["latency_ms"].items()]
     lines.append(f"- observed epochs: {r['observed_epochs']}, missed attestations {r['missed_attestations']}, "
@@ -2156,7 +2217,7 @@ def replacement_lines(r):
              f"after the activation {r['signatures_with_e_after_activation']} of "
              f"{r['signatures_after_activation']} signatures include E's share",
              f"- signatures by generation since D was lost: {r['signatures_by_generation']}",
-             f"- Lighthouse requests failed: {r['lighthouse_requests_failed']}, retried by the proxy: "
+             f"- Lighthouse requests failed: {r['lighthouse_requests_failed']}, retried by the gateway: "
              f"{r['lighthouse_requests_retried_by_proxy']}"]
     lines += [f"- latency end to end p50/p95 ms (n), {label}: {ms(p)}" for label, p in r["latency_ms"].items()]
     lines += [f"- consensus authorization p50/p95 ms (n), {label}: {ms(p)}"
@@ -2261,7 +2322,7 @@ def run_all(observed=3, proposal_epochs=12):
     key = dkg()
     activation = activate(key, chain)
     deposit(key, chain)
-    proxy_start()
+    gateway_start()
     vc_start(key)
     index, activation_epoch = wait_active(key, chain)
     recorder = Recorder(index, activation_epoch, chain)
@@ -2327,7 +2388,7 @@ def migrated_network(observed=1):
     key = dkg()
     activation = activate(key, chain)
     deposit(key, chain)
-    proxy_start()
+    gateway_start()
     vc_start(key)
     tracking = track_activation(key, chain)
     wait("two epochs attested by the original client", "migration", 12 * chain.epoch_seconds(), 5,
@@ -2500,7 +2561,7 @@ def builder_flow(chain, key, index, observed):
 
 
 def registration_checks(key):
-    """The policy's refusals through the proxy: another fee recipient, a timestamp beyond the
+    """The policy's refusals through the gateway: another fee recipient, a timestamp beyond the
     window, another key in the body."""
     proxy = f"http://127.0.0.1:{PROXY_PORT}"
     path = f"/api/v1/eth2/sign/{key}"
@@ -2566,7 +2627,7 @@ def run_mev(observed=6):
     activation = activate(key, chain)
     deposit(key, chain)
     registration_policy()
-    proxy_start()
+    gateway_start()
     vc_start(key, builder=True)
     index, activation_epoch = wait_active(key, chain)
     recorder = Recorder(index, activation_epoch, chain)
@@ -2638,7 +2699,7 @@ def payload_revealed(slot):
 
 
 def stored_request(kind):
-    """The body of the latest request of `kind` Lighthouse got signed (the proxy keeps them)."""
+    """The body of the latest request of `kind` Lighthouse got signed (the gateway keeps them)."""
     directory = f"{WORK}/requests"
     for name in sorted(os.listdir(directory), reverse=True):
         with open(f"{directory}/{name}") as file:
@@ -2651,7 +2712,7 @@ def stored_request(kind):
 
 
 def gloas_checks(key):
-    """The Gloas rules through the proxy, on requests Lighthouse got signed: a second PTC vote
+    """The Gloas rules through the gateway, on requests Lighthouse got signed: a second PTC vote
     for its slot, an envelope of a slot the validator signed no block for, an envelope and
     preferences paying a fee recipient the policy does not allow."""
     proxy = f"http://127.0.0.1:{PROXY_PORT}"
@@ -2797,7 +2858,7 @@ def run_gloas(after=6):
     activation = activate(key, chain)
     deposit(key, chain)
     registration_policy(gas_limit_max=GLOAS_GAS_LIMIT_MAX)
-    proxy_start()
+    gateway_start()
     vc_start(key, image=GLOAS_LIGHTHOUSE)
     index, activation_epoch = wait_active(key, chain)
     if activation_epoch >= GLOAS_EPOCH - 1:
@@ -2878,39 +2939,45 @@ def bridges_stop():
 
 
 def gcp_latency():
-    """Where the time of each signature Lighthouse obtained went: end to end (the failover
-    proxy), the round trip to the sealed node that answered (its bridge: the network, TLS and the
-    node), and the coordinator's own time (`signed validator duty ... total_ms`); the network's
-    share is the round trip less the coordinator's time. The driver's status reads through the
-    bridges time the network and TLS alone. Saved as `gcp.json`."""
-    proxy = {r["signing_root"]: r for r in proxy_records()
-             if r.get("type") and r.get("status") == 200 and r.get("signing_root")}
-    trips, probes = {}, []
+    """Where the time of each signature Lighthouse obtained went: end to end (the gateway's
+    record), the round trip to the sealed node that answered (the gateway's winning attempt: the
+    network, TLS and the node), and the coordinator's own time (`signed validator duty ...
+    total_ms`); the network's share is the round trip less the coordinator's time. The driver's
+    status reads through the bridges time the network and TLS alone. Saved as `gcp.json`."""
+    lighthouse = {r["signing_root"]: r for r in proxy_records()
+                  if r.get("type") and r.get("status") == 200 and r.get("signing_root")
+                  and r.get("client") != PROBE_AGENT}
+    trips = {root: r["attempts"][-1]["ms"] for root, r in lighthouse.items() if r.get("attempts")}
+    probes = []
     for node in range(NODES):
         for line in read(f"{WORK}/logs/bridge-{node}.jsonl").splitlines():
             record = json.loads(line)
-            if record.get("type") and record.get("status") == 200 and record.get("signing_root"):
-                trips[record["signing_root"]] = record["attempts"][-1]["ms"]
-            elif record["method"] == "GET" and record.get("status") == 200:
-                # The driver's status reads: the network and TLS without a signature.
+            if record["method"] == "GET" and record.get("status") == 200:
                 probes.append(record["attempts"][-1]["ms"])
     coordinator = {r["signing_root"]: float(r["total_ms"]) for r in signer_records()
                    if r["ok"] and r.get("signing_root") and r.get("total_ms")}
-    roots = [root for root in proxy if root in trips and root in coordinator]
+    roots = [root for root in lighthouse if root in trips and root in coordinator]
     result = {
-        "end_to_end_ms": percentiles([proxy[root]["ms"] for root in proxy]),
-        "round_trip_ms": percentiles([trips[root] for root in proxy if root in trips]),
-        "coordinator_ms": percentiles([coordinator[root] for root in proxy if root in coordinator]),
+        "end_to_end_ms": percentiles([r["ms"] for r in lighthouse.values()]),
+        "round_trip_ms": percentiles(list(trips.values())),
+        "coordinator_ms": percentiles([coordinator[root] for root in lighthouse if root in coordinator]),
         "network_ms": percentiles([trips[root] - coordinator[root] for root in roots]),
+        "gateway_ms": percentiles([lighthouse[root]["ms"] - trips[root] for root in lighthouse
+                                   if root in trips]),
         "status_read_ms": percentiles(probes),
-        "by_type": {kind: percentiles([r["ms"] for r in proxy.values() if r["type"] == kind])
-                    for kind in sorted({r["type"] for r in proxy.values()})},
+        "hedged": sum(1 for r in lighthouse.values() if any(a.get("hedged") for a in r["attempts"])),
+        "invalid_signatures": sum(1 for r in proxy_records() for a in r.get("attempts", [])
+                                  if a.get("invalid_signature")),
+        "by_type": {kind: percentiles([r["ms"] for r in lighthouse.values() if r["type"] == kind])
+                    for kind in sorted({r["type"] for r in lighthouse.values()})},
     }
     save("gcp.json", result)
-    for name in ("end_to_end_ms", "round_trip_ms", "coordinator_ms", "network_ms", "status_read_ms"):
+    for name in ("end_to_end_ms", "round_trip_ms", "coordinator_ms", "network_ms", "gateway_ms",
+                 "status_read_ms"):
         value = result[name]
         log(f"gcp latency {name}: " + (f"p50 {value['p50']}, p95 {value['p95']}, "
                                        f"max {value['max']} (n = {value['n']})" if value["n"] else "none"))
+    log(f"gcp: {result['hedged']} hedged requests, {result['invalid_signatures']} invalid signatures caught")
     return result
 
 
@@ -2926,7 +2993,7 @@ def run_gcp(directory, observed=10):
     key = dkg()
     activation = activate(key, chain)
     deposit(key, chain)
-    proxy_start()
+    gateway_start(gcp=directory)
     vc_start(key)
     index, activation_epoch = wait_active(key, chain)
     recorder = Recorder(index, activation_epoch, chain)
@@ -2990,7 +3057,7 @@ def main():
             report()
         elif args.command == "stop":
             vc_stop()
-            proxy_stop()
+            gateway_stop()
             bridges_stop()
             signers_stop()
             devnet_down()

@@ -80,7 +80,7 @@ Kurtosis devnet (ethereum-package): geth + Lighthouse beacon node + genesis vali
 Lighthouse validator client v8.3.2: web3signer validators only, no keystore (the DKG key;
                                     after the migration scenario, also a genesis key)
           │ Web3Signer HTTP API
-failover proxy (development)  ──>  4 eth-mpc-signer nodes (this repository)
+mpc-gateway (docs/gateway.md)  ──>  4 eth-mpc-signer nodes (this repository)
 ```
 
 1. Done: the Web3Signer API, `POST /api/v1/eth2/sign/{identifier}` and
@@ -95,9 +95,11 @@ failover proxy (development)  ──>  4 eth-mpc-signer nodes (this repository)
    signs its one deposit message (`DEPOSIT`, behind `--enable-deposit-signing`), and the deposit
    goes through the deposit contract.
 4. Done: the devnet (`integration/ethereum`, [ethereum-devnet.md](ethereum-devnet.md)). A real
-   Lighthouse validator client performs duties with the MPC network as its only signer, through a
-   development failover proxy. The run also covers a keyholder offline, a coordinator failure and
-   a coordinator crash mid-request, with acceptance checked in the beacon state.
+   Lighthouse validator client performs duties with the MPC network as its only signer, through
+   the gateway ([gateway.md](gateway.md): hedged failover, each signature checked, attested nodes
+   only); runs before 2026-11-11 used a development failover proxy. The run also covers a keyholder
+   offline, a coordinator failure and a coordinator crash mid-request, with acceptance checked in
+   the beacon state.
 5. Done: import of an existing validator key ([key-import.md](key-import.md)). An offline trusted
    dealer splits an EIP-2335 keystore into the network's sharing; the key is registered,
    installed, given its previous signer's EIP-3076 history and activated through consensus. The

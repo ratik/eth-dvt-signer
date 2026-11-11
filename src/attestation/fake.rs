@@ -381,9 +381,11 @@ async fn control(
             *value = new.to_string();
         }
     }
-    Ok(json!({"instance": name, "rtmr1": vm.rtmr1, "rtmr2": vm.rtmr2, "rtmr3": vm.rtmr3,
+    Ok(
+        json!({"instance": name, "rtmr1": vm.rtmr1, "rtmr2": vm.rtmr2, "rtmr3": vm.rtmr3,
         "dbgstat": vm.dbgstat})
-    .to_string())
+        .to_string(),
+    )
 }
 
 async fn admit(State(inner): State<Arc<Mutex<Inner>>>, Json(request): Json<Value>) -> Reply {
@@ -391,10 +393,15 @@ async fn admit(State(inner): State<Arc<Mutex<Inner>>>, Json(request): Json<Value
         .as_array()
         .ok_or((StatusCode::BAD_REQUEST, "images: a list".to_string()))?
         .iter()
-        .map(|image| match (image["rtmr1"].as_str(), image["rtmr2"].as_str()) {
-            (Some(rtmr1), Some(rtmr2)) => Ok((rtmr1.to_string(), rtmr2.to_string())),
-            _ => Err((StatusCode::BAD_REQUEST, "each image: rtmr1 and rtmr2".to_string())),
-        })
+        .map(
+            |image| match (image["rtmr1"].as_str(), image["rtmr2"].as_str()) {
+                (Some(rtmr1), Some(rtmr2)) => Ok((rtmr1.to_string(), rtmr2.to_string())),
+                _ => Err((
+                    StatusCode::BAD_REQUEST,
+                    "each image: rtmr1 and rtmr2".to_string(),
+                )),
+            },
+        )
         .collect::<Result<Vec<_>, _>>()?;
     inner.lock().unwrap().admitted = images.clone();
     Ok(json!({"admitted": images

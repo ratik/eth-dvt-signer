@@ -81,6 +81,9 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", 
 rustls-pki-types = { version = "1.15", features = ["std"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["alloc"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
+# The gateway's metrics (`gateway`, `mpc-gateway`, docs/gateway.md): already in the tree through
+# commonware-runtime.
+prometheus-client = "0.25"
 
 [dev-dependencies]
 # Reference BLS implementation of Ethereum consensus clients (already used by commonware).

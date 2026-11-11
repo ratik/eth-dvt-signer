@@ -34,7 +34,7 @@ use commonware_utils::{
 use eth_mpc_signer::{
     attestation::{Attester, Keys, Statement},
     engine::{self, Channels},
-    eth::horizon::{Horizon, Network},
+    eth::horizon::Horizon,
     executor::Stop,
     import::envelope::ShareKey,
     peers::Peers,
@@ -248,37 +248,8 @@ struct Args {
     #[arg(long)]
     approved_reshares: Option<PathBuf>,
 
-    /// The Ethereum network whose clock bounds the duties this node admits and signs, and whose
-    /// fork schedule their `fork_info` must follow (`mainnet` or `hoodi`): no duty for a slot
-    /// that has not started, or an epoch too far ahead, or under another fork's domain
-    /// (`docs/ethereum-signing.md`, time horizon and fork schedule). Without a network (this
-    /// flag, or the `--eth-genesis-*` and `--eth-fork-schedule` flags of another one) the node
-    /// signs no duty.
-    #[arg(long, conflicts_with = "eth_genesis_time")]
-    eth_network: Option<String>,
-
-    /// Another network's genesis time (unix seconds), with `--eth-seconds-per-slot`,
-    /// `--eth-genesis-validators-root` and `--eth-fork-schedule`: a devnet.
-    #[arg(
-        long,
-        requires_all = ["eth_seconds_per_slot", "eth_genesis_validators_root", "eth_fork_schedule"]
-    )]
-    eth_genesis_time: Option<u64>,
-
-    #[arg(long, requires = "eth_genesis_time")]
-    eth_seconds_per_slot: Option<u64>,
-
-    #[arg(long, requires = "eth_genesis_time")]
-    eth_genesis_validators_root: Option<String>,
-
-    /// Another network's fork schedule: `phase0=0x<version>@0,altair=0x<version>@<epoch>,...`,
-    /// every fork it has scheduled, in order (`phase0` to `gloas`).
-    #[arg(long, requires = "eth_genesis_time")]
-    eth_fork_schedule: Option<String>,
-
-    /// Another network's slots per epoch: only the mainnet preset's 32 is supported.
-    #[arg(long, requires = "eth_genesis_time", default_value_t = 32)]
-    eth_slots_per_epoch: u64,
+    #[command(flatten)]
+    eth: eth_mpc_signer::eth::network::NetworkArgs,
 
     /// The approvers of protected operations (`docs/administration.md`): a JSON file
     /// `{"threshold": M, "approvers": ["0x<ed25519 public key>", ...]}`, the same on every node.
@@ -544,7 +515,7 @@ fn main() {
         Ipv4Addr::LOCALHOST,
         args.http_port + u16::try_from(args.id).expect("id too large"),
     ));
-    let horizon = match network(&args) {
+    let horizon = match args.eth.network() {
         Ok(network) => {
             match &network {
                 None => {
@@ -822,43 +793,4 @@ fn main() {
             }
         }
     });
-}
-
-/// The Ethereum network of the command line, if any.
-fn network(args: &Args) -> Result<Option<Network>, String> {
-    if let Some(name) = &args.eth_network {
-        return Network::named(name)
-            .map(Some)
-            .ok_or(format!("unknown Ethereum network {name} (mainnet, hoodi)"));
-    }
-    let Some(genesis_time) = args.eth_genesis_time else {
-        return Ok(None);
-    };
-    let seconds_per_slot = args
-        .eth_seconds_per_slot
-        .filter(|seconds| *seconds > 0)
-        .ok_or("--eth-seconds-per-slot must be above 0")?;
-    let root = args.eth_genesis_validators_root.as_deref().unwrap_or("");
-    let genesis_validators_root = hex::decode(root.strip_prefix("0x").unwrap_or(root))
-        .ok()
-        .and_then(|bytes| bytes.try_into().ok())
-        .ok_or("--eth-genesis-validators-root must be 32 bytes of hex")?;
-    let schedule = args
-        .eth_fork_schedule
-        .as_deref()
-        .ok_or("another network needs its fork schedule (--eth-fork-schedule)")?;
-    let forks =
-        Network::parse_schedule(schedule).map_err(|err| format!("--eth-fork-schedule: {err}"))?;
-    let network = Network {
-        genesis_time,
-        seconds_per_slot,
-        slots_per_epoch: args.eth_slots_per_epoch,
-        genesis_validators_root,
-        // Read once, for the life of the process.
-        forks: Vec::leak(forks),
-    };
-    network
-        .validate()
-        .map_err(|err| format!("--eth-fork-schedule: {err}"))?;
-    Ok(Some(network))
 }

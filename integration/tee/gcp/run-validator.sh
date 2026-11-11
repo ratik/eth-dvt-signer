@@ -12,9 +12,10 @@
 # The VMs exist only while it runs: `gcp.sh down` deletes them, their disks and addresses on any
 # exit, with the integration environment. The run's files stay in $IT_HOME/runs/<UTC time>/.
 #
-# The validator client, its beacon node and the failover proxy run on this host: each signing
-# request crosses the Internet to europe-west4 (the nodes admit this host's address only), over a
-# kept TLS 1.3 connection, through a loopback bridge per node (it.py `bridges_start`).
+# The validator client, its beacon node and the gateway (mpc-gateway, docs/gateway.md) run on this
+# host: each signing request crosses the Internet to europe-west4 (the nodes admit this host's
+# address only), over a kept mTLS 1.3 connection pinned to the node's attested key. The loopback
+# bridges (it.py `bridges_start`) carry only the driver's own calls.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 eth="$(cd "$here/../../ethereum/scripts" && pwd)"
@@ -34,9 +35,13 @@ cleanup() {
 	touch "$work/gcp/stop-logs"
 	[ -z "$logs_pid" ] || wait "$logs_pid" || true
 	"$eth/env.sh" exec python3 /it/src/integration/ethereum/scripts/it.py stop || true
-	[ ! -e "$work/gcp/run-label" ] || bash "$here/run.sh" down "$IT_WORK/gcp" || true
+	if [ -e "$work/gcp/run-label" ] && ! bash "$here/run.sh" down "$IT_WORK/gcp"; then
+		log "GCP TEARDOWN FAILED: VMs, disks or addresses may be left; again: run.sh down $IT_WORK/gcp"
+		status=1
+	fi
 	"$eth/env.sh" down || true
 	log "run $stamp: exit $status, report and logs in $work"
+	exit "$status"
 }
 trap cleanup EXIT
 

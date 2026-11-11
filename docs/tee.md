@@ -261,8 +261,9 @@ test host, not in the repository (`project.env.example`).
 - **`run-validator.sh IMAGE [EPOCHS]`** (on the test host) runs Lighthouse's validator client on
   the integration devnet (docs/ethereum-devnet.md), signed by four sealed nodes on GCP:
   - `gcp.sh up` boots them with the devnet's flags;
-  - the failover proxy reaches them over mTLS through a loopback bridge per node, on kept TLS 1.3
-    connections;
+  - Lighthouse signs through `mpc-gateway` (docs/gateway.md), which reaches their mTLS API
+    directly, attests each node against the run's policy (Google's key set) and checks every
+    signature; per-node loopback bridges serve the driver's own calls (DKG, activation, deposit);
   - the DKG key goes through its whole lifecycle, then EPOCHS epochs of duties;
   - `gcp.json` splits the latency between the network and the nodes.
 - **VM lifetime.** VMs, their disks and addresses exist only during a command: a `trap` deletes
@@ -296,6 +297,22 @@ test host, not in the repository (`project.env.example`).
     signatures p50 5.3 ms).
   - The deadline is an attestation a third into the slot: 1.33 s on this devnet, 4 s on
     mainnet.
+- **`run-validator.sh` through `mpc-gateway`** (2026-11-11, run `20261111T190732Z`, image version
+  2, 10 epochs):
+  - **Attestation.** The gateway attested all four nodes (Google's key set; RTMR1, RTMR2 and each
+    node's RTMR3; the served TLS key) and used them all. It checked them again every 5 minutes
+    and every check passed. Each check showed on the nodes' consoles as a new token service,
+    about 301 s apart.
+  - **Duties.** 59 signing requests, all signed and checked: no hedge, no retry, no invalid
+    signature.
+  - **Latency end to end** (Lighthouse's 54 requests): p50 50.3 ms, p95 95.2 ms, max 98.8 ms:
+    - the coordinator: p50 31.3 ms;
+    - the network: p50 13.6 ms, p95 62.6 ms;
+    - the gateway itself (signing root and signature check): p50 4.3 ms, max 6.7 ms.
+    The run through the proxy had p50 47.5 ms.
+  - **Teardown.** The run's own teardown failed: `gcp.sh down` read its third argument for the
+    directory. The VMs ran 8 minutes longer, until `run.sh down` deleted them by hand. Fixed: a
+    failed teardown now fails the run.
 
 ## Tests
 

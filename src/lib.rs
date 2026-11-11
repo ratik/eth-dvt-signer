@@ -14,6 +14,7 @@ pub mod executor;
 #[cfg(any(test, feature = "fuzzing"))]
 #[doc(hidden)]
 pub mod fuzzing;
+pub mod gateway;
 pub mod hooks;
 pub mod import;
 pub mod peers;

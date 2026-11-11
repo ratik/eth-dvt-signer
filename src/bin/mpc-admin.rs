@@ -1905,56 +1905,6 @@ fn anchor_acknowledge(
 // ---------------------------------------------------------------------------------------------
 // TEE nodes (docs/tee.md): the mTLS API and attestation.
 
-/// Accepts any server certificate whose key signs the handshake: for `attest`, which then
-/// requires the key to be the one the node's attestation names.
-#[derive(Debug)]
-struct AttestedLater(Arc<rustls::crypto::CryptoProvider>);
-
-impl rustls::client::danger::ServerCertVerifier for AttestedLater {
-    fn verify_server_cert(
-        &self,
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &[rustls::pki_types::CertificateDer<'_>],
-        _: &rustls::pki_types::ServerName<'_>,
-        _: &[u8],
-        _: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        certificate: &rustls::pki_types::CertificateDer<'_>,
-        signature: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            certificate,
-            signature,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        certificate: &rustls::pki_types::CertificateDer<'_>,
-        signature: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            certificate,
-            signature,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
-}
-
 /// The client of `https://` nodes: the operator's certificate, and the node CAs of
 /// `--tls-node-ca` (or, for `attest`, the attested key checked after each answer).
 fn tls_client(args: &Args, attesting: bool) -> Result<Option<Arc<rustls::ClientConfig>>, String> {
@@ -1973,13 +1923,14 @@ fn tls_client(args: &Args, attesting: bool) -> Result<Option<Arc<rustls::ClientC
     let key = PrivateKeyDer::from_pem_slice(&read(key)?)
         .map_err(|err| format!("{}: {err}", key.display()))?;
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|err| err.to_string())?;
     let builder = match (&args.tls_node_ca, attesting) {
+        // `attest` then requires the key that answered to be the attested one.
         (_, true) => builder
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AttestedLater(provider))),
+            .with_custom_certificate_verifier(eth_mpc_signer::tls::AnyServerKey::new()),
         (Some(path), false) => {
             let mut roots = rustls::RootCertStore::empty();
             for certificate in CertificateDer::pem_slice_iter(&read(path)?) {
