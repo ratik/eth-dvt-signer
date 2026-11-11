@@ -261,7 +261,15 @@ fn tee_1_sealed_nodes_attest_their_keys_sign_over_mtls_and_keep_nothing_in_the_c
     for statement in &statements {
         assert_eq!(statement.vault, "gcp-tdx");
         let evidence = statement.evidence.as_ref().expect("evidence");
-        let verified = verify(evidence, &gcp.policy(), &gcp.jwks(), b"", now()).unwrap();
+        let verified = verify(
+            evidence,
+            &gcp.policy(),
+            &gcp.jwks(),
+            b"",
+            now(),
+            Some(statement.index),
+        )
+        .unwrap();
         assert_eq!(verified.keys, statement.keys);
         assert_eq!(
             verified.instance,
@@ -286,7 +294,7 @@ fn tee_1_sealed_nodes_attest_their_keys_sign_over_mtls_and_keep_nothing_in_the_c
     assert_eq!(status, 200, "{text}");
     let statement: Statement = serde_json::from_str(&text).unwrap();
     let evidence = statement.evidence.as_ref().unwrap();
-    verify(evidence, &gcp.policy(), &gcp.jwks(), &nonce, now()).unwrap();
+    verify(evidence, &gcp.policy(), &gcp.jwks(), &nonce, now(), Some(1)).unwrap();
     assert_eq!(statement.keys, statements[1].keys);
     let attested_leaf =
         CertificateDer::pem_slice_iter(statement.tls_certificate.as_deref().unwrap().as_bytes())
@@ -299,7 +307,17 @@ fn tee_1_sealed_nodes_attest_their_keys_sign_over_mtls_and_keep_nothing_in_the_c
         "the served certificate is the attested one"
     );
     // Another nonce does not verify.
-    assert!(verify(evidence, &gcp.policy(), &gcp.jwks(), &[0x5b; 32], now()).is_err());
+    assert!(
+        verify(
+            evidence,
+            &gcp.policy(),
+            &gcp.jwks(),
+            &[0x5b; 32],
+            now(),
+            Some(1)
+        )
+        .is_err()
+    );
 
     // DKG, activation and a duty signed over mTLS.
     let key = validator(&network);
@@ -686,4 +704,96 @@ fn tee_3_shares_are_encrypted_only_to_keys_a_sealed_node_attested() {
                 .is_some_and(|ready| ready.len() == NODES)
         });
     }
+}
+
+/// An image upgrade (docs/tee.md, "Upgrading the image"): while the provider admits the old and
+/// the new image, nodes move to the new one on their own VMs (same instance, same disk), one at a
+/// time, unseal the same vault and sign; clients attest them under a policy naming both images.
+/// Once the old image is retired, a node back on it no longer gets its key.
+#[test]
+fn tee_6_an_image_upgrade_keeps_the_vault_and_retires_the_old_image() {
+    use eth_mpc_signer::attestation::{testing::Vm, verify::Policy};
+    let (network, gcp, operator, statements) = network(|_| true);
+    let key = validator(&network);
+    let release = Vm::new("release");
+    let old = (release.rtmr1, release.rtmr2);
+    let new = ("c3".repeat(48), "d4".repeat(48));
+    let report = |id: usize, (rtmr1, rtmr2): &(String, String)| {
+        let (rtmr1, rtmr2) = (rtmr1.clone(), rtmr2.clone());
+        gcp.set_vm(&format!("mpc-tee-{id}"), move |vm| {
+            vm.rtmr1 = rtmr1;
+            vm.rtmr2 = rtmr2;
+        });
+    };
+
+    // Both images admitted: nodes 2 and 3 move to the new one, one at a time.
+    gcp.admit(&[old.clone(), new.clone()]);
+    for (id, target) in [(2usize, 2u64), (3, 4)] {
+        report(id, &new);
+        network.restart_node(id);
+        network.wait_for_ready(&[id]);
+        signs(
+            &network,
+            id,
+            &statements[id],
+            &operator,
+            &key,
+            &attestation(target - 1, target, id as u8),
+        );
+    }
+
+    // A client whose policy names both images attests node 3 on the new one, with its keys; a
+    // policy of the old image alone refuses it.
+    let nonce = [0x6c; 32];
+    let (status, text, _) = http::request_tls(
+        network.https_addr(3),
+        Operator::client(&statements[3], Some(&operator)),
+        "GET",
+        &format!("/attestation?nonce=0x{}", hex::encode(nonce)),
+        None,
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    assert_eq!(status, 200, "{text}");
+    let statement: Statement = serde_json::from_str(&text).unwrap();
+    assert_eq!(statement.keys, statements[3].keys);
+    let evidence = statement.evidence.as_ref().unwrap();
+    let both = gcp.policy();
+    assert_eq!(both.rtmr1, vec![old.0.clone(), new.0.clone()]);
+    let verified = verify(evidence, &both, &gcp.jwks(), &nonce, now(), Some(3)).unwrap();
+    assert_eq!(verified.rtmr1, new.0);
+    let old_only = Policy {
+        rtmr1: vec![old.0.clone()],
+        rtmr2: vec![old.1.clone()],
+        ..both
+    };
+    assert!(verify(evidence, &old_only, &gcp.jwks(), &nonce, now(), Some(3)).is_err());
+
+    // The old image retired: node 2 back on it is refused its key (STS); on the new one it
+    // unseals and signs.
+    gcp.admit(std::slice::from_ref(&new));
+    report(2, &old);
+    let refusals = gcp.refusals().len();
+    network.stop_node(2);
+    network.start_node(2);
+    assert_eq!(network.wait_exit(2).code(), Some(1), "{}", network.log(2));
+    let node_2 = eth_mpc_signer::attestation::testing::instance_id("mpc-tee-2");
+    assert!(
+        gcp.refusals()[refusals..]
+            .iter()
+            .any(|refusal| refusal.starts_with("sts") && refusal.contains(&node_2)),
+        "{:?}",
+        gcp.refusals()
+    );
+    report(2, &new);
+    network.start_node(2);
+    network.wait_for_ready(&[2]);
+    signs(
+        &network,
+        2,
+        &statements[2],
+        &operator,
+        &key,
+        &attestation(5, 6, 2),
+    );
 }

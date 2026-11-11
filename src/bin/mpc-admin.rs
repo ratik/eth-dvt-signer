@@ -140,6 +140,10 @@ enum Command {
         #[arg(long)]
         certificates: Option<PathBuf>,
     },
+    /// Offline: the RTMR3 a sealed node's token carries when it runs with the configuration in
+    /// DIR (the files of its instance metadata `mpc-<name>`, as the image reads them), for the
+    /// policy's `rtmr3` (docs/tee.md). Prints the configuration's digest and RTMR3.
+    ConfigRtmr3 { dir: PathBuf },
     /// Offline: create a new approver key (owner-only file) and print its public key. Never
     /// overwrites a file.
     ApproverKey {
@@ -366,6 +370,15 @@ fn main() -> ExitCode {
                 certificates.as_deref(),
             )
         }),
+        Command::ConfigRtmr3 { dir } => {
+            use eth_mpc_signer::attestation::config;
+            config::read_dir(&dir)
+                .and_then(|files| config::digest_of(&files))
+                .map(|digest| {
+                    println!("digest {}", hex::encode(digest));
+                    println!("rtmr3 {}", hex::encode(config::rtmr3(&digest)));
+                })
+        }
         Command::ApproverKey { output } => approver_key(&output),
         Command::ApproverPublicKey { key } => {
             load_key(&key).map(|key| println!("{}", format_key(&key.public_key())))
@@ -2069,7 +2082,9 @@ fn attest(
                 "no evidence (vault {}): pass --allow-unattested to accept it",
                 statement.vault
             )),
-            Some(evidence) => verify(evidence, &policy, &jwks, &nonce, now).map(Some),
+            Some(evidence) => {
+                verify(evidence, &policy, &jwks, &nonce, now, Some(statement.index)).map(Some)
+            }
         }
         .and_then(|verified| {
             // Over mTLS, the key that answered must be the attested one.
@@ -2088,13 +2103,19 @@ fn attest(
             Ok(verified) => {
                 match &verified {
                     Some(verified) => println!(
-                        "{}: node {} attested ({}, instance {}, rtmr1 {}…, rtmr2 {}…), identity {}",
+                        "{}: node {} attested ({}, instance {}, rtmr1 {}…, rtmr2 {}…, rtmr3 {}…{}), identity {}",
                         node.name,
                         statement.index,
                         statement.vault,
                         verified.instance.as_deref().unwrap_or("?"),
                         &verified.rtmr1[..verified.rtmr1.len().min(12)],
                         &verified.rtmr2[..verified.rtmr2.len().min(12)],
+                        &verified.rtmr3[..verified.rtmr3.len().min(12)],
+                        if policy.rtmr3.is_some() {
+                            ", its configuration"
+                        } else {
+                            ", configuration not checked"
+                        },
                         statement.keys.identity
                     ),
                     None => println!(
@@ -2104,6 +2125,7 @@ fn attest(
                 }
                 if let Some(share_key) = &statement.keys.share_encryption_key {
                     members.push(json!({
+                        "index": statement.index,
                         "identity": statement.keys.identity,
                         "share_encryption_key": share_key,
                         "evidence": statement.evidence,

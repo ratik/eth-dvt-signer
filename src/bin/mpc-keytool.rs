@@ -101,6 +101,10 @@ struct CommitteeFile {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CommitteeMember {
+    /// The node's index (`mpc-admin attest` writes it): checks its configuration when the policy
+    /// pins each node's (`rtmr3`).
+    #[serde(default)]
+    index: Option<u64>,
     /// ed25519 consensus identity (`GET /identity` of the node).
     identity: String,
     /// X25519 share-encryption public key (`mpc-keytool share-key`).
@@ -143,7 +147,7 @@ impl Attestation {
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|err| err.to_string())?
             .as_secs();
-        let verified = verify(evidence, &self.policy, &self.jwks, &nonce, now)
+        let verified = verify(evidence, &self.policy, &self.jwks, &nonce, now, member.index)
             .map_err(|err| format!("{}: {err}", member.identity))?;
         let same = |a: &str, b: &str| unhex(a).is_some() && unhex(a) == unhex(b);
         if !same(&verified.keys.identity, &member.identity)

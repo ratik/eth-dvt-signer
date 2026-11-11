@@ -17,6 +17,7 @@ use aws_lc_rs::signature::{RSA_PKCS1_2048_8192_SHA256, RsaPublicKeyComponents};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 /// The issuer of Google Cloud Attestation tokens.
 pub const GOOGLE_ISSUER: &str = "https://confidentialcomputing.googleapis.com";
@@ -46,6 +47,12 @@ pub struct Policy {
     /// ID), if set.
     #[serde(default)]
     pub project_number: Option<String>,
+    /// Each node's allowed `tdx.rtmr3`, by node index: the configuration the operator wrote for
+    /// it, as its image measures it (`mpc-admin config-rtmr3`, [super::config]). If set, a node
+    /// it does not name is refused, and so is a node whose configuration differs (a host that
+    /// rewrote the instance metadata). Unset, the configuration is not checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtmr3: Option<BTreeMap<u64, Vec<String>>>,
     /// How old a token may be (seconds).
     pub max_age_seconds: u64,
 }
@@ -55,6 +62,14 @@ impl Policy {
         let policy: Self = serde_json::from_str(text).map_err(|err| err.to_string())?;
         if policy.rtmr1.is_empty() || policy.rtmr2.is_empty() {
             return Err("the policy allows no measurement (rtmr1, rtmr2)".into());
+        }
+        if let Some((node, _)) = policy
+            .rtmr3
+            .iter()
+            .flatten()
+            .find(|(_, allowed)| allowed.is_empty())
+        {
+            return Err(format!("the policy allows no configuration (rtmr3) for node {node}"));
         }
         Ok(policy)
     }
@@ -119,18 +134,22 @@ pub struct Verified {
     pub keys: Keys,
     pub rtmr1: String,
     pub rtmr2: String,
+    /// The configuration's measurement (`tdx.rtmr3`; empty if the token has none).
+    pub rtmr3: String,
     /// `submods.gce.instance_id`, if present (a TDX token names no instance name).
     pub instance: Option<String>,
     pub issued_at: u64,
 }
 
-/// Check `evidence` for the client's `nonce` at `now` (unix seconds).
+/// Check `evidence` for the client's `nonce` at `now` (unix seconds), from node `node` (its index;
+/// needed when the policy pins each node's configuration, [Policy::rtmr3]).
 pub fn verify(
     evidence: &Evidence,
     policy: &Policy,
     jwks: &Jwks,
     nonce: &[u8],
     now: u64,
+    node: Option<u64>,
 ) -> Result<Verified, String> {
     if evidence.platform != GCP_TDX {
         return Err(format!("unsupported platform {}", evidence.platform));
@@ -208,6 +227,23 @@ pub fn verify(
     };
     let rtmr1 = measurement("rtmr1", &policy.rtmr1)?;
     let rtmr2 = measurement("rtmr2", &policy.rtmr2)?;
+    let rtmr3 = match &policy.rtmr3 {
+        None => tdx
+            .get("rtmr3")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        Some(configurations) => {
+            let node = node.ok_or(
+                "the policy pins each node's configuration (rtmr3), and the node's index is unknown",
+            )?;
+            let allowed = configurations.get(&node).ok_or_else(|| {
+                format!("the policy names no configuration (rtmr3) for node {node}")
+            })?;
+            measurement("rtmr3", allowed)
+                .map_err(|err| format!("node {node} runs another configuration: {err}"))?
+        }
+    };
     let gce = claims.get("submods").and_then(|submods| submods.get("gce"));
     if let Some(project) = &policy.project_number {
         let actual = gce
@@ -225,6 +261,7 @@ pub fn verify(
         keys: evidence.keys.clone(),
         rtmr1,
         rtmr2,
+        rtmr3,
         instance,
         issued_at,
     })

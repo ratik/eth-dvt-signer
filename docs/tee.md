@@ -54,11 +54,20 @@ condition:
   outside TDX's model.
 - **The rest of the state is in the clear.** The host can still rewrite one node's records (L-30,
   tolerated by `f = 1`) or roll its disk back (the restart floor and the anchor).
-- **Configuration.** The configuration (flags, peers file) comes from the VM's metadata. The image
-  measures it into RTMR3, which is attested but not part of the key release, because a
-  configuration changes between boots. Every safety-relevant operation stays approver-gated. A
-  sealed node refuses `--allow-missing-consensus-journal` and `--close-epoch-at`: recovering with
-  them needs a debug image, which KMS never releases a key to.
+- **Configuration.** The configuration (flags, peers file, approvers) comes from the VM's
+  metadata. It is not part of the key release, since a configuration changes between boots. The
+  image measures it into RTMR3, so a host can still make KMS release a node's key to that node
+  under a configuration it rewrote. Clients refuse such a node when their policy pins each node's
+  configuration (`rtmr3`, below): `mpc-admin attest`, `mpc-keytool split`. Every safety-relevant
+  operation stays approver-gated. A sealed node refuses `--allow-missing-consensus-journal` and
+  `--close-epoch-at`: recovering with them needs a debug image, which KMS never releases a key
+  to.
+- **Hard resets.** The vTPM counts an unorderly shutdown (a hard reset, a host failure) as a
+  failed authorization. After three, it locks out the attestation key gotpm quotes with
+  (dictionary-attack lockout), and the node can neither attest nor unseal. Observed on GCE
+  (2026-11-10): the lockout lifted about 15.5 minutes after the third reset, and the node then
+  unsealed on its own: availability of that node only, which `f = 1` tolerates. Restart sealed
+  nodes gracefully (`gcloud compute instances stop`, then `start`), not with `reset`.
 - **Old shares.** An old sealed share restored from a disk snapshot stays inside the vault. It
   cannot leave it, so erasure after a reshare holds against copying.
 - **Client roles.** Over mTLS they are not split: any certificate of the operator's CA gets the
@@ -136,12 +145,40 @@ condition:
 {"issuer": "https://confidentialcomputing.googleapis.com", "audience": "eth-mpc-signer",
  "hwmodel": "GCP_INTEL_TDX", "dbgstat": "disabled-since-boot",
  "rtmr1": ["<GRUB's and the release UKI's>"], "rtmr2": ["<GRUB's commands, the UKI, its command line>"],
- "project_number": "NUMBER", "max_age_seconds": 600}
+ "project_number": "NUMBER",
+ "rtmr3": {"0": ["<node 0's configuration>"], "1": ["…"], "2": ["…"], "3": ["…"]},
+ "max_age_seconds": 600}
 ```
 
-The measurements are the ones tokens carry, exactly. The image build (`integration/tee`) predicts
-them for GCE, and `gcp.sh measure` confirms them against a real token. For an offline `split` of
-evidence older than `max_age_seconds`, re-attest or raise it.
+- **`rtmr1`, `rtmr2`.** The measurements are the ones tokens carry, exactly. The image build
+  (`integration/tee`) predicts them for GCE, and `gcp.sh measure` confirms them against a real
+  token. During an upgrade, the lists name the old and the new image.
+- **`rtmr3`.** Each node's configuration, by node index: the files written to its instance
+  metadata, as its image measures them. `mpc-admin config-rtmr3 DIR` computes it from those files
+  (`args`, `peers`, `client-ca`, `approvers`).
+  - A node it does not name is refused, and so is a node whose RTMR3 differs (a host that rewrote
+    its metadata).
+  - The committee `mpc-admin attest` writes carries each node's index, for `split`.
+  - Without `rtmr3`, the configuration is reported, not checked.
+- **Offline `split`.** For evidence older than `max_age_seconds`, re-attest or raise it.
+
+## Upgrading the image
+
+A node keeps its vault across images: the vault's data key is wrapped by its KMS key, which the
+provider releases to any admitted image on that node's VM. An upgrade therefore admits two images
+for a while:
+
+1. **Measure the new image** (`gcp.sh measure NEW`) and **admit both** (`gcp.sh admit OLD NEW`).
+   The provider's condition names each image's RTMR1 and RTMR2 together. The clients' policy
+   names both images' measurements.
+2. **Move each node, one at a time,** on its own VM: stop it, replace its boot disk with one of
+   the new image, start it. The instance ID stays, so its key's binding holds; the data disk
+   stays, so does its state. It unseals the same vault, so its keys, its TLS certificate and the
+   node CA that clients pin do not change. Check it signs before moving the next one.
+3. **Retire the old image** (`gcp.sh admit NEW`). A node that boots the old image is refused its
+   key from then on.
+
+A node's configuration does not change in an upgrade, so neither does its RTMR3.
 
 ## The `gcp-tdx` platform
 
@@ -198,18 +235,29 @@ test host, not in the repository (`project.env.example`).
   `integration/tee`.
 - **`measure IMAGE`** boots one VM in measure mode. From its token and TDX event log, it replays
   the RTMRs and checks them against the token and the build's measurements (GRUB and our UKI in
-  RTMR1; GRUB's commands, the UKI and our command line in RTMR2; Google's GRUB rule). Then the
-  provider admits exactly that RTMR1 and RTMR2, and the clients' policy is written.
+  RTMR1; GRUB's commands, the UKI and our command line in RTMR2; Google's GRUB rule). It keeps the
+  image's RTMR1 and RTMR2 and admits nothing.
+- **`admit IMAGE...`** makes the provider admit exactly these measured images, and writes the
+  clients' policy naming them (`admitted.policy.json`). A run adds each node's configuration
+  (`rtmr3`) to it.
   On 2026-11-10 (image of run `20261110T182701Z`), the token's RTMR1 and RTMR2 were the ones the
   build predicted, and the event log replayed to all four RTMRs.
 - **`run IMAGE DEBUG`** runs four sealed nodes:
   - vaults made on the VMs, with Google's evidence;
   - the cluster unsealed through Google's STS and KMS;
-  - `mpc-admin attest` against Google's key set;
+  - `mpc-admin attest` against Google's key set, each node's configuration pinned;
+  - a host's rewrite of node 2's configuration: the node unseals, and `attest` refuses it, and only
+    it;
   - DKG, activation, a duty over mTLS;
   - a reset that unseals again;
   - refusals: node 3's disk under the debug image (its key bound to that VM: STS refuses the
     measurements), and on another VM with the release image (KMS refuses: another instance ID).
+- **`upgrade OLD NEW`** runs the upgrade above on four sealed nodes:
+  - the cluster and a validator on OLD;
+  - each node moved to NEW, signing after each move;
+  - `attest` under both images, then under NEW alone;
+  - OLD retired: a reset still unseals; a node put back on OLD is refused its key while the others
+    sign.
 - **`run-validator.sh IMAGE [EPOCHS]`** (on the test host) runs Lighthouse's validator client on
   the integration devnet (docs/ethereum-devnet.md), signed by four sealed nodes on GCP:
   - `gcp.sh up` boots them with the devnet's flags;
@@ -222,10 +270,22 @@ test host, not in the repository (`project.env.example`).
   again at the end.
 
 **Results (2026-11-10, image of run `20261110T182701Z`, europe-west4-a, `c3-standard-4`):**
-- **`run`:** 25 of 25 checks. Real vaults and Google tokens; unsealing through STS and KMS;
-  `mpc-admin attest` against Google's key set; DKG, activation and duties over mTLS; a reset that
-  unseals again. STS refuses the debug image on node 3's disk; KMS refuses the release image on
-  another VM.
+- **`run`:** 29 of 29 checks (2026-11-10, run `run-20261110T221338Z`):
+  - real vaults and Google tokens, unsealing through STS and KMS;
+  - `mpc-admin attest` against Google's key set, with each node's configuration (RTMR3) pinned;
+  - node 2 with a rewritten configuration unsealed, and `attest` refused it alone; back on its
+    configuration, it verified again;
+  - DKG, activation and duties over mTLS; a restart that unseals again;
+  - STS refuses the debug image on node 3's disk; KMS refuses the release image on another VM.
+- **`upgrade`:** 39 of 39 checks (run `upgrade-20261110T222858Z`, image `20261110T182701Z` to
+  its version 2, `20261110T212601Z`):
+  - each node moved on its own VM: it unsealed the same vault, kept its share, and signed;
+  - `attest` passed under both images, then under version 2 alone;
+  - with version 2 alone admitted, node 3 back on the old image was refused its key (STS) while
+    the other three signed; back on version 2, it signed.
+  - Version 2's RTMR1 and RTMR2 were the ones its build predicted.
+- **The vTPM lockout** (see the limits above) stopped a first `run`, whose node 2 had three hard
+  resets. The runs now restart nodes gracefully.
 - **`run-validator.sh` (10 epochs, 4 s slots):**
   - Duties: 10 of 10 epochs attested with the correct target and head; 12 blocks signed, all
     canonical; no error or retry.
@@ -243,7 +303,10 @@ test host, not in the repository (`project.env.example`).
   - `vault::tests`: sealing, swaps, other keys, permissions, plain and sealed vaults not mixed;
   - `dkg::secrets::tests`: a sealed store holds no scalar or seed in the clear, opens only with
     its cipher and partition, and refuses clear values;
-  - `attestation::verify::tests`: each check of a token refuses on its own;
+  - `attestation::verify::tests`: each check of a token refuses on its own; a pinned
+    configuration admits each node with its own RTMR3 only;
+  - `attestation::config::tests`: the configuration's digest and RTMR3 are the image's (a vector
+    computed with the image's shell code; on GCP, node 0's matched its token);
   - `tls::tests`: only the operator CA's clients reach the attested key;
   - `peers::tests`.
 - **E2E (`tests/e2e/tee.rs`),** against the fake of Google's attestation, STS and KMS
@@ -260,4 +323,8 @@ test host, not in the repository (`project.env.example`).
   - **TEE-4:** two sealed and two plain nodes run one network.
   - **TEE-5:** the mTLS API refuses no certificate, another CA's, and a client pinning another
     node's CA.
+  - **TEE-6:** an image upgrade:
+    - nodes move to the new image while both are admitted, unseal the same vault and sign;
+    - a policy naming both images attests them, one naming the old image alone refuses them;
+    - once the old image is retired, a node back on it is refused its key.
 - **Fuzzing:** the `peers` and `attestation` targets.

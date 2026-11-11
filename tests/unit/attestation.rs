@@ -22,6 +22,7 @@ fn policy(vm: &Vm) -> Policy {
         rtmr1: vec![vm.rtmr1.clone()],
         rtmr2: vec![vm.rtmr2.clone()],
         project_number: Some(vm.project_number.clone()),
+        rtmr3: None,
         max_age_seconds: 600,
     }
 }
@@ -58,6 +59,7 @@ fn a_token_over_the_keys_and_nonce_verifies() {
         &issuer.jwks(),
         b"client nonce",
         NOW + 5,
+        Some(0),
     )
     .unwrap();
     assert_eq!(verified.keys, keys());
@@ -71,6 +73,7 @@ fn a_token_over_the_keys_and_nonce_verifies() {
         &issuer.jwks(),
         b"",
         NOW,
+        Some(0),
     )
     .unwrap();
 }
@@ -81,7 +84,7 @@ fn every_check_refuses_on_its_own() {
     let vm = Vm::new("mpc-tee-0");
     let nonce = b"client nonce";
     let refused = |evidence: Evidence, policy: &Policy, now: u64| {
-        verify(&evidence, policy, &issuer.jwks(), nonce, now).unwrap_err()
+        verify(&evidence, policy, &issuer.jwks(), nonce, now, Some(0)).unwrap_err()
     };
     let edited = |edit: fn(&mut Value)| evidence(&issuer, &vm, &keys(), nonce, edit);
 
@@ -111,7 +114,7 @@ fn every_check_refuses_on_its_own() {
     let mut other_keys = fresh.clone();
     other_keys.keys.share_encryption_key = Some(hex0x(&[8u8; 32]));
     refused(other_keys, &policy(&vm), NOW);
-    assert!(verify(&fresh, &policy(&vm), &issuer.jwks(), b"other", NOW).is_err());
+    assert!(verify(&fresh, &policy(&vm), &issuer.jwks(), b"other", NOW, Some(0)).is_err());
     let mut platform = fresh.clone();
     platform.platform = "other".into();
     refused(platform, &policy(&vm), NOW);
@@ -136,4 +139,51 @@ fn a_policy_must_allow_measurements() {
         Policy::from_json(&serde_json::to_string(&good).unwrap()).unwrap(),
         good
     );
+}
+
+/// A policy that pins each node's configuration (`rtmr3`) admits a node only with the RTMR3 of
+/// the configuration written for its index.
+#[test]
+fn a_pinned_configuration_is_checked_per_node() {
+    let issuer = Issuer::new("k1");
+    let mut vm = Vm::new("mpc-tee-0");
+    vm.rtmr3 = "c0".repeat(48);
+    let nonce = b"client nonce";
+    let fresh = evidence(&issuer, &vm, &keys(), nonce, |_| {});
+    let pinned = |configurations: &[(u64, &str)]| Policy {
+        rtmr3: Some(
+            configurations
+                .iter()
+                .map(|(node, rtmr3)| (*node, vec![rtmr3.to_string()]))
+                .collect(),
+        ),
+        ..policy(&vm)
+    };
+    let check = |policy: &Policy, node: Option<u64>| {
+        verify(&fresh, policy, &issuer.jwks(), nonce, NOW, node)
+    };
+
+    // Its own configuration, for its index.
+    let ours = pinned(&[(0, &"c0".repeat(48)), (1, &"c1".repeat(48))]);
+    assert_eq!(check(&ours, Some(0)).unwrap().rtmr3, vm.rtmr3);
+    // Another node's configuration, an index the policy does not name, an unknown index.
+    assert!(check(&ours, Some(1)).unwrap_err().contains("another configuration"));
+    assert!(check(&ours, Some(2)).unwrap_err().contains("no configuration"));
+    assert!(check(&ours, None).is_err());
+    // Another configuration than the one written for it (a rewritten instance metadata).
+    assert!(check(&pinned(&[(0, &"d0".repeat(48))]), Some(0)).is_err());
+    // Without `rtmr3`, the configuration is reported, not checked.
+    assert_eq!(check(&policy(&vm), None).unwrap().rtmr3, vm.rtmr3);
+
+    // In a policy file: node indices as keys, at least one value each.
+    let text = |rtmr3: &str| {
+        format!(
+            r#"{{"issuer": "i", "audience": "a", "hwmodel": "h", "dbgstat": "d",
+                "rtmr1": ["01"], "rtmr2": ["02"], "rtmr3": {rtmr3}, "max_age_seconds": 600}}"#
+        )
+    };
+    let parsed = Policy::from_json(&text(r#"{"0": ["aa"], "3": ["bb", "cc"]}"#)).unwrap();
+    assert_eq!(parsed.rtmr3.unwrap()[&3], vec!["bb".to_string(), "cc".to_string()]);
+    assert!(Policy::from_json(&text(r#"{"0": []}"#)).is_err());
+    assert!(Policy::from_json(&text(r#"{"zero": ["aa"]}"#)).is_err());
 }

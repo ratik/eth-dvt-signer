@@ -4,30 +4,33 @@
 #
 # `up` boots the nodes as `run` does (vaults, Google's attestation, STS and KMS, mTLS), with the
 # devnet's flags and the approver set that `it.py gcp-prepare` left in DIR, node 0 accepting the
-# one deposit-signing request. It leaves them running, and writes DIR/nodes.json for the driver's
-# bridges. `gcp.sh down` deletes them (run-validator.sh does on any exit). `logs` copies each
+# one deposit-signing request. It leaves them running, holding the cluster, and writes
+# DIR/nodes.json for the driver's bridges. `gcp.sh down DIR` deletes them and releases the cluster
+# (run-validator.sh does on any exit). `logs` copies each
 # node's serial console into OUT/signer-<i>.log while DIR/stop-logs is absent: the node's log lines
 # without journald's console prefix, as the report reads a local signer's log.
 
 validator_up() {
 	local image="$1" i
 	run="$2"
-	local policy="/it/gcp/images/$image.policy.json"
-	[ -s "$policy" ] || die "no policy for $image: run \`gcp.sh measure $image\` first"
+	admitted "$image" || die "$image is not admitted: run \`gcp.sh admit $image\` first"
 	[ -x "$ADMIN" ] || die "no $ADMIN"
 	[ -s "$run/chain-args" ] && [ -s "$run/approvers.json" ] ||
 		die "no chain-args or approvers.json in $run (it.py gcp-prepare)"
 	mkdir -p "$run/statements" "$run/admin"
 	: >"$run/summary"
 	failed=0
+	hold "$CLUSTER_BUSY"
+	echo "$RUN_VALUE" >"$run/run-label"
 	trap cluster_teardown EXIT
 	log "devnet signers in $run: image $image"
 	operator_certificates
 	printf '%s\n' --enable-deposit-signing >"$run/node-0-args"
 	boot_vaults "$image"
 	boot_sealed "$run/chain-args" "$run/approvers.json"
-	check "mpc-admin attest: Google's evidence and the served TLS key verify on every node" \
-		attest_all "$policy"
+	run_policy "$ADMITTED_POLICY"
+	check "mpc-admin attest: Google's evidence, each node's configuration and the served TLS key verify" \
+		attest_all "$run/policy.json"
 	[ "$failed" -eq 0 ] || die "some checks failed: $run/summary"
 	"$PY" - "$run" "$NODES" <<'PY'
 import json, sys

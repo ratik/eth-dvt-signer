@@ -14,6 +14,7 @@ On the test server (`IT_HOME`, default `~/eth-mpc-it`):
 integration/ethereum/scripts/env.sh tee-qemu        # 4 sealed VMs and 4 control VMs
 TEE_REPRO=0 integration/ethereum/scripts/env.sh tee-qemu   # skip the second build
 TEE_GOTPM=0 integration/ethereum/scripts/env.sh tee-qemu   # no gotpm (no network; no GCE token)
+TEE_IMAGE_VERSION=2 integration/ethereum/scripts/env.sh tee-qemu   # images of version 2 (below)
 ```
 
 Each run writes `IT_HOME/tee/runs/<time>/`:
@@ -288,6 +289,7 @@ grub-rule <log> [--tpm]` applies Google's GRUB rule alone. `measure.py selftest
 `qemu.sh build` writes `measurements` next to each image. `env.sh tee-qemu` prints
 `expected-measurements`:
 
+- `image.version`: the image's version, when it has one ("Image versions").
 - `binary.sha256`, `tee-token.sha256`, `gotpm.sha256`: what the root holds.
 - `uki.sha384`: the UKI file, also what GRUB measures into RTMR2.
 - `uki.authenticode-sha384`, `grub.authenticode-sha384`, `kernel.authenticode-sha384`: the digests
@@ -359,6 +361,51 @@ each run (in a tmpfs at the same path) and is identical too. What makes it so:
 
 Not yet tried: a build on another host. On a difference, `qemu.sh compare` names the differing
 UKI sections, partitions and root files.
+
+## Image versions
+
+`TEE_IMAGE_VERSION=V` (`env.sh tee-qemu`, `qemu.sh build`) gives the image a version, for
+example to test an image update: two images of one signer whose measurements differ. mkosi's
+`--image-version` writes `IMAGE_VERSION="V"` into the root's `os-release` and the initrd's
+`initrd-release`. `V` takes only `0-9`, `a-z`, `.`, `_` and `-` (os-release's rule).
+
+Of a version-2 release against the release without a version, of the same binaries (run
+`20261110T212601Z` against `20261110T182701Z`):
+
+- Changed: the root hash, and with it the UKI's `.cmdline` and the UUIDs of the two verity
+  partitions (systemd-repart takes them from the root hash), so the GPT event; the UKI's `.osrel`
+  and `.initrd`; the UKI, RTMR1 and RTMR2.
+- Unchanged: the signer, `tee-token`, gotpm, GRUB and `grub.cfg`, the kernel, the partition
+  offsets and sizes, the boot chain. The QEMU test of the version-2 images passes as well.
+
+`measurements` then starts with `image.version V`, and `uki.osrel IMAGE_VERSION="V"` shows it
+in the UKI; the build fails if the UKI does not carry it. Without `TEE_IMAGE_VERSION` (or empty)
+the image has no `IMAGE_VERSION` and is the image of before, bit for bit: the release built so
+in run `20261110T212601Z` equals that of `20261110T182701Z` (`disk.raw`, `disk.tar.gz`, the UKI
+and `measurements`).
+
+Version 2 of the run of 2026-11-10 (`20261110T212601Z`; the binaries of `20261110T182701Z`):
+
+```
+release uki.sha384                 28617e3c11c7976628a5b2c3a09644420771f6650014d0205cfacfc20d540180ce152be670eca5dc1e7656772d303f06
+release uki.authenticode-sha384    c50646d2de596d75da7af9bdc3b232845e97fae7999ee6b0e5dde2012d2e996a7c15a132083a9a894c908b75bedde9b4
+release roothash                   36257603589edb889a0aa2ab237c1f56f55ae541278fc12b7370f4a718b12b31
+release gpt-event.sha384           65dc4c59d56fff20eadccb81952ef504109ae7a2d877753131f955fc90067e402cdba3653f527574b28b65745b893b7d
+release gce.rtmr1                  24d519c20e9df3f6b5bd0e6729387ff02cc567e27ce66fa00025935fbe3f6b3b71ca507b72704316020b93d54d4990f5
+release gce.rtmr2                  f5efec550e02a73d377be5a91af64165474e2a853f15ba3060bbbc741438d7f854b10cf84dd783018150a21df39e72c6
+release disk.tar.gz.sha256         2fc1b2af7c30453653b4f3fa4407c0880430cabe6c280d6c4babb458a9b6feab
+debug   uki.sha384                 384dcb1ac722221cc5ca9bad3d42c702fcb18e90bf13baf52601887976dddc93b8069c0a2f6e4d79d6e3744cf5707d20
+debug   uki.authenticode-sha384    54f1c9910643a058b2772f133afec287a5633d04d682362bd32eb29066f31c2bb4205ae9ebea41ef5cb56c9249138cc9
+debug   roothash                   4595bf8733ed6e7626787e9e49f875be6001f43890478bef74de7b833d699829
+debug   gpt-event.sha384           46ed4aaaae8123eeeb23aeeeaedcdc5b76bea351e68cff4e984a857b17ff8df23e23216030a1ec079f5db8fa6b24b680
+debug   gce.rtmr1                  96150ca7304916b0b9beb189ecd87b389bf426912325ac98f8ff1daf81dac98ea474447df8f268bb402f93d011e044d4
+debug   gce.rtmr2                  8c8c9f6ec02bed15b1c1dae594d22e127ca1131f70100a9455a40fab8bdbf00abb5abc07681767d2ca718ea52f3ef5b3
+debug   disk.tar.gz.sha256         9b826b42a4da9fff516379ced626ce1a41b858873bd2b3b89929ffd7757614c0
+```
+
+That run built its images by hand from `20261110T182701Z`'s binaries and host tools (the signer
+of the working tree had changed since); `TEE_IMAGE_VERSION=2 env.sh tee-qemu` does the same with
+the binaries it builds.
 
 ## Open points for GCP (stage 3)
 

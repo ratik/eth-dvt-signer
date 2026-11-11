@@ -229,6 +229,7 @@ pub fn attestation(bytes: &[u8]) {
         rtmr1: vec!["00".into()],
         rtmr2: vec!["00".into()],
         project_number: None,
+        rtmr3: None,
         max_age_seconds: 600,
     };
     let Ok(text) = std::str::from_utf8(bytes) else {
@@ -243,7 +244,7 @@ pub fn attestation(bytes: &[u8]) {
     {
         let _ = statement.keys.binding(b"nonce");
         let _ = statement.keys.serves(text.as_bytes());
-        assert!(verify(evidence, &policy, &jwks, b"", 1_800_000_000).is_err());
+        assert!(verify(evidence, &policy, &jwks, b"", 1_800_000_000, Some(0)).is_err());
     }
 }
 

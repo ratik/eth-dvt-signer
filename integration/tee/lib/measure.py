@@ -122,7 +122,7 @@ def uki(path):
             cmdline = raw.rstrip(b"\0").decode().strip()
         if name == ".osrel":
             for line in raw.decode(errors="replace").splitlines():
-                if line.startswith(("VERSION_CODENAME=", "IMAGE_ID=")):
+                if line.startswith(("VERSION_CODENAME=", "IMAGE_ID=", "IMAGE_VERSION=")):
                     print(f"uki.osrel {line}")
         if name == ".uname":
             kernel = raw.rstrip(b"\0").decode()

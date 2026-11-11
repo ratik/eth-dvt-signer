@@ -164,7 +164,8 @@ tee_qemu() {
 	# Google's attestation, STS and KMS, with a debug and a tampered VM. Logs and measurements in
 	# IT_HOME/tee/runs/<time>/. The image builds run as root in a container with CAP_SYS_ADMIN
 	# (mkosi's namespaces) and no devices; the VMs run as the host user with /dev/kvm only, and
-	# no network beyond QEMU's user-mode one. TEE_REPRO=0 skips the second build.
+	# no network beyond QEMU's user-mode one. TEE_REPRO=0 skips the second build;
+	# TEE_IMAGE_VERSION=V builds the images of version V (integration/tee/README.md).
 	local nodes="${1:-4}" tools name run status=0
 	# shellcheck source=../../tee/versions.env
 	source "$repo/integration/tee/versions.env"
@@ -253,6 +254,7 @@ tee_qemu() {
 			--security-opt seccomp=unconfined \
 			-v "$IT_HOME/tee/cache:/it/tee/cache" -v "$run:/it/out" -v "$repo:/it/src:ro" \
 			-e TEE_SNAPSHOT="$TEE_SNAPSHOT" -e TEE_SOURCE_DATE_EPOCH="$TEE_SOURCE_DATE_EPOCH" \
+			-e TEE_IMAGE_VERSION="${TEE_IMAGE_VERSION:-}" \
 			-e BINARY="/it/out/eth-mpc-signer-$which" "${helpers[@]}" \
 			-e OWNER="$(id -u):$(id -g)" "$tools" \
 			bash /it/src/integration/tee/qemu.sh build "${build%-*}" "/it/out/$build" || return 1
@@ -272,7 +274,7 @@ tee_qemu() {
 		"$nodes" || status=1
 	{
 		for build in release-a debug; do
-			sed -n -E "s/^(binary\.sha256|tee-token\.sha256|gotpm\.sha256|uki\.sha384|uki\.authenticode-sha384|grub\.authenticode-sha384|kernel\.authenticode-sha384|roothash|gpt-event\.sha384|gce\.rtmr1|gce\.rtmr2|disk\.tar\.gz\.sha256) /${build%-a} \1 /p" \
+			sed -n -E "s/^(image\.version|binary\.sha256|tee-token\.sha256|gotpm\.sha256|uki\.sha384|uki\.authenticode-sha384|grub\.authenticode-sha384|kernel\.authenticode-sha384|roothash|gpt-event\.sha384|gce\.rtmr1|gce\.rtmr2|disk\.tar\.gz\.sha256) /${build%-a} \1 /p" \
 				"$run/$build/measurements"
 		done
 		echo "GCE image: <build>/image/disk.tar.gz, guest OS features UEFI_COMPATIBLE,TDX_CAPABLE,GVNIC"

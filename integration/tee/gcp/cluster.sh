@@ -98,11 +98,39 @@ wait_activated() {
 		sleep 5
 	done
 }
-# Fresh evidence from every node, verified against POLICY with Google's key set (fetched), from
-# the TLS key that answered.
+# attest_all POLICY [LABEL]: fresh evidence from every node, verified against POLICY with
+# Google's key set (fetched), from the TLS key that answered. The committee, the node CAs and the
+# output go to RUN/admin/{committee,node-cas,attest}[-LABEL].
 attest_all() {
-	admin attest --policy "$1" --committee "$run/admin/committee.json" \
-		--certificates "$run/admin/node-cas.pem" >"$run/admin/attest.txt" 2>&1
+	local suffix="${2:+-$2}"
+	admin attest --policy "$1" --committee "$run/admin/committee$suffix.json" \
+		--certificates "$run/admin/node-cas$suffix.pem" >"$run/admin/attest$suffix.txt" 2>&1
+}
+
+# refuses_configuration POLICY LABEL INDEX: `mpc-admin attest` refuses node INDEX, and only it,
+# because its configuration (RTMR3) is not the one POLICY pins for it.
+refuses_configuration() {
+	! attest_all "$1" "$2" &&
+		grep -q "node $3 runs another configuration" "$run/admin/attest-$2.txt" &&
+		[ "$(grep -c 'runs another configuration' "$run/admin/attest-$2.txt")" -eq 1 ]
+}
+
+# run_policy BASE: BASE (the admitted images' policy) with each node's configuration pinned: the
+# RTMR3 of RUN/config-I-sealed (`mpc-admin config-rtmr3`). Written to RUN/policy.json.
+run_policy() {
+	local i
+	for ((i = 0; i < NODES; i++)); do
+		"$ADMIN" config-rtmr3 "$run/config-$i-sealed" | awk '$1 == "rtmr3" { print $2 }' \
+			>"$run/rtmr3-$i"
+		[ -s "$run/rtmr3-$i" ] || die "no RTMR3 for $run/config-$i-sealed"
+	done
+	"$PY" - "$1" "$run" "$NODES" >"$run/policy.json" <<'PY'
+import json, sys
+policy = json.load(open(sys.argv[1]))
+run, n = sys.argv[2], int(sys.argv[3])
+policy["rtmr3"] = {str(i): [open(f"{run}/rtmr3-{i}").read().strip()] for i in range(n)}
+print(json.dumps(policy, indent=2))
+PY
 }
 
 activate_validator() {
@@ -163,9 +191,15 @@ config() {
 	printf '%s\n' "$@" >"$dir/args"
 }
 
-reset_vm() {
-	mark_boot "$1"
-	gcloud compute instances reset "$1" --zone="$ZONE" --format=none
+# restart_vm NAME: VM NAME shut down and started again, gracefully. A hard reset
+# (`gcloud compute instances reset`) is an unorderly shutdown for the vTPM: it counts as a failed
+# authorization, and after three the vTPM locks the attestation key out for about 15 minutes
+# (TPM dictionary-attack lockout; observed on GCE, 2026-11-10), so the node cannot attest or unseal.
+restart_vm() {
+	gcloud compute instances stop "$1" --zone="$ZONE" --format=none
+	# A stopped VM's console starts again with its next boot.
+	rm -f "$run/$1.from"
+	gcloud compute instances start "$1" --zone="$ZONE" --format=none
 }
 
 # refused_by NAME WHAT SECONDS: VM NAME's node refused to start because WHAT refused it (`STS: `,
@@ -175,11 +209,48 @@ refused_by() { wait_serial "$1" "refusing to start.*$2" "$3"; }
 # The instance ID GCE gave VM NAME (what a TDX token names the VM by).
 instance_id() { gcloud compute instances describe "$1" --zone="$ZONE" --format='value(id)'; }
 
-# The run's end, on any exit: its VMs, disks and addresses deleted, every key released to nobody.
+# The run's end, on any exit: its VMs, disks and addresses deleted, every key released to nobody,
+# the cluster released.
 cluster_teardown() {
-	teardown
+	teardown_run
 	local i
 	for ((i = 0; i < NODES; i++)); do bind_key "$i" || true; done
+	rm -f "$CLUSTER_BUSY"
+}
+
+# approver_set: three approver keys, any two of which sign (RUN/approvers/approvers.json).
+approver_set() {
+	local approvers=() i
+	mkdir -p "$run/approvers"
+	for i in 0 1 2; do approvers+=("\"$("$ADMIN" approver-key --output "$run/approvers/$i.key")\""); done
+	echo "{\"threshold\": 2, \"approvers\": [$(
+		IFS=,
+		echo "${approvers[*]}"
+	)]}" >"$run/approvers/approvers.json"
+}
+
+# validator_ceremony: a validator DKG through node 0 over mTLS, every node's share stored, and the
+# key activated with two approvers' signatures on every node (VALIDATOR_KEY).
+validator_ceremony() {
+	local i deadline=$((SECONDS + 600))
+	CEREMONY=tee-gcp
+	check "DKG started through node 0 over mTLS" \
+		test "$(api_status 0 POST /dkg/start "{\"ceremony_id\":\"$CEREMONY\",\"validator\":true}")" = 200
+	VALIDATOR_KEY=
+	until [ -n "$VALIDATOR_KEY" ] || [ $SECONDS -ge $deadline ]; do
+		VALIDATOR_KEY="$(api_body 0 GET "/dkg/status/$CEREMONY" | "$PY" -c '
+import json, sys
+s = json.load(sys.stdin)
+print(s.get("public_key", "") if s.get("status") == "completed" else "")' 2>/dev/null || true)"
+		[ -n "$VALIDATOR_KEY" ] || sleep 5
+	done
+	for ((i = 0; i < NODES; i++)); do
+		check "node $i: the ceremony completed and its share is stored (sealed)" wait_stored "$i" "$VALIDATOR_KEY" 180
+	done
+	check "activation drafted, signed by two approvers and submitted" activate_validator
+	for ((i = 0; i < NODES; i++)); do
+		check "node $i: the validator key is active" wait_activated "$i" "$VALIDATOR_KEY" 180
+	done
 }
 
 # operator_certificates: the operator's CA and client certificate (RUN/operator), which the
@@ -204,6 +275,7 @@ boot_vaults() {
 	for ((i = 0; i < NODES; i++)); do
 		name="$(instance "$i")"
 		gcloud compute addresses create "mpc-tee-run-$i" --region="$REGION" --format=none
+		echo "mpc-tee-run-$i" >>"$run/addresses"
 		gcloud compute addresses describe "mpc-tee-run-$i" --region="$REGION" \
 			--format='value(address)' >"$run/address-$i"
 		mapfile -t vault < <(vault_args "$i")
@@ -257,7 +329,7 @@ PY
 		cp "$run/operator/ca.pem" "$run/config-$i-sealed/client-ca"
 		cp "$2" "$run/config-$i-sealed/approvers"
 		vm_config "$name" "$run/config-$i-sealed"
-		reset_vm "$name"
+		restart_vm "$name"
 	done
 	log "boot 2: the sealed cluster"
 	for ((i = 0; i < NODES; i++)); do
@@ -268,61 +340,57 @@ PY
 
 cluster() {
 	local image="$1" debug="${2:-}" i name
-	local policy="/it/gcp/images/$image.policy.json"
-	[ -s "$policy" ] || die "no policy for $image: run \`gcp.sh measure $image\` first"
+	admitted "$image" || die "$image is not admitted: run \`gcp.sh admit $image\` first"
 	[ -x "$ADMIN" ] || die "no $ADMIN"
 	run="/it/gcp/runs/run-$(date -u +%Y%m%dT%H%M%SZ)"
 	mkdir -p "$run/operator" "$run/statements" "$run/approvers" "$run/admin"
 	: >"$run/summary"
 	failed=0
+	hold "$CLUSTER_BUSY"
 	trap cluster_teardown EXIT
 	log "run $run: image $image${debug:+, debug image $debug}"
 
 	operator_certificates
-	# Three approvers (any two sign).
-	local approvers=()
-	for i in 0 1 2; do approvers+=("\"$("$ADMIN" approver-key --output "$run/approvers/$i.key")\""); done
-	echo "{\"threshold\": 2, \"approvers\": [$(
-		IFS=,
-		echo "${approvers[*]}"
-	)]}" >"$run/approvers/approvers.json"
+	approver_set
 	printf '%s\n' "${CHAIN_ARGS[@]}" >"$run/chain-args"
 
 	boot_vaults "$image"
 	boot_sealed "$run/chain-args" "$run/approvers/approvers.json"
 
-	# Fresh evidence from Google for every node, against the measured policy, from the TLS key
-	# that answered (Google's key set fetched).
-	check "mpc-admin attest: Google's evidence and the served TLS key verify on every node" \
-		attest_all "$policy"
+	# Fresh evidence from Google for every node, against the admitted images and each node's
+	# configuration as written (RTMR3), from the TLS key that answered (Google's key set fetched).
+	run_policy "$ADMITTED_POLICY"
+	check "mpc-admin attest: Google's evidence, each node's configuration and the served TLS key verify" \
+		attest_all "$run/policy.json"
 
-	CEREMONY=tee-gcp
-	check "DKG started through node 0 over mTLS" \
-		test "$(api_status 0 POST /dkg/start "{\"ceremony_id\":\"$CEREMONY\",\"validator\":true}")" = 200
-	local deadline=$((SECONDS + 600))
-	VALIDATOR_KEY=
-	until [ -n "$VALIDATOR_KEY" ] || [ $SECONDS -ge $deadline ]; do
-		VALIDATOR_KEY="$(api_body 0 GET "/dkg/status/$CEREMONY" | "$PY" -c '
-import json, sys
-s = json.load(sys.stdin)
-print(s.get("public_key", "") if s.get("status") == "completed" else "")' 2>/dev/null || true)"
-		[ -n "$VALIDATOR_KEY" ] || sleep 5
-	done
-	for ((i = 0; i < NODES; i++)); do
-		check "node $i: the ceremony completed and its share is stored (sealed)" wait_stored "$i" "$VALIDATOR_KEY" 180
-	done
-	check "activation drafted, signed by two approvers and submitted" activate_validator
-	for ((i = 0; i < NODES; i++)); do
-		check "node $i: the validator key is active" wait_activated "$i" "$VALIDATOR_KEY" 180
-	done
+	# A host that rewrites a node's instance metadata: node 2's `args` gains a comment line. The
+	# node runs as before and KMS releases its key (the configuration is not part of the release),
+	# but its RTMR3 differs, so clients refuse it.
+	name="$(instance 2)"
+	mkdir -p "$run/config-2-rewritten"
+	cp "$run/config-2-sealed/"* "$run/config-2-rewritten/"
+	printf '# rewritten by the host\n' >>"$run/config-2-rewritten/args"
+	vm_config "$name" "$run/config-2-rewritten"
+	restart_vm "$name"
+	sleep 20
+	check "node 2 with a rewritten configuration: unseals (KMS does not check it) and answers" ready 2 900
+	check "mpc-admin attest: refuses node 2 (its RTMR3 is not its configuration's), and only it" \
+		refuses_configuration "$run/policy.json" rewritten 2
+	vm_config "$name" "$run/config-2-sealed"
+	restart_vm "$name"
+	sleep 20
+	check "node 2 back on its configuration: answers" ready 2 900
+	check "mpc-admin attest: every node verifies again" attest_all "$run/policy.json" restored
+
+	validator_ceremony
 	check "a duty signed through node 1 over mTLS" duty 1 0 1 2 3
 
-	# A reset: node 1 unseals again (a fresh attestation, STS and KMS) and signs.
-	reset_vm "$(instance 1)"
+	# A restart: node 1 unseals again (a fresh attestation, STS and KMS) and signs.
+	restart_vm "$(instance 1)"
 	sleep 20
-	check "node 1: unseals after a reset and answers" ready 1 900
+	check "node 1: unseals after a restart and answers" ready 1 900
 	check "node 1: the ceremony is still stored" wait_stored 1 "$VALIDATOR_KEY" 120
-	check "node 1: signs a duty after the reset" duty 1 0 1 2 3
+	check "node 1: signs a duty after the restart" duty 1 0 1 2 3
 
 	# Node 3's data disk under the debug image, node 3's key bound to that VM too: STS refuses the
 	# token (RTMR1 and RTMR2 differ), so KMS never releases the data key; the other three keep

@@ -27,7 +27,12 @@ fn helper(socket: &std::path::Path, answer: &'static str) -> std::thread::JoinHa
 
 #[test]
 fn a_token_comes_from_the_helper_socket() {
-    let dir = std::env::temp_dir().join(format!("vault-gcp-{}", std::process::id()));
+    // Unique: a container's process IDs repeat from run to run, and the temporary directory stays.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("vault-gcp-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -60,4 +65,5 @@ fn a_token_comes_from_the_helper_socket() {
             .block_on(platform(&dir.join("missing.sock")).token("aud", None))
             .is_err()
     );
+    std::fs::remove_dir_all(&dir).unwrap();
 }

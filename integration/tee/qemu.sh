@@ -15,7 +15,8 @@
 #                                 the lock-down checks, a tampered VM that of dm-verity. Logs in RUN
 #
 # Environment: TEE_SNAPSHOT, TEE_SOURCE_DATE_EPOCH (versions.env), BINARY (the node binary),
-# TOKEN_BINARY and GOTPM_BINARY (tee-token and gotpm, for `build`),
+# TOKEN_BINARY and GOTPM_BINARY (tee-token and gotpm, for `build`), TEE_IMAGE_VERSION (`build`,
+# optional: the image's version, README "Image versions"),
 # OWNER (uid:gid the build outputs are given back to), HOSTBIN (tee-fake-gcp and mpc-admin built
 # with test-hooks, for `test`).
 set -euo pipefail
@@ -95,10 +96,20 @@ EOF
 	# GRUB, for the ESP (mkosi.repart/00-esp.conf); /efi is not in the root partition.
 	grub_efi "$extra/efi/grub"
 
-	log "building the $profile image in $out"
+	# The image's version (README "Image versions"): IMAGE_VERSION in the root's os-release and
+	# the initrd's initrd-release, so in the UKI's .osrel and .initrd: another root hash, UKI,
+	# RTMR1 and RTMR2, and nothing else. Unset or empty: no IMAGE_VERSION, the image of before.
+	local version=()
+	if [ -n "${TEE_IMAGE_VERSION:-}" ]; then
+		[[ "$TEE_IMAGE_VERSION" =~ ^[0-9a-z._-]+$ ]] ||
+			die "TEE_IMAGE_VERSION: only 0-9, a-z, '.', '_' and '-' (os-release's IMAGE_VERSION)"
+		version=(--image-version "$TEE_IMAGE_VERSION")
+	fi
+
+	log "building the $profile image${TEE_IMAGE_VERSION:+, version $TEE_IMAGE_VERSION,} in $out"
 	local profiles=()
 	[ "$profile" = release ] || profiles=(--profile "$profile")
-	mkosi --directory "$here/image" "${profiles[@]}" \
+	mkosi --directory "$here/image" "${profiles[@]}" "${version[@]}" \
 		--source-date-epoch "$TEE_SOURCE_DATE_EPOCH" \
 		--sandbox-tree "$sandbox" --extra-tree "$extra" \
 		--output-directory "$out/image" --workspace-directory "$out" \
@@ -162,6 +173,7 @@ measure() {
 	cmp -s "$esp/uki.efi" "$uki" || die "the ESP's UKI is not $uki"
 	cmp -s "$esp/grub.cfg" "$here/image/grub/grub.cfg" || die "the ESP's grub.cfg is not image/grub/grub.cfg"
 	{
+		[ -z "${TEE_IMAGE_VERSION:-}" ] || echo "image.version $TEE_IMAGE_VERSION"
 		echo "binary.sha256 $(sha256sum "$out/extra/usr/bin/eth-mpc-signer" | cut -d' ' -f1)"
 		for file in usr/bin/tee-token usr/lib/eth-mpc-signer/gotpm; do
 			[ ! -f "$out/extra/$file" ] ||
@@ -174,8 +186,16 @@ measure() {
 		echo "disk.sha256 $(sha256sum "$disk" | cut -d' ' -f1)"
 		echo "disk.tar.gz.sha256 $(sha256sum "$out/image/disk.tar.gz" | cut -d' ' -f1)"
 	} >"$out/measurements"
+	# The UKI's os-release carries the version asked for, or none.
+	if [ -n "${TEE_IMAGE_VERSION:-}" ]; then
+		grep -qxF "uki.osrel IMAGE_VERSION=\"$TEE_IMAGE_VERSION\"" "$out/measurements" ||
+			die "the UKI's os-release has no IMAGE_VERSION=\"$TEE_IMAGE_VERSION\""
+	else
+		! grep -q '^uki.osrel IMAGE_VERSION=' "$out/measurements" ||
+			die "the UKI's os-release has an IMAGE_VERSION, TEE_IMAGE_VERSION is empty"
+	fi
 	log "measurements of $out:"
-	grep -E '^(binary|tee-token|gotpm|uki\.(sha384|authenticode|kernel)|grub\.(authenticode|cmd)|roothash|gpt-event|gce\.|esp\.file|disk)' \
+	grep -E '^(image\.version|binary|tee-token|gotpm|uki\.(sha384|authenticode|kernel)|grub\.(authenticode|cmd)|roothash|gpt-event|gce\.|esp\.file|disk)' \
 		"$out/measurements" >&2
 }
 

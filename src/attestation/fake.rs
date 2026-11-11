@@ -11,8 +11,10 @@
 //!   to (the IAM binding on the real key: a TDX token names the VM by instance ID, not by name),
 //!   with the associated data checked.
 //!
-//! - **Control** (`POST /control/vm/<instance>`, `{"rtmr1", "rtmr2", "dbgstat"}`): what an instance
-//!   reports from now on (another image, a debug VM), for tests outside this process.
+//! - **Control** (`POST /control/vm/<instance>`, `{"rtmr1", "rtmr2", "rtmr3", "dbgstat"}`): what an
+//!   instance reports from now on (another image, a debug VM, another configuration), for tests
+//!   outside this process. `POST /control/admit`, `{"images": [{"rtmr1", "rtmr2"}]}`: the images
+//!   the provider's condition admits from now on (an upgrade: both, then the new one only).
 //!
 //! Node `i` runs as instance `mpc-tee-<i>` with key `node-<i>`, bound to that VM's instance ID. A
 //! VM of another name (another instance) gets another ID.
@@ -57,8 +59,8 @@ pub fn key(id: usize) -> String {
 struct Inner {
     issuer: Issuer,
     vms: BTreeMap<String, Vm>,
-    rtmr1: Vec<String>,
-    rtmr2: Vec<String>,
+    /// The images (RTMR1, RTMR2) the provider's condition admits.
+    admitted: Vec<(String, String)>,
     /// KMS key → the instance ID its IAM binding admits.
     bindings: BTreeMap<String, String>,
     /// Access token → instance ID.
@@ -99,8 +101,7 @@ impl FakeGcp {
             vms: (0..n)
                 .map(|id| (instance(id), Vm::new(&instance(id))))
                 .collect(),
-            rtmr1: vec![release.rtmr1.clone()],
-            rtmr2: vec![release.rtmr2.clone()],
+            admitted: vec![(release.rtmr1, release.rtmr2)],
             bindings: (0..n)
                 .map(|id| (key(id), instance_id(&instance(id))))
                 .collect(),
@@ -114,6 +115,7 @@ impl FakeGcp {
             .route("/sts", post(sts))
             .route("/kms/{*path}", post(kms))
             .route("/control/vm/{instance}", post(control))
+            .route("/control/admit", post(admit))
             .with_state(inner.clone());
         let listener = std::net::TcpListener::bind(address).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -144,6 +146,11 @@ impl FakeGcp {
         edit(vm);
     }
 
+    /// The images (RTMR1, RTMR2) the provider admits from now on.
+    pub fn admit(&self, images: &[(String, String)]) {
+        self.inner.lock().unwrap().admitted = images.to_vec();
+    }
+
     pub fn refusals(&self) -> Vec<String> {
         self.inner.lock().unwrap().refusals.clone()
     }
@@ -161,9 +168,10 @@ impl FakeGcp {
             audience: AUDIENCE.into(),
             hwmodel: "GCP_INTEL_TDX".into(),
             dbgstat: "disabled-since-boot".into(),
-            rtmr1: inner.rtmr1.clone(),
-            rtmr2: inner.rtmr2.clone(),
+            rtmr1: distinct(inner.admitted.iter().map(|(rtmr1, _)| rtmr1)),
+            rtmr2: distinct(inner.admitted.iter().map(|(_, rtmr2)| rtmr2)),
             project_number: Some(Vm::new("release").project_number),
+            rtmr3: None,
             max_age_seconds: 600,
         }
     }
@@ -252,14 +260,9 @@ async fn sts(State(inner): State<Arc<Mutex<Inner>>>, Json(request): Json<Value>)
         && claims["hwmodel"] == "GCP_INTEL_TDX"
         && claims["dbgstat"] == "disabled-since-boot"
         && claims["exp"].as_u64().is_some_and(|exp| exp > now())
-        && inner
-            .rtmr1
-            .iter()
-            .any(|value| claims["tdx"]["rtmr1"] == value.as_str())
-        && inner
-            .rtmr2
-            .iter()
-            .any(|value| claims["tdx"]["rtmr2"] == value.as_str());
+        && inner.admitted.iter().any(|(rtmr1, rtmr2)| {
+            claims["tdx"]["rtmr1"] == rtmr1.as_str() && claims["tdx"]["rtmr2"] == rtmr2.as_str()
+        });
     let instance = claims["submods"]["gce"]["instance_id"]
         .as_str()
         .unwrap_or_default()
@@ -371,14 +374,43 @@ async fn control(
     for (field, value) in [
         ("rtmr1", &mut vm.rtmr1),
         ("rtmr2", &mut vm.rtmr2),
+        ("rtmr3", &mut vm.rtmr3),
         ("dbgstat", &mut vm.dbgstat),
     ] {
         if let Some(new) = request.get(field).and_then(Value::as_str) {
             *value = new.to_string();
         }
     }
-    Ok(
-        json!({"instance": name, "rtmr1": vm.rtmr1, "rtmr2": vm.rtmr2, "dbgstat": vm.dbgstat})
-            .to_string(),
-    )
+    Ok(json!({"instance": name, "rtmr1": vm.rtmr1, "rtmr2": vm.rtmr2, "rtmr3": vm.rtmr3,
+        "dbgstat": vm.dbgstat})
+    .to_string())
+}
+
+async fn admit(State(inner): State<Arc<Mutex<Inner>>>, Json(request): Json<Value>) -> Reply {
+    let images = request["images"]
+        .as_array()
+        .ok_or((StatusCode::BAD_REQUEST, "images: a list".to_string()))?
+        .iter()
+        .map(|image| match (image["rtmr1"].as_str(), image["rtmr2"].as_str()) {
+            (Some(rtmr1), Some(rtmr2)) => Ok((rtmr1.to_string(), rtmr2.to_string())),
+            _ => Err((StatusCode::BAD_REQUEST, "each image: rtmr1 and rtmr2".to_string())),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    inner.lock().unwrap().admitted = images.clone();
+    Ok(json!({"admitted": images
+        .iter()
+        .map(|(rtmr1, rtmr2)| json!({"rtmr1": rtmr1, "rtmr2": rtmr2}))
+        .collect::<Vec<_>>()})
+    .to_string())
+}
+
+/// `values` without repeats, in their order.
+fn distinct<'a>(values: impl Iterator<Item = &'a String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for value in values {
+        if !out.contains(value) {
+            out.push(value.clone());
+        }
+    }
+    out
 }

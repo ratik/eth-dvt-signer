@@ -8,6 +8,8 @@
 //! - the share-encryption key, which `mpc-keytool split` encrypts to;
 //! - the TLS key, which validator clients pin.
 
+/// The configuration a sealed node's image measures into RTMR3.
+pub mod config;
 /// A fake of Google's attestation, STS and KMS (`test-hooks` builds): never in a deployment.
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod fake;

@@ -34,7 +34,7 @@ cleanup() {
 	touch "$work/gcp/stop-logs"
 	[ -z "$logs_pid" ] || wait "$logs_pid" || true
 	"$eth/env.sh" exec python3 /it/src/integration/ethereum/scripts/it.py stop || true
-	bash "$here/run.sh" down || true
+	[ ! -e "$work/gcp/run-label" ] || bash "$here/run.sh" down "$IT_WORK/gcp" || true
 	"$eth/env.sh" down || true
 	log "run $stamp: exit $status, report and logs in $work"
 }

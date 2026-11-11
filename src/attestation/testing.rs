@@ -19,6 +19,8 @@ pub struct Vm {
     pub service_account: String,
     pub rtmr1: String,
     pub rtmr2: String,
+    /// The configuration's measurement (RTMR3).
+    pub rtmr3: String,
     pub hwmodel: String,
     pub dbgstat: String,
 }
@@ -33,6 +35,7 @@ impl Vm {
             service_account: "workload@test-project.iam.gserviceaccount.com".into(),
             rtmr1: "a1".repeat(48),
             rtmr2: "b2".repeat(48),
+            rtmr3: "00".repeat(48),
             hwmodel: "GCP_INTEL_TDX".into(),
             dbgstat: "disabled-since-boot".into(),
         }
@@ -118,7 +121,7 @@ impl Issuer {
                 "project_number": vm.project_number,
                 "instance_id": vm.instance_id,
             }},
-            "tdx": {"mrtd": "00", "rtmr0": "00", "rtmr1": vm.rtmr1, "rtmr2": vm.rtmr2, "rtmr3": "00"},
+            "tdx": {"mrtd": "00", "rtmr0": "00", "rtmr1": vm.rtmr1, "rtmr2": vm.rtmr2, "rtmr3": vm.rtmr3},
         })
     }
 }
