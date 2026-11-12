@@ -461,6 +461,18 @@ What the keyholders add needs no record at all: their clock and a rule they alre
   validators the attestation of the switch's epoch, nothing else
   ([ethereum-devnet.md](ethereum-devnet.md#restart-floor-run-n)). No flag switches it off: a
   rollback looks exactly like a planned restart.
+- **What the client gets.** A keyholder tells the coordinator `restart_floor` (on the wire, its
+  own refusal: tag 9). When those refusals alone leave fewer than 3 keyholders that may sign, the
+  coordinator answers `412` with `"protection": "restart_floor"` and each keyholder's refusal.
+  - The refusal is final for the duty, whoever coordinates, so the gateway does not ask the
+    other nodes again.
+  - A failure the floor shares with an absent keyholder stays `503`: that keyholder may come
+    back.
+  - The anchored marks answer the same way, as `anchored_marks` ([anchor.md](anchor.md)).
+  - Before 2026-11-12 these refusals answered `503` (`INSUFFICIENT_SIGNERS`), and the gateway
+    asked every node twice.
+  - A node that does not know the tag takes the message for no answer: in a mixed-version
+    network, the old answer (`503` or `504`).
 - **What it does not cover.** A surround vote: a client that crafts an attestation with an older
   source than a lost one and a target above the floor gets it signed (honest clients never send
   one; Lighthouse's own database refuses it too). The development `POST /sign`, which signs no

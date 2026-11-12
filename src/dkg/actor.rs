@@ -1377,7 +1377,7 @@ impl<
                     return Err(Refusal::BeyondHorizon);
                 }
                 // Not a new duty of a slot (an attestation: an epoch) this process may have signed
-                // for before it started (L-1); the peer is told as for the horizon, for good.
+                // for before it started (L-1); the peer is told so, for good.
                 if !loaded
                     && let Some(floor) = self.restart_floor
                     && !floor.admits(kind, period)
@@ -1389,18 +1389,22 @@ impl<
                         floor_epoch = floor.epoch(),
                         "not signing a duty at or below this process's restart floor"
                     );
-                    return Err(Refusal::BeyondHorizon);
+                    return Err(Refusal::RestartFloor);
                 }
-                // Nothing new before this node's chain is confirmed against the anchor, and no
-                // block or attestation the anchored marks refuse (a surround vote included).
-                if !loaded
-                    && let Some(why) = self
-                        .anchor
-                        .as_ref()
-                        .and_then(|anchor| anchor.refusal(kind, period, source))
-                {
-                    warn!(?kind, period, ?source, %why, "anchor: not signing");
-                    return Err(Refusal::BeyondHorizon);
+                // Nothing new before this node's chain is confirmed against the anchor (it may be
+                // soon: told as for the horizon), and no block or attestation the anchored marks
+                // refuse (a surround vote included; for good).
+                if !loaded && let Some(anchor) = self.anchor.as_ref() {
+                    if let Some(why) = anchor.gate_refusal() {
+                        warn!(?kind, period, %why, "anchor: not signing");
+                        return Err(Refusal::BeyondHorizon);
+                    }
+                    if let Some(why) =
+                        keeper::anchored_refusal(&anchor.anchored(), kind, period, source)
+                    {
+                        warn!(?kind, period, ?source, %why, "anchor: not signing");
+                        return Err(Refusal::AnchoredMarks);
+                    }
                 }
                 // A registration, Gloas preferences or an envelope only while the policy in force
                 // allows its terms (a registration also its window), an authorized one asked

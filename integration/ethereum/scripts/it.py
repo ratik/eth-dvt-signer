@@ -1779,7 +1779,10 @@ def report(chain=None):
         fresh = [s for s in signed if in_window(s["ts"], name) and s["ok"] and s.get("authorization_ms")]
         per_scenario[name] = {
             "signing_requests": len(requests),
-            "http_errors": len(requests) - len(ok),
+            # 412: refused for good (the keyholders' restart floor or anchored marks), not an error
+            # of the network; Lighthouse sends nothing else a node refuses so.
+            "http_errors": len([r for r in requests if r["status"] not in (200, 412)]),
+            "refused": len([r for r in requests if r["status"] == 412]),
             "retried_by_proxy": len(retried),
             "end_to_end_ms": percentiles([r["ms"] for r in ok]),
             "authorization_ms": percentiles([float(s["authorization_ms"]) for s in fresh]),
@@ -1896,13 +1899,15 @@ def report(chain=None):
                      f"{signed_blocks['canonical']}, finalized {signed_blocks['finalized']}, not canonical "
                      f"{signed_blocks['not_canonical_slots']}")
     lines.append("")
-    lines.append("| Scenario | Requests | HTTP errors | Gateway retries | End-to-end p50/p95 ms (n) | "
-                 "Authorization p50/p95 ms (n) | Missed attestations | Proposals | Recovery s |")
-    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    lines.append("| Scenario | Requests | HTTP errors | Refused (412) | Gateway retries | "
+                 "End-to-end p50/p95 ms (n) | Authorization p50/p95 ms (n) | Missed attestations | "
+                 "Proposals | Recovery s |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for name, s in per_scenario.items():
         e2e, auth = s["end_to_end_ms"], s["authorization_ms"]
         lines.append(
-            f"| {name} | {s['signing_requests']} | {s['http_errors']} | {s['retried_by_proxy']} | "
+            f"| {name} | {s['signing_requests']} | {s['http_errors']} | {s.get('refused', 0)} | "
+            f"{s['retried_by_proxy']} | "
             f"{e2e.get('p50')}/{e2e.get('p95')} ({e2e['n']}) | {auth.get('p50')}/{auth.get('p95')} ({auth['n']}) | "
             f"{s['attestations']['missed']} of {s['attestations']['epochs']} | "
             f"{s['proposals']['canonical']} of {s['proposals']['assigned']} | {s.get('recovery_seconds', '')} |")

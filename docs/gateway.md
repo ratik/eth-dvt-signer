@@ -41,7 +41,8 @@ and what not · Tests.
    - So a faulty coordinator (one node, within `f = 1`) cannot make the validator publish a wrong
      signature and miss the duty.
 4. **Refusals are final.** Every other answer (400, 403, 404, 412, 500) is returned as the node
-   gave it: the refusal is the network's.
+   gave it: the refusal is the network's. That includes a duty the keyholders' restart floor or
+   anchored marks refuse (`412`, `protection`): no other node would sign it.
 
 `GET /api/v1/eth2/publicKeys` goes to the first node that answers. `/upcheck` answers 200 while at
 least one node is usable.

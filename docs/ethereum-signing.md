@@ -497,8 +497,9 @@ of this signer (README, Ethereum compatibility).
 | Refused by slashing protection: double proposal, double vote, surround vote, at or below an imported history's floors, another chain, too many roots in a period | 412 | `{"error": "..", "refusal": {"reason": "double_proposal", "slot": 64}}` |
 | A builder registration, Gloas preferences or an envelope the registration policy (or a registration's window) refuses ([above](#builder-registrations)) | 412 | `{"error": "..", "registration": {"reason": "fee_recipient", "fee_recipient": "0x.."}}` |
 | Beyond this node's time horizon ([above](#time-horizon)) | 412 | `{"error": "..", "beyond": {"reason": "future_slot", "slot": .., "latest": ..}}` |
+| Refused by the keyholders' own protection: too few keyholders may sign it, whoever coordinates ([restart floor](slashing-protection.md#the-restart-floor), [anchored marks](anchor.md)) | 412 | `{"error": "..", "protection": "restart_floor", "refusals": {"1": "restart_floor", ..}}` |
 | No Ethereum network configured | 503 | `{"error": ".."}` |
-| This node is not ready to submit a new authorization, too few signers, too many requests, a full queue of builder registrations | 503 | `{"error": "..", "reasons": [..]}` when not ready |
+| This node is not ready to submit a new authorization, too few signers, too many requests, a full queue of builder registrations | 503 | `{"error": "..", "reasons": [..]}` when not ready; each participant's refusal in `refusals` |
 | Authorization or partial collection timed out | 504 | `{"error": ".."}` |
 | Anything else | 500 | `{"error": ".."}` |
 

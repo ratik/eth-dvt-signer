@@ -437,6 +437,7 @@ mpc-gateway --nodes http://127.0.0.1:8080,http://127.0.0.1:8081,http://127.0.0.1
 | malformed or unsupported request, `signingRoot` different from the computed root | 400 |
 | unknown validator key, or a key that is not activated | 404 |
 | refused by slashing protection | 412 (with `refusal.reason`) |
+| refused by the keyholders' restart floor or anchored marks (too few may sign it) | 412 (with `protection`) |
 | not ready, too few signers, busy | 503 |
 | authorization or signing timeout | 504 |
 

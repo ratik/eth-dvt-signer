@@ -129,6 +129,22 @@ pub struct Signed {
     pub timings: Timings,
 }
 
+/// Whether the protection refusals alone ([Refusal::is_protection]) leave fewer than `threshold`
+/// of `participants` able to sign: then no coordinator gets the duty signed, however many of the
+/// others answer. A failure that other refusals or silence share is not protection's alone (an
+/// absent keyholder may come back).
+pub fn protection_refuses(
+    participants: usize,
+    threshold: usize,
+    refusals: &BTreeMap<u32, Refusal>,
+) -> bool {
+    let protected = refusals
+        .values()
+        .filter(|reason| reason.is_protection())
+        .count();
+    protected > 0 && participants.saturating_sub(protected) < threshold
+}
+
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum SignError {
     #[error("unknown ceremony")]
@@ -144,6 +160,17 @@ pub enum SignError {
     NotReady(Vec<Reason>),
     #[error("not enough participants can sign")]
     InsufficientSigners {
+        authorization: Authorization,
+        valid: usize,
+        refusals: BTreeMap<u32, Refusal>,
+    },
+    /// The keyholders' slashing protection refuses the duty ([Refusal::is_protection]: the
+    /// restart floor, the anchored marks): with every other participant signing, still too few.
+    /// Final for the duty, whoever coordinates.
+    #[error(
+        "refused by the keyholders' slashing protection (restart floor, anchored marks): too few keyholders may sign this duty"
+    )]
+    Protected {
         authorization: Authorization,
         valid: usize,
         refusals: BTreeMap<u32, Refusal>,
@@ -1017,6 +1044,13 @@ async fn collect<E: Clock, S: Sender<PublicKey = PublicKey>>(
             )
             .collect();
         if participants.len().saturating_sub(lost.len()) < threshold {
+            if protection_refuses(participants.len(), threshold, &refusals) {
+                return Err(SignError::Protected {
+                    authorization,
+                    valid: collected.partials.len(),
+                    refusals,
+                });
+            }
             return Err(SignError::InsufficientSigners {
                 authorization,
                 valid: collected.partials.len(),

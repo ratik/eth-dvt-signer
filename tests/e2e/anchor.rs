@@ -472,10 +472,12 @@ fn an_6_an_acknowledged_rollback_resumes_under_the_anchored_marks() {
         .map(|node| network.count(*node, "anchor: not signing"))
         .sum();
     let (status, answer) = sign(&network, 1, &key, &attestation(0, epoch, 3));
-    assert_ne!(
-        status, 200,
-        "a surround vote signed after the acknowledgment: {answer}"
+    // Refused for good by the keyholders' protection (412), not unavailable (503).
+    assert_eq!(
+        status, 412,
+        "a surround vote after the acknowledgment: {answer}"
     );
+    assert_eq!(answer["protection"], "anchored_marks", "{answer}");
     let now: usize = network
         .all()
         .iter()

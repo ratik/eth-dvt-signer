@@ -84,7 +84,10 @@ one faulty record (a forged height, digest or marks) can neither satisfy nor blo
 - **Anchored marks.** Each mark is the second-highest value across the nodes' records. The
   keyholder gives no partial for a new block at or below the anchored slot, nor for an
   attestation with a target at or below the anchored target or a source below the anchored source
-  (a surround vote). They apply on top of the restart floor.
+  (a surround vote). They apply on top of the restart floor. Such a refusal is final for the
+  duty: when too few keyholders may sign, the client gets `412` with
+  `"protection": "anchored_marks"` ([slashing-protection.md](slashing-protection.md#the-restart-floor)).
+  The gate below is not: it answers `503`, since the keyholder may sign once confirmed.
 - **Confirmation gate.** The keyholder gives no new partial (Ethereum duty or development
   signature) until two of the three highest records (by height) lie on its own chain: its block at
   that height has the record's digest. While it waits, readiness says `anchor_behind` and the node

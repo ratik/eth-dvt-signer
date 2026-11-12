@@ -100,6 +100,7 @@
 //!
 //! There is no authentication: the node binds this API to loopback only.
 
+use crate::signer::wire::Refusal;
 use crate::{
     admin::{Administration, AuthorizationJson, Endorsement},
     dkg::{
@@ -131,10 +132,7 @@ use crate::{
 };
 #[cfg(feature = "dev-api")]
 use crate::{
-    signer::{
-        coordinator::{AuthorizationKind, Timings},
-        wire::Refusal,
-    },
+    signer::coordinator::{AuthorizationKind, Timings},
     types::{PayloadHash, SignRequest, format_hash},
 };
 #[cfg(feature = "dev-api")]
@@ -154,7 +152,6 @@ use commonware_utils::{
     ordered::{Quorum as _, Set},
 };
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "dev-api")]
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
@@ -707,6 +704,13 @@ struct Eth2Error {
     registration: Option<RegistrationRefusal>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     reasons: Vec<Reason>,
+    /// The keyholders' slashing protection refuses the duty for good, whoever coordinates:
+    /// `restart_floor` or `anchored_marks` (each keyholder's own, in `refusals`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    protection: Option<Refusal>,
+    /// Why each participant that refused did, by share index.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    refusals: BTreeMap<u32, Refusal>,
 }
 
 /// A duty beyond this node's horizon: refused before anything is submitted. A duty for another
@@ -729,6 +733,8 @@ fn beyond_error(beyond: Beyond) -> Response {
             fork: None,
             registration: None,
             reasons: Vec::new(),
+            protection: None,
+            refusals: BTreeMap::new(),
         }),
     )
         .into_response()
@@ -744,6 +750,8 @@ fn eth2_error(status: StatusCode, error: String) -> Response {
             fork: None,
             registration: None,
             reasons: Vec::new(),
+            protection: None,
+            refusals: BTreeMap::new(),
         }),
     )
         .into_response()
@@ -760,6 +768,8 @@ fn registration_error(refusal: RegistrationRefusal) -> Response {
             fork: None,
             registration: Some(refusal),
             reasons: Vec::new(),
+            protection: None,
+            refusals: BTreeMap::new(),
         }),
     )
         .into_response()
@@ -781,6 +791,8 @@ fn fork_error(wrong: WrongFork) -> Response {
                 fork: Some(wrong),
                 registration: None,
                 reasons: Vec::new(),
+                protection: None,
+                refusals: BTreeMap::new(),
             }),
         )
             .into_response(),
@@ -871,7 +883,7 @@ async fn eth2_sign(
             DutyRefusal::SourceAfterTarget { .. } | DutyRefusal::NotSelfBuilt { .. },
         ) => StatusCode::BAD_REQUEST,
         SignError::NotApproved => StatusCode::FORBIDDEN,
-        SignError::Refused(_) => StatusCode::PRECONDITION_FAILED,
+        SignError::Refused(_) | SignError::Protected { .. } => StatusCode::PRECONDITION_FAILED,
         SignError::NotReady(_)
         | SignError::InsufficientSigners { .. }
         | SignError::Busy
@@ -879,6 +891,12 @@ async fn eth2_sign(
         | SignError::Stopped => StatusCode::SERVICE_UNAVAILABLE,
         SignError::AuthorizationTimeout | SignError::Timeout { .. } => StatusCode::GATEWAY_TIMEOUT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    let refusals = match &error {
+        SignError::Protected { refusals, .. }
+        | SignError::InsufficientSigners { refusals, .. }
+        | SignError::Timeout { refusals, .. } => refusals.clone(),
+        _ => BTreeMap::new(),
     };
     let body = Eth2Error {
         error: error.to_string(),
@@ -889,6 +907,15 @@ async fn eth2_sign(
         beyond: None,
         fork: None,
         registration: None,
+        protection: match &error {
+            SignError::Protected { refusals, .. } => refusals
+                .values()
+                .copied()
+                .filter(|r| r.is_protection())
+                .min(),
+            _ => None,
+        },
+        refusals,
         reasons: match error {
             SignError::NotReady(reasons) => reasons,
             _ => Vec::new(),
@@ -1010,6 +1037,7 @@ async fn sign(State(api): State<Api>, body: Result<Json<SignBody>, JsonRejection
         SignError::InsufficientSigners { .. } => {
             (StatusCode::SERVICE_UNAVAILABLE, "INSUFFICIENT_SIGNERS")
         }
+        SignError::Protected { .. } => (StatusCode::PRECONDITION_FAILED, "REFUSED_BY_PROTECTION"),
         SignError::Timeout { .. } => (StatusCode::GATEWAY_TIMEOUT, "SIGNING_TIMEOUT"),
         SignError::Busy | SignError::Overloaded(_) | SignError::Stopped => {
             (StatusCode::SERVICE_UNAVAILABLE, "UNAVAILABLE")
@@ -1029,6 +1057,11 @@ async fn sign(State(api): State<Api>, body: Result<Json<SignBody>, JsonRejection
     match error {
         SignError::Conflict(authorization) => response.height = Some(authorization.height),
         SignError::InsufficientSigners {
+            authorization,
+            valid,
+            refusals,
+        }
+        | SignError::Protected {
             authorization,
             valid,
             refusals,

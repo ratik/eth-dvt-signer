@@ -175,12 +175,27 @@ pub enum Refusal {
     /// or its epoch is too far ahead, by this node's clock.
     #[error("the duty is beyond this node's time horizon")]
     BeyondHorizon,
+    /// A new duty of a slot (an attestation: an epoch) this process may have signed for before it
+    /// started: at or below its restart floor (`eth::horizon::RestartFloor`, audit L-1). Final for
+    /// the duty. A node that does not know this tag takes the message for no answer.
+    #[error("at or below this node's restart floor")]
+    RestartFloor,
+    /// A block or attestation the anchored marks refuse (`anchor`, a surround vote included).
+    /// Final for the duty.
+    #[error("refused by the anchored marks")]
+    AnchoredMarks,
 }
 
 impl Refusal {
     /// Whether waiting can change the answer.
     pub const fn is_final(self) -> bool {
         !matches!(self, Self::NotAuthorized)
+    }
+
+    /// Whether it is the keyholder's slashing protection refusing a duty that may conflict with
+    /// one signed before: any keyholder may answer so, and no other one will sign it instead.
+    pub const fn is_protection(self) -> bool {
+        matches!(self, Self::RestartFloor | Self::AnchoredMarks)
     }
 
     fn tag(self) -> u8 {
@@ -198,6 +213,8 @@ impl Refusal {
             6 => Self::WrongPurpose,
             7 => Self::StaleGeneration,
             8 => Self::BeyondHorizon,
+            9 => Self::RestartFloor,
+            10 => Self::AnchoredMarks,
             _ => return None,
         })
     }

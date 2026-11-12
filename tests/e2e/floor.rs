@@ -171,14 +171,26 @@ fn floor_2_a_restart_of_every_node_costs_at_most_the_current_epoch() {
         .iter()
         .map(|node| network.count(*node, REFUSED))
         .collect();
+    // Refused for good (412, the keyholders' protection), not unavailable (503).
     let (status, answer) = sign(&network, 2, &key, &block(lowest, 7));
-    assert_ne!(status, 200, "a new block at the floor signed: {answer}");
+    assert_eq!(status, 412, "a new block at the floor: {answer}");
+    assert_eq!(answer["protection"], "restart_floor", "{answer}");
     let epoch = lowest / 32;
     let (status, answer) = sign(&network, 3, &key, &attestation(epoch - 1, epoch, 1));
-    assert_ne!(
-        status, 200,
+    assert_eq!(
+        status, 412,
         "a new attestation of the floor's epoch: {answer}"
     );
+    assert_eq!(answer["protection"], "restart_floor", "{answer}");
+    // Enough floor refusals that three cannot sign (a keyholder may not have the authorization
+    // yet, and say so).
+    let floored = answer["refusals"].as_object().map_or(0, |refusals| {
+        refusals
+            .values()
+            .filter(|reason| *reason == "restart_floor")
+            .count()
+    });
+    assert!(floored >= 2, "{answer}");
     assert!(
         all.iter()
             .zip(&seen)
