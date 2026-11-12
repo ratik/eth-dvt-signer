@@ -164,6 +164,7 @@ fn a_plain_vault_cannot_open_a_sealed_one_nor_the_reverse() {
             token: gcp::TokenSource::Url("http://127.0.0.1:9/token".into()),
             sts_endpoint: "http://127.0.0.1:9/sts".into(),
             kms_endpoint: "http://127.0.0.1:9/kms".into(),
+            metadata_endpoint: "http://127.0.0.1:9/metadata".into(),
         });
         assert!(matches!(
             Vault::open(&plain, &gcp, true).await,

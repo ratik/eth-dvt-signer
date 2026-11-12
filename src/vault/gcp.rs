@@ -10,12 +10,23 @@
 //!   TDX VM with debug disabled. Cloud KMS lets that principal set (this node's instance name)
 //!   encrypt and decrypt with this node's key, which wraps the vault's data key.
 //!
-//! Tests point the token source, STS and KMS at fakes (`TokenSource::Url`, the endpoints): the
-//! same requests, another issuer, which no real KMS would accept.
+//! - **The VM's own project.** The key and the provider must be the VM's own project's
+//!   ([same_project]). Otherwise a host that writes the VM's configuration could name a KMS key of
+//!   its own project, grant this VM's principal set its use, and unwrap the data key with it.
+//!   - The project's number comes from the attestation token (Google's).
+//!   - The project's ID comes from the metadata server, whose number must match the token's.
+//!
+//! Tests point the token source, STS, KMS and the metadata server at fakes (`TokenSource::Url`,
+//! the endpoints): the same requests, another issuer, which no real KMS would accept. Only a build
+//! with the `fake-gcp` feature takes them ([Config::check]). A host that names its own KMS
+//! endpoint sees the data key in the encrypt request.
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD},
+};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
@@ -49,11 +60,155 @@ pub struct Config {
     pub sts_endpoint: String,
     /// `https://cloudkms.googleapis.com/v1`.
     pub kms_endpoint: String,
+    /// The metadata server (`http://169.254.169.254/computeMetadata/v1`): the project's ID.
+    pub metadata_endpoint: String,
 }
 
 impl Config {
     pub const STS: &'static str = "https://sts.googleapis.com/v1/token";
     pub const KMS: &'static str = "https://cloudkms.googleapis.com/v1";
+    pub const METADATA: &'static str = "http://169.254.169.254/computeMetadata/v1";
+
+    /// Refuse a configuration a host could use to learn the data key.
+    /// - A key or provider name that is not whole and plain: it goes into request paths as it is,
+    ///   and a name with `..` could reach another project's key.
+    /// - Unless `test_endpoints` (a build with the `fake-gcp` feature): any token source, STS,
+    ///   KMS or metadata server other than Google's.
+    pub fn check(&self, test_endpoints: bool) -> Result<(), String> {
+        key_project(&self.kms_key).ok_or_else(|| {
+            format!(
+                "--gcp-kms-key {}: not projects/<project>/locations/<location>/keyRings/<ring>/cryptoKeys/<key>",
+                self.kms_key
+            )
+        })?;
+        provider_project(&self.wif_provider).ok_or_else(|| {
+            format!(
+                "--gcp-wif-provider {}: not projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>",
+                self.wif_provider
+            )
+        })?;
+        if test_endpoints {
+            return Ok(());
+        }
+        let mut test = Vec::new();
+        if matches!(self.token, TokenSource::Url(_)) {
+            test.push("--gcp-token-url");
+        }
+        for (flag, value, google) in [
+            ("--gcp-sts-endpoint", &self.sts_endpoint, Self::STS),
+            ("--gcp-kms-endpoint", &self.kms_endpoint, Self::KMS),
+            ("--gcp-metadata-endpoint", &self.metadata_endpoint, Self::METADATA),
+        ] {
+            if value != google {
+                test.push(flag);
+            }
+        }
+        if test.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "{}: only in a test build (feature fake-gcp). A host that names its own KMS \
+                 would see the vault's data key",
+                test.join(", ")
+            ))
+        }
+    }
+}
+
+/// A plain segment of a resource name: no `.`, `/` or `%`, so no path tricks.
+fn plain(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+/// The project (ID or number) of a whole KMS key name
+/// `projects/<p>/locations/<l>/keyRings/<r>/cryptoKeys/<k>`.
+pub fn key_project(key: &str) -> Option<&str> {
+    match key.split('/').collect::<Vec<_>>()[..] {
+        ["projects", project, "locations", location, "keyRings", ring, "cryptoKeys", name]
+            if [project, location, ring, name].iter().all(|s| plain(s)) =>
+        {
+            Some(project)
+        }
+        _ => None,
+    }
+}
+
+/// The project number of a whole Workload Identity provider name
+/// `projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>`.
+pub fn provider_project(provider: &str) -> Option<&str> {
+    match provider.split('/').collect::<Vec<_>>()[..] {
+        [
+            "projects",
+            number,
+            "locations",
+            "global",
+            "workloadIdentityPools",
+            pool,
+            "providers",
+            name,
+        ] if !number.is_empty()
+            && number.bytes().all(|byte| byte.is_ascii_digit())
+            && plain(pool)
+            && plain(name) =>
+        {
+            Some(number)
+        }
+        _ => None,
+    }
+}
+
+/// Check that the key and the provider of `config` are this VM's project's:
+/// - `token_number`: the project number the VM's attestation token names (Google's);
+/// - `metadata_number` and `metadata_id`: the project's number and ID from the metadata server.
+pub fn same_project(
+    config: &Config,
+    token_number: &str,
+    metadata_number: &str,
+    metadata_id: &str,
+) -> Result<(), String> {
+    if metadata_number != token_number {
+        return Err(format!(
+            "the metadata server's project {metadata_number} is not the attestation token's \
+             {token_number}"
+        ));
+    }
+    let provider = provider_project(&config.wif_provider).unwrap_or_default();
+    if provider != token_number {
+        return Err(format!(
+            "--gcp-wif-provider {} is not of this VM's project {token_number}",
+            config.wif_provider
+        ));
+    }
+    let key = key_project(&config.kms_key).unwrap_or_default();
+    if key != metadata_id && key != token_number {
+        return Err(format!(
+            "--gcp-kms-key {} is not of this VM's project {metadata_id} ({token_number})",
+            config.kms_key
+        ));
+    }
+    Ok(())
+}
+
+/// The project number an attestation token names (`submods.gce.project_number`). The token came
+/// from Google over TLS (gotpm, the image's helper): its signature is the clients' to check.
+fn token_project_number(token: &str) -> Result<String, String> {
+    let payload = token
+        .split('.')
+        .nth(1)
+        .ok_or("the attestation token is not a JWT")?;
+    let claims: Value = URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or("the attestation token's claims are not base64url JSON")?;
+    match claims.pointer("/submods/gce/project_number") {
+        Some(Value::String(number)) => Ok(number.clone()),
+        Some(Value::Number(number)) => Ok(number.to_string()),
+        _ => Err("the attestation token names no project (submods.gce.project_number)".into()),
+    }
 }
 
 /// The wrapped data key, as `dek.wrapped` holds it.
@@ -165,6 +320,13 @@ impl Platform {
         let token = self
             .token(&format!("https://iam.googleapis.com/{provider}"), None)
             .await?;
+        let number = token_project_number(&token)?;
+        same_project(
+            &self.config,
+            &number,
+            &self.metadata("project/numeric-project-id").await?,
+            &self.metadata("project/project-id").await?,
+        )?;
         let request = json!({
             "audience": format!("//iam.googleapis.com/{provider}"),
             "grantType": "urn:ietf:params:oauth:grant-type:token-exchange",
@@ -182,6 +344,30 @@ impl Platform {
             .and_then(|value| value.as_str())
             .map(|value| Zeroizing::new(value.to_string()))
             .ok_or_else(|| "STS: no access_token in the response".into())
+    }
+
+    /// A value of the metadata server, as `path` under its `computeMetadata/v1`.
+    async fn metadata(&self, path: &str) -> Result<String, String> {
+        let url = format!(
+            "{}/{path}",
+            self.config.metadata_endpoint.trim_end_matches('/')
+        );
+        let response = self
+            .http
+            .get(&url)
+            .header("Metadata-Flavor", "Google")
+            .send()
+            .await
+            .map_err(|err| format!("metadata server, {path}: {err}"))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|err| format!("metadata server, {path}: {err}"))?;
+        if !status.is_success() {
+            return Err(format!("metadata server, {path}: {status}"));
+        }
+        Ok(text.trim().to_string())
     }
 
     async fn post(

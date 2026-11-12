@@ -67,3 +67,46 @@ fn a_directory_reads_as_the_image_reads_it() {
     std::fs::remove_dir_all(&dir).unwrap();
     assert_eq!(digest_of(&read).unwrap(), digest_of(&files()).unwrap());
 }
+
+fn with_args(args: &str) -> Vec<File> {
+    let mut files = files();
+    files.retain(|(name, _)| name != "args");
+    files.push(("approvers".into(), b"{}\n".to_vec()));
+    files.push(("args".into(), args.as_bytes().to_vec()));
+    files
+}
+
+#[test]
+fn a_pinned_configuration_reads_only_its_own_files() {
+    // The GCP harness's sealed configuration (integration/tee/gcp/cluster.sh), and `identity`.
+    let sealed = "--id=2\n--peers=/run/eth-mpc-signer/config/peers\n\
+                  --client-ca=/run/eth-mpc-signer/config/client-ca\n\
+                  # a comment\n\n\
+                  --approvers\n/run/eth-mpc-signer/config/approvers\n\
+                  --vault=gcp-tdx\n\
+                  --gcp-kms-key=projects/p/locations/l/keyRings/r/cryptoKeys/node-2\n\
+                  --gcp-token-socket=/run/eth-mpc-signer/token.sock\n";
+    check_args(&with_args(sealed)).unwrap();
+    check_args(&with_args(&format!("identity\n{sealed}"))).unwrap();
+
+    for (args, wanted) in [
+        // The test endpoints: a host's KMS would see the data key.
+        ("--gcp-kms-endpoint=http://10.0.2.2/kms\n", "--gcp-kms-endpoint"),
+        ("--gcp-token-url\nhttp://10.0.2.2/token\n", "--gcp-token-url"),
+        ("--gcp-sts-endpoint=https://sts.example\n", "--gcp-sts-endpoint"),
+        ("--gcp-metadata-endpoint=http://10.0.2.2/m\n", "--gcp-metadata-endpoint"),
+        ("--gotpm=/var/lib/mpc/gotpm\n", "--gotpm"),
+        ("--data-dir=/tmp\n", "--data-dir"),
+        // Files the host can rewrite, unmeasured.
+        ("--approvers=/var/lib/mpc/approvers\n", "--approvers"),
+        ("--approvers\napprovers\n", "--approvers"),
+        ("--peers=/run/eth-mpc-signer/config/../peers\n", "--peers"),
+        ("--peers=/run/eth-mpc-signer/config/missing\n", "--peers"),
+        ("--gcp-token-socket=/var/lib/mpc/token.sock\n", "--gcp-token-socket"),
+        ("--client-ca\n", "--client-ca"),
+    ] {
+        let err = check_args(&with_args(&format!("--id=2\n{args}"))).unwrap_err();
+        assert!(err.contains(wanted), "{args}: {err}");
+    }
+    assert!(check_args(&[("peers".into(), Vec::new())]).is_err());
+}

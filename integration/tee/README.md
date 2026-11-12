@@ -11,7 +11,7 @@ API.
 On the test server (`IT_HOME`, default `~/eth-mpc-it`):
 
 ```bash
-integration/ethereum/scripts/env.sh tee-qemu        # 4 sealed VMs and 4 control VMs
+integration/ethereum/scripts/env.sh tee-qemu        # 4 sealed VMs and 5 control VMs
 TEE_REPRO=0 integration/ethereum/scripts/env.sh tee-qemu   # skip the second build
 TEE_GOTPM=0 integration/ethereum/scripts/env.sh tee-qemu   # no gotpm (no network; no GCE token)
 TEE_IMAGE_VERSION=2 integration/ethereum/scripts/env.sh tee-qemu   # images of version 2 (below)
@@ -45,7 +45,9 @@ VMs. The package cache (`IT_HOME/tee/cache`) and the target directories (`IT_HOM
    (`grub-mkimage`, the x86_64-efi modules), QEMU 10, OVMF, swtpm, OpenSSL.
 2. **Signer.** It builds `eth-mpc-signer` with default features in `RUST_IMAGE`, twice: into the
    kept target directory, then from scratch into a tmpfs at the same path. On the host it builds
-   `tee-fake-gcp`, `mpc-admin` and `mpc-keytool` with `test-hooks`.
+   `tee-fake-gcp`, `mpc-admin` and `mpc-keytool` with `test-hooks`. It builds the signer once
+   more with `fake-gcp`, the only build that takes the fake's endpoints (docs/tee.md, "What the
+   node itself refuses"), for the cluster's VMs.
 3. **gotpm.** It builds go-tpm-tools' `gotpm` (the `cmd` module at `TEE_GOTPM_COMMIT`, tag
    v0.4.11) twice in
    the tools image (`qemu.sh gotpm`): Debian's Go 1.26 (`GOTOOLCHAIN=local`), modules from the Go
@@ -54,6 +56,8 @@ VMs. The package cache (`IT_HOME/tee/cache`) and the target directories (`IT_HOM
    modules are cached in `IT_HOME/tee/go`. It needs the network (GitHub, proxy.golang.org);
    `TEE_GOTPM=0` skips it, and the image then has no gotpm and gets no token on GCE.
 4. **Images.** It builds the release image twice (one from each signer) and the debug image once.
+   It also builds `release-fake`: the release profile with the `fake-gcp` signer, for the cluster's
+   VMs only (never uploaded: a host could point its node at its own KMS).
    mkosi runs as root in a container with `CAP_SYS_ADMIN` (its namespaces), without devices or
    loop devices (`RepartOffline=yes`). Before mkosi, `qemu.sh build` makes GRUB with
    `grub-mkimage`; after it, `measure` reads GRUB, `grub.cfg` and the UKI back from the disk's ESP.
@@ -64,8 +68,8 @@ VMs. The package cache (`IT_HOME/tee/cache`) and the target directories (`IT_HOM
    (OVMF, virtio disks). `tee-fake-gcp` runs in the same container; the VMs reach it at
    `10.0.2.2`, QEMU's address of the host. The harness makes the operator's CA and client
    certificate (OpenSSL) and three approver keys (`mpc-admin approver-key`, any two approve).
-   - **Boot 1 (vaults).** Each of the 4 release VMs runs `identity` with its vault flags from the
-     fake: the vault is sealed, and the statement goes to the serial console, where the harness
+   - **Boot 1 (vaults).** Each of the 4 release VMs (`release-fake`) runs `identity` with its
+     vault flags from the fake: the vault is sealed, and the statement goes to the serial console, where the harness
      reads it. The debug VM makes a plain vault the same way. The tampered VM boots the release
      image with one altered 4 KiB block in its root partition. The measuring VM boots the release
      image in measure mode with a TPM (swtpm, SHA-384 bank), as GCE's vTPM. Every VM boots
@@ -90,6 +94,8 @@ VMs. The package cache (`IT_HOME/tee/cache`) and the target directories (`IT_HOM
      - the release image's ESP holds GRUB, `grub.cfg` and the UKI, and nothing else;
      - a VM booting a copy of the release disk whose `grub.cfg` does not boot reaches GRUB's login
        (`Enter username`), which nobody has: no GRUB shell;
+     - a VM of the release image given the fake's vault flags makes no vault: its node refuses the
+       endpoints (`only in a test build`) and prints no statement;
      - `measure.py selftest` (without site packages) accepts a synthetic CCEL log of the predicted
        boot and refuses each tampering (another UKI, no GRUB commands, a non-EV_IPL event in
        RTMR2, a GRUB command whose digest is not its text's, two kernel command lines, no command

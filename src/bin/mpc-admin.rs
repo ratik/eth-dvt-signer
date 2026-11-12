@@ -142,7 +142,9 @@ enum Command {
     },
     /// Offline: the RTMR3 a sealed node's token carries when it runs with the configuration in
     /// DIR (the files of its instance metadata `mpc-<name>`, as the image reads them), for the
-    /// policy's `rtmr3` (docs/tee.md). Prints the configuration's digest and RTMR3.
+    /// policy's `rtmr3` (docs/tee.md). Prints the configuration's digest and RTMR3. Refuses a
+    /// configuration no client should pin: the sealed vault's test endpoints, or a file flag that
+    /// names a file outside the configuration (`attestation::config::check_args`).
     ConfigRtmr3 { dir: PathBuf },
     /// Offline: create a new approver key (owner-only file) and print its public key. Never
     /// overwrites a file.
@@ -373,7 +375,7 @@ fn main() -> ExitCode {
         Command::ConfigRtmr3 { dir } => {
             use eth_mpc_signer::attestation::config;
             config::read_dir(&dir)
-                .and_then(|files| config::digest_of(&files))
+                .and_then(|files| config::check_args(&files).and_then(|()| config::digest_of(&files)))
                 .map(|digest| {
                     println!("digest {}", hex::encode(digest));
                     println!("rtmr3 {}", hex::encode(config::rtmr3(&digest)));

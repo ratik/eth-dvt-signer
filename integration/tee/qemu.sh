@@ -8,11 +8,13 @@
 #                                 the node binary BINARY and its measurements in OUT/measurements
 #   qemu.sh compare A B           as root: two builds of one profile; exit 1 if they differ, with
 #                                 the differing UKI sections, partitions and files
-#   qemu.sh test RELEASE DEBUG RUN NODES
-#                                 with /dev/kvm, as the host user: NODES release VMs make their
-#                                 sealed vaults, then run as one sealed cluster (mTLS, DKG,
-#                                 signing, reboots, another image); a debug VM is the control of
-#                                 the lock-down checks, a tampered VM that of dm-verity. Logs in RUN
+#   qemu.sh test FAKE RELEASE DEBUG RUN NODES
+#                                 with /dev/kvm, as the host user: NODES VMs of FAKE (the release
+#                                 profile with a node built with `fake-gcp`, which takes the fake's
+#                                 endpoints) make their sealed vaults, then run as one sealed
+#                                 cluster (mTLS, DKG, signing, reboots, another image); a debug VM
+#                                 is the control of the lock-down checks, a tampered VM that of
+#                                 dm-verity; a RELEASE VM refuses the fake's endpoints. Logs in RUN
 #
 # Environment: TEE_SNAPSHOT, TEE_SOURCE_DATE_EPOCH (versions.env), BINARY (the node binary),
 # TOKEN_BINARY and GOTPM_BINARY (tee-token and gotpm, for `build`), TEE_IMAGE_VERSION (`build`,
@@ -625,9 +627,9 @@ admin() {
 }
 
 test_vms() {
-	local release="$1" debug="$2" i
-	run="$3"
-	cluster="$4"
+	local fake="$1" release="$2" debug="$3" i
+	run="$4"
+	cluster="$5"
 	failed=0
 	: "${HOSTBIN:?the test-hooks build of tee-fake-gcp and mpc-admin}"
 	mkdir -p "$run/ssh" "$run/operator" "$run/statements" "$run/approvers" "$run/admin"
@@ -664,13 +666,15 @@ test_vms() {
 	for _ in $(seq 1 30); do [ -f "$run/gcp/node-$((cluster - 1)).args" ] && break; sleep 1; done
 	[ -f "$run/gcp/node-$((cluster - 1)).args" ] || die "tee-fake-gcp did not start: $run/gcp.log"
 
-	# Boot 1: each release VM makes its sealed vault (`identity`) and prints its statement. The
-	# debug VM (numbered CLUSTER) makes a plain one: it is the control of the lock-down checks. The
-	# tampered VM boots the release image with one altered block of its root partition.
+	# Boot 1: each release VM makes its sealed vault (`identity`) and prints its statement. It
+	# boots FAKE: the release profile, with a node that takes the fake's endpoints (`fake-gcp`).
+	# The debug VM (numbered CLUSTER) makes a plain one: it is the control of the lock-down
+	# checks. The tampered VM boots the release image with one altered block of its root
+	# partition.
 	local vault=()
 	for ((i = 0; i < cluster; i++)); do
 		mapfile -t vault <"$run/gcp/node-$i.args"
-		vm_disks "$i" "$release"
+		vm_disks "$i" "$fake"
 		vm_config "$i" identity identity "--id=$i" --tls-san=127.0.0.1 "${vault[@]}"
 		vm_start "$i"
 	done
@@ -773,6 +777,19 @@ test_vms() {
 	vm_start "$locked"
 	check "GRUB VM $locked (grub.cfg does not boot): a login nobody has, no GRUB shell" grub_locked "$locked"
 	vm_quit "$locked"
+
+	# The release image's node takes Google's endpoints only: given the fake's (a host's own KMS
+	# would see the data key), it makes no vault.
+	local refusing=$((cluster + 4))
+	mapfile -t vault <"$run/gcp/node-0.args"
+	vm_disks "$refusing" "$release"
+	vm_config "$refusing" identity identity --id=0 --tls-san=127.0.0.1 "${vault[@]}"
+	vm_start "$refusing"
+	check "release VM $refusing: the node refuses the fake's endpoints (console)" \
+		wait_serial "$refusing" 'only in a test build (feature fake-gcp)' 300
+	check "release VM $refusing: no statement" \
+		bash -c "! grep -aq 'eth-mpc-identity: ' '$run/vm$refusing/serial.log'"
+	vm_quit "$refusing"
 	check "measure.py: the replay accepts the predicted boot, refuses each tampering, and agrees with the real GCE log" \
 		python3 "$lib/measure.py" selftest "$release/measurements" >"$run/replay-selftest.txt"
 
@@ -905,7 +922,7 @@ gotpm) gotpm "$2" ;;
 build) build "$2" "$3" ;;
 compare) compare "$2" "$3" ;;
 test)
-	test_vms "$2" "$3" "$4" "${5:-4}"
+	test_vms "$2" "$3" "$4" "$5" "${6:-4}"
 	;;
 *)
 	sed -n '2,/^set -euo/p' "$0" | sed '$d' >&2

@@ -39,6 +39,24 @@ condition:
 - the VM the key's IAM binding names, by instance ID: a TDX token names a VM by project number
   and instance ID only, never by name.
 
+**What the node itself refuses.** The vault's flags come from the instance metadata, which a host
+can rewrite before the first boot, so the node checks them before it sends the data key anywhere:
+- **Google's endpoints only.** The node sends the new data key to KMS in the clear (`encrypt`). A
+  host that named its own KMS endpoint would read it there. Only a build with the `fake-gcp`
+  feature takes another token source, STS, KMS or metadata server (`--gcp-token-url`,
+  `--gcp-*-endpoint`). The QEMU harness's cluster runs that build, and its release image refuses
+  the fake's endpoints (`integration/tee`).
+- **Whole names.** The key and the provider must be plain resource names: they go into request
+  paths as they are, and a name with `..` could reach another project's key.
+- **The VM's own project.** The key and the provider must be in the VM's own project. Otherwise a
+  host could name a KMS key of its own project and grant this VM's principal set its use.
+  - The provider is checked against the project number in the VM's attestation token.
+  - The key is checked against the project ID from the metadata server. Cloud KMS names a key by
+    project ID only (by project number, a lookup is refused), and the metadata server's project
+    number must be the token's.
+  - So a node's KMS key cannot be in a separate KMS project. Separate the KMS and IAM admins from
+    the compute admins with roles within the project, or give each node its own project.
+
 **What a sealed node achieves:**
 - **Disk and backups hold no key in the clear.** Root on the host or the cloud's operators get
   none from them; on a VM the memory is the TDX module's.
@@ -155,7 +173,11 @@ condition:
   token. During an upgrade, the lists name the old and the new image.
 - **`rtmr3`.** Each node's configuration, by node index: the files written to its instance
   metadata, as its image measures them. `mpc-admin config-rtmr3 DIR` computes it from those files
-  (`args`, `peers`, `client-ca`, `approvers`).
+  (`args`, `peers`, `client-ca`, `approvers`). It refuses a configuration no client should pin:
+  - the sealed vault's test endpoints, `--gotpm` or `--data-dir`;
+  - a file flag that names anything but a file of the configuration
+    (`/run/eth-mpc-signer/config/<name>`; the helper's socket for `--gcp-token-socket`). RTMR3
+    covers those files only: the data disk is the host's to rewrite.
   - A node it does not name is refused, and so is a node whose RTMR3 differs (a host that rewrote
     its metadata).
   - The committee `mpc-admin attest` writes carries each node's index, for `split`.
@@ -313,17 +335,32 @@ test host, not in the repository (`project.env.example`).
   - **Teardown.** The run's own teardown failed: `gcp.sh down` read its third argument for the
     directory. The VMs ran 8 minutes longer, until `run.sh down` deleted them by hand. Fixed: a
     failed teardown now fails the run.
+- **The node's own checks** ("What the node itself refuses"; 2026-11-12, image
+  `20261112T065819Z`):
+  - **QEMU (`tee-qemu`).** 77 of 77 checks, the two builds equal.
+    - The cluster ran the `release-fake` image.
+    - A VM of the release image given the fake's endpoints refused them (`only in a test
+      build`) and made no vault.
+  - **GCP `run`.** 29 of 29 checks (run `run-20261112T071909Z`). Every node passed the project
+    check against Google's metadata server: on its first boot, in the cluster, and after a
+    restart.
+  - **`config-rtmr3`.** It took the harness's sealed configurations, and their RTMR3 were the
+    tokens'.
+  - **Measurements.** `gcp.sh measure` confirmed the RTMR1 and RTMR2 the build predicted.
 
 ## Tests
 
 - **Unit tests:**
   - `vault::tests`: sealing, swaps, other keys, permissions, plain and sealed vaults not mixed;
+  - `vault::gcp::tests`: only a test build takes other endpoints; key and provider names are
+    whole and plain; the key and the provider are the VM's own project's;
   - `dkg::secrets::tests`: a sealed store holds no scalar or seed in the clear, opens only with
     its cipher and partition, and refuses clear values;
   - `attestation::verify::tests`: each check of a token refuses on its own; a pinned
     configuration admits each node with its own RTMR3 only;
   - `attestation::config::tests`: the configuration's digest and RTMR3 are the image's (a vector
-    computed with the image's shell code; on GCP, node 0's matched its token);
+    computed with the image's shell code; on GCP, node 0's matched its token); a pinned
+    configuration has no test endpoint and reads only its own files;
   - `tls::tests`: only the operator CA's clients reach the attested key;
   - `peers::tests`.
 - **E2E (`tests/e2e/tee.rs`),** against the fake of Google's attestation, STS and KMS

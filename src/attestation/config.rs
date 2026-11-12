@@ -47,6 +47,90 @@ pub fn digest_of(files: &[File]) -> Result<[u8; 48], String> {
     Ok(sha384(manifest.as_bytes()))
 }
 
+/// Where the image puts the configuration's files: `<CONFIG_DIR><name>`.
+pub const CONFIG_DIR: &str = "/run/eth-mpc-signer/config/";
+/// The image's token helper (`--gcp-token-socket`).
+pub const TOKEN_SOCKET: &str = "/run/eth-mpc-signer/token.sock";
+
+/// The node's flags that name a file it reads.
+const FILE_FLAGS: &[&str] = &[
+    "--peers",
+    "--client-ca",
+    "--approvers",
+    "--approved-reshares",
+    "--anchor-acknowledgment",
+    "--share-encryption-key",
+    "--gcp-token-socket",
+];
+/// Flags a pinned configuration does not use:
+/// - the sealed vault's test endpoints (a build with `fake-gcp` only): a host's KMS endpoint sees
+///   the data key;
+/// - `--gotpm`: a program to run (the image's node gets tokens from its helper);
+/// - `--data-dir`: the image's.
+const REFUSED_FLAGS: &[&str] = &[
+    "--gcp-token-url",
+    "--gcp-sts-endpoint",
+    "--gcp-kms-endpoint",
+    "--gcp-metadata-endpoint",
+    "--gotpm",
+    "--data-dir",
+];
+
+/// Refuse a configuration that a client must not pin, whatever its digest. Its `args`, read as
+/// the image reads them (one argument per line; blank lines and `#` lines skipped):
+/// - no flag of [REFUSED_FLAGS];
+/// - every file flag names a file of the configuration (`<CONFIG_DIR><name>`, the helper's socket
+///   for `--gcp-token-socket`). RTMR3 covers those files only: the data disk is the host's to
+///   rewrite, and a relative path is the service's working directory's.
+pub fn check_args(files: &[File]) -> Result<(), String> {
+    let args = files
+        .iter()
+        .find(|(name, _)| name == "args")
+        .ok_or("a configuration has an `args` file")?;
+    let text = std::str::from_utf8(&args.1).map_err(|_| "args: not UTF-8")?;
+    let mut lines = text
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .peekable();
+    if matches!(lines.peek(), Some(&("identity" | "measure"))) {
+        lines.next();
+    }
+    while let Some(line) = lines.next() {
+        let (flag, inline) = match line.split_once('=') {
+            Some((flag, value)) if flag.starts_with("--") => (flag, Some(value)),
+            _ => (line, None),
+        };
+        if REFUSED_FLAGS.contains(&flag) {
+            return Err(format!(
+                "args: {flag} is not for a pinned configuration (docs/tee.md)"
+            ));
+        }
+        if !FILE_FLAGS.contains(&flag) {
+            continue;
+        }
+        let value = match inline {
+            Some(value) => value,
+            None => lines
+                .next()
+                .ok_or_else(|| format!("args: {flag} without a file"))?,
+        };
+        let allowed = if flag == "--gcp-token-socket" {
+            value == TOKEN_SOCKET
+        } else {
+            value.strip_prefix(CONFIG_DIR).is_some_and(|name| {
+                valid_name(name) && files.iter().any(|(file, _)| file == name)
+            })
+        };
+        if !allowed {
+            return Err(format!(
+                "args: {flag} {value} is not a file of this configuration ({CONFIG_DIR}<name>): \
+                 a node would read it unmeasured"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// RTMR3 after the image's one extension with `digest` (from zero).
 pub fn rtmr3(digest: &[u8; 48]) -> [u8; 48] {
     let mut input = [0u8; 96];

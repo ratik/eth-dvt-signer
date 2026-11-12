@@ -159,9 +159,11 @@ tee_qemu() {
 	# (pinned in integration/tee/versions.env), the default-features signer in RUST_IMAGE, the
 	# release image built twice (both must be equal: reproducibility) and the debug image once,
 	# each with GCE's `disk.tar.gz`, gotpm built in the tools image (TEE_GOTPM=0: none), and on
-	# the host `tee-fake-gcp`, `mpc-admin` and `mpc-keytool` with test-hooks. Then NODES
-	# release VMs make their sealed vaults and run as one sealed cluster against the fake of
-	# Google's attestation, STS and KMS, with a debug and a tampered VM. Logs and measurements in
+	# the host `tee-fake-gcp`, `mpc-admin` and `mpc-keytool` with test-hooks. The release profile
+	# once more with a signer built with `fake-gcp` (release-fake): only that node takes the
+	# fake's endpoints. Then NODES release-fake VMs make their sealed vaults and run as one sealed
+	# cluster against the fake of Google's attestation, STS and KMS, with a debug and a tampered
+	# VM, and a release VM refuses the fake's endpoints. Logs and measurements in
 	# IT_HOME/tee/runs/<time>/. The image builds run as root in a container with CAP_SYS_ADMIN
 	# (mkosi's namespaces) and no devices; the VMs run as the host user with /dev/kvm only, and
 	# no network beyond QEMU's user-mode one. TEE_REPRO=0 skips the second build;
@@ -223,6 +225,21 @@ tee_qemu() {
 		log "the host tools build failed: $run/cargo-host.log"
 		return 1
 	}
+	# The node of the QEMU cluster's VMs: default features plus `fake-gcp`, which takes the fake's
+	# endpoints. Its image (release-fake) never goes to GCP: a host could point it at its own KMS.
+	log "building the signer with fake-gcp (the QEMU cluster's) in $RUST_IMAGE"
+	mkdir -p "$IT_HOME/tee/target-fake"
+	docker run --rm -u "$(id -u):$(id -g)" -v "$IT_HOME/cargo-home:/it/cargo-home" \
+		-v "$IT_HOME/tee/target-fake:/it/tee/target" -v "$repo:/it/src:ro" -v "$run:/it/out" \
+		-e CARGO_HOME=/it/cargo-home -w /it/src "$RUST_IMAGE" sh -c "
+			cargo build --locked --release --features fake-gcp --bin eth-mpc-signer \
+				--target-dir /it/tee/target &&
+			cp /it/tee/target/release/eth-mpc-signer /it/out/eth-mpc-signer-fake" \
+		>"$run/cargo-fake.log" 2>&1 || {
+		tail -n 30 "$run/cargo-fake.log" >&2
+		log "the fake-gcp signer build failed: $run/cargo-fake.log"
+		return 1
+	}
 	# go-tpm-tools' gotpm (the GCE attestation token), twice in the tools image when reproducing:
 	# a pinned commit, Debian's Go, modules checked against go.sum. TEE_GOTPM=0: none (QEMU needs
 	# none; the image then gets no token on GCE).
@@ -242,12 +259,14 @@ tee_qemu() {
 			}
 		done
 	fi
-	local builds=(release-a debug)
-	[ "${TEE_REPRO:-1}" != 1 ] || builds=(release-a release-b debug)
+	local builds=(release-a debug release-fake)
+	[ "${TEE_REPRO:-1}" != 1 ] || builds=(release-a release-b debug release-fake)
 	local build
 	for build in "${builds[@]}"; do
-		local which=a helpers=()
+		local which=a binary helpers=()
 		[ "$build" != release-b ] || which=b
+		binary="$which"
+		[ "$build" != release-fake ] || binary=fake
 		[ ! -f "$run/tee-token-$which" ] || helpers+=(-e TOKEN_BINARY="/it/out/tee-token-$which")
 		[ ! -f "$run/gotpm-$which" ] || helpers+=(-e GOTPM_BINARY="/it/out/gotpm-$which")
 		docker run --rm --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
@@ -255,7 +274,7 @@ tee_qemu() {
 			-v "$IT_HOME/tee/cache:/it/tee/cache" -v "$run:/it/out" -v "$repo:/it/src:ro" \
 			-e TEE_SNAPSHOT="$TEE_SNAPSHOT" -e TEE_SOURCE_DATE_EPOCH="$TEE_SOURCE_DATE_EPOCH" \
 			-e TEE_IMAGE_VERSION="${TEE_IMAGE_VERSION:-}" \
-			-e BINARY="/it/out/eth-mpc-signer-$which" "${helpers[@]}" \
+			-e BINARY="/it/out/eth-mpc-signer-$binary" "${helpers[@]}" \
 			-e OWNER="$(id -u):$(id -g)" "$tools" \
 			bash /it/src/integration/tee/qemu.sh build "${build%-*}" "/it/out/$build" || return 1
 	done
@@ -270,7 +289,8 @@ tee_qemu() {
 		--group-add "$(stat -c %g /dev/kvm)" -v /etc/passwd:/etc/passwd:ro \
 		-v /etc/group:/etc/group:ro -e HOME=/it/out -e HOSTBIN=/it/out/host-bin \
 		-v "$run:/it/out" -v "$repo:/it/src:ro" "$tools" \
-		bash /it/src/integration/tee/qemu.sh test /it/out/release-a /it/out/debug /it/out \
+		bash /it/src/integration/tee/qemu.sh test /it/out/release-fake /it/out/release-a \
+		/it/out/debug /it/out \
 		"$nodes" || status=1
 	{
 		for build in release-a debug; do

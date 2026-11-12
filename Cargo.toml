@@ -11,7 +11,11 @@ exclude = ["fuzz"]
 [features]
 # Fault injection for the real-process end-to-end tests (see `src/hooks.rs`). Never enable it in
 # a deployment.
-test-hooks = ["dev-api"]
+test-hooks = ["dev-api", "fake-gcp"]
+# The sealed vault's test endpoints (`--gcp-token-url`, `--gcp-sts-endpoint`, `--gcp-kms-endpoint`,
+# `--gcp-metadata-endpoint`), for `tee-fake-gcp`. A host could point a node built with it at its
+# own KMS, which sees the vault's data key. Never enable it in an image a key release admits.
+fake-gcp = []
 # The raw signing API (`POST /sign`, `GET /authorizations`) for development and tests: signs any
 # payload with a development key. Never enable it in a deployment.
 dev-api = []

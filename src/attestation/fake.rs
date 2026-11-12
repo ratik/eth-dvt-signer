@@ -11,6 +11,9 @@
 //!   to (the IAM binding on the real key: a TDX token names the VM by instance ID, not by name),
 //!   with the associated data checked.
 //!
+//! - **The metadata server** (`GET /metadata/project/project-id`, `.../numeric-project-id`, with
+//!   `Metadata-Flavor: Google`): the project of every VM, [PROJECT_ID] and its number.
+//!
 //! - **Control** (`POST /control/vm/<instance>`, `{"rtmr1", "rtmr2", "rtmr3", "dbgstat"}`): what an
 //!   instance reports from now on (another image, a debug VM, another configuration), for tests
 //!   outside this process. `POST /control/admit`, `{"images": [{"rtmr1", "rtmr2"}]}`: the images
@@ -27,7 +30,7 @@ use axum::{
     Json, Router,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
-    routing::post,
+    routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chacha20poly1305::{
@@ -44,6 +47,8 @@ use std::{
 
 pub const PROVIDER: &str =
     "projects/1/locations/global/workloadIdentityPools/tee/providers/attestation";
+/// The ID of the project every VM runs in (its number is 1, [Vm]'s).
+pub const PROJECT_ID: &str = "test-project";
 pub const AUDIENCE: &str = "eth-mpc-signer";
 
 /// The instance name of node `id`.
@@ -53,7 +58,7 @@ pub fn instance(id: usize) -> String {
 
 /// The KMS key of node `id`.
 pub fn key(id: usize) -> String {
-    format!("projects/test-project/locations/global/keyRings/tee/cryptoKeys/node-{id}")
+    format!("projects/{PROJECT_ID}/locations/global/keyRings/tee/cryptoKeys/node-{id}")
 }
 
 struct Inner {
@@ -116,6 +121,7 @@ impl FakeGcp {
             .route("/kms/{*path}", post(kms))
             .route("/control/vm/{instance}", post(control))
             .route("/control/admit", post(admit))
+            .route("/metadata/project/{field}", get(metadata))
             .with_state(inner.clone());
         let listener = std::net::TcpListener::bind(address).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -203,6 +209,8 @@ impl FakeGcp {
             format!("{url}/sts"),
             "--gcp-kms-endpoint".into(),
             format!("{url}/kms"),
+            "--gcp-metadata-endpoint".into(),
+            format!("{url}/metadata"),
         ]
     }
 
@@ -357,6 +365,18 @@ async fn kms(
             .ok_or((StatusCode::BAD_REQUEST, "decryption failed".to_string()))?;
             Ok(json!({"plaintext": BASE64.encode(plaintext)}).to_string())
         }
+        other => Err((StatusCode::NOT_FOUND, other.to_string())),
+    }
+}
+
+/// The metadata server's project values; like GCE's, only with `Metadata-Flavor: Google`.
+async fn metadata(headers: HeaderMap, Path(field): Path<String>) -> Reply {
+    if headers.get("metadata-flavor").and_then(|value| value.to_str().ok()) != Some("Google") {
+        return Err((StatusCode::FORBIDDEN, "Metadata-Flavor: Google".into()));
+    }
+    match field.as_str() {
+        "project-id" => Ok(PROJECT_ID.into()),
+        "numeric-project-id" => Ok(Vm::new("release").project_number),
         other => Err((StatusCode::NOT_FOUND, other.to_string())),
     }
 }

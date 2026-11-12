@@ -117,30 +117,38 @@ struct VaultArgs {
 
     #[arg(long, hide = true, default_value = gcp::Config::KMS)]
     gcp_kms_endpoint: String,
+
+    #[arg(long, hide = true, default_value = gcp::Config::METADATA)]
+    gcp_metadata_endpoint: String,
 }
 
 impl VaultArgs {
     fn kind(&self) -> Result<vault::Kind, String> {
         match self.vault.as_str() {
             "plain" => Ok(vault::Kind::Plain),
-            "gcp-tdx" => Ok(vault::Kind::Gcp(gcp::Config {
-                kms_key: self
-                    .gcp_kms_key
-                    .clone()
-                    .ok_or("--vault gcp-tdx needs --gcp-kms-key")?,
-                wif_provider: self
-                    .gcp_wif_provider
-                    .clone()
-                    .ok_or("--vault gcp-tdx needs --gcp-wif-provider")?,
-                attestation_audience: self.attestation_audience.clone(),
-                token: match (&self.gcp_token_url, &self.gcp_token_socket) {
-                    (Some(url), _) => gcp::TokenSource::Url(url.clone()),
-                    (None, Some(socket)) => gcp::TokenSource::Socket(socket.clone()),
-                    (None, None) => gcp::TokenSource::Gotpm(self.gotpm.clone()),
-                },
-                sts_endpoint: self.gcp_sts_endpoint.clone(),
-                kms_endpoint: self.gcp_kms_endpoint.clone(),
-            })),
+            "gcp-tdx" => {
+                let config = gcp::Config {
+                    kms_key: self
+                        .gcp_kms_key
+                        .clone()
+                        .ok_or("--vault gcp-tdx needs --gcp-kms-key")?,
+                    wif_provider: self
+                        .gcp_wif_provider
+                        .clone()
+                        .ok_or("--vault gcp-tdx needs --gcp-wif-provider")?,
+                    attestation_audience: self.attestation_audience.clone(),
+                    token: match (&self.gcp_token_url, &self.gcp_token_socket) {
+                        (Some(url), _) => gcp::TokenSource::Url(url.clone()),
+                        (None, Some(socket)) => gcp::TokenSource::Socket(socket.clone()),
+                        (None, None) => gcp::TokenSource::Gotpm(self.gotpm.clone()),
+                    },
+                    sts_endpoint: self.gcp_sts_endpoint.clone(),
+                    kms_endpoint: self.gcp_kms_endpoint.clone(),
+                    metadata_endpoint: self.gcp_metadata_endpoint.clone(),
+                };
+                config.check(cfg!(feature = "fake-gcp"))?;
+                Ok(vault::Kind::Gcp(config))
+            }
             other => Err(format!("unknown vault {other} (plain, gcp-tdx)")),
         }
     }
@@ -438,6 +446,7 @@ fn main() {
         tracing_subscriber::fmt()
             .with_env_filter(filter())
             .with_writer(std::io::stderr)
+            .with_ansi(std::io::stderr().is_terminal())
             .init();
         identity(IdentityArgs::parse_from(argv.iter().skip(1)));
     }
