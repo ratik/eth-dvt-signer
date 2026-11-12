@@ -103,6 +103,13 @@ mpc-gateway … --listen 0.0.0.0:9000 \
 `--listen-tls12` also accepts TLS 1.2. Teku speaks only TLS 1.2 to an external signer; rustls
 offers TLS 1.2 with ECDHE and AEAD ciphers only.
 
+`--listen-revoked-client-certs FILE` revokes validator clients' certificates, as a node's
+`--revoked-client-certs` does (docs/tee.md):
+- one SHA-256 fingerprint per line (`openssl x509 -noout -fingerprint -sha256`): a leaf, an
+  intermediate, or a CA of `--listen-client-ca`;
+- read again every 5 s, so a revocation needs no restart;
+- a revoked client's open connections close at its next request.
+
 ### Development nodes
 
 ```sh
@@ -180,7 +187,8 @@ It is the development proxy's format, which the devnet report reads.
   signature the network refuses, nor forge one.
 - **It is a point of failure for its validator client.** Run one per validator client, next to
   it.
-- **It does not split client roles.** Any certificate of `--listen-client-ca` gets the signing API.
+- **It does not split client roles.** Any certificate of `--listen-client-ca` gets the signing API,
+  until it is revoked (`--listen-revoked-client-certs`).
 
 ## Tests
 
@@ -203,7 +211,8 @@ It is the development proxy's format, which the devnet report reads.
   - **GW-3:** a node is dropped while its token shows another image, and taken back after; a node
     whose configuration is not the pinned one is never used.
   - **GW-4:** validator clients need a certificate of the client CA; TLS 1.2 only with
-    `--listen-tls12`.
+    `--listen-tls12`; a revoked validator client is refused once the gateway reads its list
+    again.
 - **Devnet.** Lighthouse signs through the gateway in every devnet run (docs/ethereum-devnet.md),
   and on GCP in front of sealed nodes (docs/tee.md, `run-validator.sh`).
   - **Devnet results.** Runs O to U, every mode: no signature failed the check, and every

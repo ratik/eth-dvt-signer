@@ -97,7 +97,11 @@ impl Config {
         for (flag, value, google) in [
             ("--gcp-sts-endpoint", &self.sts_endpoint, Self::STS),
             ("--gcp-kms-endpoint", &self.kms_endpoint, Self::KMS),
-            ("--gcp-metadata-endpoint", &self.metadata_endpoint, Self::METADATA),
+            (
+                "--gcp-metadata-endpoint",
+                &self.metadata_endpoint,
+                Self::METADATA,
+            ),
         ] {
             if value != google {
                 test.push(flag);
@@ -127,11 +131,16 @@ fn plain(segment: &str) -> bool {
 /// `projects/<p>/locations/<l>/keyRings/<r>/cryptoKeys/<k>`.
 pub fn key_project(key: &str) -> Option<&str> {
     match key.split('/').collect::<Vec<_>>()[..] {
-        ["projects", project, "locations", location, "keyRings", ring, "cryptoKeys", name]
-            if [project, location, ring, name].iter().all(|s| plain(s)) =>
-        {
-            Some(project)
-        }
+        [
+            "projects",
+            project,
+            "locations",
+            location,
+            "keyRings",
+            ring,
+            "cryptoKeys",
+            name,
+        ] if [project, location, ring, name].iter().all(|s| plain(s)) => Some(project),
         _ => None,
     }
 }

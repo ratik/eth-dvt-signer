@@ -183,6 +183,13 @@ struct Args {
     #[arg(long, requires = "https_listen")]
     client_ca: Option<PathBuf>,
 
+    /// Client certificates the mTLS listener refuses: one SHA-256 fingerprint of a certificate's
+    /// DER per line (`openssl x509 -noout -fingerprint -sha256`), a leaf, an intermediate or a CA
+    /// of `--client-ca`. Read again every few seconds: a revoked client's open connections close
+    /// at its next request (docs/tee.md).
+    #[arg(long, requires = "https_listen")]
+    revoked_client_certs: Option<PathBuf>,
+
     /// Serve no plain HTTP API on loopback: the mTLS listener only.
     #[arg(long, requires = "https_listen")]
     no_http: bool,
@@ -605,9 +612,21 @@ fn main() {
             (Some(address), Some((key, chain)), Some(client_ca)) => {
                 let client_ca = std::fs::read_to_string(client_ca)
                     .unwrap_or_else(|err| refuse(format!("{}: {err}", client_ca.display())));
-                let config = eth_mpc_signer::tls::server_config(key, chain, &client_ca)
+                let revoked = match &args.revoked_client_certs {
+                    Some(path) => {
+                        let (revoked, reload) = eth_mpc_signer::tls::Revocations::from_file(
+                            path,
+                            eth_mpc_signer::tls::REVOCATIONS_RELOAD,
+                        )
+                        .unwrap_or_else(|err| refuse(err));
+                        ::tokio::spawn(reload);
+                        revoked
+                    }
+                    None => eth_mpc_signer::tls::Revocations::none(),
+                };
+                let config = eth_mpc_signer::tls::server_config(key, chain, &client_ca, &revoked)
                     .unwrap_or_else(|err| refuse(err));
-                Some((address, config))
+                Some((address, config, revoked))
             }
             _ => None,
         };
@@ -761,8 +780,8 @@ fn main() {
                 }
             }));
         }
-        if let Some((address, config)) = https {
-            let listener = eth_mpc_signer::tls::Listener::bind(address, config)
+        if let Some((address, config, revoked)) = https {
+            let listener = eth_mpc_signer::tls::Listener::bind(address, config, revoked)
                 .await
                 .unwrap_or_else(|err| refuse(format!("--https-listen {address}: {err}")));
             info!(%address, "serving the API over mTLS");

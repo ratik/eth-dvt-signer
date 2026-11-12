@@ -371,7 +371,11 @@ async fn kms(
 
 /// The metadata server's project values; like GCE's, only with `Metadata-Flavor: Google`.
 async fn metadata(headers: HeaderMap, Path(field): Path<String>) -> Reply {
-    if headers.get("metadata-flavor").and_then(|value| value.to_str().ok()) != Some("Google") {
+    if headers
+        .get("metadata-flavor")
+        .and_then(|value| value.to_str().ok())
+        != Some("Google")
+    {
         return Err((StatusCode::FORBIDDEN, "Metadata-Flavor: Google".into()));
     }
     match field.as_str() {

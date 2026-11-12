@@ -375,7 +375,9 @@ fn main() -> ExitCode {
         Command::ConfigRtmr3 { dir } => {
             use eth_mpc_signer::attestation::config;
             config::read_dir(&dir)
-                .and_then(|files| config::check_args(&files).and_then(|()| config::digest_of(&files)))
+                .and_then(|files| {
+                    config::check_args(&files).and_then(|()| config::digest_of(&files))
+                })
                 .map(|digest| {
                     println!("digest {}", hex::encode(digest));
                     println!("rtmr3 {}", hex::encode(config::rtmr3(&digest)));

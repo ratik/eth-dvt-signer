@@ -204,7 +204,9 @@ fn the_project_number_comes_from_the_token() {
         )
     };
     assert_eq!(
-        token_project_number(&token(json!({"submods": {"gce": {"project_number": "42"}}}))),
+        token_project_number(&token(
+            json!({"submods": {"gce": {"project_number": "42"}}})
+        )),
         Ok("42".into())
     );
     assert_eq!(

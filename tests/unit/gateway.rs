@@ -324,7 +324,10 @@ fn a_node_that_could_not_finish_is_asked_again() {
         let (answer, attempts) = sign(&gateway).await;
         assert!(signed(&answer));
         assert_eq!(
-            attempts.iter().map(|a| (a.backend.clone(), a.status)).collect::<Vec<_>>(),
+            attempts
+                .iter()
+                .map(|a| (a.backend.clone(), a.status))
+                .collect::<Vec<_>>(),
             vec![
                 (first.url.clone(), Some(504)),
                 (second.url.clone(), Some(504)),

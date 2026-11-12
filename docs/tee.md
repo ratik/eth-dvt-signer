@@ -89,7 +89,9 @@ can rewrite before the first boot, so the node checks them before it sends the d
 - **Old shares.** An old sealed share restored from a disk snapshot stays inside the vault. It
   cannot leave it, so erasure after a reshare holds against copying.
 - **Client roles.** Over mTLS they are not split: any certificate of the operator's CA gets the
-  whole API, while the approvers still gate protected operations (P0).
+  whole API, while the approvers still gate protected operations (P0). A certificate can be
+  revoked (`--revoked-client-certs`, below). On a sealed node, a revocation takes a
+  configuration change and a restart.
 
 ## Running sealed nodes
 
@@ -118,6 +120,7 @@ can rewrite before the first boot, so the node checks them before it sends the d
    - `--peers peers.json`;
    - `--https-listen 0.0.0.0:8443 --client-ca operator-ca.pem` (TLS 1.3, a client certificate of
      the operator's CA required);
+   - `--revoked-client-certs revoked-client-certs`, to revoke client certificates (below);
    - `--no-http`, to serve the mTLS listener only.
 
    Without `--peers`, a node runs with development keys derived from `--id`, as before.
@@ -125,6 +128,25 @@ can rewrite before the first boot, so the node checks them before it sends the d
    A sealed node refuses to start without `--peers`, with a plain vault's files, with
    `--share-encryption-key`, or when any item or secret does not open. It also refuses when KMS
    does not release its data key.
+
+   **Revoking a client certificate** (a stolen operator certificate, a retired gateway):
+   - **The list.** `--revoked-client-certs FILE` holds one SHA-256 fingerprint of a certificate's
+     DER per line. `openssl x509 -in client.pem -noout -fingerprint -sha256 >> FILE` appends one;
+     `#` starts a comment.
+   - **What is refused.** A listed leaf or intermediate is refused in the handshake. A listed CA
+     of `--client-ca` no longer issues clients.
+   - **When it applies.** The node reads the list again every 5 s (`tls::REVOCATIONS_RELOAD`):
+     new handshakes at once, and a revoked client's open connections at its next request. A file
+     that no longer parses keeps the list in force, with a warning.
+   - **On a sealed node** the list is a file of the configuration
+     (`/run/eth-mpc-signer/config/revoked-client-certs`, instance metadata
+     `mpc-revoked-client-certs`), so it is measured into RTMR3. It is read at boot only: a host
+     cannot empty it, and changing it changes RTMR3. To revoke:
+     1. write the new list into the node's metadata;
+     2. add the new configuration's RTMR3 (`mpc-admin config-rtmr3`) to the clients' policies
+        (the gateway's, `mpc-admin`'s) next to the old one;
+     3. restart the VM gracefully;
+     4. drop the old RTMR3 from the policies.
 4. **Check the nodes:**
 
    ```sh
@@ -361,7 +383,9 @@ test host, not in the repository (`project.env.example`).
   - `attestation::config::tests`: the configuration's digest and RTMR3 are the image's (a vector
     computed with the image's shell code; on GCP, node 0's matched its token); a pinned
     configuration has no test endpoint and reads only its own files;
-  - `tls::tests`: only the operator CA's clients reach the attested key;
+  - `tls::tests`: only the operator CA's clients reach the attested key; a revoked leaf,
+    intermediate or CA is refused; a changed list closes a revoked client's open connection and
+    refuses its new ones, a broken file keeps the list in force;
   - `peers::tests`.
 - **E2E (`tests/e2e/tee.rs`),** against the fake of Google's attestation, STS and KMS
   (`tests/e2e/harness/gcp.rs`):
@@ -376,7 +400,8 @@ test host, not in the repository (`project.env.example`).
     acknowledge their shares.
   - **TEE-4:** two sealed and two plain nodes run one network.
   - **TEE-5:** the mTLS API refuses no certificate, another CA's, and a client pinning another
-    node's CA.
+    node's CA. The operator's certificate, once listed in `--revoked-client-certs`, is refused
+    within a reload, and served again once the list drops it.
   - **TEE-6:** an image upgrade:
     - nodes move to the new image while both are admitted, unseal the same vault and sign;
     - a policy naming both images attests them, one naming the old image alone refuses them;

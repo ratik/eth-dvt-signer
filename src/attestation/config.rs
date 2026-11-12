@@ -56,6 +56,7 @@ pub const TOKEN_SOCKET: &str = "/run/eth-mpc-signer/token.sock";
 const FILE_FLAGS: &[&str] = &[
     "--peers",
     "--client-ca",
+    "--revoked-client-certs",
     "--approvers",
     "--approved-reshares",
     "--anchor-acknowledgment",
@@ -117,9 +118,9 @@ pub fn check_args(files: &[File]) -> Result<(), String> {
         let allowed = if flag == "--gcp-token-socket" {
             value == TOKEN_SOCKET
         } else {
-            value.strip_prefix(CONFIG_DIR).is_some_and(|name| {
-                valid_name(name) && files.iter().any(|(file, _)| file == name)
-            })
+            value
+                .strip_prefix(CONFIG_DIR)
+                .is_some_and(|name| valid_name(name) && files.iter().any(|(file, _)| file == name))
         };
         if !allowed {
             return Err(format!(

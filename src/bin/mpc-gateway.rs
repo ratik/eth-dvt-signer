@@ -46,6 +46,13 @@ struct Args {
     #[arg(long, requires = "listen_tls_cert")]
     listen_tls12: bool,
 
+    /// Validator clients' certificates it refuses: one SHA-256 fingerprint of a certificate's DER
+    /// per line (`openssl x509 -noout -fingerprint -sha256`), a leaf, an intermediate or a CA of
+    /// `--listen-client-ca`. Read again every few seconds: a revoked client's open connections
+    /// close at its next request.
+    #[arg(long, requires = "listen_tls_cert")]
+    listen_revoked_client_certs: Option<PathBuf>,
+
     /// The nodes, comma-separated, in order of preference: `https://host:8443` (a node's mTLS
     /// API) or `http://127.0.0.1:port` (a node with development keys).
     #[arg(long, value_delimiter = ',', required = true)]
@@ -150,6 +157,14 @@ fn run(args: Args) -> Result<(), String> {
         .as_deref()
         .map(|path| Jwks::from_json(&read_text(path)?))
         .transpose()?;
+    let (revoked, reload) = match &args.listen_revoked_client_certs {
+        Some(path) => {
+            let (revoked, reload) = tls::Revocations::from_file(path, tls::REVOCATIONS_RELOAD)
+                .map_err(|err| format!("--listen-revoked-client-certs {err}"))?;
+            (revoked, Some(reload))
+        }
+        None => (tls::Revocations::none(), None),
+    };
     let server_tls = match (
         &args.listen_tls_cert,
         &args.listen_tls_key,
@@ -166,6 +181,7 @@ fn run(args: Args) -> Result<(), String> {
                 &read_text(chain)?,
                 &read_text(client_ca)?,
                 args.listen_tls12,
+                &revoked,
             )?)
         }
         _ => None,
@@ -194,6 +210,9 @@ fn run(args: Args) -> Result<(), String> {
         .build()
         .map_err(|err| err.to_string())?;
     runtime.block_on(async move {
+        if let Some(reload) = reload {
+            tokio::spawn(reload);
+        }
         let gateway = Gateway::new(config)?;
         gateway.check_all().await;
         let usable = gateway.nodes().iter().filter(|node| node.usable()).count();
@@ -217,7 +236,7 @@ fn run(args: Args) -> Result<(), String> {
         let router = gateway.router();
         match server_tls {
             Some(server_tls) => {
-                let listener = tls::Listener::bind(args.listen, server_tls)
+                let listener = tls::Listener::bind(args.listen, server_tls, revoked)
                     .await
                     .map_err(|err| format!("--listen {}: {err}", args.listen))?;
                 tracing::info!(address = %args.listen, "listening (TLS, client certificates)");

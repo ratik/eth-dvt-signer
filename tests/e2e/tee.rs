@@ -154,6 +154,9 @@ pub(crate) fn network_with(
     .unwrap();
     let peers_path = network.dir.join("peers.json");
     std::fs::write(&peers_path, peers.to_json()).unwrap();
+    // No certificate revoked yet (TEE-5 revokes one).
+    let revoked_path = network.dir.join("revoked-client-certs");
+    std::fs::write(&revoked_path, "").unwrap();
     for id in 0..NODES {
         let mut args = vault(id);
         args.extend([
@@ -163,6 +166,8 @@ pub(crate) fn network_with(
             network.https_addr(id).to_string(),
             "--client-ca".into(),
             operator.ca_path.display().to_string(),
+            "--revoked-client-certs".into(),
+            revoked_path.display().to_string(),
         ]);
         network.set_node_args(id, args);
         network.start_node(id);
@@ -510,6 +515,34 @@ fn tee_5_the_mtls_api_refuses_clients_without_the_operators_certificate() {
     assert!(call(Operator::client(&statements[0], Some(&stranger))).is_err());
     // A client that pins another node's CA does not accept this node's certificate.
     assert!(call(Operator::client(&statements[1], Some(&operator))).is_err());
+
+    // The operator's certificate revoked: refused once the node reads its list again.
+    std::fs::write(
+        network.dir.join("revoked-client-certs"),
+        format!(
+            "{}\n",
+            hex::encode(eth_mpc_signer::tls::fingerprint(&operator.chain[0]))
+        ),
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + 4 * eth_mpc_signer::tls::REVOCATIONS_RELOAD;
+    while call(Operator::client(&statements[0], Some(&operator))).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the revoked certificate is still served"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // Lifted again: served again.
+    std::fs::write(network.dir.join("revoked-client-certs"), "").unwrap();
+    let deadline = std::time::Instant::now() + 4 * eth_mpc_signer::tls::REVOCATIONS_RELOAD;
+    while call(Operator::client(&statements[0], Some(&operator))).is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the certificate is still refused"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 const ADMIN: &str = env!("CARGO_BIN_EXE_mpc-admin");

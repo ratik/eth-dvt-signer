@@ -539,4 +539,39 @@ fn gateway_4_validator_clients_need_a_certificate_of_its_client_ca() {
         upcheck(&gateway, client(&ca, Some(&vc), true)).unwrap(),
         200
     );
+    drop(gateway);
+
+    // A revoked validator client: refused once the gateway reads its list again.
+    let revoked = network.dir.join("gateway-revoked-client-certs");
+    std::fs::write(&revoked, "").unwrap();
+    let mut args = listen(false);
+    args.extend([
+        "--listen-revoked-client-certs".to_string(),
+        revoked.display().to_string(),
+    ]);
+    let gateway = start(
+        &network,
+        &gcp,
+        &operator,
+        &[0, 1, 2, 3],
+        &policy(&gcp, release_rtmr3),
+        &args,
+        Some(client(&ca, Some(&vc), false)),
+    );
+    std::fs::write(
+        &revoked,
+        format!(
+            "{}\n",
+            hex::encode(eth_mpc_signer::tls::fingerprint(&vc.chain[0]))
+        ),
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + 4 * eth_mpc_signer::tls::REVOCATIONS_RELOAD;
+    while upcheck(&gateway, client(&ca, Some(&vc), false)).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the revoked validator client is still served"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
