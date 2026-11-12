@@ -61,7 +61,7 @@ use commonware_cryptography::{
         },
         primitives::{group::Share, variant::PartialSignature},
     },
-    ed25519::{self, PrivateKey, PublicKey},
+    ed25519::{PrivateKey, PublicKey},
     transcript::{Summary, Transcript, Version},
 };
 use commonware_macros::select;
@@ -1150,11 +1150,7 @@ impl<
             .map(|(player, _)| player),
         };
         let derived = player.map_err(FinalizeError::from).and_then(|player| {
-            player.finalize::<Faults, ed25519::Batch>(
-                &mut *self.context,
-                ceremony.logs(),
-                &Sequential,
-            )
+            player.finalize::<Faults>(&mut *self.context, ceremony.logs(), &Sequential)
         });
         let key_share = match derived {
             Ok((_, share)) => KeyShare::new(ceremony, share),

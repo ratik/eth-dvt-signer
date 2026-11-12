@@ -517,7 +517,7 @@ fn load_key(path: &Path) -> Result<PrivateKey, String> {
     let text = text.trim();
     hex::decode(text.strip_prefix("0x").unwrap_or(text))
         .ok()
-        .and_then(|bytes| PrivateKey::decode(bytes.as_slice()).ok())
+        .and_then(|bytes| PrivateKey::decode(bytes).ok())
         .ok_or_else(|| format!("{} is not an approver key", path.display()))
 }
 
@@ -669,7 +669,7 @@ fn administration(nodes: &[Node]) -> Result<(Digest, u64), String> {
     let cluster = cluster.ok_or("no node answers")?;
     let digest = hex::decode(cluster.trim_start_matches("0x"))
         .ok()
-        .and_then(|bytes| Digest::decode(bytes.as_slice()).ok())
+        .and_then(|bytes| Digest::decode(bytes).ok())
         .ok_or("bad cluster id")?;
     Ok((digest, nonce + 1))
 }
@@ -1714,7 +1714,7 @@ fn anchor_cluster(nodes: &[Node], at: &AnchorAt) -> Result<Digest, String> {
     match &at.cluster {
         Some(cluster) => hex::decode(cluster.trim_start_matches("0x"))
             .ok()
-            .and_then(|bytes| Digest::decode(bytes.as_slice()).ok())
+            .and_then(|bytes| Digest::decode(bytes).ok())
             .ok_or_else(|| format!("--cluster {cluster} is not 32 bytes of 0x-hex")),
         None if nodes.is_empty() => Err("--cluster or --nodes is required".into()),
         None => administration(nodes).map(|(cluster, _)| cluster),

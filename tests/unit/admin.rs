@@ -248,7 +248,7 @@ fn the_admin_command_encoding() {
     for _ in 0..100_000 {
         nested.extend_from_slice(&[15, 1]);
     }
-    assert!(Command::decode(nested.as_slice()).is_err());
+    assert!(Command::decode(commonware_codec::Copying(nested.as_slice())).is_err());
     let inner = authorized(&admin, 7, activation(1), &[100]);
     let mut twice = authorized(&admin, 7, activation(1), &[100]);
     twice.command = Command::Admin(Box::new(inner));
@@ -640,7 +640,7 @@ fn approvals_wrap_exits_and_deposits_only() {
     let exit = command("sign-exit", &exit_request(7, 300, 12, "0x03000000", 1)).unwrap();
     let encoded = Command::Admin(Box::new(authorized(&admin, 1, exit, &[100, 101]))).encode();
     assert!(matches!(
-        Command::decode(encoded.as_ref()),
+        Command::decode(commonware_codec::Copying(encoded.as_ref())),
         Ok(Command::Admin(_))
     ));
     let Command::Duty(mut request) =
@@ -653,7 +653,7 @@ fn approvals_wrap_exits_and_deposits_only() {
     assert!(!attestation.is_protected());
     let encoded =
         Command::Admin(Box::new(authorized(&admin, 1, attestation, &[100, 101]))).encode();
-    assert!(Command::decode(encoded.as_ref()).is_err());
+    assert!(Command::decode(commonware_codec::Copying(encoded.as_ref())).is_err());
 }
 
 /// The builder registration policy is a protected command: approvals bind every field of it

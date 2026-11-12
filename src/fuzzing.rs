@@ -33,9 +33,10 @@ use std::sync::OnceLock;
 
 /// `bytes` decoded as `T`, if they are one; its encoding decodes again to the same encoding.
 pub(crate) fn round_trip<T: DecodeExt<()> + Encode>(bytes: &[u8]) -> Option<T> {
-    let value = T::decode(bytes).ok()?;
+    let value = T::decode(commonware_codec::Copying(bytes)).ok()?;
     let encoded = value.encode();
-    let again = T::decode(encoded.as_ref()).expect("a value's own encoding decodes");
+    let again = T::decode(commonware_codec::Copying(encoded.as_ref()))
+        .expect("a value's own encoding decodes");
     assert_eq!(
         again.encode().as_ref(),
         encoded.as_ref(),

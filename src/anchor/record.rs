@@ -1,7 +1,8 @@
 //! One anchor record: what a keyholder wrote before it signed past its previous record
 //! (docs/anchor.md).
 
-use bytes::{Buf, BufMut};
+use bytes::BufMut;
+use commonware_codec::Buf;
 use commonware_codec::{
     EncodeSize, Error as CodecError, FixedSize as _, Read, ReadExt as _, Write,
 };

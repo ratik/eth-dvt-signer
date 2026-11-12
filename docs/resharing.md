@@ -45,7 +45,7 @@ A reshare does not revoke a compromised share ([Old shares](#old-shares)).
 
 The network uses the **reshare** mode of commonware's Feldman-Desmedt DKG, the construction of
 Desmedt97 ("Redistributing secret shares to new access structures"). It is part of the pinned
-`commonware-cryptography` 2026.9.0 and runs on the same dealer, player and dealer-log pipeline as
+`commonware-cryptography` 2026.10.0 and runs on the same dealer, player and dealer-log pipeline as
 the DKG. This repository implements no cryptography of its own.
 
 **The old sharing.** Let `f(x) = s + a₁x + a₂x²` be the sharing of the active generation.

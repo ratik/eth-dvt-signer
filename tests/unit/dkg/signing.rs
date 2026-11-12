@@ -33,12 +33,13 @@ fn dst_is_ethereum_ciphersuite() {
 #[test]
 fn threshold_signature_matches_ethereum_vector() {
     deterministic::Runner::default().start(|mut context| async move {
-        let secret = Private::decode(hex(SECRET).as_slice())
+        let secret = Private::decode(commonware_codec::Copying(hex(SECRET).as_slice()))
             .unwrap()
             .expose_unwrap();
-        let public = GroupKey::decode(hex(PUBLIC).as_slice()).unwrap();
+        let public = GroupKey::decode(commonware_codec::Copying(hex(PUBLIC).as_slice())).unwrap();
         let root: [u8; 32] = hex(ROOT).try_into().unwrap();
-        let expected = Signature::decode(hex(SIGNATURE).as_slice()).unwrap();
+        let expected =
+            Signature::decode(commonware_codec::Copying(hex(SIGNATURE).as_slice())).unwrap();
         assert_eq!(
             public.encode().as_ref(),
             hex(PUBLIC).as_slice(),

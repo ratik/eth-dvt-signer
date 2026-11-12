@@ -51,7 +51,7 @@ use commonware_consensus::{
     marshal::{Update, ancestry::Ancestry},
     simplex::types::Context,
 };
-use commonware_cryptography::{Digestible as _, ed25519::PublicKey, sha256::Digest};
+use commonware_cryptography::{Digested, Digestible as _, ed25519::PublicKey, sha256::Digest};
 use commonware_runtime::{Clock, Metrics, Spawner};
 use commonware_utils::channel::mpsc;
 use commonware_utils::ordered::Set;
@@ -473,7 +473,7 @@ impl Application {
             if policy.is_none() {
                 policy = last_policy(&block);
             }
-            ancestor = ancestry.next().await;
+            ancestor = ancestry.next().await.map(|block| block.inner_shared());
         }
     }
 
@@ -594,8 +594,8 @@ where
         (context, consensus): (E, Self::Context),
         mut ancestry: impl Ancestry<Self::Block>,
         _: (),
-    ) -> Option<Self::Block> {
-        let parent = ancestry.next().await?;
+    ) -> Option<Digested<Self::Block>> {
+        let parent = ancestry.next().await?.inner_shared();
         // The epoch ended with the parent: skip the view (a test hook builds on it anyway, as a
         // faulty leader would).
         if self.ends_epoch(&parent) && !hooks::propose_past_terminal() {
@@ -625,7 +625,7 @@ where
             if policy.is_none() {
                 policy = last_policy(&block);
             }
-            ancestor = ancestry.next().await;
+            ancestor = ancestry.next().await.map(|block| block.inner_shared());
         }
         let next = (parent.height().get() >= executed).then_some(nonce + pending + 1);
         let policy = policy.or(committed);
@@ -658,7 +658,8 @@ where
             transactions = block.transactions.len(),
             "proposing a block"
         );
-        Some(block)
+        let digest = block.digest();
+        Some(Digested::precomputed(block, digest))
     }
 
     async fn verify(
@@ -675,6 +676,7 @@ where
         let (Some(block), Some(parent)) = (ancestry.next().await, ancestry.next().await) else {
             return false;
         };
+        let (block, parent) = (block.inner_shared(), parent.inner_shared());
         let now = hooks::clock(context.current());
         for transaction in &block.transactions {
             // A duty under a domain this network's fork schedule does not give it (P0.3).
@@ -790,7 +792,10 @@ impl Reporter for Application {
         match update {
             Update::Block(block, ack) => {
                 // If the executor is gone the node is shutting down; dropping `ack` stops marshal.
-                let _ = self.executor.send(Message::Finalized { block, ack });
+                let _ = self.executor.send(Message::Finalized {
+                    block: block.inner_shared(),
+                    ack,
+                });
             }
             // Knowledge only (not durable yet): what the executor has not applied is a backlog.
             Update::Tip(_, height, _) => {

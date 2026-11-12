@@ -293,7 +293,7 @@ signatures enter blocks. The cost: **every** player must be online.
   block.
 - Reveals would let the ceremony complete without the node, but its share would then be public.
 - commonware's `golden` DKG (non-interactive, encrypted dealings with proofs on chain) would let
-  an offline player recover its share later without a reveal. It is ALPHA in commonware 2026.9.0
+  an offline player recover its share later without a reveal. It is still ALPHA in commonware 2026.10.0
   and is not used.
 
 ### Persistence
@@ -336,7 +336,10 @@ commonware provides:
 - the DKG math: `Dealer`, `Player`, `observe`, commitment and ack checks, share derivation;
 - the binding of acks and logs to a round transcript;
 - BLS signing and threshold recovery (`ops::sign`, `ops::verify`, `threshold::recover`);
-- encrypted, authenticated p2p;
+- encrypted, authenticated p2p: the SAKE V1 handshake and CUPS V1 records (ChaCha20-Poly1305).
+  Versions are not negotiated: every node runs the same release. A node built on commonware
+  2026.9.0 cannot connect to one built on 2026.10.0, so an upgrade across them stops and restarts
+  every node;
 - BFT consensus;
 - atomic `Metadata` writes.
 

@@ -149,5 +149,5 @@ fn registration_policy_encoding() {
     let mut unsorted = bytes.to_vec();
     unsorted[2..22].copy_from_slice(&[2; 20]);
     unsorted[22..42].copy_from_slice(&[1; 20]);
-    assert!(Command::decode(unsorted.as_slice()).is_err());
+    assert!(Command::decode(commonware_codec::Copying(unsorted.as_slice())).is_err());
 }

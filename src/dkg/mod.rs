@@ -32,7 +32,8 @@ pub mod secrets;
 pub mod signing;
 pub mod wire;
 
-use bytes::{Buf, BufMut};
+use bytes::BufMut;
+use commonware_codec::Buf;
 use commonware_codec::{EncodeSize, Error as CodecError, Read, ReadExt as _, Write, varint::UInt};
 use commonware_cryptography::{
     bls12381::primitives::variant::{MinPk, Variant as BlsVariant},

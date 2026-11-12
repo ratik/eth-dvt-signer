@@ -188,7 +188,8 @@ pub fn decrypt(json: &[u8], password: &str) -> Result<Secret, Error> {
     let mut cipher = ctr::Ctr128BE::<Aes128>::new_from_slices(&key[..16], &iv)
         .map_err(|_| Error::Invalid("cipher key or iv length"))?;
     cipher.apply_keystream(secret.as_mut());
-    let private = Private::decode(secret.as_ref()).map_err(|_| Error::Secret)?;
+    let private =
+        Private::decode(commonware_codec::Copying(secret.as_ref())).map_err(|_| Error::Secret)?;
 
     let public = public_key(&private);
     if let Some(declared) = &keystore.pubkey {

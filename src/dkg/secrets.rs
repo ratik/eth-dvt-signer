@@ -25,7 +25,8 @@ use super::{
     ceremony::{Ceremony, Origin},
 };
 use crate::vault::Cipher;
-use bytes::{Buf, BufMut};
+use bytes::BufMut;
+use commonware_codec::Buf;
 use commonware_codec::{
     DecodeExt as _, Encode as _, EncodeSize, Error as CodecError, Read, ReadExt as _, Write,
     varint::UInt,
@@ -436,7 +437,8 @@ impl<E: Context> Secrets<E> {
                     let plaintext = cipher
                         .open(&sealed_aad(&partition, key), bytes)
                         .ok_or(Error::Open)?;
-                    Value::decode(plaintext.as_slice()).map_err(|_| Error::Open)?
+                    Value::decode(commonware_codec::Copying(plaintext.as_slice()))
+                        .map_err(|_| Error::Open)?
                 }
             };
             values.insert(key.clone(), value);

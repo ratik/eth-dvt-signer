@@ -20,7 +20,8 @@ use crate::{
     application::Scheme,
     types::{Block, Command},
 };
-use bytes::{Buf, BufMut};
+use bytes::BufMut;
+use commonware_codec::Buf;
 use commonware_codec::{EncodeSize, Error as CodecError, Read, ReadExt as _, Write};
 use commonware_consensus::types::{Epoch, EpochInfo, Epocher, Height};
 use commonware_cryptography::{

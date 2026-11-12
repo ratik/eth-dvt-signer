@@ -338,7 +338,7 @@ fn e2e_rsh_3_crash_around_activation() {
 /// The session digest of a reshare, as its status gives it.
 pub(crate) fn session(status: &Value) -> Digest {
     let bytes = hex::decode(status["session"].as_str().unwrap().trim_start_matches("0x")).unwrap();
-    Digest::decode(bytes.as_slice()).unwrap()
+    Digest::decode(bytes).unwrap()
 }
 
 /// A share acknowledgement of reshare `round`, signed with node `node`'s identity, as a

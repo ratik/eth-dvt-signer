@@ -40,7 +40,8 @@ use crate::{
     eth::duty::ValidatorKey,
     import::manifest::{Invalid, Manifest},
 };
-use bytes::{Buf, BufMut};
+use bytes::BufMut;
+use commonware_codec::Buf;
 use commonware_codec::{
     Encode as _, EncodeSize, Error as CodecError, Read, ReadExt as _, Write, varint::UInt,
 };
@@ -53,7 +54,7 @@ use commonware_cryptography::{
         },
         primitives::sharing::{Mode, ModeVersion, Sharing},
     },
-    ed25519::{self, PrivateKey, PublicKey, Signature},
+    ed25519::{PrivateKey, PublicKey, Signature},
     sha256::Digest,
 };
 use commonware_parallel::Sequential;
@@ -67,7 +68,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use tracing::warn;
 
 /// A dealer log as submitted to consensus: signed by its dealer for one ceremony.
-pub type SignedLog = SignedDealerLog<Variant, PrivateKey>;
+pub type SignedLog = SignedDealerLog<Variant, PublicKey>;
 
 /// One ceremony as every node sees it.
 #[derive(Clone, Debug, PartialEq)]
@@ -544,7 +545,7 @@ impl Ceremony {
                 self.config.participants.write(&mut bytes);
                 Set::<PublicKey>::default().write(&mut bytes);
                 Output::read_cfg(
-                    &mut bytes.as_slice(),
+                    &mut commonware_codec::Copying(bytes.as_slice()),
                     &(MAX_PARTICIPANTS, ModeVersion::v0()),
                 )
                 .ok()
@@ -919,11 +920,7 @@ impl Ceremonies {
                 continue;
             }
             if ceremony.logs.len() >= ceremony.required_logs() {
-                match observe::<Variant, PublicKey, Faults, ed25519::Batch>(
-                    rng,
-                    ceremony.logs(),
-                    &Sequential,
-                ) {
+                match observe::<Variant, PublicKey, Faults>(rng, ceremony.logs(), &Sequential) {
                     Ok(output) => {
                         // Players must finalize with exactly the logs that produced the key.
                         ceremony

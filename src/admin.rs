@@ -90,7 +90,7 @@ pub fn format_key(key: &PublicKey) -> String {
 
 fn parse_key(value: &str) -> Result<PublicKey, String> {
     unhex(value)
-        .and_then(|bytes| PublicKey::decode(bytes.as_slice()).ok())
+        .and_then(|bytes| PublicKey::decode(commonware_codec::Copying(bytes.as_slice())).ok())
         .ok_or_else(|| format!("{value} is not an Ed25519 public key"))
 }
 
@@ -341,7 +341,9 @@ fn approvals(approvers: &Approvers, json: &[ApprovalJson]) -> Result<Vec<Approva
                 .index(&key)
                 .ok_or_else(|| format!("{} is not an approver", approval.approver))?;
             let signature = unhex(&approval.signature)
-                .and_then(|bytes| Signature::decode(bytes.as_slice()).ok())
+                .and_then(|bytes| {
+                    Signature::decode(commonware_codec::Copying(bytes.as_slice())).ok()
+                })
                 .ok_or_else(|| format!("{} is not an Ed25519 signature", approval.signature))?;
             Ok(Approval {
                 approver,
@@ -722,7 +724,7 @@ impl SignedCommand {
 
     pub fn cluster(&self) -> Result<Digest, String> {
         unhex(&self.cluster_id)
-            .and_then(|bytes| Digest::decode(bytes.as_slice()).ok())
+            .and_then(|bytes| Digest::decode(commonware_codec::Copying(bytes.as_slice())).ok())
             .ok_or_else(|| format!("cluster_id {} is not 32 bytes of 0x-hex", self.cluster_id))
     }
 
@@ -805,7 +807,9 @@ impl SignedCommand {
                     return Err("not in the approver set".to_string());
                 }
                 let signature = unhex(&approval.signature)
-                    .and_then(|bytes| Signature::decode(bytes.as_slice()).ok())
+                    .and_then(|bytes| {
+                        Signature::decode(commonware_codec::Copying(bytes.as_slice())).ok()
+                    })
                     .ok_or("not an Ed25519 signature")?;
                 if key.verify(NAMESPACE, &message, &signature) {
                     Ok(())

@@ -70,7 +70,9 @@ impl Peers {
             .enumerate()
             .map(|(index, entry)| {
                 let key = crate::import::unhex(&entry.identity)
-                    .and_then(|bytes| PublicKey::decode(bytes.as_slice()).ok())
+                    .and_then(|bytes| {
+                        PublicKey::decode(commonware_codec::Copying(bytes.as_slice())).ok()
+                    })
                     .ok_or_else(|| {
                         format!("node {index}: identity is not an Ed25519 public key")
                     })?;

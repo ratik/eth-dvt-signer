@@ -657,11 +657,12 @@ fn main() {
         );
 
         let p2p = lookup::Config::local(
-            signer.clone(),
+            engine::handshake(signer.clone()),
             &union(engine::NAMESPACE, b"_P2P"),
             listen,
             NonZeroUsize::new(nodes as usize).expect("participants"),
             engine::MAX_MESSAGE_SIZE,
+            engine::P2P_MAILBOX_SIZE,
         );
         let (mut network, mut oracle) = lookup::Network::new(context.child("network"), p2p);
 

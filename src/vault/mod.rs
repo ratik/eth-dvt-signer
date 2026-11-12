@@ -317,7 +317,7 @@ impl Vault {
     /// The node's identity; with `create`, a new one if the vault has none.
     pub fn identity(&self, create: bool) -> Result<PrivateKey, Error> {
         if let Some(bytes) = self.read(IDENTITY)? {
-            return PrivateKey::decode(bytes.as_slice())
+            return PrivateKey::decode(commonware_codec::Copying(bytes.as_slice()))
                 .map_err(|_| Error::Malformed(self.dir.join(IDENTITY).display().to_string()));
         }
         if !create {

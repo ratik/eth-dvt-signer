@@ -215,7 +215,9 @@ mod enabled {
         };
         text.lines()
             .filter_map(|line| hex::decode(line.trim()).ok())
-            .filter_map(|bytes| crate::types::Transaction::decode(bytes.as_slice()).ok())
+            .filter_map(|bytes| {
+                crate::types::Transaction::decode(commonware_codec::Copying(bytes.as_slice())).ok()
+            })
             .collect()
     }
 

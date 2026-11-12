@@ -98,8 +98,8 @@ pub fn verify_signature(key: &ValidatorKey, root: &Root, signature: &[u8]) -> bo
     use crate::dkg::{GroupKey, signing};
     use commonware_codec::DecodeExt as _;
     let (Ok(key), Ok(signature)) = (
-        GroupKey::decode(key.as_slice()),
-        signing::Signature::decode(signature),
+        GroupKey::decode(commonware_codec::Copying(key.as_slice())),
+        signing::Signature::decode(commonware_codec::Copying(signature)),
     ) else {
         return false;
     };

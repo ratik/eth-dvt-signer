@@ -1159,7 +1159,9 @@ mod validator {
         legacy.push(1);
         legacy.extend_from_slice(&[9; 32]);
         legacy.extend_from_slice(&2u64.to_be_bytes());
-        let Value::Validator(validator) = Value::read(&mut legacy.as_slice()).unwrap() else {
+        let Value::Validator(validator) =
+            Value::read(&mut commonware_codec::Copying(legacy.as_slice())).unwrap()
+        else {
             panic!("a validator");
         };
         assert_eq!(
@@ -1176,7 +1178,7 @@ mod validator {
         let encoded = Value::Validator(validator.clone()).encode();
         assert_eq!(encoded[0], 7);
         assert_eq!(
-            Value::read(&mut encoded.as_ref()).unwrap(),
+            Value::read(&mut commonware_codec::Copying(encoded.as_ref())).unwrap(),
             Value::Validator(validator)
         );
     }
@@ -1224,6 +1226,7 @@ mod validator {
             let (blob, len) = context.open(partition, newest.1.as_bytes()).await.unwrap();
             blob.resize(len / 2).await.unwrap();
             blob.sync().await.unwrap();
+            drop(blob);
 
             let mut store = Store::init(context.child("second"), "torn", committee)
                 .await
@@ -2385,10 +2388,7 @@ mod validator {
             slashing::Floors,
         };
         use commonware_cryptography::Signer as _;
-        use commonware_cryptography::{
-            bls12381::primitives::group::{Private, Scalar, Share},
-            ed25519,
-        };
+        use commonware_cryptography::bls12381::primitives::group::{Private, Scalar, Share};
         use commonware_parallel::Sequential;
         use commonware_utils::ordered::Quorum as _;
         use rand::{SeedableRng as _, rngs::StdRng};
@@ -2458,7 +2458,7 @@ mod validator {
                 .into_iter()
                 .map(|player| {
                     player
-                        .finalize::<Faults, ed25519::Batch>(context, ceremony.logs(), &Sequential)
+                        .finalize::<Faults>(context, ceremony.logs(), &Sequential)
                         .unwrap()
                         .1
                 })

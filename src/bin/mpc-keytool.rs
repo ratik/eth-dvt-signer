@@ -348,7 +348,7 @@ fn read_committee(
             attestation.check(&member)?;
         }
         let identity = unhex(&member.identity)
-            .and_then(|bytes| PublicKey::decode(bytes.as_slice()).ok())
+            .and_then(|bytes| PublicKey::decode(bytes).ok())
             .ok_or_else(|| format!("invalid identity {}", member.identity))?;
         let share_key = unhex_array::<32>(&member.share_encryption_key).ok_or_else(|| {
             format!(

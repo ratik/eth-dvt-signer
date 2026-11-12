@@ -211,22 +211,22 @@ fn the_encoding_round_trips_and_only_a_valid_policy_decodes() {
     let mut swapped = bytes.to_vec();
     swapped[1..21].copy_from_slice(&address(2));
     swapped[21..41].copy_from_slice(&address(1));
-    assert!(Policy::decode(swapped.as_slice()).is_err());
+    assert!(Policy::decode(commonware_codec::Copying(swapped.as_slice())).is_err());
     let mut reversed = bytes.to_vec();
     let gas = 1 + 40;
     reversed[gas..gas + 8].copy_from_slice(&70_000_000u64.to_be_bytes());
-    assert!(Policy::decode(reversed.as_slice()).is_err());
+    assert!(Policy::decode(commonware_codec::Copying(reversed.as_slice())).is_err());
     let mut many = Vec::new();
     UInt((MAX_FEE_RECIPIENTS + 1) as u32).write(&mut many);
     for index in 0..=MAX_FEE_RECIPIENTS {
         many.extend_from_slice(&address(index as u8));
     }
     many.extend_from_slice(&[0; 32]);
-    assert!(Policy::decode(many.as_slice()).is_err());
+    assert!(Policy::decode(commonware_codec::Copying(many.as_slice())).is_err());
     // Trailing bytes.
     let mut longer = bytes.to_vec();
     longer.push(0);
-    assert!(Policy::decode(longer.as_slice()).is_err());
+    assert!(Policy::decode(commonware_codec::Copying(longer.as_slice())).is_err());
 }
 
 #[test]

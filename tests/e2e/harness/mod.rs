@@ -455,7 +455,7 @@ impl TestNetwork {
             })
             .unwrap_or_else(|| self.fail("no node has an approver set"));
         let cluster = unhex(&json!(cluster));
-        let cluster = commonware_codec::DecodeExt::decode(cluster.as_slice()).unwrap();
+        let cluster = commonware_codec::DecodeExt::decode(cluster).unwrap();
         let keys = approver_keys();
         let mut command = SignedCommand::draft(&cluster, operation, nonce, request)?;
         for signer in signers {

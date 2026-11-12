@@ -14,7 +14,7 @@ use commonware_p2p::{
 use commonware_runtime::{
     Blob as _, Clock as _, Handle, IoBuf, Quota, Storage as _, Supervisor as _, deterministic,
 };
-use commonware_utils::{NZU64, NZUsize, TryCollect as _, ordered::Set, probability};
+use commonware_utils::{NZU32, NZU64, NZUsize, TryCollect as _, ordered::Set, probability};
 use eth_mpc_signer::{
     admin::{Administration, Approvers, Endorsement},
     dkg::{self, CeremonyId, DkgStatus, actor::ShareStatus, ceremony::Ceremony},
@@ -25,7 +25,7 @@ use eth_mpc_signer::{
     slashing::ChainIdentity,
     types::{Command, SignRequest},
 };
-use std::{collections::VecDeque, fmt, num::NonZeroU32, time::Duration};
+use std::{collections::VecDeque, fmt, num::NonZeroUsize, time::Duration};
 
 pub const NODES: u64 = 4;
 
@@ -86,6 +86,10 @@ impl<R: Receiver<PublicKey = PublicKey>> Receiver for Tap<R> {
                 self.queue.push_back((from.clone(), message));
             }
         }
+    }
+
+    fn capacity(&self) -> NonZeroUsize {
+        self.inner.capacity()
     }
 }
 
@@ -227,7 +231,8 @@ pub async fn start_network_with(
         }
     }
 
-    let quota = Quota::per_second(NonZeroU32::MAX);
+    // The nodes' own quota (`main`): receivers hold one burst per peer, allocated up front.
+    let quota = Quota::per_second(NZU32!(1_000));
     let mut clients = Vec::new();
     let mut dkg = Vec::new();
     let mut coordinators = Vec::new();

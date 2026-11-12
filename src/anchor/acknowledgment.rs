@@ -99,7 +99,7 @@ fn unhex(value: &str) -> Option<Vec<u8>> {
 
 fn digest(value: &str, what: &str) -> Result<Digest, String> {
     unhex(value)
-        .and_then(|bytes| Digest::decode(bytes.as_slice()).ok())
+        .and_then(|bytes| Digest::decode(commonware_codec::Copying(bytes.as_slice())).ok())
         .ok_or_else(|| format!("{what} {value} is not 32 bytes of 0x-hex"))
 }
 
@@ -202,13 +202,17 @@ impl AcknowledgmentDocument {
             .iter()
             .map(|approval| {
                 let key = unhex(&approval.approver)
-                    .and_then(|bytes| PublicKey::decode(bytes.as_slice()).ok())
+                    .and_then(|bytes| {
+                        PublicKey::decode(commonware_codec::Copying(bytes.as_slice())).ok()
+                    })
                     .ok_or("not an Ed25519 public key")?;
                 if approvers.index(&key).is_none() {
                     return Err("not in the approver set".to_string());
                 }
                 let signature = unhex(&approval.signature)
-                    .and_then(|bytes| Signature::decode(bytes.as_slice()).ok())
+                    .and_then(|bytes| {
+                        Signature::decode(commonware_codec::Copying(bytes.as_slice())).ok()
+                    })
                     .ok_or("not an Ed25519 signature")?;
                 if key.verify(NAMESPACE, &message, &signature) {
                     Ok(())

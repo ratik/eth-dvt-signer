@@ -4,7 +4,7 @@ A threshold signer for Ethereum validators. Four nodes hold shares of a validato
 any three of them sign. No node, and no operator, ever holds the whole key. A validator client
 uses the network as a remote signer through the standard Web3Signer API.
 
-It is built on [commonware](https://github.com/commonwarexyz/monorepo) `2026.9.0` (consensus,
+It is built on [commonware](https://github.com/commonwarexyz/monorepo) `2026.10.0` (consensus,
 p2p, storage, BLS12-381 DKG) and tested with a real Lighthouse validator client on a local
 devnet and with sealed nodes on GCP Confidential VMs.
 
@@ -100,7 +100,7 @@ Time for one signing request, measured at the client.
 | Setup | Request | p50 | p95 |
 | --- | --- | --- | --- |
 | GCP: 4 sealed nodes (TDX, `c3-standard-4`, europe-west4), Lighthouse and the gateway on a remote host | Lighthouse duties, 54 requests | 50.3 ms | 95.2 ms |
-| Devnet: 4 nodes, Lighthouse and the gateway on one Linux host | all duties of a run, 64 to 3 713 requests | 259 to 301 ms | 437 to 581 ms |
+| Devnet: 4 nodes, Lighthouse and the gateway on one Linux host | all duties of a full run, 2 748 requests | 330 ms | 669 ms |
 | One laptop: 4 nodes on loopback | new attestation | 352 ms | 580 ms |
 | One laptop: 4 nodes on loopback | the same attestation again | 6.8 ms | 10.9 ms |
 | One laptop: 4 nodes on loopback | new block proposal | 351 ms | 564 ms |
@@ -112,6 +112,10 @@ Time for one signing request, measured at the client.
 - For comparison: an attestation is due one third into its slot, 4 s on mainnet.
 - With one node offline, a request that falls on that node's turn as leader waits for the 2 s
   leader timeout (laptop p99: 2.3 s).
+- The GCP and laptop rows were measured on commonware 2026.9.0. The devnet row is from
+  2026.10.0. Under load, 2026.10.0 is slower than 2026.9.0: the same devnet run took p50 293 ms
+  and p95 531 ms on 2026.9.0. The difference is in consensus. With sequential requests there is
+  none. ([docs/ethereum-devnet.md](docs/ethereum-devnet.md#commonware-2026100-runs-v-and-w))
 
 Details: [docs/tee.md](docs/tee.md) (GCP), [docs/ethereum-devnet.md](docs/ethereum-devnet.md)
 (devnet runs), [docs/internals.md](docs/internals.md#benchmarks) (laptop benchmarks).

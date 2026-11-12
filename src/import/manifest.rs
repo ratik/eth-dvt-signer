@@ -18,7 +18,8 @@ use crate::{
     eth::duty::ValidatorKey,
     import::{dealer, hex0x, unhex, unhex_array},
 };
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{BufMut, BytesMut};
+use commonware_codec::Buf;
 use commonware_codec::{
     DecodeExt as _, Encode as _, EncodeSize, Error as CodecError, Read, ReadExt as _, Write,
     varint::UInt,
@@ -393,7 +394,9 @@ impl Manifest {
                     ));
                 }
                 let identity = unhex(&member.identity)
-                    .and_then(|bytes| PublicKey::decode(bytes.as_slice()).ok())
+                    .and_then(|bytes| {
+                        PublicKey::decode(commonware_codec::Copying(bytes.as_slice())).ok()
+                    })
                     .ok_or_else(|| field("participant identity"))?;
                 let share_key = unhex_array::<32>(&member.share_encryption_key)
                     .ok_or_else(|| field("participant share_encryption_key"))?;
@@ -408,7 +411,9 @@ impl Manifest {
             .iter()
             .map(|commitment| {
                 unhex(commitment)
-                    .and_then(|bytes| GroupKey::decode(bytes.as_slice()).ok())
+                    .and_then(|bytes| {
+                        GroupKey::decode(commonware_codec::Copying(bytes.as_slice())).ok()
+                    })
                     .ok_or_else(|| field("commitment (compressed G1 point)"))
             })
             .collect::<Result<Vec<_>, _>>()?;

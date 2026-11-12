@@ -104,7 +104,9 @@ fn parse(line: &str) -> Result<(ValidatorKey, Set<PublicKey>), String> {
         .split(',')
         .map(|identity| {
             unhex(identity)
-                .and_then(|bytes| PublicKey::decode(bytes.as_slice()).ok())
+                .and_then(|bytes| {
+                    PublicKey::decode(commonware_codec::Copying(bytes.as_slice())).ok()
+                })
                 .ok_or_else(|| format!("{identity} is not an ed25519 public key"))
         })
         .collect::<Result<Vec<_>, _>>()?;

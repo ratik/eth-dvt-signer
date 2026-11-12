@@ -1338,7 +1338,9 @@ fn parse_identities(field: &str, values: &[String]) -> Result<Set<PublicKey>, St
         .map(|value| {
             hex::decode(value.strip_prefix("0x").unwrap_or(value))
                 .ok()
-                .and_then(|bytes| PublicKey::decode(bytes.as_slice()).ok())
+                .and_then(|bytes| {
+                    PublicKey::decode(commonware_codec::Copying(bytes.as_slice())).ok()
+                })
                 .ok_or_else(|| format!("{field}: {value} is not an ed25519 public key"))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1777,7 +1779,7 @@ struct ReconfigureBody {
 fn parse_identity(field: &str, value: &str) -> Result<PublicKey, ApiError> {
     hex::decode(value.strip_prefix("0x").unwrap_or(value))
         .ok()
-        .and_then(|bytes| PublicKey::decode(bytes.as_slice()).ok())
+        .and_then(|bytes| PublicKey::decode(commonware_codec::Copying(bytes.as_slice())).ok())
         .ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,

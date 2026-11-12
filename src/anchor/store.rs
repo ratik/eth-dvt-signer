@@ -243,7 +243,7 @@ impl AnchorStore {
             .iter()
             .filter_map(|prefix| prefix.filename())
             .filter_map(|name| hex::decode(name).ok())
-            .filter_map(|bytes| PublicKey::decode(bytes.as_slice()).ok())
+            .filter_map(|bytes| PublicKey::decode(commonware_codec::Copying(bytes.as_slice())).ok())
             .collect())
     }
 

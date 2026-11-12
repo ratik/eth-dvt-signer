@@ -619,13 +619,14 @@ async fn run(
             if again.effects != applied.effects {
                 return Err(format!("height {height}: the replica decided otherwise"));
             }
-            if rng.random_ratio(1, 5) {
-                *replica = open(context, &replica_name).await;
-                replica
-                    .protection()
-                    .verify()
-                    .map_err(|err| format!("height {height}: the reopened replica: {err}"))?;
-            }
+        }
+        if copy.is_some() && rng.random_ratio(1, 5) {
+            // Closed first: a blob is open once at a time.
+            copy = None;
+            copy.insert(open(context, &replica_name).await)
+                .protection()
+                .verify()
+                .map_err(|err| format!("height {height}: the reopened replica: {err}"))?;
         }
     }
     nothing_slashable(&accepted)?;
@@ -769,7 +770,7 @@ fn hostile_storage_stops_the_store_or_is_a_tolerated_rewrite() {
                             let index = rng.random_range(0..bytes.len());
                             bytes[index] ^= 1 << rng.random_range(0..8);
                         }
-                        match Value::decode(bytes.as_slice()) {
+                        match Value::decode(commonware_codec::Copying(bytes.as_slice())) {
                             Ok(mutated) if mutated != original => {
                                 metadata.put(target.clone(), mutated);
                                 (target.clone(), Some(original.clone()))

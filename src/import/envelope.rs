@@ -301,7 +301,8 @@ pub fn open(
         )
         .map_err(|_| Error::Decrypt)?,
     );
-    let share = Share::decode(plaintext.as_slice()).map_err(|_| Error::Share)?;
+    let share =
+        Share::decode(commonware_codec::Copying(plaintext.as_slice())).map_err(|_| Error::Share)?;
     if share.index != index {
         return Err(Error::Share);
     }

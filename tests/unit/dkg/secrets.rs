@@ -9,7 +9,7 @@ use crate::dkg::{
         tests::{committee, deal, signers},
     },
 };
-use commonware_cryptography::{Hasher as _, Sha256, Signer as _, ed25519};
+use commonware_cryptography::{Hasher as _, Sha256, Signer as _};
 use commonware_math::algebra::Random as _;
 use commonware_parallel::Sequential;
 use commonware_runtime::{Blob as _, Runner as _, Storage as _, Supervisor as _, deterministic};
@@ -36,7 +36,7 @@ fn completed(context: &mut deterministic::Context) -> (Ceremony, KeyShare) {
         .into_iter()
         .nth(signers.iter().position(|s| s.public_key() == me).unwrap())
         .unwrap()
-        .finalize::<Faults, ed25519::Batch>(context, ceremony.logs(), &Sequential)
+        .finalize::<Faults>(context, ceremony.logs(), &Sequential)
         .unwrap();
     assert_eq!(share.index.get() as usize, index);
     let key_share = KeyShare::new(&ceremony, share);
@@ -104,6 +104,7 @@ fn interrupted_write_never_exposes_a_partial_share() {
         let (blob, len) = context.open(PARTITION, newest).await.unwrap();
         blob.resize(len / 2).await.unwrap();
         blob.sync().await.unwrap();
+        drop(blob);
 
         // The previous complete state comes back: the seed, no share at all.
         let secrets = Secrets::init(context.child("b"), PARTITION.into(), None)

@@ -816,6 +816,34 @@ gateway.
   gateway's own share (signing root, signature check) was 4.3 ms p50 on GCP
   ([tee.md](tee.md#on-gcp-integrationteegcp)).
 
+### commonware 2026.10.0 (runs V and W)
+
+Run V (2026-11-12) is the first full run on commonware 2026.10.0, the version this repository
+pins. Run W ran the previous commit, on commonware 2026.9.0, on the same host on the same day, for
+comparison. Both ran in mode `run`, exited 0, and passed every security check. The columns are
+the same as in the table above.
+
+| Run | Directory | commonware | Attested epochs | Proposals canonical | Requests | p50 / p95 ms |
+| --- | --- | --- | --- | --- | --- | --- |
+| V | `20261112T155217Z` | 2026.10.0 | 26 of 27 (epoch 27 missed) | 34 of 34 | 2 748 | 330 / 669 |
+| W | `20261112T202850Z` | 2026.9.0 | 27 of 27 | 29 of 29 | 2 758 | 293 / 531 |
+
+- **Epoch 27 (run V).** The migration scenario restarts the Lighthouse validator client to add
+  the imported key. The restart (16:53:40 to 16:53:44) covered the attestation time of slot 867,
+  the DKG validator's duty in that epoch. Lighthouse never asked for that attestation. The
+  signers did not cause the miss.
+- **Latency under load.** End-to-end p50 / p95 ms per scenario, run W, then run V:
+  - baseline: 222 / 454, then 215 / 467;
+  - migration: 300 / 534, then 321 / 643;
+  - resharing: 287 / 525, then 348 / 725.
+
+  The increase is in consensus. For example, the authorization p50 in resharing went from
+  241 ms to 301 ms. It shows only with two validators and many concurrent duties (about 1 900 sync
+  committee selection proofs). With sequential requests on loopback there is no difference:
+  `bench::latency` and `bench::eth2_latency` ([internals.md](internals.md#benchmarks)), 150
+  requests each, two rounds per version, give the same mean for both versions. The p95 of
+  2026.10.0 is 10 to 30 ms higher. The cause is not known yet.
+
 ## Troubleshooting
 
 - **A run fails.** `failure.json` and the end of `run.log` name the stage that failed

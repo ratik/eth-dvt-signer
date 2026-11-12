@@ -148,7 +148,7 @@ fn completes_and_players_agree() {
         let mut partials = Vec::new();
         for (player, signer) in players.into_iter().zip(&signers) {
             let (local, share) = player
-                .finalize::<Faults, ed25519::Batch>(&mut context, ceremony.logs(), &Sequential)
+                .finalize::<Faults>(&mut context, ceremony.logs(), &Sequential)
                 .unwrap();
             assert_eq!(local, output);
             let key_share = KeyShare::new(&ceremony, share);
@@ -197,7 +197,7 @@ fn late_log_changes_nothing() {
         // The late dealer, as a player, still derives a share of the same key.
         for player in players {
             let (local, _) = player
-                .finalize::<Faults, ed25519::Batch>(&mut context, after.logs(), &Sequential)
+                .finalize::<Faults>(&mut context, after.logs(), &Sequential)
                 .unwrap();
             assert_eq!(&local, output);
         }
@@ -354,7 +354,7 @@ pub(crate) mod reshare {
             .into_iter()
             .map(|player| {
                 player
-                    .finalize::<Faults, ed25519::Batch>(context, ceremony.logs(), &Sequential)
+                    .finalize::<Faults>(context, ceremony.logs(), &Sequential)
                     .unwrap()
                     .1
             })
@@ -435,7 +435,7 @@ pub(crate) mod reshare {
             .zip(signers)
             .map(|(player, signer)| {
                 let (output, share) = player
-                    .finalize::<Faults, ed25519::Batch>(context, ceremony.logs(), &Sequential)
+                    .finalize::<Faults>(context, ceremony.logs(), &Sequential)
                     .unwrap();
                 assert_eq!(Some(&output), ceremony.output.as_ref());
                 KeyShare::new(&ceremony, share.clone())
@@ -752,14 +752,16 @@ pub(crate) mod reshare {
             g2.write_reshare(&mut bytes);
             assert_eq!(bytes.len(), g2.reshare_encode_size());
             assert_eq!(
-                &Ceremony::read_reshare(&mut bytes.as_slice(), true).unwrap(),
+                &Ceremony::read_reshare(&mut commonware_codec::Copying(bytes.as_slice()), true)
+                    .unwrap(),
                 g2
             );
             let completed = ceremonies.by_round(1).unwrap();
             let mut bytes = Vec::new();
             completed.write_reshare(&mut bytes);
             assert_eq!(
-                &Ceremony::read_reshare(&mut bytes.as_slice(), true).unwrap(),
+                &Ceremony::read_reshare(&mut commonware_codec::Copying(bytes.as_slice()), true)
+                    .unwrap(),
                 completed
             );
         });
@@ -979,11 +981,7 @@ pub(crate) mod reshare {
                         .zip(&players)
                         .map(|(state, signer)| {
                             let (derived, share) = state
-                                .finalize::<Faults, ed25519::Batch>(
-                                    &mut context,
-                                    g1.logs(),
-                                    &Sequential,
-                                )
+                                .finalize::<Faults>(&mut context, g1.logs(), &Sequential)
                                 .unwrap();
                             assert_eq!(&derived, output);
                             KeyShare::new(&g1, share.clone())
@@ -1175,7 +1173,8 @@ pub(crate) mod reshare {
                 g1.write_reshare(&mut bytes);
                 assert_eq!(bytes.len(), g1.reshare_encode_size());
                 assert_eq!(
-                    Ceremony::read_reshare(&mut bytes.as_slice(), true).unwrap(),
+                    Ceremony::read_reshare(&mut commonware_codec::Copying(bytes.as_slice()), true)
+                        .unwrap(),
                     g1
                 );
                 let mut r1_ceremonies = Ceremonies::new(committee(&signers));
@@ -1194,7 +1193,8 @@ pub(crate) mod reshare {
                 let dealers = r1.reshare().unwrap().dealers.encode_size();
                 bytes.truncate(bytes.len() - dealers);
                 assert_eq!(
-                    Ceremony::read_reshare(&mut bytes.as_slice(), false).unwrap(),
+                    Ceremony::read_reshare(&mut commonware_codec::Copying(bytes.as_slice()), false)
+                        .unwrap(),
                     r1
                 );
             });
@@ -1347,7 +1347,7 @@ fn write_fuzz_seeds() {
         let ceremony = ceremonies.iter().next().unwrap().clone();
         let player = players.into_iter().next().unwrap();
         let (_, share) = player
-            .finalize::<Faults, ed25519::Batch>(&mut context, ceremony.logs(), &Sequential)
+            .finalize::<Faults>(&mut context, ceremony.logs(), &Sequential)
             .unwrap();
         let key_share = KeyShare::new(&ceremony, share);
         let request = Request::duty(id, [0x11; 48], [7; 32]);

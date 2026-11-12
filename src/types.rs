@@ -15,7 +15,8 @@ use crate::{
         ImportedBlock,
     },
 };
-use bytes::{Buf, BufMut};
+use bytes::BufMut;
+use commonware_codec::Buf;
 use commonware_codec::{Encode, EncodeSize, Error, Read, ReadExt, Write, varint::UInt};
 use commonware_consensus::{Heightable, types::Height};
 use commonware_cryptography::{

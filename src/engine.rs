@@ -30,6 +30,7 @@ use crate::{
     types::Block,
 };
 use commonware_broadcast::buffered;
+use commonware_codec::varint::UInt;
 use commonware_consensus::{
     Epochable as _, Viewable as _,
     marshal::{self, core::Actor as Marshal, resolver::p2p as marshal_resolver, standard::Inline},
@@ -37,7 +38,8 @@ use commonware_consensus::{
     types::{Epoch, ViewDelta},
 };
 use commonware_cryptography::{
-    Crc32, Digest as _, Digestible as _, Hasher as _, Sha256, Signer as _,
+    ChaCha20Poly1305, Crc32, Digest as _, Digested, Digestible as _, Hasher as _, Sha256,
+    Signer as _,
     certificate::Verifier as _,
     ed25519::{PrivateKey, PublicKey},
     sha256::Digest,
@@ -46,14 +48,22 @@ use commonware_macros::select;
 use commonware_p2p::{Blocker, Provider, Receiver, Sender};
 use commonware_parallel::Sequential;
 use commonware_runtime::{
-    Blob as _, BufferPooler, Clock, Handle, Metrics, ReadOptions, Spawner, Storage, WriteOptions,
+    Blob as _, Clock, Handle, Metrics, ReadOptions, Spawner, Storage, WriteOptions,
     buffer::paged::CacheRef,
 };
 use commonware_storage::{
     archive::{Archive, Identifier, prunable},
+    metadata::{self, Metadata},
     translator::TwoCap,
 };
-use commonware_utils::{NZU16, NZU64, NZUsize, channel::mpsc, ordered::Set, vec::NonEmptyVec};
+use commonware_stream::{
+    SakeCups,
+    cups::{self, Cups},
+    sake::{self, Sake},
+};
+use commonware_utils::{
+    NZDuration, NZU16, NZU64, NZUsize, channel::mpsc, ordered::Set, sequence::U64, vec::NonEmptyVec,
+};
 use rand_core::CryptoRng;
 use std::{
     num::{NonZeroU64, NonZeroUsize},
@@ -114,6 +124,27 @@ pub fn consensus_journal(prefix: &str, epoch: u64) -> String {
 
 /// Largest p2p message (a full block is ~40KB).
 pub const MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
+
+/// Capacity of the authenticated p2p network's internal mailboxes.
+pub const P2P_MAILBOX_SIZE: NonZeroUsize = NZUsize!(1_000);
+
+/// The authenticated p2p transport: a SAKE handshake under the node's identity, then CUPS records
+/// sealed with ChaCha20-Poly1305.
+pub type Handshake = SakeCups<PrivateKey, ChaCha20Poly1305>;
+
+/// [Handshake] for `signer`. Versions are not negotiated: every node of a network runs these
+/// (SAKE V1, CUPS V1), and a node on other versions cannot connect.
+pub fn handshake(signer: PrivateKey) -> Handshake {
+    Cups::new(
+        Sake {
+            signer,
+            synchrony_bound: Duration::from_secs(5),
+            max_handshake_age: Duration::from_secs(10),
+            version: sake::Version::V1,
+        },
+        cups::Version::V1,
+    )
+}
 
 const MAILBOX_SIZE: NonZeroUsize = NZUsize!(1024);
 const IO_BUFFER_SIZE: NonZeroUsize = NZUsize!(1024 * 1024);
@@ -403,6 +434,15 @@ pub enum StartError {
          would never reach it; refusing to start"
     )]
     CloseBelowState { close: u64, height: u64 },
+    /// The startup checks read marshal's processed height from its metadata before marshal
+    /// opens it ([marshal_processed]); marshal then restored another one. Its metadata format
+    /// differs from the one this node reads (a commonware upgrade), so the checks may have used a
+    /// wrong height.
+    #[error(
+        "marshal restored processed height {restored}, but its metadata holds {read}: its format \
+         is not the one this node reads, so the startup checks may be wrong; refusing to start"
+    )]
+    MarshalHeight { read: u64, restored: u64 },
     #[error(
         "the replicated state applied administrative nonce {nonce} under approver set {recorded}, \
          but this node is started {configured}: refusing to start (every node needs the \
@@ -516,6 +556,29 @@ fn check_recovery<E: commonware_storage::Context>(
     Ok(false)
 }
 
+/// The entry of marshal's metadata (`{prefix}-marshal-application-metadata`) that holds its
+/// processed height: the last finalized block the application acknowledged. It is marshal's own
+/// private key (`LATEST_KEY` in commonware-consensus 2026.10.0, `marshal/core/stream.rs`): check
+/// it at every commonware upgrade. A change shows at start as [StartError::MarshalHeight].
+const MARSHAL_PROCESSED_KEY: U64 = U64::new(0xFF);
+
+/// Marshal's durably processed height (0: none), read as marshal restores it, without opening
+/// marshal. The store is closed again before marshal opens it.
+async fn marshal_processed<E: commonware_storage::Context>(context: E, prefix: &str) -> u64 {
+    let metadata = Metadata::<_, U64, UInt<u64>>::init(
+        context,
+        metadata::Config {
+            partition: format!("{prefix}-marshal-application-metadata"),
+            codec_config: (),
+        },
+    )
+    .await
+    .expect("failed to open marshal's metadata");
+    metadata
+        .get(&MARSHAL_PROCESSED_KEY)
+        .map_or(0, |height| height.0)
+}
+
 /// Save, before a metadata store is opened, every copy of it that fails its integrity check.
 /// Opening the store truncates such a copy (commonware's recovery, from the other copy): saving
 /// it first, durably, to the `diagnostics` partition keeps the evidence whatever happens next
@@ -612,7 +675,7 @@ pub struct Opened<E: commonware_storage::Context, B, P> {
 /// Open the node's replicated state and secret store.
 pub async fn open<E, B, P>(context: E, config: Config<B, P>) -> Result<Opened<E, B, P>, StartError>
 where
-    E: BufferPooler + Clock + CryptoRng + Spawner + Storage + Metrics,
+    E: Clock + CryptoRng + Spawner + Storage + Metrics,
 {
     let prefix = &config.partition_prefix;
     // Durable state first, checked against itself before anything runs. Damaged copies of the
@@ -720,7 +783,7 @@ where
 
 impl<E, B, P> Opened<E, B, P>
 where
-    E: BufferPooler + Clock + CryptoRng + Spawner + Storage + Metrics,
+    E: Clock + CryptoRng + Spawner + Storage + Metrics,
     B: Blocker<PublicKey = PublicKey>,
     P: Provider<PublicKey = PublicKey>,
 {
@@ -760,7 +823,7 @@ where
         let committee = epoch.committee.clone();
         let prefix = config.partition_prefix;
         let retention = config.retention;
-        let page_cache = CacheRef::from_pooler(&context, NZU16!(16_384), NZUsize!(10_000));
+        let page_cache = CacheRef::new(NZU16!(16_384), NZUsize!(10_000));
         // A node outside the committee follows consensus without voting: its scheme verifies the
         // committee's votes and certificates but cannot sign (simplex then never votes or leads).
         let voting = committee.position(&public_key).is_some();
@@ -867,7 +930,34 @@ where
                 }
             }
         };
+        // Refuse before marshal opens its metadata: opening it can durably raise its round floor
+        // there (from a block archived but not yet acknowledged), and a node that refuses to start
+        // leaves its evidence as it found it.
+        let processed = marshal_processed(context.child("marshal_processed"), &prefix).await;
+        let journal = consensus_journal(&prefix, epoch.epoch);
+        let journal_present =
+            matches!(context.scan(&journal).await, Ok(blobs) if !blobs.is_empty());
+        let journal_missing = check_recovery(
+            &store,
+            &secrets,
+            processed,
+            &journal,
+            journal_present,
+            config.allow_missing_consensus_journal,
+        )?;
+        let state_height = store.height();
+        if let Some(close) = config.close_epoch_at
+            && close <= state_height
+        {
+            return Err(StartError::CloseBelowState {
+                close,
+                height: state_height,
+            });
+        }
+
         let genesis = Block::genesis();
+        let genesis_digest = genesis.digest();
+        let genesis = Digested::precomputed(genesis, genesis_digest);
         let (marshal_actor, marshal, marshal_floor) = Marshal::init(
             context.child("marshal"),
             finalizations,
@@ -875,7 +965,7 @@ where
             marshal::Config {
                 provider: schemes.clone(),
                 epocher: heights.clone(),
-                start: marshal::Start::Genesis(genesis.clone()),
+                start: marshal::Start::Genesis(genesis),
                 partition_prefix: format!("{prefix}-marshal"),
                 mailbox_size: MAILBOX_SIZE,
                 view_retention: ViewDelta::new(10),
@@ -891,24 +981,13 @@ where
             },
         )
         .await;
-        let journal = consensus_journal(&prefix, epoch.epoch);
-        let journal_present =
-            matches!(context.scan(&journal).await, Ok(blobs) if !blobs.is_empty());
-        let journal_missing = check_recovery(
-            &store,
-            &secrets,
-            marshal_floor.height().map_or(0, |height| height.get()),
-            &journal,
-            journal_present,
-            config.allow_missing_consensus_journal,
-        )?;
-        let state_height = store.height();
-        if let Some(close) = config.close_epoch_at
-            && close <= state_height
-        {
-            return Err(StartError::CloseBelowState {
-                close,
-                height: state_height,
+        let restored = marshal_floor
+            .processed()
+            .map_or(0, |processed| processed.height().get());
+        if restored != processed {
+            return Err(StartError::MarshalHeight {
+                read: processed,
+                restored,
             });
         }
 
@@ -920,8 +999,8 @@ where
                 peer_provider: config.peer_provider.clone(),
                 blocker: config.blocker.clone(),
                 mailbox_size: MAILBOX_SIZE,
-                timeout: Duration::from_secs(2),
-                fetch_retry_timeout: Duration::from_millis(100),
+                fetch_timeout: NZDuration!(Duration::from_secs(2)),
+                fetch_retry_delay: Duration::from_millis(100),
                 priority_requests: false,
                 priority_responses: false,
             },
@@ -938,6 +1017,7 @@ where
                 priority: false,
                 codec_config: (),
                 peer_provider: config.peer_provider,
+                strategy: Sequential,
             },
         );
         let broadcast_handle = broadcast.start(channels.blocks);
@@ -1056,7 +1136,8 @@ where
             .child("signing_receiver")
             .spawn(move |_| coordinator::receive(signing_receiver, dkg_sender, pending));
 
-        // Marshal adapter: verifies blocks inline and feeds finalized ones to the application.
+        // Marshal adapter: verifies blocks inline for consensus and forwards its activity to
+        // marshal, which feeds finalized blocks (with their ack) to the application.
         let peers = epochs
             .iter()
             .flat_map(|record| record.committee.iter())
@@ -1074,32 +1155,34 @@ where
             marshal: marshal.clone(),
             peers,
         };
+        let updates = Application::new(
+            mempool,
+            tip,
+            executor_mailbox,
+            Rules {
+                epochs: consensus_status.epochs.clone(),
+                candidates: consensus_status.candidates.clone(),
+                terminal: consensus_status.terminal.clone(),
+                horizon: config.horizon,
+                admin: config.administration.clone(),
+                committed,
+            },
+        );
         let application = Inline::new(
             context.child("application"),
-            Application::new(
-                mempool,
-                tip,
-                executor_mailbox,
-                Rules {
-                    epochs: consensus_status.epochs.clone(),
-                    candidates: consensus_status.candidates.clone(),
-                    terminal: consensus_status.terminal.clone(),
-                    horizon: config.horizon,
-                    admin: config.administration.clone(),
-                    committed,
-                },
-            ),
+            updates.clone(),
             marshal.clone(),
             heights,
         );
-        let marshal_handle = marshal_actor.start(application.clone(), buffer, resolver);
+        let marshal_handle = marshal_actor.start(updates, buffer, resolver);
 
         // Consensus resumes above the last finalization this node durably processed in this epoch:
         // whatever its journal holds (or lost), it never votes again in a view at or below it.
         // Marshal's processed height only moves forward, as the floor must; the epoch's genesis
         // (the previous epoch's last block) is the lowest floor there is.
         let (floor, floor_at) = match marshal_floor
-            .height()
+            .processed()
+            .map(|processed| processed.height())
             .filter(|height| height.get() > epoch.boundary)
         {
             Some(height) => match marshal.get_finalization(height).await {
@@ -1133,8 +1216,8 @@ where
                 elector: RoundRobin::<Sha256>::default(),
                 blocker: config.blocker,
                 automaton: application.clone(),
-                relay: application,
-                reporter: marshal,
+                relay: application.clone(),
+                reporter: application,
                 partition: journal,
                 mailbox_size: MAILBOX_SIZE,
                 epoch: Epoch::new(epoch.epoch),
@@ -1150,7 +1233,10 @@ where
                 // unblocks them. 10 s stalled authorizations for up to 10 s; 3 s keeps the skip
                 // timeout above it.
                 timeout_retry: Duration::from_secs(3),
-                fetch_timeout: Duration::from_secs(1),
+                fetch_timeout: NZDuration!(Duration::from_secs(1)),
+                // As before the upgrade, which retried an unresolved certificate fetch after the
+                // fetch timeout: a peer that answered without it is asked again a second later.
+                fetch_retry_delay: Duration::from_secs(1),
                 view_retention: ViewDelta::new(10),
                 skip: SkipPolicy::Enabled {
                     timeout: Duration::from_secs(11),
@@ -1213,7 +1299,7 @@ where
     FA: Archive<
         Value = simplex::types::Finalization<Scheme, commonware_cryptography::sha256::Digest>,
     >,
-    BA: Archive<Value = Block>,
+    BA: Archive<Value = Arc<Block>>,
 {
     if epoch.epoch == 0 {
         return Ok(());

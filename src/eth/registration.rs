@@ -49,7 +49,8 @@ use super::{
     duty::Duty,
     types::{Address, ValidatorRegistration, hex_bytes},
 };
-use bytes::{Buf, BufMut};
+use bytes::BufMut;
+use commonware_codec::Buf;
 use commonware_codec::{
     EncodeSize, Error as CodecError, FixedSize as _, Read, ReadExt as _, Write, varint::UInt,
 };

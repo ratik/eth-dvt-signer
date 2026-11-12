@@ -66,7 +66,7 @@ fn roundtrip() {
     let mut bad = vec![2u8];
     bad.extend_from_slice(&[0; 32]);
     bad.push(11);
-    assert!(Message::decode(bad.as_slice()).is_err());
+    assert!(Message::decode(commonware_codec::Copying(bad.as_slice())).is_err());
 }
 
 #[test]

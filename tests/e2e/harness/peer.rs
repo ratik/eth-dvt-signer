@@ -80,11 +80,12 @@ impl FakePeer {
                     }
                 }
                 let p2p = lookup::Config::local(
-                    signer,
+                    engine::handshake(signer),
                     &union(engine::NAMESPACE, b"_P2P"),
                     listen,
                     NonZeroUsize::new(n).unwrap(),
                     engine::MAX_MESSAGE_SIZE,
+                    engine::P2P_MAILBOX_SIZE,
                 );
                 let (mut network, mut oracle) = lookup::Network::new(context.child("network"), p2p);
                 oracle.track(0, peers);

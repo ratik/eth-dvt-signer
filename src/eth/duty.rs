@@ -20,7 +20,8 @@ use super::{
         SyncAggregatorSelectionData, ValidatorRegistration, Version, VoluntaryExit, hex_bytes,
     },
 };
-use bytes::{Buf, BufMut};
+use bytes::BufMut;
+use commonware_codec::Buf;
 use commonware_codec::{EncodeSize, Error as CodecError, Read, ReadExt as _, Write, varint::UInt};
 use serde::{Deserialize, Serialize};
 use ssz::{Decode as _, Encode as _};

@@ -41,7 +41,8 @@ use crate::{
     state::{self, Authorization, State},
     types::{Authorized, Command, Outcome, PayloadHash, Transaction},
 };
-use bytes::{Buf, BufMut};
+use bytes::BufMut;
+use commonware_codec::Buf;
 use commonware_codec::{Encode as _, varint::UInt};
 use commonware_codec::{EncodeSize, Error as CodecError, FixedSize, Read, ReadExt, Write};
 use commonware_cryptography::{Digest as _, ed25519::PublicKey, sha256::Digest};

@@ -291,9 +291,7 @@ fn an_4_a_forged_record_of_one_node_is_ignored() {
         .last()
         .expect("node 3 wrote a record");
     let head: SignedRecord = commonware_codec::DecodeExt::decode(
-        std::fs::read(chain.join(format!("{latest:020}")))
-            .unwrap()
-            .as_slice(),
+        std::fs::read(chain.join(format!("{latest:020}"))).unwrap(),
     )
     .unwrap();
     let forged = SignedRecord::sign(

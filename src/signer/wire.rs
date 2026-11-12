@@ -11,7 +11,8 @@ use crate::{
     eth::duty::ValidatorKey,
     types::PayloadHash,
 };
-use bytes::{Buf, BufMut};
+use bytes::BufMut;
+use commonware_codec::Buf;
 use commonware_codec::{Encode as _, EncodeSize, Error as CodecError, Read, ReadExt as _, Write};
 use commonware_cryptography::{
     Hasher as _, Sha256, bls12381::primitives::variant::PartialSignature, sha256::Digest,
