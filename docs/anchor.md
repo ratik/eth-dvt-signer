@@ -192,7 +192,20 @@ per node per day on mainnet.
 
 `mpc-admin anchor check` shows what the nodes would read. It cannot read the bucket's retention
 or policy: check them with the provider's own tools. `integration/anchor/check.sh` checks a real
-bucket's WORM behaviour (create-only, no overwrite, no delete) with credentials you provide.
+bucket with credentials you provide:
+- its WORM behaviour: create-only, no overwrite, no delete;
+- on S3, that the policy denies `s3:PutLifecycleConfiguration` to everyone;
+- its lifecycle rules. A policy that denies new rules leaves a rule set before it running, so the
+  script reads the rules.
+  - An expiration on S3 hides records behind delete markers: FAIL.
+  - A move to Glacier or Deep Archive makes records readable only after a restore: FAIL.
+  - A Delete on GCS removes records once retention ends: FAIL.
+  - Another storage class on GCS is still read at once: PASS.
+  - A setting these credentials cannot read: UNCHECKED, for the bucket's owner to check.
+
+**Tested on GCS** (2026-11-12; docs/tee.md). Four sealed nodes wrote their records to a real
+bucket with their VMs' accounts, read them back after a restart, and confirmed their chains.
+`check.sh` passed the bucket, and failed it once a Delete rule was added. Not yet tested on S3.
 
 ## Operating
 

@@ -23,6 +23,11 @@
 #   gcp.sh upgrade OLD NEW        four sealed nodes of OLD moved to NEW on their VMs, one at a
 #                                 time, while both are admitted; then OLD retired and refused
 #   gcp.sh teardown               delete whatever a run left (VMs, disks, addresses)
+#   gcp.sh anchor-up              a test anchor bucket (docs/anchor.md): retention ANCHOR_RETENTION
+#                                 (default 1h), not locked; the VMs' account may create and read
+#                                 objects only. While it exists, `run` gives its nodes an anchor
+#                                 under it (one prefix per run)
+#   gcp.sh anchor-down            the test anchor bucket deleted, its retention cleared first
 #   gcp.sh up IMAGE DIR           four sealed nodes of IMAGE for the integration devnet's validator
 #                                 client (run-validator.sh), left running: DIR/nodes.json
 #   gcp.sh logs DIR OUT           their serial consoles into OUT/signer-<i>.log until DIR/stop-logs
@@ -365,6 +370,43 @@ PY
 # admitted IMAGE: whether the provider admits IMAGE (`admit`).
 admitted() { [ -s "$ADMITTED" ] && grep -qx -- "$1" "$ADMITTED"; }
 
+# --- the test anchor bucket ----------------------------------------------------------------------
+
+ANCHOR_FILE=/it/gcp/anchor
+ANCHOR_BUCKET="${ANCHOR_BUCKET:-$PROJECT-anchor-test}"
+
+# anchor_up: the bucket, its unlocked retention, and the VMs' account's object create and read
+# (no delete, no overwrite). The bucket's retention is a test's: hours, never locked, so
+# `anchor-down` can delete it.
+anchor_up() {
+	if ! gcloud storage buckets describe "gs://$ANCHOR_BUCKET" --format='value(name)' >/dev/null 2>&1; then
+		log "creating the test anchor bucket gs://$ANCHOR_BUCKET (retention ${ANCHOR_RETENTION:-1h}, not locked)"
+		gcloud storage buckets create "gs://$ANCHOR_BUCKET" --location="$REGION" \
+			--uniform-bucket-level-access --retention-period="${ANCHOR_RETENTION:-1h}" \
+			--labels="$LABEL" --format=none
+	fi
+	local role
+	for role in roles/storage.objectCreator roles/storage.objectViewer; do
+		gcloud storage buckets add-iam-policy-binding "gs://$ANCHOR_BUCKET" \
+			--member="serviceAccount:$WORKLOAD_SA" --role="$role" --format=none
+	done
+	echo "gs://$ANCHOR_BUCKET" >"$ANCHOR_FILE"
+	log "anchor: gs://$ANCHOR_BUCKET; \`run\` writes under gs://$ANCHOR_BUCKET/<run>"
+}
+
+# anchor_down: the bucket's retention cleared (it was never locked), then the bucket and every
+# record in it deleted.
+anchor_down() {
+	rm -f "$ANCHOR_FILE"
+	gcloud storage buckets describe "gs://$ANCHOR_BUCKET" --format='value(name)' >/dev/null 2>&1 || {
+		log "no test anchor bucket gs://$ANCHOR_BUCKET"
+		return 0
+	}
+	gcloud storage buckets update "gs://$ANCHOR_BUCKET" --clear-retention-period --format=none
+	gcloud storage rm --recursive "gs://$ANCHOR_BUCKET" --quiet
+	log "deleted gs://$ANCHOR_BUCKET"
+}
+
 case "${1:-}" in
 setup) setup ;;
 image) image "$2" "$3" "${4:-}" ;;
@@ -390,6 +432,8 @@ teardown)
 	run=/tmp
 	teardown
 	;;
+anchor-up) anchor_up ;;
+anchor-down) anchor_down ;;
 up | logs | down)
 	# shellcheck source=cluster.sh
 	source "$here/cluster.sh"

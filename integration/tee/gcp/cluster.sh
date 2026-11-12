@@ -206,6 +206,38 @@ restart_vm() {
 # the provider's condition; `KMS decrypt: `, the key's binding), as its console shows.
 refused_by() { wait_serial "$1" "refusing to start.*$2" "$3"; }
 
+# anchor_writers N: at least N nodes have records in this run's anchor (one directory per node's
+# key, records `<sequence>` under it, docs/anchor.md).
+anchor_writers() {
+	local writers
+	writers="$(gcloud storage ls --recursive "$ANCHOR/**" 2>/dev/null | "$PY" -c '
+import sys
+nodes = {line.rstrip().rsplit("/", 2)[-2] for line in sys.stdin if line.rstrip().rsplit("/", 1)[-1].isdigit()}
+print(len(nodes))')"
+	echo "anchor: $writers node(s) wrote records" >&2
+	[ "${writers:-0}" -ge "$1" ]
+}
+
+# anchor_confirmed: every node's anchor is `confirmed` (GET /status): it read the records, and its
+# chain holds what they name.
+anchor_confirmed() {
+	local i state
+	for ((i = 0; i < NODES; i++)); do
+		state="$(api_body "$i" GET /status | "$PY" -c 'import json, sys; print((json.load(sys.stdin).get("anchor") or {}).get("state"))')"
+		echo "anchor: node $i $state" >&2
+		[ "$state" = confirmed ] || return 1
+	done
+}
+
+# anchor_answered: no node's console says the anchor did not answer (at start, or a record write):
+# GCS answered every node, with the credentials of the VM's account.
+anchor_answered() {
+	local i
+	for ((i = 0; i < NODES; i++)); do
+		! serial "$(instance "$i")" | grep -aE 'anchor unreachable at start|anchor: record not written' || return 1
+	done
+}
+
 # The instance ID GCE gave VM NAME (what a TDX token names the VM by).
 instance_id() { gcloud compute instances describe "$1" --zone="$ZONE" --format='value(id)'; }
 
@@ -324,7 +356,8 @@ PY
 		mapfile -t vault < <(vault_args "$i")
 		config "$run/config-$i-sealed" "--id=$i" "--participants=$NODES" "--peers=$CONFIG_DIR/peers" \
 			--p2p-listen=0.0.0.0:3000 --https-listen=0.0.0.0:8443 "--client-ca=$CONFIG_DIR/client-ca" \
-			--no-http "--approvers=$CONFIG_DIR/approvers" "${chain[@]}" "${extra[@]}" "${vault[@]}"
+			--no-http "--approvers=$CONFIG_DIR/approvers" ${ANCHOR:+"--anchor=$ANCHOR"} \
+			"${chain[@]}" "${extra[@]}" "${vault[@]}"
 		cp "$run/peers.json" "$run/config-$i-sealed/peers"
 		cp "$run/operator/ca.pem" "$run/config-$i-sealed/client-ca"
 		cp "$2" "$run/config-$i-sealed/approvers"
@@ -348,7 +381,10 @@ cluster() {
 	failed=0
 	hold "$CLUSTER_BUSY"
 	trap cluster_teardown EXIT
-	log "run $run: image $image${debug:+, debug image $debug}"
+	# With a test anchor bucket (`gcp.sh anchor-up`): this run's anchor under it.
+	ANCHOR=
+	[ ! -s "$ANCHOR_FILE" ] || ANCHOR="$(cat "$ANCHOR_FILE")/${run##*/}"
+	log "run $run: image $image${debug:+, debug image $debug}${ANCHOR:+, anchor $ANCHOR}"
 
 	operator_certificates
 	approver_set
@@ -384,6 +420,10 @@ cluster() {
 
 	validator_ceremony
 	check "a duty signed through node 1 over mTLS" duty 1 0 1 2 3
+	if [ -n "$ANCHOR" ]; then
+		check "anchor: the keyholders wrote their records to $ANCHOR before their partials" \
+			anchor_writers 3
+	fi
 
 	# A restart: node 1 unseals again (a fresh attestation, STS and KMS) and signs.
 	restart_vm "$(instance 1)"
@@ -391,6 +431,11 @@ cluster() {
 	check "node 1: unseals after a restart and answers" ready 1 900
 	check "node 1: the ceremony is still stored" wait_stored 1 "$VALIDATOR_KEY" 120
 	check "node 1: signs a duty after the restart" duty 1 0 1 2 3
+	if [ -n "$ANCHOR" ]; then
+		check "anchor: every node read and wrote it without degrading (consoles)" anchor_answered
+		check "anchor: every node confirmed its chain against the records (GET /status)" \
+			anchor_confirmed
+	fi
 
 	# Node 3's data disk under the debug image, node 3's key bound to that VM too: STS refuses the
 	# token (RTMR1 and RTMR2 differ), so KMS never releases the data key; the other three keep

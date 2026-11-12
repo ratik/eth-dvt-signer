@@ -310,6 +310,12 @@ test host, not in the repository (`project.env.example`).
     signature; per-node loopback bridges serve the driver's own calls (DKG, activation, deposit);
   - the DKG key goes through its whole lifecycle, then EPOCHS epochs of duties;
   - `gcp.json` splits the latency between the network and the nodes.
+- **`anchor-up` / `anchor-down`** make and delete a test anchor bucket. Its retention lasts hours
+  and is not locked, and the VMs' account may only create and read its objects. While it exists,
+  `run` gives each sealed node `--anchor` under it (one prefix per run). The nodes reach GCS with
+  their VM's account, from the metadata server: no key leaves the project. The run checks that
+  the keyholders wrote records, that no node degraded, and that every node confirmed its chain
+  against the records (`GET /status`).
 - **VM lifetime.** VMs, their disks and addresses exist only during a command: a `trap` deletes
   them on any exit, and `teardown` (or `down`) removes leftovers. Each key is released to nobody
   again at the end.
@@ -369,6 +375,18 @@ test host, not in the repository (`project.env.example`).
   - **`config-rtmr3`.** It took the harness's sealed configurations, and their RTMR3 were the
     tokens'.
   - **Measurements.** `gcp.sh measure` confirmed the RTMR1 and RTMR2 the build predicted.
+- **The anchor on GCS** (2026-11-12, image `20261112T112542Z`, run `run-20261112T114459Z`):
+  32 of 32 checks, the cluster's 29 and the anchor's 3.
+  - Every sealed node wrote its records to a real bucket (3 to 4 records each), with its VM's
+    account from the metadata server.
+  - After node 1's restart, no node degraded, and every node confirmed its chain against the
+    records (`GET /status`: `confirmed`).
+  - `integration/anchor/check.sh` on the same bucket:
+    - the bucket wrote once, then refused a second create-only write, an overwrite and a delete;
+    - with no lifecycle rule: PASS;
+    - with a Delete rule added for the check: FAIL, as it should (the rule then cleared).
+  - The bucket (retention 1 h, not locked) was deleted after the run.
+  - The image's QEMU run passed too (`tee-qemu`, run `20261112T112542Z`).
 
 ## Tests
 
