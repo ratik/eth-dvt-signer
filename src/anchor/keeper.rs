@@ -2,8 +2,13 @@
 //! before giving a partial, the anchored marks and the confirmation gate it signs under, and the
 //! replies it holds while a record is being written.
 //!
-//! The logic is synchronous; the keyholder actor runs [`write`] in a task of its own and posts the
-//! outcome back to its mailbox.
+//! The logic is synchronous; the keyholder actor runs [`write_noting`] in a task of its own and
+//! posts the outcome back to its mailbox.
+//!
+//! **A write whose outcome was lost** (no answer within [WRITE_TIMEOUT], a lost reply) may still
+//! have landed. The keeper keeps the record it sent ([Job::attempt]) and reads its head back before
+//! the next write. If its next place holds that very record, the record is its own and counts as
+//! written. Any other record there, or beyond it, is another process's: a clone, as before.
 
 use super::{
     record::{Marks, Record, SignedRecord},
@@ -17,7 +22,7 @@ use commonware_cryptography::{
     sha256::Digest,
 };
 use std::{
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -98,6 +103,9 @@ pub struct Job {
     pub digest: Digest,
     pub head: Option<SignedRecord>,
     pub refresh: bool,
+    /// A record an earlier write sent without learning whether it landed: found at its place,
+    /// it is this node's own, not a clone's.
+    pub attempt: Option<SignedRecord>,
 }
 
 /// A keyholder's anchor state.
@@ -109,6 +117,8 @@ pub struct Keeper<R> {
     /// Its latest record, if it knows it (`head_known`).
     head: Option<SignedRecord>,
     head_known: bool,
+    /// The record of a write whose outcome was lost ([Job::attempt]).
+    attempt: Option<SignedRecord>,
     /// The marks of the record being written, if one is.
     writing: Option<Marks>,
     /// Replies held for a record covering their marks.
@@ -156,6 +166,7 @@ impl<R> Keeper<R> {
             generation,
             head,
             head_known,
+            attempt: None,
             writing: None,
             held: Vec::new(),
             anchored,
@@ -239,6 +250,7 @@ impl<R> Keeper<R> {
             digest: self.digest,
             head: self.head.clone(),
             refresh: !self.head_known,
+            attempt: self.attempt.clone(),
         }
     }
 
@@ -281,6 +293,7 @@ impl<R> Keeper<R> {
     pub fn written(&mut self, record: SignedRecord) -> (Vec<R>, Option<Job>) {
         self.head = Some(record);
         self.head_known = true;
+        self.attempt = None;
         self.writing = None;
         self.degraded = false;
         self.unanchored = Marks::default();
@@ -297,8 +310,19 @@ impl<R> Keeper<R> {
         (given.into_iter().map(|(_, reply)| reply).collect(), next)
     }
 
-    /// The write failed or timed out: the keyholder is degraded, and gives every held reply.
-    pub fn failed(&mut self, now: SystemTime) -> Vec<R> {
+    /// A write sent `attempted` (if it got that far) without learning whether it landed: its
+    /// head is read again before the next write, which takes `attempted` as its own if found.
+    fn lost(&mut self, attempted: Option<SignedRecord>) {
+        if attempted.is_some() {
+            self.attempt = attempted;
+            self.head_known = false;
+        }
+    }
+
+    /// The write failed or timed out, after sending `attempted` if it got that far: the
+    /// keyholder is degraded, and gives every held reply.
+    pub fn failed(&mut self, now: SystemTime, attempted: Option<SignedRecord>) -> Vec<R> {
+        self.lost(attempted);
         self.writing = None;
         self.degraded = true;
         self.last_attempt = Some(now);
@@ -342,8 +366,10 @@ impl<R> Keeper<R> {
         Some(self.job(marks))
     }
 
-    /// A due write failed (nothing was held for it).
-    pub fn due_failed(&mut self, now: SystemTime) {
+    /// A due write failed (nothing was held for it), after sending `attempted` if it got that
+    /// far.
+    pub fn due_failed(&mut self, now: SystemTime, attempted: Option<SignedRecord>) {
+        self.lost(attempted);
         self.writing = None;
         self.degraded = true;
         self.last_attempt = Some(now);
@@ -359,32 +385,100 @@ pub async fn write(
     job: Job,
     now: SystemTime,
 ) -> Result<SignedRecord, AnchorError> {
-    let head = if job.refresh {
-        store.latest(&key.public_key()).await?
+    write_noting(store, key, cluster, generation, job, now, &Mutex::new(None)).await
+}
+
+/// [write], noting in `attempted` each record it sends before it sends it: if the write ends
+/// without an outcome (a timeout drops it), the caller still knows what may have landed.
+pub async fn write_noting(
+    store: &AnchorStore,
+    key: &PrivateKey,
+    cluster: Digest,
+    generation: u64,
+    job: Job,
+    now: SystemTime,
+    attempted: &Mutex<Option<SignedRecord>>,
+) -> Result<SignedRecord, AnchorError> {
+    let node = key.public_key();
+    let mut head = if job.refresh {
+        store.latest(&node).await?
     } else {
-        job.head
+        job.head.clone()
     };
-    let marks = head
-        .as_ref()
-        .map_or(job.marks, |head| head.record.marks.max(job.marks));
-    let record = SignedRecord::sign(
-        key,
-        Record {
-            cluster,
-            node: key.public_key(),
-            generation,
-            sequence: head.as_ref().map_or(0, |head| head.record.sequence + 1),
-            previous: head
+    if let Some(attempt) = &job.attempt {
+        head = after_attempt(store, head, attempt)?;
+    }
+    let record = |head: &Option<SignedRecord>| {
+        SignedRecord::sign(
+            key,
+            Record {
+                cluster,
+                node: node.clone(),
+                generation,
+                sequence: head.as_ref().map_or(0, |head| head.record.sequence + 1),
+                previous: head
+                    .as_ref()
+                    .map_or_else(|| Digest::from([0; 32]), SignedRecord::hash),
+                height: job.height,
+                digest: job.digest,
+                marks: head
+                    .as_ref()
+                    .map_or(job.marks, |head| head.record.marks.max(job.marks)),
+                written_at: now
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |since| since.as_millis() as u64),
+            },
+        )
+    };
+    let note = |record: &SignedRecord| {
+        *attempted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(record.clone());
+    };
+    let first = record(&head);
+    note(&first);
+    match store.put(&first).await {
+        Ok(()) => Ok(first),
+        Err(AnchorError::Exists { path }) => {
+            // The earlier attempt at this very place, landed after the head was read back: this
+            // node's own record. Write after it, once.
+            let Some(attempt) = job
+                .attempt
                 .as_ref()
-                .map_or_else(|| Digest::from([0; 32]), SignedRecord::hash),
-            height: job.height,
-            digest: job.digest,
-            marks,
-            written_at: now
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |since| since.as_millis() as u64),
-        },
-    );
-    store.put(&record).await?;
-    Ok(record)
+                .filter(|attempt| attempt.record.sequence == first.record.sequence)
+            else {
+                return Err(AnchorError::Exists { path });
+            };
+            if store.get(&node, attempt.record.sequence).await?.as_ref() != Some(attempt) {
+                return Err(AnchorError::Exists { path });
+            }
+            let next = record(&Some(attempt.clone()));
+            note(&next);
+            store.put(&next).await?;
+            Ok(next)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// The head to write after, read back as `latest`, given the `attempt` of a write whose outcome
+/// was lost: below its place, it did not land (yet); at its place, it must be that very record;
+/// beyond it, another process wrote.
+fn after_attempt(
+    store: &AnchorStore,
+    latest: Option<SignedRecord>,
+    attempt: &SignedRecord,
+) -> Result<Option<SignedRecord>, AnchorError> {
+    let sequence = attempt.record.sequence;
+    match &latest {
+        Some(latest)
+            if latest.record.sequence > sequence
+                || (latest.record.sequence == sequence && latest != attempt) =>
+        {
+            Err(AnchorError::Exists {
+                path: store.place(&attempt.record.node, latest.record.sequence),
+            })
+        }
+        _ => Ok(latest),
+    }
 }

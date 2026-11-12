@@ -404,7 +404,12 @@ pub enum Anchored {
     Written(SignedRecord),
     /// Another process wrote at this node's next place: a clone, or an older copy of it.
     Taken(String),
-    Failed(String),
+    /// No outcome: an error, or no answer in time. `attempted` is the record it sent, if it got
+    /// that far, which may have landed.
+    Failed {
+        why: String,
+        attempted: Option<crate::anchor::SignedRecord>,
+    },
 }
 
 /// A partial computed and held until an anchor record covers its duty.
@@ -1561,16 +1566,24 @@ impl<
             .child("anchor")
             .spawn(move |context| async move {
                 let now = crate::hooks::clock(context.current());
+                let attempted = std::sync::Mutex::new(None);
+                let failed = |why: String| Anchored::Failed {
+                    why,
+                    attempted: attempted
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take(),
+                };
                 let outcome = select! {
-                    written = keeper::write(&store, &key, cluster, generation, job, now) => {
+                    written = keeper::write_noting(&store, &key, cluster, generation, job, now, &attempted) => {
                         match written {
                             Ok(record) => Anchored::Written(record),
                             Err(crate::anchor::AnchorError::Exists { path }) => Anchored::Taken(path),
-                            Err(err) => Anchored::Failed(err.to_string()),
+                            Err(err) => failed(err.to_string()),
                         }
                     },
                     _ = context.sleep(keeper::WRITE_TIMEOUT) => {
-                        Anchored::Failed(format!("no answer within {:?}", keeper::WRITE_TIMEOUT))
+                        failed(format!("no answer within {:?}", keeper::WRITE_TIMEOUT))
                     },
                 };
                 let _ = sender.send(Message::Anchored { outcome, held });
@@ -1608,18 +1621,18 @@ impl<
                     reason: format!("another process writes this node's anchor records ({path})"),
                 });
             }
-            Anchored::Failed(why) => {
+            Anchored::Failed { why, attempted } => {
                 warn!(
                     %why,
                     "anchor: record not written; degraded: signing under the restart floor alone \
                      until the anchor answers again"
                 );
                 if held {
-                    for held in anchor.failed(now) {
+                    for held in anchor.failed(now, attempted) {
                         self.deliver(held);
                     }
                 } else {
-                    anchor.due_failed(now);
+                    anchor.due_failed(now, attempted);
                 }
             }
         }

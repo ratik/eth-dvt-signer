@@ -126,6 +126,11 @@ impl AnchorStore {
         self.root.clone().join(hex::encode(node.encode()).as_str())
     }
 
+    /// Where `node`'s record `sequence` is, for messages.
+    pub fn place(&self, node: &PublicKey, sequence: u64) -> String {
+        self.record_path(node, sequence).to_string()
+    }
+
     fn record_path(&self, node: &PublicKey, sequence: u64) -> Path {
         self.node_path(node)
             .join(format!("{sequence:020}").as_str())

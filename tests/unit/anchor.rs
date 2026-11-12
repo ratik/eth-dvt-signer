@@ -361,7 +361,7 @@ mod keeper_tests {
         let (Step::Hold(Some(_)), None) = anchor.step(vote, 1) else {
             panic!("held")
         };
-        assert_eq!(anchor.failed(at(0)), vec![1]);
+        assert_eq!(anchor.failed(at(0), None), vec![1]);
         assert!(anchor.degraded());
         // Degraded: given at once, what was signed is remembered.
         let later = keeper::needed(DutyKind::Attestation, 4, Some(3));
@@ -447,6 +447,7 @@ mod keeper_tests {
                 digest: digest_of(10, 0),
                 head,
                 refresh,
+                attempt: None,
             };
             let first = keeper::write(&store, &key(1), cluster(), 0, job(None, false), at(0))
                 .await
@@ -471,6 +472,171 @@ mod keeper_tests {
                 .await,
                 Err(AnchorError::Exists { .. })
             ));
+        });
+    }
+}
+
+mod lost_write_tests {
+    use super::*;
+    use crate::anchor::keeper::{self, Job, Keeper, Step};
+    use crate::eth::duty::DutyKind;
+    use std::{
+        sync::{Arc, Mutex},
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    fn at(seconds: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(1_700_000_000 + seconds)
+    }
+
+    fn job(head: Option<SignedRecord>, refresh: bool, attempt: Option<SignedRecord>) -> Job {
+        Job {
+            marks: marks(1, 1, 2),
+            height: 10,
+            digest: digest_of(10, 0),
+            head,
+            refresh,
+            attempt,
+        }
+    }
+
+    #[test]
+    fn a_write_that_landed_without_an_answer_is_the_nodes_own() {
+        block_on(async {
+            let store = Arc::new(AnchorStore::in_memory(&cluster()));
+            let mut anchor: Keeper<u32> = Keeper::new(
+                store.clone(),
+                key(1),
+                cluster(),
+                Some((View::default(), None, true)),
+                10,
+                digest_of(10, 0),
+            );
+            let vote = keeper::needed(DutyKind::Attestation, 3, Some(2));
+            let (Step::Hold(Some(first)), None) = anchor.step(vote, 1) else {
+                panic!("held")
+            };
+            // The record lands, but its answer is lost (a timeout): degraded.
+            let attempted = Mutex::new(None);
+            let landed =
+                keeper::write_noting(&store, &key(1), cluster(), 0, first, at(0), &attempted)
+                    .await
+                    .unwrap();
+            let attempt = attempted.lock().unwrap().take();
+            assert_eq!(attempt.as_ref(), Some(&landed));
+            assert_eq!(anchor.failed(at(0), attempt), vec![1]);
+            assert!(anchor.degraded());
+
+            // The catch-up reads the head back, finds its own record there, and writes after it:
+            // no clone, no stop.
+            let catch_up = anchor
+                .due(at(31), Duration::from_secs(600))
+                .expect("a retry");
+            assert!(catch_up.refresh);
+            assert_eq!(catch_up.attempt.as_ref(), Some(&landed));
+            let next = keeper::write(&store, &key(1), cluster(), 0, catch_up, at(31))
+                .await
+                .unwrap();
+            assert_eq!(next.record.sequence, 1);
+            assert_eq!(next.record.previous, landed.hash());
+            anchor.written(next);
+            assert!(!anchor.degraded());
+        });
+    }
+
+    #[test]
+    fn an_attempt_that_lands_after_the_head_was_read_back_is_taken_as_its_own() {
+        block_on(async {
+            // The attempt (sequence 0), made against a store it never reached.
+            let attempted = Mutex::new(None);
+            let attempt = keeper::write_noting(
+                &AnchorStore::in_memory(&cluster()),
+                &key(1),
+                cluster(),
+                0,
+                job(None, false, None),
+                at(0),
+                &attempted,
+            )
+            .await
+            .unwrap();
+            // It lands between the read-back (nothing yet) and the next write.
+            let store = AnchorStore::in_memory(&cluster());
+            store.put(&attempt).await.unwrap();
+            let next = keeper::write(
+                &store,
+                &key(1),
+                cluster(),
+                0,
+                job(None, false, Some(attempt.clone())),
+                at(31),
+            )
+            .await
+            .unwrap();
+            assert_eq!(next.record.sequence, 1);
+            assert_eq!(next.record.previous, attempt.hash());
+
+            // Another record at that place is a clone's.
+            let other = AnchorStore::in_memory(&cluster());
+            let clone = record(&key(1), 0, None, 11, 0, marks(9, 9, 9));
+            other.put(&clone).await.unwrap();
+            assert!(matches!(
+                keeper::write(
+                    &other,
+                    &key(1),
+                    cluster(),
+                    0,
+                    job(None, false, Some(attempt)),
+                    at(31)
+                )
+                .await,
+                Err(AnchorError::Exists { .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn a_clone_is_still_found_after_a_lost_write() {
+        block_on(async {
+            let store = AnchorStore::in_memory(&cluster());
+            let first = keeper::write(&store, &key(1), cluster(), 0, job(None, false, None), at(0))
+                .await
+                .unwrap();
+            // This node's attempt at sequence 1 did not land; a clone wrote there instead.
+            let attempt = record(&key(1), 1, Some(&first), 12, 0, marks(2, 2, 3));
+            let clone = record(&key(1), 1, Some(&first), 13, 0, marks(5, 5, 6));
+            store.put(&clone).await.unwrap();
+            let read_back =
+                |attempt: &SignedRecord| job(Some(first.clone()), true, Some(attempt.clone()));
+            assert!(matches!(
+                keeper::write(&store, &key(1), cluster(), 0, read_back(&attempt), at(31)).await,
+                Err(AnchorError::Exists { .. })
+            ));
+            // Or wrote beyond it.
+            let beyond = record(&key(1), 2, Some(&clone), 14, 0, marks(6, 6, 7));
+            store.put(&beyond).await.unwrap();
+            assert!(matches!(
+                keeper::write(&store, &key(1), cluster(), 0, read_back(&clone), at(31)).await,
+                Err(AnchorError::Exists { .. })
+            ));
+            // Nothing landed at all: the head read back is the last record, and the write goes on.
+            let quiet = AnchorStore::in_memory(&cluster());
+            let first = keeper::write(&quiet, &key(1), cluster(), 0, job(None, false, None), at(0))
+                .await
+                .unwrap();
+            let lost = record(&key(1), 1, Some(&first), 12, 0, marks(2, 2, 3));
+            let next = keeper::write(
+                &quiet,
+                &key(1),
+                cluster(),
+                0,
+                job(Some(first.clone()), true, Some(lost)),
+                at(31),
+            )
+            .await
+            .unwrap();
+            assert_eq!(next.record.sequence, 1);
+            assert_eq!(next.record.previous, first.hash());
         });
     }
 }

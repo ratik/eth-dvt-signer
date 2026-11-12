@@ -62,8 +62,17 @@ and holds the partial (its own coordinator's request, or a peer's) until the wri
   the held partials under the restart floor alone, tries the anchor again every 30 s, and then
   writes a catch-up record with the marks it signed meanwhile. Readiness says
   `anchor_unavailable` (state `degraded`); signing goes on.
-- **A clone.** A write whose place is taken means another process writes as this node (a copy of
-  its data directory, or an older copy of it): the node stops, exit status 77.
+- **A write whose answer was lost** (no answer within 2 s, a lost reply) may still have landed.
+  - The node keeps the record it sent and reads its own latest record back before the next
+    write.
+  - Its next place holding that very record means the record is its own: it counts as written,
+    and the next record follows it. So does a place the record took between the read-back and
+    the next write.
+  - Without this, a slow write that landed made the next one find its place taken, and the node
+    stopped as if a clone ran (until 2026-11-12).
+- **A clone.** A write whose place is taken by another record means another process writes as
+  this node (a copy of its data directory, or an older copy of it): the node stops, exit status
+  77. After a lost write, so does any other record at the sent record's place, or beyond it.
 
 ### Reading, and the rules
 
