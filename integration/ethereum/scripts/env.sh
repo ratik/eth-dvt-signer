@@ -3,7 +3,7 @@
 #
 #   one privileged Docker-in-Docker container, alone on a network of its own, with no published
 #   port. Its inner Docker daemon listens on its Unix socket only. Kurtosis, the devnet, the four
-#   signers, the failover proxy and the Lighthouse validator client all run inside it and talk
+#   signers, the gateway (`mpc-gateway`) and the Lighthouse validator client all run inside it and talk
 #   over its loopback. What the inner daemon publishes (Kurtosis' engine API, the devnet's ports)
 #   binds inside that container only: no other container shares its network, and nothing is
 #   published on the host. Nothing else on the host is touched.

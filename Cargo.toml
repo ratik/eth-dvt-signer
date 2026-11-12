@@ -19,7 +19,7 @@ fake-gcp = []
 # The raw signing API (`POST /sign`, `GET /authorizations`) for development and tests: signs any
 # payload with a development key. Never enable it in a deployment.
 dev-api = []
-# Fuzzing entry points (`src/fuzzing.rs`) for the `fuzz/` crate and `tests/fuzz_regressions.rs`.
+# Fuzzing entry points (`src/fuzzing.rs`) for the `fuzz/` crate and `fuzzing::tests`.
 # Never enable it in a deployment.
 fuzzing = []
 

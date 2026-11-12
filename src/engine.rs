@@ -162,7 +162,8 @@ pub struct Config<B, P> {
     pub retention: Retention,
     /// Signing coordinator timeouts and limits.
     pub signing: coordinator::Config,
-    /// Start even though the consensus journal is missing (an operator decision, see the README).
+    /// Start even though the consensus journal is missing (an operator decision, see
+    /// docs/recovery.md).
     pub allow_missing_consensus_journal: bool,
     /// This node's share-encryption key, to install shares of imported keys (`import`).
     pub share_key: Option<crate::import::envelope::ShareKey>,
@@ -373,7 +374,7 @@ pub enum StartError {
     #[error(
         "consensus journal (partition {partition}) is missing although this node has finalized \
          history (height {height}): it may have voted in views it no longer remembers, and voting \
-         again could equivocate; refusing to start (see the README, Recovery, before using \
+         again could equivocate; refusing to start (see docs/recovery.md, §6, before using \
          --allow-missing-consensus-journal)"
     )]
     MissingJournal { partition: String, height: u64 },

@@ -406,8 +406,8 @@ fn f4_both_copies_corrupted_fails_closed() {
 }
 
 /// R5: the consensus journal is gone while the node has finalized history. It may have voted in
-/// views it no longer remembers, so it refuses to start. The README's operator procedure lets it
-/// start once the network is well past those views, explicitly.
+/// views it no longer remembers, so it refuses to start. The operator procedure of
+/// docs/recovery.md (§6) lets it start once the network is well past those views, explicitly.
 #[test]
 fn r5_missing_consensus_journal_fails_closed() {
     let (network, _) = network_with_key();

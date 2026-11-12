@@ -1,4 +1,4 @@
-//! TEE-1 to TEE-5: nodes whose keys are sealed in a vault (docs/tee.md), on the `gcp-tdx` platform
+//! TEE-1 to TEE-6: nodes whose keys are sealed in a vault (docs/tee.md), on the `gcp-tdx` platform
 //! against a fake of Google's attestation, STS and KMS (`harness::gcp`), with real identities
 //! (`--peers`) and the mTLS API.
 //!

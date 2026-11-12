@@ -11,8 +11,8 @@
 //!   and acknowledgments, import manifests, peers files, attestation statements and tokens)
 //!   yields values every later step accepts without panicking.
 //!
-//! The fuzz targets (`fuzz/fuzz_targets`) call these, and `tests/fuzz_regressions.rs` replays every
-//! input a campaign found (`fuzz/regressions/<target>`) through them on stable Rust.
+//! The fuzz targets (`fuzz/fuzz_targets`) call these, and `fuzzing::tests` (`tests/unit/fuzzing.rs`)
+//! replays every input a campaign found (`fuzz/regressions/<target>`) through them on stable Rust.
 
 use crate::{
     admin::{Approvers, SignedCommand, duty_overview, history_overview},

@@ -3,45 +3,73 @@
 ## Layers
 
 ```
-HTTP adapters           src/rpc.rs              Web3Signer API (src/eth/web3signer parses typed
-                                                duties); the development API (`dev-api` only).
+HTTP API                src/rpc.rs              Web3Signer API (src/eth/web3signer parses typed
+                                                duties); operations; the development API
+                                                (`dev-api` builds only).
         │ DutyRequest {validator, fork, duty} / SignRequest {ceremony, nonce, payload_hash}
 Coordinator             src/signer/coordinator  authorization (consensus if needed), partial
                                                 collection, recovery, verification. Knows nothing
                                                 about HTTP.
         │ executor messages / signing p2p channel
-Replicated state        src/executor, storage,  validator activations (chain identity, once);
-                        src/slashing            duties: signing root computed from the typed duty,
+Consensus               src/application,        blocks from the mempool, simplex voting; marshal
+                        src/engine, src/epochs  hands finalized blocks to the executor in order.
+        │ finalized blocks
+Replicated state        src/executor, state,    validator activations (chain identity, once);
+                        storage, slashing       duties: signing root computed from the typed duty,
                                                 activation, chain and slashing rules, record;
                                                 development requests: (ceremony, nonce) -> payload.
-                                                Decided by consensus, committed atomically per block.
+                                                Committed atomically, one sync per block.
 Keyholder               src/dkg/actor           shares; signs only committed authorizations of the
                                                 kind a request names: (validator key, root) for a
                                                 validator key's ceremony (its active share
                                                 generation only), (ceremony, nonce) for a
                                                 development key's.
 Anchor (optional)       src/anchor              append-only records on S3, GCS or a directory
-                                                outside the nodes' storage: written by a
-                                                keyholder before it signs past them, read at
-                                                start; a whole-network rollback stops the nodes.
+                                                outside the nodes' storage. A keyholder writes one
+                                                before it signs past its marks; a node reads them
+                                                at start; a whole-network rollback stops the nodes.
 Crypto                  src/dkg/signing         Ethereum ciphersuite over raw 32-byte roots.
 Ethereum types          src/eth                 containers, SSZ hash_tree_root, domains, roots.
 ```
 
-Two roles are kept apart: **voters** (the consensus committee, which also runs the coordinators)
-and **keyholders** (the players of a key's active generation). They coincide until a keyholder is
-replaced (R2): then a follower, which votes on nothing and coordinates nothing, holds a share.
+Two roles are kept apart:
+- **Voters**: the consensus committee of the current epoch. Each voter also runs a coordinator.
+- **Keyholders**: the players of a key's active share generation.
 
-The core never sees HTTP types, and the HTTP layer never sees shares or partial signatures. For
-validator keys, the state machine computes what is signed from the typed duty, so the signing
-root and the slashing decision cannot disagree. The client's `signingRoot` is only compared with
-it. The development API signs opaque 32-byte roots.
+The two sets are the same until a keyholder is replaced (R2). Then a follower holds a share. A
+follower votes on nothing and coordinates nothing.
+
+Boundaries:
+- The core never sees HTTP types. The HTTP layer never sees shares or partial signatures.
+- For validator keys, the state machine computes what is signed from the typed duty. So the
+  signing root and the slashing decision cannot disagree. The client's `signingRoot` is only
+  compared with it (`400` if it differs).
+- The development API signs opaque 32-byte roots.
+
+Other modules:
+
+| Module | Role |
+| --- | --- |
+| `src/engine.rs` | Wires one node: consensus (simplex), marshal, block broadcast, backfill, the application, the executor, the DKG actor and the coordinator. A follower runs the same engine with a scheme that cannot vote, and no coordinator. |
+| `src/application.rs` | Builds blocks from the mempool. Does not propose or vote for duties beyond the time horizon, protected commands without approvals, registrations the policy refuses, or a child of an epoch's last block. |
+| `src/epochs.rs` | Consensus epochs (R3): which committee votes on which heights. |
+| `src/admin.rs` | Protected commands and the approvers' Ed25519 signatures (P0). |
+| `src/readiness.rs` | What a node can safely do now: sign an applied authorization, or submit a new one. |
+| `src/peers.rs` | The peers file: each node's identity and p2p address. |
+| `src/dkg/` | The DKG and resharing ceremonies, the node's secrets, the operator's approval of new keyholders (R2). |
+| `src/import/` | Import of an existing key: the trusted dealer's split, the manifest, the HPKE share envelopes. |
+| `src/vault/` | The node's long-lived keys: plain files, or sealed (`--vault gcp-tdx`). |
+| `src/attestation/` | A sealed node's attestation statement, and its check against a policy. |
+| `src/tls.rs` | The mTLS listener, client certificate revocation, and the client verifiers that accept only an attested key. |
+| `src/gateway/` | The validator client's endpoint, `mpc-gateway` ([gateway.md](gateway.md)). |
+| `src/hooks.rs` | Fault injection for the E2E tests (`test-hooks` builds only). |
+| `src/bin/` | `mpc-admin`, `mpc-keytool`, `mpc-gateway`, `tee-token`, `tee-fake-gcp` (tests only). |
 
 ## Signing lifecycle
 
 | Step | Where | Durable | Consensus |
 | ---- | ----- | ------- | --------- |
-| T0 request received | coordinator (any node) | | |
+| T0 request received | coordinator (any voter) | | |
 | T1 `Sign` command submitted | executor mempool + gossip | | |
 | T2 block finalized | marshal -> executor | consensus journal / archive | yes |
 | T3 authorization applied | `Store::apply_block` sync | state partition | |
@@ -51,26 +79,44 @@ it. The development API signs opaque 32-byte roots.
 | T6 signature recovered and verified | coordinator | | |
 | T7 response | HTTP | | |
 
-The response carries the durations between these points (`timings_ms`), and the coordinator logs
-them (`signed`). A validator duty has the same steps: T1 submits a `Duty` command, and T3 applies
-the slashing decision, its record and the authorization in the one sync. T3' hands
-`(ceremony round, signing root)` to the keyholder. Before T1, the coordinator reads the committed
-decision: an already authorized duty skips to T4, and a refused one ends there (`412`).
+The development `/sign` response carries the times between these points (`timings_ms`). The
+coordinator logs them (`signed`; `signed validator duty` for a duty).
+
+A validator duty takes the same steps, with these differences:
+- Before T1, the coordinator reads the committed decision. An authorized duty skips to T4. A
+  refused duty ends there (`412`; `400` or `404` for some refusals).
+- At T1 the coordinator submits a `Duty` command. At T3 the one sync applies the slashing decision,
+  its record and the authorization.
+- At T3' the keyholder receives the duty authorization: validator key, ceremony round and signing
+  root.
 
 ## Real-process E2E harness (`tests/e2e`)
 
-- `harness::TestNetwork`: spawns the real binary per node with random free ports and a temporary
-  directory; stop/restart/restart-with-env (test hooks); readiness and polling waits with
-  deadlines; HTTP client; log access; diagnostics and cleanup on drop.
-- `harness::peer::FakePeer`: takes a stopped node's identity on the real authenticated p2p network
-  and speaks the signing protocol with a scripted responder (and, optionally, that node's real
-  share). It is the injection point for protocol-level adversarial tests.
-- Test hooks (`--features test-hooks`, `src/hooks.rs`): crash after authorization or after N
-  partials, hold block execution, exit when stdin closes. Off in normal builds. `test-hooks`
-  enables `dev-api`, so the E2E binary also serves the development signing API.
+Run it with `cargo test --features test-hooks --test e2e`.
 
-The harness drives nodes only through their public interfaces (process, HTTP, p2p), so the same
-scenarios can run against nodes started elsewhere.
+- `harness::TestNetwork` runs the real binary, one process per node, with a temporary directory and
+  a reserved block of ports (a lock file shared by all test processes). It can:
+  - stop and restart a node, also with other environment variables (test hooks) or arguments;
+  - freeze and thaw a node (`SIGSTOP`, `SIGCONT`);
+  - snapshot and restore a node's data directory, whole or by partition;
+  - wait for readiness and poll for a condition, with deadlines;
+  - call the nodes over HTTP and read their logs.
+
+  On failure it prints the tail of every log and keeps the directory. Nodes are killed when it is
+  dropped, and exit on their own if the test process dies (they watch their stdin).
+- `harness::peer::FakePeer` takes a stopped node's identity on the real authenticated p2p network.
+  It speaks the signing protocol through a scripted responder, optionally with that node's real
+  share, and can send raw messages on the other channels (DKG, mempool). It is the injection point
+  for protocol-level adversarial tests.
+- `harness::gcp` is the fake of Google's attestation, STS and KMS, for sealed nodes.
+- Test hooks (`--features test-hooks`, `src/hooks.rs`) are driven by environment variables. They
+  crash or pause a node at named points (for example after authorization, or after n partials),
+  hold block application, exit when stdin closes, and make a node act faulty (corrupt signatures,
+  inject transactions, skew its clock). Normal builds have none of them. `test-hooks` enables
+  `dev-api` and `fake-gcp`, so the E2E binary also serves the development signing API.
+
+The harness drives nodes through their processes (arguments, environment, signals), HTTP, p2p and
+data directories.
 
 ## Ethereum validator client (Kurtosis and Lighthouse)
 
@@ -83,82 +129,87 @@ Lighthouse validator client v8.3.2: web3signer validators only, no keystore (the
 mpc-gateway (docs/gateway.md)  ──>  4 eth-mpc-signer nodes (this repository)
 ```
 
-1. Done: the Web3Signer API, `POST /api/v1/eth2/sign/{identifier}` and
-   `GET /api/v1/eth2/publicKeys` ([ethereum-signing.md](ethereum-signing.md)). It differs from the
-   first plan: the request's `signingRoot` is not trusted, and there is no nonce. The duty is sent
-   typed, and the state machine computes its root.
-2. Done: slashing protection inside the replicated state machine, the specification's rules over
-   the whole history ([slashing-protection.md](slashing-protection.md)). EIP-3076 import (for
-   imported keys) and export are done. Not done: pruning, and an anchor against whole-network
-   rollback (designed only).
-3. Done: validator onboarding. The DKG key is activated for the devnet's chain, the MPC network
-   signs its one deposit message (`DEPOSIT`, behind `--enable-deposit-signing`), and the deposit
-   goes through the deposit contract.
-4. Done: the devnet (`integration/ethereum`, [ethereum-devnet.md](ethereum-devnet.md)). A real
+The Gloas devnet runs Lighthouse v8.3.3 (`integration/ethereum/kurtosis/network-gloas.yaml`). The
+devnet sends deposits to the deposit contract with Foundry's `cast` against geth
+(`integration/ethereum/scripts/it.py`). Anvil is not used: it simulates the execution layer only,
+and cannot replace a beacon node or a validator client in signing tests.
+
+## Implemented features
+
+1. **Web3Signer API**: `POST /api/v1/eth2/sign/{identifier}` and `GET /api/v1/eth2/publicKeys`
+   ([ethereum-signing.md](ethereum-signing.md)). The request's `signingRoot` is not trusted, and
+   there is no nonce. The duty is sent typed, and the state machine computes its root.
+2. **Slashing protection** inside the replicated state machine: the specification's rules over the
+   whole history ([slashing-protection.md](slashing-protection.md)). EIP-3076 import (for imported
+   keys) and export. Slashing history is never pruned.
+3. **Validator onboarding.** The DKG key is activated for the devnet's chain. The MPC network signs
+   its one deposit message (`DEPOSIT`, only with `--enable-deposit-signing`), and the deposit goes
+   through the deposit contract.
+4. **The devnet** (`integration/ethereum`, [ethereum-devnet.md](ethereum-devnet.md)). A real
    Lighthouse validator client performs duties with the MPC network as its only signer, through
    the gateway ([gateway.md](gateway.md): hedged failover, each signature checked, attested nodes
-   only); runs before 2026-11-11 used a development failover proxy. The run also covers a keyholder
-   offline, a coordinator failure and a coordinator crash mid-request, with acceptance checked in
-   the beacon state.
-5. Done: import of an existing validator key ([key-import.md](key-import.md)). An offline trusted
-   dealer splits an EIP-2335 keystore into the network's sharing; the key is registered,
-   installed, given its previous signer's EIP-3076 history and activated through consensus. The
-   devnet migrates a genesis validator from Lighthouse's local keystore.
-6. Done: resharing (R1) ([resharing.md](resharing.md)). A validator key (DKG or imported) gets new
-   shares within the committee through commonware's Feldman-Desmedt reshare; the key, history
-   and activation stay; the new share generation is activated by consensus, and signing requests
-   name the generation they use.
-7. Done: replacing a lost keyholder (R2) ([resharing.md](resharing.md#r2-replacing-a-lost-keyholder)).
-   A node outside the committee runs as a non-voting follower (commonware secondary peer, a
-   verifier-only consensus scheme) with its own replicated state; the remaining keyholders reshare
-   the key to it with an explicit dealer and player set, which their operators approved locally.
-   The consensus committee is not reconfigured by R2: with one voter lost, consensus has no fault
-   tolerance left until R3.
-8. Done: replacing a lost consensus voter (R3) ([reconfiguration.md](reconfiguration.md)). The
-   committee finalizes a block carrying a reconfiguration, which ends its consensus epoch: no
-   honest node builds or votes for a child of it, every node commits the next epoch (one member
-   replaced by a configured follower) with that block and exits (status 75), and restarted, runs
-   the next epoch from it, on its own journal and consensus channels. Marshal verifies every
-   height with its own epoch's committee. A maintenance operation (`mpc-admin replace-node`), not
-   online reconfiguration.
-9. Done: P0 hardening. A time horizon: each node admits, proposes and votes for a duty or a
-   slashing-protection import only once its slot (or epochs) started by its own clock; the state
-   machine never reads a clock ([ethereum-signing.md](ethereum-signing.md#time-horizon)).
-   Administration signed by approvers: activations, imported-key registrations, reshares to new
-   keyholders and reconfigurations need a threshold of offline Ed25519 approvals and the next
-   administrative nonce, checked by every voter; only an approved reconfiguration ends an epoch
-   ([administration.md](administration.md)).
-10. Done: P0.1 to P0.3. EIP-3076 imports, voluntary exits and deposits need approvals over the
-   exact command; a keyholder signs an exit or a deposit only if the state records its root as
-   approved. Every duty's `fork_info` must follow the node's pinned fork schedule
-   ([ethereum-signing.md](ethereum-signing.md#fork-schedule)), checked by the API, the leader and
-   every voter; the network's identity is part of the cluster id.
-11. Done: builder registrations. `VALIDATOR_REGISTRATION` is signed only under the registration
-   policy the approvers set (replicated state, applied in block order): its fee recipients, gas
-   limit range and timestamp window, checked by the API, the leader, every voter, the block
-   application and every keyholder, a retry included. Registrations go after every other
-   transaction, at most 16 per block, from a bounded queue
-   ([ethereum-signing.md](ethereum-signing.md#builder-registrations)).
-12. Done: Gloas (EIP-7732). PTC votes, envelopes of self-built payloads and proposer preferences,
-   aggregates rooted progressively, Gloas block headers, as Lighthouse v8.3 sends them. One vote
-   and one envelope per slot, an envelope only for the validator's own block of that slot (both
-   rules of the replicated state); preferences and envelopes under the registration policy. An
-   envelope enters consensus as a summary with its root; the pinned schedule gates Gloas
-   ([ethereum-signing.md](ethereum-signing.md#gloas)).
-13. Done: the restart floor (L-1 narrowed). A keyholder process refuses new blocks, attestations,
-   PTC votes and envelopes of the slot (attestations: the epoch) it may have signed for before it
-   started, so a whole-network rollback signs no double proposal or double vote; no record, no
-   switch ([slashing-protection.md](slashing-protection.md#the-restart-floor)).
-14. Done: the WORM anchor (L-1 narrowed further, optional, `--anchor`). Keyholders write signed,
-   create-only records to S3, GCS or a directory outside the nodes' rollback domain before they
-   sign past their marks; at start a node reads every node's latest record, signs only once its
-   chain holds what the records name, refuses surround votes under the anchored marks, and stops
-   (exit status 77) when the records show the network was rolled back. The approvers can
-   acknowledge a rollback whose newer state is lost ([anchor.md](anchor.md)).
+   only). Runs before 2026-11-11 used a development failover proxy. The run also covers a keyholder
+   offline, a coordinator failure and a coordinator crash mid-request, and checks acceptance in the
+   beacon state.
+5. **Import of an existing validator key** ([key-import.md](key-import.md)). An offline trusted
+   dealer splits an EIP-2335 keystore into the network's sharing. The key is registered, installed,
+   given its previous signer's EIP-3076 history and activated through consensus. The devnet
+   migrates a genesis validator from Lighthouse's local keystore.
+6. **Resharing (R1)** ([resharing.md](resharing.md)). A validator key (DKG or imported) gets new
+   shares within the committee through commonware's Feldman-Desmedt reshare. The key, history and
+   activation stay. Consensus activates the new share generation, and signing requests name the
+   generation they use.
+7. **Replacing a lost keyholder (R2)**
+   ([resharing.md](resharing.md#r2-replacing-a-lost-keyholder)). A node outside the committee runs
+   as a non-voting follower (a commonware secondary peer with a verifier-only consensus scheme) and
+   keeps its own replicated state. The remaining keyholders reshare the key to it with an explicit
+   dealer and player set, which their operators approved locally. R2 does not reconfigure the
+   consensus committee: with one voter lost, consensus has no fault tolerance left until R3.
+8. **Replacing a lost consensus voter (R3)** ([reconfiguration.md](reconfiguration.md)). The
+   committee finalizes a block that carries a reconfiguration, which ends its consensus epoch:
+   - no honest node builds or votes for a child of that block;
+   - every node commits the next epoch (one member replaced by a configured follower) with that
+     block and exits (status 75);
+   - restarted, it runs the next epoch from that block, on its own journal and consensus channels.
 
-## Anvil
+   Marshal verifies every height with its own epoch's committee. This is a maintenance operation
+   (`mpc-admin replace-node`), not online reconfiguration.
+9. **P0 hardening.**
+   - Time horizon: each node admits, proposes and votes for a duty or a slashing-protection import
+     only once its slot (or epochs) started by its own clock. The state machine never reads a clock
+     ([ethereum-signing.md](ethereum-signing.md#time-horizon)).
+   - Administration signed by approvers: activations, imported-key registrations, reshares to new
+     keyholders and reconfigurations need a threshold of offline Ed25519 approvals and the next
+     administrative nonce. Every voter checks them. Only an approved reconfiguration ends an epoch
+     ([administration.md](administration.md)).
+10. **P0.1 to P0.3.** EIP-3076 imports, voluntary exits and deposits need approvals over the exact
+    command. A keyholder signs an exit or a deposit only if the state records its root as approved.
+    Every duty's `fork_info` must follow the node's pinned fork schedule
+    ([ethereum-signing.md](ethereum-signing.md#fork-schedule)); the API, the leader and every voter
+    check it. The network's identity is part of the cluster id.
+11. **Builder registrations.** `VALIDATOR_REGISTRATION` is signed only under the registration policy
+    that the approvers set (replicated state, applied in block order): its fee recipients, gas
+    limit range and timestamp window. The API, the leader, every voter, the block application and
+    every keyholder check it, a retry included. Registrations go after every other transaction, at
+    most 16 per block, from a bounded queue
+    ([ethereum-signing.md](ethereum-signing.md#builder-registrations)).
+12. **Gloas (EIP-7732).** PTC votes, envelopes of self-built payloads and proposer preferences,
+    aggregates rooted progressively, and Gloas block headers, as Lighthouse v8.3 sends them.
+    - One vote and one envelope per slot, and an envelope only for the validator's own block of
+      that slot. Both are rules of the replicated state.
+    - Preferences and envelopes are signed only under the registration policy.
+    - An envelope enters consensus as a summary with its root.
+    - The pinned schedule gates Gloas ([ethereum-signing.md](ethereum-signing.md#gloas)).
+13. **The restart floor** (narrows L-1). A keyholder process refuses new blocks, attestations, PTC
+    votes and envelopes of a slot (attestations: an epoch) it may have signed for before it
+    started. So a whole-network rollback signs no double proposal or double vote. The floor needs
+    no stored record, and normal builds cannot turn it off
+    ([slashing-protection.md](slashing-protection.md#the-restart-floor)).
+14. **The WORM anchor** (narrows L-1 further; optional, `--anchor`). Keyholders write signed,
+    create-only records to S3, GCS or a directory outside the nodes' rollback domain before they
+    sign past their marks. At start a node reads every node's latest record. It then:
+    - signs only once its chain holds what the records name;
+    - refuses surround votes under the anchored marks;
+    - stops (exit status 77) when the records show that the network was rolled back.
 
-Anvil simulates the execution layer only. If execution-layer tests are needed later (deposit
-contract interactions, mainnet forks), they go in their own test target with Anvil as an external
-process, separate from validator-signing tests. It cannot replace a beacon node or validator
-client for signing tests.
+    The approvers can acknowledge a rollback whose newer state is lost ([anchor.md](anchor.md)).

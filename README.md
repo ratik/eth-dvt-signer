@@ -1,789 +1,182 @@
 # eth-mpc-signer
 
-A 4-node threshold signer built on [commonware](https://github.com/commonwarexyz/monorepo)
-`v2026.9.0`:
+A threshold signer for Ethereum validators. Four nodes hold shares of a validator's BLS key, and
+any three of them sign. No node, and no operator, ever holds the whole key. A validator client
+uses the network as a remote signer through the standard Web3Signer API.
 
-- distributed key generation (DKG) of a 3-of-4 BLS12-381 key, with no trusted dealer
-  (see [DKG](#dkg));
-- Ethereum validator signing through the Web3Signer API (`GET /api/v1/eth2/publicKeys`,
-  `POST /api/v1/eth2/sign/{public key}`). The replicated state machine computes each duty's
-  signing root, applies slashing protection and authorizes it through consensus. Then 3 of the 4
-  nodes sign it ([docs/ethereum-signing.md](docs/ethereum-signing.md),
-  [docs/slashing-protection.md](docs/slashing-protection.md));
-- migration of an existing validator without changing its public key: an offline tool
-  (`mpc-keytool`) splits its EIP-2335 keystore into 3-of-4 shares, one encrypted per node, and its
-  previous signer's EIP-3076 slashing history is imported before it can sign
-  ([docs/key-import.md](docs/key-import.md)). This is a trusted-dealer split, not a DKG: the key
-  existed in full before it;
-- resharing (R1): new, independently random shares of a validator key (DKG or imported) inside
-  the same committee, with commonware's Feldman-Desmedt reshare; the key, its identity and its
-  slashing history unchanged, the new share generation activated through consensus
-  ([docs/resharing.md](docs/resharing.md));
-- replacing a lost keyholder (R2): a permanently lost node's share moves to a new node, a
-  non-voting follower of consensus, the remaining keyholders dealing (A, B, C, D → A, B, C, E);
-  the key and its history unchanged, the consensus committee deliberately unchanged
-  ([docs/resharing.md](docs/resharing.md#r2-replacing-a-lost-keyholder));
-- replacing a lost consensus voter (R3): the committee finalizes a block that ends its consensus
-  epoch, every node stops after it and restarts in the next epoch, with the follower voting
-  instead of the lost node (A, B, C, D → A, B, C, E), from one operator command (`mpc-admin
-  replace-node`); the key, its shares and its history unchanged
-  ([docs/reconfiguration.md](docs/reconfiguration.md));
-- a time horizon on signing: no duty, and no slashing-protection import, whose slot or epochs have
-  not started by each node's clock is admitted, proposed or voted for, so a far-future duty cannot
-  poison a validator's history ([docs/ethereum-signing.md](docs/ethereum-signing.md#time-horizon));
-- administration signed by approvers: activations, imported-key registrations, EIP-3076 history
-  imports, reshares to new keyholders and reconfigurations take effect only with a threshold of
-  offline Ed25519 approver signatures and the next administrative nonce, checked by every voter (`mpc-admin draft`, `sign`,
-  `submit`; [docs/administration.md](docs/administration.md));
-- for development builds only (`dev-api` feature): `POST /sign` authorizes
-  `(ceremony_id, nonce) -> payload_hash` once, through consensus, and returns the threshold
-  signature of any 32-byte payload (see [Signing](#signing)).
+It is built on [commonware](https://github.com/commonwarexyz/monorepo) `2026.9.0` (consensus,
+p2p, storage, BLS12-381 DKG) and tested with a real Lighthouse validator client on a local
+devnet and with sealed nodes on GCP Confidential VMs.
 
-A validator client signs through `mpc-gateway` ([docs/gateway.md](docs/gateway.md)): one
-Web3Signer endpoint for the network. It sends each request to an attested node, hedges to the next
-when one is slow, and returns a signature only once it verifies against the validator key and the
-signing root the gateway computes itself.
+**Status: not production-ready.** It has no independent audit, and some limits are still open
+(see [Limitations](#limitations)).
 
-A real Lighthouse v8.3.2 validator client has run against it on a local proof-of-stake devnet
-(Kurtosis), as a validator whose key exists only as the network's shares
-([docs/ethereum-devnet.md](docs/ethereum-devnet.md)).
+## What it does
 
-**Not production-ready**: no client roles or rate limits (the plain API is loopback only; the
-mTLS API admits any certificate of the operator's CA; protected operations need approvers'
-signatures), no independent audit, and slashing history that a rollback of every node would lose
-([Limitations](#limitations-next-steps)). Nodes run with development keys unless they are given
-real identities (`--peers`), optionally sealed in a TEE ([docs/tee.md](docs/tee.md)).
+- **Key generation without a dealer.** A distributed key generation (DKG) makes a 3-of-4
+  BLS12-381 key. No party ever knows the private key.
+- **Validator signing through consensus.** Every duty (attestation, block, aggregate, sync
+  committee message, ...) goes through BFT consensus first. The replicated state computes the
+  signing root and applies slashing protection. Only then do three keyholders give partial
+  signatures. ([docs/ethereum-signing.md](docs/ethereum-signing.md),
+  [docs/slashing-protection.md](docs/slashing-protection.md))
+- **Key import.** An existing validator key (EIP-2335 keystore) is split offline into shares, one
+  encrypted for each node. Its EIP-3076 slashing history is imported before it signs. The public
+  key does not change. ([docs/key-import.md](docs/key-import.md))
+- **Resharing and replacement.** New shares for the same key (R1); a lost keyholder replaced by a
+  new node (R2); a lost consensus voter replaced (R3). The key and its history stay the same.
+  ([docs/resharing.md](docs/resharing.md), [docs/reconfiguration.md](docs/reconfiguration.md))
+- **Approvers.** Protected operations (activation, key import, history import, reshare to new
+  keyholders, reconfiguration, voluntary exit, deposit, registration policy) need a threshold of
+  offline Ed25519 approver signatures. ([docs/administration.md](docs/administration.md))
+- **Protection against rollback.** A node refuses new duties of the slot or epoch it may have
+  signed before it restarted (the restart floor). An optional WORM anchor in S3 or GCS also
+  detects a rollback of the whole network and stops it.
+  ([docs/slashing-protection.md](docs/slashing-protection.md#the-restart-floor),
+  [docs/anchor.md](docs/anchor.md))
+- **Sealed nodes (optional).** A node can run in a GCP Confidential VM (Intel TDX). Its keys are
+  encrypted with a data key that Cloud KMS releases only to an attested image. Clients check each
+  node's attestation and configuration. ([docs/tee.md](docs/tee.md))
+- **Gateway.** `mpc-gateway` gives a validator client one Web3Signer endpoint for the whole
+  network. It checks every node's attestation, fails over between nodes, and verifies every
+  signature before it returns it. ([docs/gateway.md](docs/gateway.md))
 
-Design notes: [docs/architecture.md](docs/architecture.md) (signing, E2E harness, Ethereum
-integration), [docs/security-review.md](docs/security-review.md) and the adversarial audit
-[docs/audit.md](docs/audit.md) (findings, fault model, coverage).
-
-## Model
-
-Two kinds of signing commands, decided by consensus. A validator duty, for keys started as
-validator keys (`"validator": true`):
-
-```rust
-struct DutyRequest {
-    validator: [u8; 48], // the validator public key (a DKG group key)
-    fork: ForkInfo,      // fork versions and genesis validators root, as the validator client sent them
-    duty: Duty,          // a typed duty: block header, attestation data, RANDAO epoch, ...
-}
-```
-
-A validator key signs nothing until it is activated, once and immutably, for one chain (its
-genesis validators root), by an `ActivateValidator` command decided by consensus. The state machine
-computes the signing root and decides the duty with the validator's activation and slashing history
-([docs/slashing-protection.md](docs/slashing-protection.md)): only the activated chain, no second
-block for a slot, no double vote and no surround vote. The decision and the record are committed
-together.
-
-A generic authorization, for development keys (`dev-api`):
-
-```rust
-struct SignRequest {
-    ceremony: CeremonyId, // a completed DKG ceremony: whose key signs
-    nonce: u64,           // caller-chosen id, not an Ethereum slot/epoch
-    payload_hash: [u8; 32],
-}
-```
-
-Replicated state (`src/state.rs`): `(ceremony, nonce) -> {payload_hash, height}`.
-
-| Request                                     | Result                   |
-| ------------------------------------------- | ------------------------ |
-| unknown ceremony                            | `UNKNOWN_CEREMONY`       |
-| ceremony in progress or failed              | `CEREMONY_NOT_COMPLETED` |
-| new `(ceremony, nonce)`                     | `ACCEPTED`               |
-| same `(ceremony, nonce)`, same hash         | `ALREADY_ACCEPTED`       |
-| same `(ceremony, nonce)`, different hash    | `REJECTED`               |
-
-An authorization never changes once finalized. Only an authorized payload is ever signed. A
-validator key never signs a generic authorization (`VALIDATOR_KEY`), and a development key never
-signs a duty.
-
-## Architecture
+## How it works
 
 ```
-Client ──HTTP──> Node i ──p2p gossip (mempool)──> all nodes
-                                                     │
-                     leader of the view builds a Block from its mempool
-                                                     │
-            simplex consensus (votes/certificates) + buffered broadcast of blocks
-                                                     │
-                 marshal: finalized blocks, in order, persisted, backfilled
-                                                     │
-                executor: apply() each command -> State -> Metadata store (one sync)
-                                                     │
-          committed changes -> DKG actor (keys, partial signatures); then client answers
+validator client ──Web3Signer API──> mpc-gateway ──mTLS──> node (coordinator)
+                                                              │
+         1. consensus authorizes the duty: signing root, slashing protection, fork schedule
+                                                              │
+         2. the coordinator asks every keyholder for a partial signature
+            each keyholder signs only a duty that is committed in its own state
+                                                              │
+         3. three valid partials -> one BLS signature -> checked against the validator key
+                                                              │
+validator client <──────────── signature (checked again by the gateway) ───────┘
 ```
 
-| Module                     | Role | commonware |
-| -------------------------- | ---- | ---------- |
-| `src/main.rs`              | CLI, tokio runtime, authenticated p2p (`lookup`), HTTP server | `runtime`, `p2p` |
-| `src/engine.rs`            | wires one node together | `consensus::simplex`, `consensus::marshal`, `broadcast::buffered`, `storage::archive` |
-| `src/application.rs`       | mempool, block proposal (`propose`/`verify`), hands finalized blocks to the executor | `consensus::Application` (wrapped by marshal `Inline`) |
-| `src/executor.rs`          | the state machine actor: applies finalized blocks, answers clients | |
-| `src/state.rs`             | authorization rules (pure, deterministic) | |
-| `src/storage.rs`           | persistent replicated state: atomic commit per block, `Committed` authorizations | `storage::metadata` |
-| `src/types.rs`             | `SignRequest`, `Command`, `Transaction`, `Block`, codecs | `codec` |
-| `src/slashing.rs`          | slashing protection of validator keys (pure, deterministic, part of the state) | |
-| `src/eth/types.rs`         | Ethereum consensus containers: Web3Signer JSON, SSZ, `hash_tree_root` | sigp `ethereum_ssz`, `tree_hash` |
-| `src/eth/duty.rs`          | typed duties, fork info, domains and signing roots | |
-| `src/eth/web3signer.rs`    | Web3Signer request parsing | |
-| `src/rpc.rs`               | HTTP API (request parsing stays here) | |
-| `src/dkg/ceremony.rs`      | replicated ceremony state: configs, dealer logs, public result | `cryptography::bls12381::dkg::feldman_desmedt` (`observe`) |
-| `src/dkg/actor.rs`         | this node's dealer, player and shares; the only producer of partial signatures | `feldman_desmedt` (`Dealer`, `Player`) |
-| `src/dkg/signing.rs`       | BLS threshold signing domains (Ethereum, internal) | `primitives::ops`, `ops::threshold` |
-| `src/dkg/wire.rs`          | private dealer/player messages (p2p channel 6) | `p2p` |
-| `src/dkg/secrets.rs`       | this node's secret store: dealer seed, received dealings, final share | `storage::metadata` |
-| `src/signer/coordinator.rs`| per-request coordinator: authorization, partial collection, recovery | `p2p` |
-| `src/signer/wire.rs`       | signing protocol messages (p2p channel 7) | `p2p` |
-| `src/hooks.rs`             | fault injection for E2E tests (`test-hooks` feature only) | |
+- Consensus tolerates one faulty node out of four (`n >= 3f + 1`).
+- Any node can coordinate. A retry on another node gets the same signature: consensus decides a
+  duty once.
+- A keyholder also refuses a duty when its own checks fail: the time horizon (no duty of a slot
+  that has not started), its restart floor, or the anchored marks.
 
-Notes:
+Design notes: [docs/architecture.md](docs/architecture.md).
 
-- Every command goes through consensus, so all nodes apply the same commands in the same order and
-  end up with the same state.
-- A command is wrapped in a `Transaction` with a random `id`. Two submissions of the same request
-  are different transactions: the first is `ACCEPTED`, the second `ALREADY_ACCEPTED`.
-- The leader rotates every view (round robin). Any node can take requests: it gossips them to the
-  others, so the next leader includes them.
-- State and the height of the last applied block are written in one atomic `sync`, so a crash never
-  leaves a half-applied block, and a re-delivered block is skipped.
-- Consensus tolerates `f = 1` faulty node out of 4 (`n >= 3f + 1`).
+## Components
 
-## Storage
+| Binary | Role |
+| --- | --- |
+| `eth-mpc-signer` | The node: consensus, state, DKG, signing, the HTTP and mTLS API. `eth-mpc-signer identity` makes a node's keys in its vault. |
+| `mpc-gateway` | The validator client's Web3Signer endpoint in front of the nodes. |
+| `mpc-admin` | Operator and approver tool: status, attestation checks, drafts and offline signatures of protected operations, anchor checks. |
+| `mpc-keytool` | Offline tool for key import: splits a keystore into encrypted shares. |
+| `tee-token` | Runs inside the sealed image only: gets attestation tokens for the node. |
 
-| What | Kept |
-| ---- | ---- |
-| Authorizations (~60 B each) and ceremonies | forever |
-| Slashing history (~66 B per authorized duty, measured) | forever |
-| Finalized blocks and their certificates | the last `--retain-blocks` blocks (default 100 000) |
-| Consensus journal, marshal cache | a few recent views |
-| Key shares (secret store) | forever |
+## Quick start (local network)
 
-- While idle, a leader waits up to 1.5 s for transactions before proposing an empty block, so an
-  idle network produces ~1 block per 1.6 s (37 per minute measured). A request is proposed as soon
-  as the leader sees it. The wait must stay below the leader timeout (2 s): the others give up on
-  a leader that has not proposed by then, which is also what an offline leader costs per turn.
-- History is pruned once every 4096 blocks (one archive section), keeping between
-  `--retain-blocks` and `--retain-blocks + 4096` blocks. The window is counted in blocks, empty
-  ones included: the default is about 45 hours of an idle network (0.61 blocks/s measured).
-- A node that was offline for longer than the window cannot backfill the missing blocks from its
-  peers. Recover it by hand from a healthy node:
-  1. stop the lagging node and the healthy one (with one node already down, consensus pauses
-     until the healthy one is back);
-  2. replace every partition of the lagging node's `data/node-i` with the healthy node's copy,
-     **except `registry-secrets` and `registry-consensus`**, which stay the lagging node's own;
-  3. restart both.
-
-  Never take those two from another node, and never take `registry-consensus` from an old backup:
-  another node's key share makes this node's partial signatures invalid, and another or an older
-  consensus journal makes it vote twice in a view, after which its peers block it for an hour
-  ([audit](docs/audit.md), L-7).
-  Tested by `recovery::lagging_node_restored_from_peer_copy`.
-- **Format 2.** The replicated state lives in partition `registry-state` with a format version.
-  Format 1 (the global nonce registry, partition `registry-registry`) is not migrated: a node that
-  finds it refuses to start with an explicit error rather than ignoring it. Block encoding also
-  changed. To upgrade a local network, stop it and start from an empty data directory (back up
-  `data/` first if it matters; nothing is deleted automatically).
-- **Inconsistent storage fails closed.** Before anything runs, a node checks its durable state
-  against itself and refuses to start (log `refusing to start`, exit status 1) when:
-  - the replicated state is behind the finalized blocks it already acknowledged (a damaged newest
-    copy, a state partition deleted or restored on its own);
-  - a key share is stored for a ceremony the state does not have as completed (state lost or
-    rolled back, share kept);
-  - the consensus journal (`registry-consensus`) is missing while it has finalized history;
-  - both copies of the state or of the secret store are damaged.
-
-  Nothing is deleted or reset. A copy that fails its integrity check, which opening the store
-  truncates, is first saved to `registry-diagnostics` (once, never rewritten); the working stores
-  recover as commonware does on any start. Restore the node's directory from one
-  consistent backup instead, but keep its current consensus journal: with an older journal the
-  node forgets its own votes, may vote twice in a view, and its peers then block it for an hour
-  ([audit](docs/audit.md), L-7). Consensus resumes above the last finalization the node processed,
-  so it never votes again at or below it, whatever its journal holds.
-- **Lost consensus journal.** Start the node only after the other three have finalized at least 15
-  blocks (more views than peers keep, 10) since it stopped, with
-  `--allow-missing-consensus-journal`; votes it forgot are then in views its peers no longer
-  consider. Never restore an old journal instead.
-- Readiness, the startup checks, the supported and unsupported recovery procedures and why a
-  whole-network rollback cannot be detected: [docs/recovery.md](docs/recovery.md).
-
-## DKG
-
-One ceremony creates one group key shared by the 4 nodes: threshold 3, BLS12-381 `MinPk` (48-byte
-G1 public keys, 96-byte G2 signatures), commonware's Feldman-Desmedt (Joint-Feldman) DKG. Every node
-is both a dealer and a player, so no party ever knows the group private key.
-
-```
-POST /dkg/start ──> StartCeremony tx ──consensus──> InProgress, round r (same on every node)
-     dealer i ──Dealing: commitment + player j's share──> player j      (p2p channel 6, encrypted)
-     dealer i <──Ack: j's signature over the commitment─── player j
-     dealer i, once all 4 players acked ──DealerLog tx (commitment + 4 acks)──> consensus
-     first 3 valid logs in a block ──observe()──> Completed: public polynomial in the state
-     each player: finalize() with exactly those logs ──> its own share ──> secret store
-```
-
-- **Agreement.** The configuration (id, participants, threshold 3, protocol version 1, round) and the
-  dealer logs go through consensus, so every node finalizes with the same logs and derives the same
-  public key. A ceremony id is used once: the same request returns the existing ceremony, a
-  different configuration under that id is rejected (`409`), even when it arrives through another
-  node at the same time.
-- **Final once completed.** The ceremony completes in the first block where at least 3 valid logs
-  are recorded. If more than 3 are recorded by then, the first 3 in dealer-key order are used,
-  whatever their arrival order. Only those logs are kept, and the record is then frozen: a log
-  arriving later, even a valid fourth one, is ignored (`ceremony is not in progress`). It cannot
-  change the public key or the set of commitments used.
-- **Binding.** Each ceremony has a session digest (config, round, starting block) that is part of
-  the DKG namespace. Acks and logs of one ceremony (or of another chain) do not verify in another.
-- **No secrets on chain.** Feldman-Desmedt lets a dealer publish ("reveal") the dealing of a player
-  that did not acknowledge it. This application refuses such logs, so only commitments and
-  signatures enter blocks. The cost: **every** player must be online.
-  - 3 logs are enough on the *dealer* side, but every log must cover every *player*: an ack, or
-    a reveal of that player's dealing. Feldman-Desmedt has no other way to deliver a share later.
-  - So with a node down for the whole window (32 blocks), dealers 0-2 cannot get its ack, their
-    logs would reveal its share, and the ceremony fails instead. Start a new one (new id) once
-    the node is back. A node that returns before the deadline still gets its dealings, since
-    dealers retransmit every block.
-  - Allowing reveals would let the ceremony complete without the node, but its share would then
-    be public.
-  - commonware's `golden` DKG (non-interactive, encrypted dealings with proofs published on chain,
-    ALPHA in 2026.9.0) would let an offline player recover its share later without any reveal.
-- **Persistence.** Every node has a secret store (`data/node-i`, partition `registry-secrets`,
-  directory mode `0700`), separate from the replicated state. Each write is an atomic, checksummed
-  `Metadata` commit:
-  - the dealer seed (random, persisted before dealing, so a restart replays the same dealing);
-  - every dealing the player acknowledged (persisted before the ack);
-  - the final share, written once and never overwritten. It is checked against the agreed public
-    polynomial when loaded and used only after it is durably stored.
-
-  A torn write rolls back to the previous copy. If both copies are corrupt, the node refuses to
-  start.
-- **Restart.** Shares are reloaded and verified. A node that crashed before storing its share
-  derives it again from the persisted dealings. It never regenerates randomness for a ceremony.
-
-Guarantees from commonware: the DKG math (`Dealer`, `Player`, `observe`, commitment and ack checks,
-share derivation), the binding of acks and logs to a round transcript, BLS signing and threshold
-recovery (`ops::sign`, `ops::verify`, `threshold::recover`), encrypted authenticated p2p, BFT
-consensus and atomic `Metadata` writes. Guarantees from this application:
-- ceremony agreement and uniqueness through consensus;
-- the no-reveal policy and the deadline;
-- the session binding;
-- persisting before acknowledging or using;
-- write-once, verified shares;
-- keeping shares out of the API and the logs.
-
-### Ethereum compatibility
-
-`POST /sign` returns signatures in Ethereum consensus format. Checked against Ethereum consensus BLS
-(`src/dkg/signing.rs`, `tests/dkg.rs`, `tests/signing.rs`, `tests/e2e`):
-
-| Property | Ethereum | Here |
-| -------- | -------- | ---- |
-| Variant | minimal-pubkey-size: G1 keys, G2 signatures | `MinPk` |
-| Ciphersuite / DST | `BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_` | `signing::ETHEREUM_DST` (= commonware `MinPk::MESSAGE`) |
-| Hash-to-curve | `hash_to_G2`, SSWU, random oracle (RFC 9380) | blst `hash_to_g2` |
-| Signed message | the 32-byte signing root, as is | `Message::Ethereum(root)`, no prefix |
-| Encoding | 48-byte / 96-byte compressed (ZCash flags) | blst `compress`; decoding rejects infinity and checks subgroups |
-
-- **Official vector.** Ethereum vector `sign_case_8cd3d4d0d9a5b265` (bls12-381-tests v0.1.2): its
-  secret key is split 3-of-4, and every 3 of the 4 partial signatures recover exactly the official
-  signature bytes.
-- **Independent check.** A DKG-generated group key and every signature returned by `/sign` pass blst
-  `key_validate`, `sig_validate` and `verify` with the Ethereum DST, the checks an Ethereum client
-  does. Another root, or the key of another ceremony, fails.
-- **Domains.** commonware's convenience `sign_message` prefixes a namespace to the message, which
-  Ethereum does not, so it is not used for Ethereum. Internal messages use their own DST
-  (`signing::INTERNAL_DST`), so they can never verify as Ethereum signatures; nothing exposed
-  signs in the internal domain today.
-- **Signing roots, domains and slashing protection** are computed by the state machine for the
-  duties of the Web3Signer API ([docs/ethereum-signing.md](docs/ethereum-signing.md)). They are
-  checked against consensus-spec-tests vectors, the roots Web3Signer publishes, and an independent
-  Python SSZ implementation.
-- **Not covered:** full Phase 0 and Altair blocks, `BUILDER_REQUEST_AUTH`, builder bids, Heze.
-  Voluntary exits and deposits are signed only with the approvers' authorization (P0.2), every
-  duty's `fork_info` must follow the node's pinned fork schedule (P0.3), builder registrations are
-  signed only under the approvers' registration policy (fee recipients, gas limit range, timestamp
-  window; [docs/ethereum-signing.md](docs/ethereum-signing.md#builder-registrations)), and Gloas's
-  PTC votes, envelopes of self-built payloads and proposer preferences under its rules (one vote
-  and one envelope per slot, an envelope only for the validator's own block, preferences and
-  envelopes under the policy; [docs/ethereum-signing.md](docs/ethereum-signing.md#gloas)). `POST /sign` (`dev-api`) signs
-  whatever root it is given, with no slashing protection: its nonce is not a slot or an epoch.
-
-## Signing
-
-A validator duty (`POST /api/v1/eth2/sign/{key}`) and a development request (`POST /sign`) take
-the same path. They differ in what is authorized: a duty's signing root, computed and checked for
-slashing by the state machine, against a caller's payload for `(ceremony_id, nonce)`. Each
-keyholder checks the matching record in its own committed state (`(ceremony, root)` for duties).
-The duty flow is in [docs/ethereum-signing.md](docs/ethereum-signing.md#flow).
-
-```
-POST /sign {ceremony_id, nonce, payload_hash} ──> any node: the coordinator
-  1. finalized authorization of (ceremony_id, nonce)?
-       same payload ──> reuse it (no consensus)          other payload ──> 409
-       none ──> Sign command ──consensus──> finalized ──> applied durably on each node
-  2. Request{id, ceremony_id, nonce, payload} ──p2p channel 7──> every participant (itself too)
-       each participant signs only if (ceremony_id, nonce) -> payload is committed in its own state
-  3. first 3 valid partials (authenticated sender = share index, signature verifies)
-  4. recover (interpolation, no private key) ──> verify against the group key ──> 96-byte signature
-```
-
-- **Only authorization needs consensus.** Collecting partials and recovering the signature does
-  not: a retry, on any node, just collects them again. BLS signatures are deterministic, so any 3
-  signers give the same signature. Nothing (partials, signatures) is persisted.
-- **The signing gate.** A partial signature is produced by one function (`dkg::actor`), for an
-  authorization that exists as a `storage::Committed` value: created only by the store, from state it
-  synced to disk. The executor hands them to the DKG actor after the sync and before answering any
-  client. A request (HTTP or p2p) never authorizes anything: a node with no committed authorization
-  answers `not_authorized` (and signs later if the authorization arrives), a different payload gets
-  `conflict`. The authorized payload is what gets signed.
-- **No leader.** Any node coordinates; it asks all participants, completes with the first 3 valid
-  partials, re-asks silent ones every 500 ms, stops at `--signing-timeout` (default 10 s). A slow or
-  offline node does not block it. One coordinator handles at most 256 requests at once.
-- **Byzantine responses.** A partial counts only if its index is the authenticated sender's own
-  index, it verifies against that index's public share, and that index has not answered yet. A
-  participant sending 3 invalid responses is ignored for that request. Responses for other requests
-  or ceremonies never reach this one.
-
-## Run
+Four nodes on one machine, with development keys:
 
 ```bash
-./scripts/local-net.sh
+ETH_NETWORK=hoodi APPROVERS=approvers.json ./scripts/local-net.sh
 ```
 
-Node `i` serves p2p on `127.0.0.1:300i` and HTTP on `127.0.0.1:808i`. Data is in `data/node-i`
-(see [Storage](#storage) about older data). To run a single node by hand:
-`cargo run --release -- --id 0`.
+- Node `i` listens for p2p on `127.0.0.1:300i` and for HTTP on `127.0.0.1:808i`. Its data is in
+  `data/node-i`, its log in `data/node-i.log`.
+- `ETH_NETWORK` (`mainnet` or `hoodi`) sets the chain whose clock and fork schedule bound the
+  duties. Without it, a node signs no duty.
+- `APPROVERS` is the file of approver public keys and threshold. Without it, no protected
+  operation is possible (also no validator activation).
+- `FEATURES=dev-api` adds `POST /sign`, a raw signing API for development only.
 
-Development keys come from the node index (`ed25519::PrivateKey::from_seed(i)`). Do not use them
-outside a local network. Real identities: `eth-mpc-signer identity` makes each node's keys in its
-vault (`--vault plain`, or sealed in a TEE with `--vault gcp-tdx`), and every node starts with the
-same peers file (`--peers`); `--https-listen` and `--client-ca` serve the API over mTLS
-([docs/tee.md](docs/tee.md)).
-
-Every node needs the same two settings:
-
-- `--eth-network mainnet|hoodi` (or `--eth-genesis-time`, `--eth-seconds-per-slot`,
-  `--eth-genesis-validators-root` and `--eth-fork-schedule` for a devnet). Without it, the node
-  signs no duty ([time horizon](docs/ethereum-signing.md#time-horizon),
-  [fork schedule](docs/ethereum-signing.md#fork-schedule)).
-- `--approvers approvers.json`, the approvers' public keys and threshold. Without it, no protected
-  operation (activation, key registration, reshare to new keyholders, reconfiguration, EIP-3076
-  import, voluntary exit, deposit) is possible
-  ([docs/administration.md](docs/administration.md)).
-
-`scripts/local-net.sh` passes them from `ETH_NETWORK=hoodi` and `APPROVERS=approvers.json`.
-
-Recommended in production: `--anchor s3://bucket/prefix` (or `gs://`), the same on every node, a
-WORM bucket that the node operators cannot delete from. Keyholders write a record there before
-they sign past their previous one, and a node that finds its whole network rolled back stops
-with exit status 77 ([docs/anchor.md](docs/anchor.md)).
-
-A follower (a keyholder that does not vote, R2) is node `participants + j`, run with the same
-`--participants` and `--followers` as every other node: `cargo run --release -- --id 4
---followers 1`, the voters also with `--followers 1`. A voter deals to new keyholders only with
-`--approved-reshares <file>` naming the key and the exact new keyholder set
-([docs/resharing.md](docs/resharing.md#local-approval-of-new-keyholders)).
-
-Logs are in `data/node-i.log`. For a duty, the coordinator logs `submitted validator duty` and,
-once done, `signed validator duty` with the phase timings. Every node logs `applied validator duty`
-with the validator, duty type, computed signing root and decision. Development requests log
-`submitted signing authorization`, `applied signing authorization` and `signed`:
-
-```bash
-grep -E 'validator duty|submitted signing|applied signing|signed' data/node-0.log
-```
-
-`scripts/local-net.sh` builds the default binary, without the development API;
-`FEATURES=dev-api ./scripts/local-net.sh` enables `POST /sign`.
-
-Set `RUST_LOG=debug` for consensus internals.
-
-## API
-
-Validator keys and the Web3Signer API ([docs/ethereum-signing.md](docs/ethereum-signing.md)):
-
-```bash
-curl -s localhost:8080/dkg/start -H 'content-type: application/json' \
-  -d '{"ceremony_id": "validator-eth", "validator": true}'
-curl -s localhost:8081/validators                      # [{"public_key":"0xa1b2..","status":"inactive",..}]
-# Activation is a protected operation: drafted, signed offline by the approvers, submitted.
-mpc-admin --nodes 127.0.0.1:8080,127.0.0.1:8081,127.0.0.1:8082,127.0.0.1:8083 draft activate \
-  --request '{"public_key": "0xa1b2..", "genesis_validators_root": "0x0470.."}' --output activate.json
-mpc-admin sign --command activate.json --key alice.key --output activate-alice.json   # offline
-mpc-admin --nodes ... submit --command activate-alice.json --command activate-bob.json  # once, through consensus
-curl -s localhost:8081/api/v1/eth2/publicKeys          # ["0xa1b2.."] once activated
-curl -s localhost:8082/api/v1/eth2/sign/0xa1b2.. -H 'content-type: application/json' \
-  -H 'accept: application/json' -d @tests/fixtures/web3signer/attestation.json
-# {"signature":"0x8f3e..(96 bytes)"}
-# the conflicting attestation: 412 {"error":"..","refusal":{"reason":"double_vote","target":0}}
-```
-
-A validator client signs through the gateway rather than one node
-([docs/gateway.md](docs/gateway.md)):
-
-```bash
-mpc-gateway --nodes http://127.0.0.1:8080,http://127.0.0.1:8081,http://127.0.0.1:8082,http://127.0.0.1:8083 \
-  --allow-unattested --eth-network hoodi --listen 127.0.0.1:9000 --metrics-listen 127.0.0.1:9001
-# Lighthouse: a `web3signer` validator definition with url http://127.0.0.1:9000
-```
-
-| `POST /api/v1/eth2/sign/{key}` | HTTP |
-| ------------------------------ | ---- |
-| signed | 200 (`{"signature"}`, or `text/plain` without `Accept: application/json`) |
-| malformed or unsupported request, `signingRoot` different from the computed root | 400 |
-| unknown validator key, or a key that is not activated | 404 |
-| refused by slashing protection | 412 (with `refusal.reason`) |
-| refused by the keyholders' restart floor or anchored marks (too few may sign it) | 412 (with `protection`) |
-| not ready, too few signers, busy | 503 |
-| authorization or signing timeout | 504 |
-
-DKG (a development key unless `"validator": true`):
-
-```bash
-curl -s localhost:8080/dkg/start -H 'content-type: application/json' -d '{"ceremony_id": "validator-001"}'
-# {"ceremony_id":"validator-001","status":"in_progress","threshold":3,"participants":4,"round":0,
-#  "protocol_version":1,"participant_id":"0xedd0..","participant_index":3,"share":"pending"}
-
-curl -s localhost:8081/dkg/status/validator-001
-# {"ceremony_id":"validator-001","status":"completed","public_key":"0x8d6b..","threshold":3,
-#  "participants":4,"round":0,"protocol_version":1,"participant_id":"0x478b..","participant_index":0,
-#  "share":"stored"}
-
-for i in 0 1 2 3; do curl -s localhost:808$i/dkg/public-key/validator-001; echo; done   # same key 4 times
-```
-
-- `POST /dkg/start` returns once the start is finalized. Optional `threshold` and
-  `protocol_version` must match the supported values (`3`, `1`): `400` for a new id, `409` for an
-  id already used with other values or the other purpose (`validator`). An identical request
-  returns the ceremony (idempotent).
-- `GET /dkg/status/{id}`: `404` with `"status":"not_started"` if unknown. `public_key` appears
-  once `completed`. `share` is this node's share state (`pending`, `stored`, `unavailable`), never
-  the share.
-- `GET /dkg/public-key/{id}`: `404` if unknown, `409` until completed.
-
-Then development signing (`dev-api` builds only; `404` otherwise; `403 VALIDATOR_KEY` for a
-validator key):
-
-```bash
-curl -s localhost:8081/sign -H 'content-type: application/json' -d '{"ceremony_id": "validator-001",
-  "nonce": 100, "payload_hash": "0xabababababababababababababababababababababababababababababababab"}'
-# {"ceremony_id":"validator-001","nonce":100,"payload_hash":"0xabab..","result":"SIGNED",
-#  "authorization":"NEW","height":10,"signature":"0x9334..(96 bytes)","signers":[0,2,3],
-#  "timings_ms":{"authorization_ms":389.2,"apply_ms":10.8,"first_partial_ms":1.7,"collect_ms":5.9,
-#  "recover_ms":1.7,"total_ms":416.2}}
-
-curl -s localhost:8083/authorizations/validator-001/100   # {"ceremony_id":..,"payload_hash":..,"height":10}
-curl -s localhost:8082/status
-# {"height":11,"authorizations":1,"mempool":0,"signing_in_flight":0,"signing_sessions":0,
-#  "parked_requests":0,"readiness":{"state":"ready","reasons":[],"can_submit_authorization":true,
-#  "can_sign_authorized":true,"startup_checks":"passed","applied_height":11,
-#  "known_finalized_height":11,"last_block_age_ms":640,"state_height_at_start":0,
-#  "unavailable_shares":[],"consensus":{"voting":true,"journal_missing_at_start":false}}}
-curl -s localhost:8082/ready   # the readiness alone: 200 when ready, 503 otherwise
-```
-
-Readiness is computed from what the node observes, never from a startup delay, and never claims
-that the node has the network's latest block ([docs/recovery.md](docs/recovery.md)):
-
-| `reasons` | Meaning | `state` |
-| --------- | ------- | ------- |
-| `no_block_since_start` | nothing applied since this process started | `syncing` |
-| `local_backlog` | more than 2 finalized blocks known here are not applied | `syncing` |
-| `no_recent_finalization` | no block applied for 10 s: consensus stalled or unreachable from here | `degraded` |
-| `share_unavailable` | a completed ceremony has no usable share here | `degraded` |
-
-A node that is not ready still signs authorizations it has applied (each partial is checked by
-its keyholder); it refuses to submit new ones (`NOT_READY`). `consensus.floor_height` and
-`floor_view` show the finalization consensus resumed above after a restart.
-
-| `POST /sign` | HTTP | `result` |
-| ------------ | ---- | -------- |
-| signed | 200 | `SIGNED` (`authorization`: `NEW` or `EXISTING`) |
-| bad JSON, id, nonce or hash (exactly 32 bytes, hex) | 400 | `INVALID` |
-| unknown ceremony | 404 | `UNKNOWN_CEREMONY` |
-| ceremony in progress or failed | 409 | `CEREMONY_NOT_COMPLETED` |
-| `(ceremony_id, nonce)` authorized for another payload | 409 | `REJECTED` (with the authorization `height`) |
-| participants refused for good (3 cannot sign) | 503 | `INSUFFICIENT_SIGNERS` |
-| too many requests in flight, node stopping | 503 | `UNAVAILABLE` |
-| a new authorization is needed but this node is not ready | 503 | `NOT_READY` (with `reasons`) |
-| authorization not finalized within 30 s | 504 | `AUTHORIZATION_TIMEOUT` (it may still finalize) |
-| fewer than 3 valid partials within `--signing-timeout` | 504 | `SIGNING_TIMEOUT` |
-
-After a failure past authorization, the authorization stays: the same request retries the signing.
-Errors carry `height`, `valid_partials` and per-participant `refusals` when known, never key
-material. `POST /sign` changed with this stage: `ceremony_id` is required, and `GET /nonces/{nonce}`
-became `GET /authorizations/{ceremony_id}/{nonce}`.
-
-## Tests
-
-Fast (unit tests and 4-node simulations in commonware's deterministic runtime, ~40 s):
-
-```bash
-cargo test
-```
-
-Unit tests live in `tests/unit/`, one file per module: `tests/unit/slashing.rs` tests
-`src/slashing.rs`. Each file is compiled into the library as that module's `tests` child
-(`#[cfg(test)] #[path = "..."] mod tests;`), so it reaches private items, and keeps its name:
-`slashing::tests::...`.
-
-Real processes (the actual binary, 4 OS processes, real p2p, HTTP and storage, ~3 min), built only
-with the `test-hooks` feature:
-
-```bash
-cargo test --features test-hooks --test e2e
-```
-
-The E2E tests run `target/debug/eth-mpc-signer`, which any `cargo test` or `cargo build` with
-other features replaces. Do not run them concurrently. After a default build, run
-`touch src/main.rs` so the next `test-hooks` build relinks it ([audit](docs/audit.md), T-8).
-
-Latency benchmarks (100 sequential requests per scenario, `BENCH_REQUESTS` to change; `latency`
-also selects `eth2_latency`) and CPU and storage costs of the Ethereum path:
-
-```bash
-cargo test --release --features test-hooks --test e2e latency -- --ignored --nocapture --test-threads=1
-cargo test --release --test eth_bench -- --ignored --nocapture
-cargo test --release --lib apply_cost -- --ignored --nocapture
-```
-
-`tests/network.rs`: the authorization rules across nodes, concurrent conflicting requests,
-duplicate submissions, a restart of every node from disk, pruning of old history.
-
-`tests/dkg.rs` does the same for the DKG:
-- a full ceremony, then threshold signing over an Ethereum signing root (also verified with blst):
-  - partial signatures verify individually;
-  - every 3-of-4 combination recovers the same valid signature;
-  - 2 partials, a relabeled partial, a partial over another message, or an invalid partial do not;
-- duplicate and conflicting starts;
-- a node offline during the ceremony (it fails, then a new one succeeds);
-- a restart after the ceremony;
-- a valid fourth dealer log arriving after completion (nothing changes);
-- a byzantine dealer sending garbage, wrong shares, a conflicting commitment, duplicates and forged
-  acks;
-- a share write torn by a crash.
-
-Ethereum signing ([docs/ethereum-signing.md](docs/ethereum-signing.md#compatibility-evidence)):
-- `tests/eth_vectors.rs`: `hash_tree_root` of 39 consensus-spec-tests `ssz_static` cases (vendored
-  in `tests/vectors`), and signing roots that Web3Signer publishes for its examples;
-- `tests/eth_web3signer.rs`: request parsing on the Web3Signer examples and on requests produced
-  by Lighthouse v8.3.2's own code (`tests/fixtures/lighthouse`, with its generator), each root
-  compared with Lighthouse's and with `ssz_roots.py` (an independent Python implementation);
-  unsupported and malformed requests;
-- `tests/eth_duties.rs`: duties over the simulated network, each signature verified with blst
-  against the validator key. It covers every supported duty, every slashing refusal, concurrent
-  conflicting duties through different nodes, activation (explicit, concurrent, immutable, after
-  a restart, with a stale node), the authorization-binding scenarios of a Byzantine coordinator, a
-  failed coordinator, an isolated node and a full restart. `SIM_SEED=<n>` runs another schedule;
-- `tests/production_api.rs`: a default build serves the Web3Signer API and no raw signing route;
-- unit tests: `slashing::tests` (the rules, activation, and the logarithmic attestation checks
-  against the full scan, `SLASHING_SEEDS=<n>`), `storage::tests::validator` (persistence,
-  activation, purposes, earlier data, a torn duty block, startup refusal of altered history).
-
-Key import ([docs/key-import.md](docs/key-import.md)):
-- `tests/key_import.rs`: the EIP-2335 test vectors, wrong passwords and malformed keystores, any 3
-  shares signing exactly as the original key (compared with blst) and 2 not, manifests,
-  envelopes bound to their node, manifest and ceremony, and the `mpc-keytool` CLI;
-- `eth::interchange::tests`: the official EIP-3076 interchange tests (`tests/vectors/eip3076`),
-  malformed and self-slashable interchanges, floors, export;
-- `storage::tests::validator::imported`: the lifecycle in the state machine, and altered import
-  state refused at startup;
-- `tests/e2e/import.rs` (E2E-IMP-1, E2E-IMP-2): the whole import on real processes.
-
-Resharing ([docs/resharing.md](docs/resharing.md)):
-- `dkg::ceremony::tests::reshare`: the key unchanged and every share refreshed over many seeds,
-  any 3 new shares sign and 2 cannot, old and new shares never combine, dealings that would change
-  the key or conflict refused, replays, an imported key;
-- `storage::tests::validator::reshare`: the lifecycle through consensus with the same slashing
-  history and refusals before and after, aborts, restarts, an imported key's floors;
-- `tests/e2e/reshare.rs` (E2E-RSH-1 to RSH-5, and 10 crash points): real processes.
-
-Replacing a lost keyholder (R2, [docs/resharing.md](docs/resharing.md#tests)):
-- `tests/e2e/follower.rs` (FOL-1 to FOL-5): a non-voting follower joins, applies the same state,
-  restarts, submits a transaction and cannot vote, propose or count toward a quorum;
-- `dkg::ceremony::tests::reshare::replace`, `dkg::approval::tests`,
-  `storage::tests::validator::reshare::a_replaced_keyholder_holds_the_new_generation_through_consensus`:
-  dealers A, B, C to players A, B, C, E, the key unchanged, membership rules, invalid dealings,
-  local approvals, the lifecycle through consensus;
-- `tests/e2e/replace.rs` (R2-E2E-1 to R2-E2E-6, E restarted at four points): D stopped for good, E
-  signing with A and B while C's partials are switched off.
-
-Replacing a lost voter (R3, [docs/reconfiguration.md](docs/reconfiguration.md#tests)):
-- `epochs::tests`, `storage::tests::a_reconfiguration_commits_the_next_epoch` and the two
-  fail-closed tests, `types::tests::reconfigure_encoding`: the rules, the records, the guard's
-  condition, heights and schemes per epoch;
-- `tests/e2e/reconfigure.rs` (R3-1 to R3-9): the switch with `mpc-admin`, E voting and signing
-  without C, D back, a node left in epoch 0, crashes around the switch, refusals, a faulty leader
-  past the end of the epoch, closing an epoch.
-
-`tests/signing.rs`: signing through the coordinator, verified with blst (combinations of signers,
-another root, another ceremony's key); concurrent identical and conflicting requests; a
-coordinator dying after the authorization or holding partials; one node offline and a lagging
-node; a full restart; byzantine responses on the signing channel; refused unauthorized requests.
-
-Ethereum devnet with a real Lighthouse validator client (Kurtosis, inside an isolated
-Docker-in-Docker environment; about an hour per run, see
-[docs/ethereum-devnet.md](docs/ethereum-devnet.md)):
-
-```bash
-IT_HOME=~/eth-mpc-it ./integration/ethereum/scripts/run.sh
-```
-
-Every check below, in the same pinned Rust image on the same host (fmt, clippy, `cargo test`, the
-E2E suite three times, the L-1 reproducer, every fuzz target for 30 s; logs in
-`$IT_HOME/validation/`):
-
-```bash
-IT_HOME=~/eth-mpc-it ./integration/ethereum/scripts/env.sh validate 3
-```
-
-Fuzzing (`fuzz/`, one target per input a peer, an API client, the anchor, the disk or an operator's
-tool gives a node; a pinned nightly installed under `$IT_HOME`, never used for the signer itself),
-here every target for an hour, four at once:
-
-```bash
-IT_HOME=~/eth-mpc-it ./integration/ethereum/scripts/env.sh fuzz all 3600 4
-```
-
-`cargo test` also runs a model test of the replicated state (random duty blocks against an
-independent reference of the slashing rules, a replica reopened at random heights; `MODEL_SEEDS`),
-hostile storage (single edits of the state partition; `HOSTILE_SEEDS`), and every checked-in fuzz
-seed and regression ([docs/audit.md](docs/audit.md), "Fuzzing, a model test and hostile storage").
-
-`tests/e2e` (real processes): E2E-1 to E2E-9 below, E2E-ETH-1 to E2E-ETH-10 (`eth2.rs`: every
-duty through the Web3Signer API, activation, slashing refusals, concurrent conflicts, a full
-restart, crashes around a duty's application, failed requests, a lagging node, nodes rolled back
-before a duty and before the activation, the authorization binding over real p2p, deposit
-signing), plus the
-audit scenarios of
-[docs/audit.md](docs/audit.md) (rollback, crash boundaries, concurrency, cancellation, byzantine
-traffic, limits, lifecycle, corrupted storage) and the recovery scenarios R1-R6 of
-[docs/recovery.md](docs/recovery.md) (readiness after restarts, rollbacks, a lagging node,
-inconsistent storage, an offline peer), and the WORM anchor's `anchor::an_1` to `an_6`
-([docs/anchor.md](docs/anchor.md#tests); `tests/anchor_protocol.rs` checks the S3 and GCS
-requests against an in-process fake), and the sealed vault's TEE-1 to TEE-5 (`tee.rs`, against a
-fake of Google's attestation, STS and KMS; [docs/tee.md](docs/tee.md#tests)). E2E-1 to E2E-9: cold start to a blst-verified signature,
-idempotency, conflicting requests, one node offline, coordinator crash (after authorization and
-after 2 partials, through test hooks), full network restart, unauthorized p2p signing requests and
-byzantine partial signatures (from a scripted peer that takes a stopped node's identity on the real
-authenticated p2p), and a lagging signer; plus the manual recovery of a node behind the retained
-history. The harness picks free ports, uses a temporary
-directory, kills the nodes when the test ends (they also exit if the test process dies) and prints
-every node's log tail on failure. Set `E2E_KEEP=1` to keep the directory. Ports come from blocks
-reserved with lock files shared by all test processes.
-
-Unit tests cover log validation, a late or extra fourth log, the deadline, codecs, the secret store,
-the storage format check, the request id and the official Ethereum signature vector.
+Development keys come from the node index. Never use them outside a local network. For real
+identities and the mTLS API, see [docs/tee.md](docs/tee.md#running-sealed-nodes).
 
 ## Latency
 
-`cargo test --release --features test-hooks --test e2e latency -- --ignored --nocapture`, one
-MacBook, 4 processes on loopback: protocol overhead, not production numbers.
+Time for one signing request, measured at the client.
 
-| ms, 100 requests each | p50 | p95 | p99 | min | max | mean |
-| --- | --- | --- | --- | --- | --- | --- |
-| new authorization, client round trip | 337 | 582 | 639 | 215 | 682 | 369 |
-| &nbsp;&nbsp;of which consensus (`authorization_ms`) | 303 | 550 | 588 | 184 | 605 | 329 |
-| &nbsp;&nbsp;of which apply (`apply_ms`) | 13 | 27 | 30 | 6 | 31 | 15 |
-| &nbsp;&nbsp;of which partials (`collect_ms`) | 8 | 29 | 39 | 4 | 46 | 11 |
-| already authorized, client round trip | 6.6 | 13.0 | 17.9 | 6.3 | 18.6 | 7.3 |
-| new authorization, one node offline | 344 | 590 | 2252 | 177 | 2352 | 431 |
+| Setup | Request | p50 | p95 |
+| --- | --- | --- | --- |
+| GCP: 4 sealed nodes (TDX, `c3-standard-4`, europe-west4), Lighthouse and the gateway on a remote host | Lighthouse duties, 54 requests | 50.3 ms | 95.2 ms |
+| Devnet: 4 nodes, Lighthouse and the gateway on one Linux host | all duties of a run, 64 to 3 713 requests | 259 to 301 ms | 437 to 581 ms |
+| One laptop: 4 nodes on loopback | new attestation | 352 ms | 580 ms |
+| One laptop: 4 nodes on loopback | the same attestation again | 6.8 ms | 10.9 ms |
+| One laptop: 4 nodes on loopback | new block proposal | 351 ms | 564 ms |
 
-Web3Signer API, same run (`eth2_latency`, 100 requests each):
+- Consensus dominates the time of a new duty. A duty that consensus already decided costs one
+  p2p round trip.
+- On GCP, the coordinator took p50 31.3 ms, the network 13.6 ms, and the gateway itself 4.3 ms
+  (signing root and signature check).
+- For comparison: an attestation is due one third into its slot, 4 s on mainnet.
+- With one node offline, a request that falls on that node's turn as leader waits for the 2 s
+  leader timeout (laptop p99: 2.3 s).
 
-| ms | p50 | p95 | p99 | min | max | mean |
-| --- | --- | --- | --- | --- | --- | --- |
-| new attestation (consensus, slashing decision, signing), client round trip | 352 | 580 | 603 | 250 | 631 | 390 |
-| &nbsp;&nbsp;of which consensus (`authorization_ms`) | 315 | 531 | 553 | 213 | 561 | 347 |
-| &nbsp;&nbsp;of which partials (`collect_ms`) | 10 | 29 | 39 | 4 | 139 | 14 |
-| same attestation again (signing only) | 6.8 | 10.9 | 16.1 | 6.4 | 30.0 | 7.4 |
-| new block proposal, client round trip | 351 | 564 | 590 | 225 | 636 | 369 |
+Details: [docs/tee.md](docs/tee.md) (GCP), [docs/ethereum-devnet.md](docs/ethereum-devnet.md)
+(devnet runs), [docs/internals.md](docs/internals.md#benchmarks) (laptop benchmarks).
 
-The same run's development API, for comparison: new authorization p50 368 ms (p99 617), already
-authorized p50 6.7 ms, one node offline p99 2146 ms. A duty costs what a generic authorization
-costs: consensus dominates. Computing a signing root takes 0.5-6 µs (4-17 µs with JSON parsing).
-The slashing decision for a new attestation takes about 2 µs whatever the history (2.2 µs with
-100 000 attestations; it was linear before). Applying a block with one new duty on disk takes
-4.1 ms with no history and 19.5 ms with 100 000 records (6.6 MB of state): the cost of rewriting
-the state partition and never pruning (L-11).
+## Limitations
 
-Authorization is one or two consensus views; each view is dominated by disk syncs (consensus
-journal, marshal archives, the state commit), not by the network. With a node offline, the requests
-that land on its turn as leader wait for the leader timeout (2 s; it was 5 s, with a p99 of 5160 ms).
-Signing an existing authorization costs one p2p round trip and four pairings.
+- **No client roles or rate limits.** The plain HTTP API listens on `127.0.0.1` only. The mTLS
+  API admits any certificate of the operator's CA (certificates can be revoked). Approvers gate
+  the protected operations, but a threshold of compromised approver keys can still use them.
+- **Clocks.** The time horizon trusts each node's system clock. No trusted time source.
+- **Rollback of every node.** It loses slashing history held in the nodes. The restart floor
+  stops a double proposal or a double vote. Only the anchor also stops a surround vote and
+  detects the rollback. The anchor tolerates one faulty node and lags by up to one record.
+- **Ethereum coverage.** Mainnet preset; the mainnet and Hoodi fork schedules, or a devnet's. No
+  Phase 0 or Altair blocks, `BUILDER_REQUEST_AUTH`, builder bids or Heze. Voluntary exits and
+  deposits need the approvers. Only Lighthouse has been run against the API.
+- **Availability costs.** Every node restarting at once (an R3 reconfiguration) costs the current
+  epoch's attestations. Two nodes restarting together can stall consensus for seconds. Restart
+  one node at a time.
+- **DKG and resharing need every node online.** A ceremony with a node offline fails, by design:
+  no share is ever revealed on chain. Old shares still sign until they are erased.
+- **Storage.** Authorizations and slashing history are kept forever, and each block rewrites the
+  state partition. No state sync: a node behind the retained history is restored by hand.
+- **Key import** is a trusted-dealer split: whoever keeps the original keystore can still sign.
+- **Sealed nodes** run on GCP only. The cloud's KMS and IAM admins can still release a node's key
+  outside the TEE: give each node its own project or account.
 
-## Limitations (next steps)
+Every known limit and finding, with its tests: [docs/audit.md](docs/audit.md). Security review:
+[docs/security-review.md](docs/security-review.md).
 
-- Static validator set, **no client authentication or rate limiting** for signing on the plain
-  API (the mTLS API, `--https-listen`, admits the operator CA's clients, without roles): anyone who can reach the HTTP port can have duties authorized and signed (within
-  slashing protection and the time horizon), and can burn a validator's slot or epoch with a duty
-  for the wrong block or fork. The HTTP API therefore binds to `127.0.0.1` only. Protected
-  operations need the approvers' offline signatures; a threshold of compromised approver keys can
-  still perform them (no time lock, rotation or HSM; audit L-25).
-- The time horizon trusts each node's system clock: one wrong clock costs that node's votes, two or
-  more far ahead could let a far-future duty through (audit L-24). No trusted time source.
-- A whole-network rollback (every node restored to older storage) forgets slashing history and
-  cannot be detected without state outside the nodes. The keyholders' restart floor keeps it from
-  signing a double proposal or a double vote (each refuses new duties of the slot and epoch it may
-  have signed for before its process started); a surround vote a client crafts, and the
-  development `POST /sign`, are not covered. The floor costs the current epoch's attestations when
-  every node restarts at once (an R3 reconfiguration), nothing when one does
-  ([docs/slashing-protection.md](docs/slashing-protection.md#the-restart-floor)). With the WORM
-  anchor (`--anchor`), surround votes under the anchored marks are refused too, and the rollback
-  is detected: every node stops with exit status 77 ([docs/anchor.md](docs/anchor.md)). The anchor
-  tolerates one faulty node, lags detection by up to one record (about an epoch), and while it is
-  unreachable the keyholders sign under the restart floor alone.
-- Ethereum: mainnet preset only. No Phase 0 and Altair blocks, `BUILDER_REQUEST_AUTH`, builder
-  bids or Heze. Builder registrations only under the approved registration policy; before Gloas it
-  does not cover the fee recipient of a block the beacon node builds itself, and within the policy
-  any API client can choose among its fee recipients (audit L-27). Gloas is signed on a schedule
-  that has it (a devnet's today; a release adds mainnet's epoch once announced); a refused or late
-  envelope or PTC vote is lost, as Lighthouse does not retry them (audit L-28). Deposits only on a node started with `--enable-deposit-signing`, one deposit message per
-  key; exits and deposits only with the approvers' authorization. Only the fork versions of the
-  pinned schedule are signed (mainnet, Hoodi, or a devnet's `--eth-fork-schedule`), in the fork
-  forms Lighthouse sends. EIP-3076 import is accepted for imported keys only, before their activation, and
-  cannot be undone (audit L-17); the export's compatibility with other signers is modeled, not tested. Only Lighthouse
-  v8.3.2 has been run against the API, on a local devnet
-  ([docs/ethereum-signing.md](docs/ethereum-signing.md#compatibility-evidence)).
-- `POST /sign` (`dev-api` builds only) is generic authorization, not slashing protection: the
-  nonce is caller-chosen, and the caller computes the signing root.
-- Authorizations and slashing history are kept forever, and every new one rewrites the state
-  partition (O(n) per block). Pruning slashing history needs low watermarks (EIP-3076).
-- DKG: the committee is the 4 configured nodes and the threshold is fixed (`n - f`). A
-  reconfiguration replaces one voter at a time, by a stop and restart of every node (R3); a
-  reshare can move a key's shares to other keyholders of the same number (R2).
-- Key import is a trusted-dealer split: whoever keeps the original keystore can still sign outside
-  the network, and that the previous signer is stopped is the operator's statement, not a check
-  ([docs/key-import.md](docs/key-import.md#assumptions)).
-- Resharing needs every dealer and player online (R1: all four nodes). Old shares still sign for
-  the same key until they are erased, which is operational: a reshare does not revoke a copied or
-  backed-up share ([docs/resharing.md](docs/resharing.md)).
-- Replacing a lost keyholder (R2) restores the key's redundancy, not consensus: the committee
-  stays A, B, C, D, so with D offline **losing another voter stops finalization** (and signing).
-  The lost node's leader turns keep costing a 2 s timeout, until a reconfiguration (R3) replaces
-  it as a voter. New keyholders need the approvers' signatures and each dealer's local approval
-  file. A new follower builds its state from the
-  retained history, or from a restored copy it cannot check (no state root)
-  ([docs/resharing.md](docs/resharing.md#security-properties-and-limitations)).
-- Replacing a lost voter (R3) stops and restarts every node, with a signing pause of a few
-  seconds; it needs the approvers' signatures, and only a configured follower can be added. If the epoch's last block is
-  notarized but never finalized, an operator must restart the voters with `--close-epoch-at` (L-21)
-  ([docs/reconfiguration.md](docs/reconfiguration.md#security-properties-and-limitations)).
-  - Liveness: every participant must be online, and a single non-cooperating player can make a
-    ceremony fail; safety is not affected. Like every Feldman-Desmedt DKG, the key is not
-    guaranteed to be uniformly random (bias of a few bits), and timing assumes synchrony.
-  - Shares are encrypted at rest only in a sealed vault (`--vault gcp-tdx`, a TDX Confidential VM,
-    [docs/tee.md](docs/tee.md)); in a plain vault, only directory permissions protect them.
-  - A node whose share is lost (both store copies) cannot recover it; run a new ceremony.
-- Not production-ready: no independent audit, development keys by default, slashing history inside the
-  rollback domain of the nodes, no rate limits on DKG or signing traffic beyond the p2p quotas.
-- The mempool is not persisted: requests not yet in a block are lost if their node crashes.
-- Two nodes restarted together can stall consensus for seconds after they are back (6.3 to 9.7 s
-  measured when they missed a certificate), enough to miss Ethereum duties
-  ([docs/audit.md](docs/audit.md) L-14). Restart one node at a time. One node stopping can
-  delay duties by a 2 s leader timeout, late for sync committee messages with 4 s slots (L-16).
-- No state sync: a node behind by more than the retention window must be restored by hand.
+## Tests
+
+```bash
+cargo test                                   # unit tests and 4-node simulations (~1 min)
+cargo test --features test-hooks --test e2e  # real processes, real p2p and storage (several minutes)
+```
+
+- The E2E tests run `target/debug/eth-mpc-signer`. Do not run them at the same time as another
+  build with other features.
+- A devnet run with a real Lighthouse validator client (Kurtosis in Docker, about an hour):
+  `IT_HOME=~/eth-mpc-it ./integration/ethereum/scripts/run.sh`
+  ([docs/ethereum-devnet.md](docs/ethereum-devnet.md)).
+- Every check in a pinned toolchain (fmt, clippy, tests, the E2E suite three times, fuzzing):
+  `IT_HOME=~/eth-mpc-it ./integration/ethereum/scripts/env.sh validate 3`.
+- The sealed image under QEMU: `./integration/ethereum/scripts/env.sh tee-qemu`
+  ([integration/tee/README.md](integration/tee/README.md)).
+
+What each test covers: [docs/internals.md](docs/internals.md#tests).
+
+## Documentation
+
+| Document | Topic |
+| --- | --- |
+| [architecture.md](docs/architecture.md) | Modules, data flow, signing path, test harness |
+| [internals.md](docs/internals.md) | Model, DKG, signing path, storage, development API, test catalog, benchmarks |
+| [ethereum-signing.md](docs/ethereum-signing.md) | The Web3Signer API, duties, status codes, time horizon, fork schedule |
+| [slashing-protection.md](docs/slashing-protection.md) | Slashing rules, the restart floor |
+| [anchor.md](docs/anchor.md) | The WORM anchor in S3 or GCS |
+| [administration.md](docs/administration.md) | Approvers and protected operations |
+| [key-import.md](docs/key-import.md) | Importing an existing validator key and its history |
+| [resharing.md](docs/resharing.md) | New shares (R1) and a replaced keyholder (R2) |
+| [reconfiguration.md](docs/reconfiguration.md) | A replaced consensus voter (R3) |
+| [recovery.md](docs/recovery.md) | Readiness, restarts, restoring a node |
+| [tee.md](docs/tee.md) | Sealed nodes on GCP Confidential VMs |
+| [gateway.md](docs/gateway.md) | `mpc-gateway` for validator clients |
+| [ethereum-devnet.md](docs/ethereum-devnet.md) | The devnet integration and its results |
+| [audit.md](docs/audit.md) | Known limits, findings and their tests |
+| [security-review.md](docs/security-review.md) | Security review |

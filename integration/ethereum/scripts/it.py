@@ -12,8 +12,13 @@ inferred from an HTTP 200: attestations and proposals are checked in the beacon 
 Usage (inside the environment):
     it.py run                     everything, then a report (WORK/report.md, WORK/report.json)
     it.py run-r2                  replacing a lost keyholder only (R2), then a report
+    it.py run-r3                  R2, then replacing a lost consensus voter (R3), then a report
     it.py run-mev                 builder registrations through a Flashbots relay, then a report
     it.py run-gloas               signing across the Gloas fork (EIP-7732), then a report
+    it.py gcp-prepare DIR         the devnet's flags and approvers for sealed nodes on GCP
+    it.py run-gcp DIR             Lighthouse signing through sealed nodes on GCP (run-validator.sh)
+    it.py stop                    stop everything: the validator client, the gateway, the bridges,
+                                  the signers and the devnet
     it.py devnet up|down          the Kurtosis enclave
     it.py signers start|stop      the four signer nodes
     it.py report                  the report from the logs of a run
@@ -2913,8 +2918,8 @@ def gcp_prepare(directory):
 def bridges_start(directory):
     """One loopback bridge per sealed node (`proxy.py` with that node alone): its mTLS API with
     the operator's client certificate and its attested CA pinned, at the HTTP port a local signer
-    has (`node_url`). The driver, `mpc-admin` and the failover proxy reach the sealed nodes as
-    they reach local ones."""
+    has (`node_url`). The driver and `mpc-admin` reach the sealed nodes as they reach local ones;
+    the gateway reaches their mTLS API itself (`gateway_start`)."""
     cluster = json.loads(read(f"{directory}/nodes.json"))
     bridges_stop()
     for node in cluster["nodes"]:

@@ -22,8 +22,8 @@
 //! completes only with at least the refreshed generation's threshold of dealers, so recipients no
 //! threshold of operators approved never receive a usable sharing. A dealer that approved a set
 //! does give each recipient one evaluation of its dealing polynomial: approve only identities you
-//! operate or trust. This is a prototype safeguard, not an authorization system: the admin API that
-//! starts reshares stays unauthenticated (README, limitations).
+//! operate or trust. It adds each dealer's own consent to the approvers' signatures, which every
+//! reshare to new keyholders needs as well (docs/administration.md, docs/resharing.md).
 
 use crate::eth::duty::ValidatorKey;
 use commonware_codec::{DecodeExt as _, Encode as _};

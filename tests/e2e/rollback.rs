@@ -192,7 +192,7 @@ fn a1_single_node_rollback() {
     assert_eq!(network.blocked_for_equivocation(3), Vec::<usize>::new());
 }
 
-/// A1 with the whole data directory restored, consensus journal included (L-10 in docs/audit.md).
+/// A1 with the whole data directory restored, consensus journal included (L-7 in docs/audit.md).
 /// Node 3 no longer knows which consensus votes it cast and, depending on timing, votes against one
 /// of them; the peers that see it block it (for an hour). Either way it must never sign B, and the
 /// intact nodes keep signing A.

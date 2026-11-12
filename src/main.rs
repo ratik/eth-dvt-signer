@@ -248,7 +248,7 @@ struct Args {
 
     /// Start although the consensus journal (`registry-consensus`) is missing while the node has
     /// finalized history. The node may have voted in views it no longer remembers: use only as
-    /// the README's recovery procedure describes.
+    /// docs/recovery.md (§6, recovery scenarios) describes.
     #[arg(long)]
     allow_missing_consensus_journal: bool,
 
