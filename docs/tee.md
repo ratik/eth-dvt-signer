@@ -312,6 +312,42 @@ A node's configuration does not change in an upgrade, so neither does its RTMR3.
   (`--gcp-sts-endpoint`, `--gcp-kms-endpoint`, `--gcp-metadata-endpoint`) can point at a fake. A
   fake issuer's tokens are worthless to the real STS and KMS.
 
+## The `sev-snp` platform (work in progress)
+
+An AMD SEV-SNP guest on a server the operator owns or rents as bare metal: EPYC Milan (7003),
+Genoa (9004) or Turin (9005), with SNP enabled in the BIOS. No cloud service holds or releases
+anything. What exists so far: the vault, the evidence and its verification (a library). Not yet:
+the image, the clients (`mpc-admin attest`, `mpc-keytool split`, `mpc-gateway`), moving the keys
+to a new image.
+
+- **Sealing** (`vault/snp.rs`). The guest device (`/dev/sev-guest`, `--snp-device`) derives a key
+  from the chip's VCEK secret with `GUEST_FIELD_SELECT` = policy, measurement and TCB version.
+  That key wraps the vault's data key in `dek.wrapped` (`eth-mpc-signer/dek-sev-snp`), with the
+  associated data `eth-mpc-signer/dek/sev-snp/v1`.
+  - Another image (measurement), a debuggable launch (policy) or another chip gets another key:
+    the vault does not open. A copy of the disk on another server does not open either.
+  - The TCB version mixed in is the one committed when the vault was made, recorded in
+    `dek.wrapped`. After a firmware or microcode update the device still derives the key for it,
+    so the vault opens. An edited version gives another key; edited fields are refused.
+  - An image update changes the measurement, hence the key: the keys must move to the new image
+    first (not done yet).
+- **Evidence.** For `GET /attestation?nonce=<hex>`, the node asks the device for a report whose
+  `REPORT_DATA` is the binding (above), then 32 zero bytes. The evidence is the report (base64,
+  `token`) and, with `--snp-vcek FILE`, the chip's VCEK (DER, base64, `vcek`).
+- **Verification** (`attestation/snp`). A client accepts the evidence if:
+  - the VCEK chains to AMD's root key for the product (ARK and ASK pinned in
+    `attestation/snp/amd/`, from AMD's KDS, the ARKs checked against virtee/sev's copies);
+  - the VCEK signed the report (ECDSA P-384), the report is from the VCEK's chip and TCB version,
+    and it does not mask its chip ID;
+  - `REPORT_DATA` is the binding of the evidence's keys and the client's nonce;
+  - the guest runs at VMPL 0, cannot be debugged and has no migration agent;
+  - the policy allows the measurement and the TCB version (`min_tcb`), and, if it pins them, the
+    node's `HOST_DATA` (its configuration's digest) and chip (`chip_ids`).
+
+  A report holds no time: only the client's nonce makes it fresh.
+- **Tests.** `--snp-fake-chip ID` (`test-hooks` builds) uses a fake chip whose VCEK is its own:
+  real clients refuse its evidence. A configuration that a client pins refuses the flag.
+
 ## On GCP (`integration/tee/gcp`)
 
 `run.sh COMMAND` runs `gcp.sh COMMAND` on the test server, in the pinned gcloud CLI image.

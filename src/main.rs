@@ -81,7 +81,8 @@ struct IdentityArgs {
 struct VaultArgs {
     /// `plain`: owner-only files in `<node-dir>/vault`. `gcp-tdx`: sealed, under a data key that
     /// Cloud KMS releases to an attested image on a Confidential VM (Intel TDX); needs `--peers`
-    /// and the `--gcp-*` flags.
+    /// and the `--gcp-*` flags. `sev-snp`: sealed, under a data key wrapped by a key the AMD
+    /// secure processor derives for this image on this chip; needs `--peers`.
     #[arg(long, default_value = "plain")]
     vault: String,
 
@@ -120,9 +121,37 @@ struct VaultArgs {
 
     #[arg(long, hide = true, default_value = gcp::Config::METADATA)]
     gcp_metadata_endpoint: String,
+
+    /// `sev-snp`: the guest device of the AMD secure processor.
+    #[arg(long, default_value = eth_mpc_signer::attestation::snp::device::DEFAULT_PATH)]
+    snp_device: PathBuf,
+
+    /// `sev-snp`: this chip's VCEK (DER, from AMD's KDS), attached to the node's evidence so that
+    /// clients need not fetch it. Public; clients check it against AMD's root.
+    #[arg(long)]
+    snp_vcek: Option<PathBuf>,
+
+    /// Tests only (`test-hooks` builds): a fake SEV-SNP chip with this id instead of the device.
+    #[arg(long, hide = true)]
+    snp_fake_chip: Option<u8>,
 }
 
 impl VaultArgs {
+    fn snp_device(
+        &self,
+    ) -> Result<std::sync::Arc<dyn eth_mpc_signer::attestation::snp::device::Device>, String> {
+        use eth_mpc_signer::attestation::snp::device::GuestDevice;
+        match self.snp_fake_chip {
+            None => Ok(std::sync::Arc::new(GuestDevice::new(&self.snp_device))),
+            #[cfg(feature = "test-hooks")]
+            Some(id) => Ok(std::sync::Arc::new(
+                eth_mpc_signer::attestation::snp::fake::Chip::new(id, [0x5E; 48]),
+            )),
+            #[cfg(not(feature = "test-hooks"))]
+            Some(_) => Err("--snp-fake-chip: only in a test build (feature test-hooks)".into()),
+        }
+    }
+
     fn kind(&self) -> Result<vault::Kind, String> {
         match self.vault.as_str() {
             "plain" => Ok(vault::Kind::Plain),
@@ -149,7 +178,20 @@ impl VaultArgs {
                 config.check(cfg!(feature = "fake-gcp"))?;
                 Ok(vault::Kind::Gcp(config))
             }
-            other => Err(format!("unknown vault {other} (plain, gcp-tdx)")),
+            "sev-snp" => {
+                let vcek = match &self.snp_vcek {
+                    Some(path) => Some(
+                        std::fs::read(path)
+                            .map_err(|err| format!("--snp-vcek {}: {err}", path.display()))?,
+                    ),
+                    None => None,
+                };
+                Ok(vault::Kind::Snp(vault::snp::Config {
+                    device: self.snp_device()?,
+                    vcek,
+                }))
+            }
+            other => Err(format!("unknown vault {other} (plain, gcp-tdx, sev-snp)")),
         }
     }
 }

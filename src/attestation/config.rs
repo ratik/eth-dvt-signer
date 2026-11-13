@@ -75,6 +75,7 @@ const REFUSED_FLAGS: &[&str] = &[
     "--gcp-metadata-endpoint",
     "--gotpm",
     "--data-dir",
+    "--snp-fake-chip",
 ];
 
 /// Refuse a configuration that a client must not pin, whatever its digest. Its `args`, read as
