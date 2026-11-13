@@ -316,9 +316,9 @@ A node's configuration does not change in an upgrade, so neither does its RTMR3.
 
 An AMD SEV-SNP guest on a server the operator owns or rents as bare metal: EPYC Milan (7003),
 Genoa (9004) or Turin (9005), with SNP enabled in the BIOS. No cloud service holds or releases
-anything. What exists so far: the vault, the evidence and its verification (a library). Not yet:
-the image, the clients (`mpc-admin attest`, `mpc-keytool split`, `mpc-gateway`), moving the keys
-to a new image.
+anything. What exists so far: the vault, the evidence, and its checks in `mpc-admin attest`,
+`mpc-keytool split` and `mpc-gateway`. Not yet: the image, moving the keys to a new image, a run
+on SNP hardware.
 
 - **Sealing** (`vault/snp.rs`). The guest device (`/dev/sev-guest`, `--snp-device`) derives a key
   from the chip's VCEK secret with `GUEST_FIELD_SELECT` = policy, measurement and TCB version.
@@ -345,6 +345,22 @@ to a new image.
     node's `HOST_DATA` (its configuration's digest) and chip (`chip_ids`).
 
   A report holds no time: only the client's nonce makes it fresh.
+- **Clients.** The same `--policy` flags take an SEV-SNP policy (`attestation/check.rs`): a
+  policy with `"platform": "sev-snp"` is one, any other a `gcp-tdx` policy; evidence of the other
+  platform is refused. `--jwks` is for `gcp-tdx` only.
+
+  ```json
+  {"platform": "sev-snp", "products": ["Genoa"],
+   "measurements": ["<launch measurement, hex>"],
+   "min_tcb": {"boot_loader": 9, "tee": 0, "snp": 23, "microcode": 72},
+   "host_data": {"0": ["<node 0's configuration digest>"]},
+   "chip_ids": {"0": ["<node 0's chip ID>"]}}
+  ```
+
+  - `mpc-admin attest` and `mpc-gateway` fetch a node's VCEK from AMD's KDS when the node does
+    not attach it, check it like an attached one, and keep it (the gateway for its lifetime).
+  - `mpc-admin attest --committee` writes each SEV-SNP member's evidence with its VCEK, so
+    `mpc-keytool split --attestation-policy` checks it offline.
 - **Tests.** `--snp-fake-chip ID` (`test-hooks` builds) uses a fake chip whose VCEK is its own:
   real clients refuse its evidence. A configuration that a client pins refuses the flag.
 

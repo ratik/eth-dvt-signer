@@ -126,16 +126,27 @@ pub(crate) fn network_with(
     sealed: impl Fn(usize) -> bool,
     env: impl Fn(usize) -> Vec<(String, String)>,
 ) -> (TestNetwork, FakeGcp, Operator, Vec<Statement>) {
+    network_with_vault(
+        |gcp, id| {
+            if sealed(id) {
+                gcp.vault_args(id)
+            } else {
+                Vec::new()
+            }
+        },
+        env,
+    )
+}
+
+/// Like [network_with], node `i` with the vault arguments `vault(gcp, i)`.
+fn network_with_vault(
+    vault: impl Fn(&FakeGcp, usize) -> Vec<String>,
+    env: impl Fn(usize) -> Vec<(String, String)>,
+) -> (TestNetwork, FakeGcp, Operator, Vec<Statement>) {
     let gcp = FakeGcp::start(NODES);
     let network =
         TestNetwork::start_with_followers(NODES, 0, Vec::new(), |_| Vec::new(), env, |_| false);
-    let vault = |id: usize| -> Vec<String> {
-        if sealed(id) {
-            gcp.vault_args(id)
-        } else {
-            Vec::new()
-        }
-    };
+    let vault = |id: usize| vault(&gcp, id);
     let statements: Vec<Statement> = (0..NODES)
         .map(|id| identity(&network, id, &vault(id)))
         .collect();
@@ -830,5 +841,107 @@ fn tee_6_an_image_upgrade_keeps_the_vault_and_retires_the_old_image() {
         &operator,
         &key,
         &attestation(5, 6, 2),
+    );
+}
+
+/// The `sev-snp` vault on fake chip `chip` (`--snp-fake-chip`).
+fn snp_vault_args(chip: u8) -> Vec<String> {
+    vec![
+        "--vault".into(),
+        "sev-snp".into(),
+        "--snp-fake-chip".into(),
+        chip.to_string(),
+        // A real VCEK: it chains to AMD's root, but did not sign the fake chips' reports.
+        "--snp-vcek".into(),
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/sev-snp/vcek_milan.der"
+        )
+        .into(),
+    ]
+}
+
+#[test]
+fn tee_7_sev_snp_vaults_seal_to_their_chip_and_clients_check_the_reports() {
+    let (network, _gcp, operator, statements) =
+        network_with_vault(|_, id| snp_vault_args(id as u8 + 1), |_| Vec::new());
+
+    // Every node made its keys in a sealed vault and attests them with an SEV-SNP report.
+    for (id, statement) in statements.iter().enumerate() {
+        assert_eq!(statement.vault, "sev-snp");
+        let evidence = statement.evidence.as_ref().expect("evidence");
+        assert_eq!(evidence.platform, "sev-snp");
+        assert!(evidence.vcek.is_some(), "the VCEK is attached");
+        let (report, _) = eth_mpc_signer::attestation::snp::decode(evidence).unwrap();
+        assert_eq!(
+            report.report_data(),
+            eth_mpc_signer::attestation::snp::report_data(&statement.keys, b""),
+            "node {id}"
+        );
+        let identity = std::fs::read(network.data_dir(id).join("vault").join("identity")).unwrap();
+        assert!(
+            identity.starts_with(b"EMSV"),
+            "node {id}: the identity is sealed"
+        );
+    }
+
+    // A restart reopens the vault on the same chip; on another chip the node does not start.
+    network.restart_node(2);
+    network.wait_for_ready(&[2]);
+    let mut args = snp_vault_args(9);
+    args.extend(network_args(&network, 2));
+    network.set_node_args(2, args);
+    network.stop_node(2);
+    network.start_node(2);
+    assert_eq!(network.wait_exit(2).code(), Some(1), "{}", network.log(2));
+    assert!(
+        network
+            .log(2)
+            .contains("does not open with this guest's sealing key"),
+        "{}",
+        network.log(2)
+    );
+    let mut args = snp_vault_args(3);
+    args.extend(network_args(&network, 2));
+    network.set_node_args(2, args);
+    network.start_node(2);
+    network.wait_for_ready(&[2]);
+
+    // `mpc-admin attest` with an SEV-SNP policy: the attached VCEK is AMD's, but it did not sign
+    // the fake chips' reports, so every node is refused. No gcp-tdx key set is needed.
+    let dir = network.dir.clone();
+    let policy = json!({
+        "platform": "sev-snp",
+        "products": ["Milan"],
+        "measurements": ["5e".repeat(48)],
+        "min_tcb": {"boot_loader": 0, "tee": 0, "snp": 0, "microcode": 0},
+    });
+    std::fs::write(dir.join("snp-policy.json"), policy.to_string()).unwrap();
+    let nodes = (0..NODES)
+        .map(|id| format!("https://{}", network.https_addr(id)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let output = run(
+        ADMIN,
+        &[
+            "--nodes".into(),
+            nodes,
+            "--tls-cert".into(),
+            operator.cert_path.display().to_string(),
+            "--tls-key".into(),
+            operator.key_path.display().to_string(),
+            "attest".into(),
+            "--policy".into(),
+            dir.join("snp-policy.json").display().to_string(),
+        ],
+    );
+    assert!(!output.status.success());
+    assert_eq!(
+        text(&output)
+            .matches("does not verify with the VCEK")
+            .count(),
+        NODES,
+        "{}",
+        text(&output)
     );
 }

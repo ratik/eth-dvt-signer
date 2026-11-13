@@ -89,7 +89,7 @@ The manifest, the encrypted shares and the share-encryption key file carry fixed
 | `mpc-keytool` command | What it does |
 | --- | --- |
 | `share-key --out FILE` | Creates a node's share-encryption key file. |
-| `split --keystore FILE --committee FILE --ceremony-id ID --output DIR` | Splits the keystore. Options: `--password-file FILE` (default: read from the terminal), `--attestation-policy FILE` with `--jwks FILE` (sealed nodes). |
+| `split --keystore FILE --committee FILE --ceremony-id ID --output DIR` | Splits the keystore. Options: `--password-file FILE` (default: read from the terminal), `--attestation-policy FILE` (sealed nodes), with `--jwks FILE` for a `gcp-tdx` policy. |
 | `inspect --manifest FILE` | Checks a manifest offline and prints what it describes. |
 
 ### Committee (`committee.json`, input of `split`)
@@ -107,7 +107,9 @@ committee.json` writes this file with each member's `index` and attestation `evi
 `mpc-keytool split --attestation-policy policy.json --jwks jwks.json` encrypts only to keys that an
 image the policy allows attested. Before it reads the keystore, it refuses if a member has no
 evidence, if the evidence fails the policy (signature, freshness, TDX, debug state, measurements),
-or if the evidence attests other keys than the member's.
+or if the evidence attests other keys than the member's. With an SEV-SNP policy, `--jwks` is not
+needed: `mpc-admin attest` wrote each member's VCEK into its evidence, and the split checks it
+against AMD's root offline.
 
 ### Share-encryption key (`mpc-keytool share-key --out FILE`)
 

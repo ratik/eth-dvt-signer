@@ -70,6 +70,9 @@ usable every 10 s. A check passes when all of these hold:
   node's configuration (RTMR3, if the policy pins it);
 - a key of the issuer's key set signed the token: Google's (fetched, and fetched again after an
   hour) or `--jwks`;
+- or, with an SEV-SNP policy, the report verifies against it ([tee.md](tee.md), the `sev-snp`
+  platform): the node's VCEK chains to AMD's root (fetched from AMD and kept if the node does not
+  attach it), the measurement, TCB version and, if pinned, `HOST_DATA` and chip;
 - the TLS key that answered is the attested one (`Keys::serves`);
 - the node's chain (`GET /eth/network`) is the gateway's.
 
@@ -144,8 +147,8 @@ mpc-gateway --nodes http://127.0.0.1:47100,http://127.0.0.1:47101,… --allow-un
 | --- | --- | --- |
 | `--nodes` | required | The nodes, comma-separated, in order of preference: `https://host:port` (a node's mTLS API) or `http://127.0.0.1:port` (a node with development keys). The first usable node coordinates. |
 | `--tls-cert`, `--tls-key` | | The operator's client certificate for `https://` nodes (PEM). The nodes' `--client-ca` issued it. |
-| `--policy` | | What a sealed node's attestation must show: the clients' policy of docs/tee.md, with each node's configuration in `rtmr3` (`mpc-admin config-rtmr3`). |
-| `--jwks` | Google's key set | The attestation issuer's key set (JWKS). Needs `--policy`. |
+| `--policy` | | What a sealed node's attestation must show: the clients' policy of docs/tee.md, `gcp-tdx` (each node's configuration in `rtmr3`, `mpc-admin config-rtmr3`) or `sev-snp` (`host_data`). |
+| `--jwks` | Google's key set | `gcp-tdx`: the attestation issuer's key set (JWKS). Needs `--policy`. |
 | `--allow-unattested` | off | Use nodes without evidence. |
 | `--eth-network`, or `--eth-genesis-time`, `--eth-seconds-per-slot`, `--eth-genesis-validators-root` and `--eth-fork-schedule` | required | The chain. Use the nodes' own values. |
 | `--hedge-after-ms` | 1000 (at least 10) | Ask the next node too when a node has not answered after this long. |

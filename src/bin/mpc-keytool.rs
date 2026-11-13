@@ -19,7 +19,8 @@ use commonware_utils::{TryCollect as _, ordered::Set};
 use eth_mpc_signer::{
     attestation::{
         Evidence,
-        verify::{Jwks, Policy, verify},
+        check::{Policy, verify},
+        verify::Jwks,
     },
     dkg::{CeremonyId, PROTOCOL_VERSION},
     import::{
@@ -77,10 +78,11 @@ enum Command {
         output: PathBuf,
         /// Encrypt only to keys a sealed node attested (docs/tee.md): every member of the
         /// committee must carry evidence (`mpc-admin attest --committee`) that verifies against
-        /// this policy and names its exact identity and share-encryption key.
-        #[arg(long, requires = "jwks")]
+        /// this policy and names its exact identity and share-encryption key. An SEV-SNP
+        /// member's evidence carries its VCEK (`mpc-admin attest` attaches it): checked offline.
+        #[arg(long)]
         attestation_policy: Option<PathBuf>,
-        /// The attestation issuer's key set (JWKS, JSON) for `--attestation-policy`.
+        /// `gcp-tdx`: the attestation issuer's key set (JWKS, JSON) for `--attestation-policy`.
         #[arg(long, requires = "attestation_policy")]
         jwks: Option<PathBuf>,
     },
@@ -117,19 +119,29 @@ struct CommitteeMember {
 /// What `--attestation-policy` checks each member's evidence against.
 struct Attestation {
     policy: Policy,
-    jwks: Jwks,
+    jwks: Option<Jwks>,
 }
 
 impl Attestation {
-    fn load(policy: &Path, jwks: &Path) -> Result<Self, String> {
+    fn load(policy: &Path, jwks: Option<&Path>) -> Result<Self, String> {
         let read = |path: &Path| {
             std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))
         };
-        Ok(Self {
-            policy: Policy::from_json(&read(policy)?)
-                .map_err(|err| format!("{}: {err}", policy.display()))?,
-            jwks: Jwks::from_json(&read(jwks)?)?,
-        })
+        let policy_path = policy;
+        let policy = Policy::from_json(&read(policy_path)?)
+            .map_err(|err| format!("{}: {err}", policy_path.display()))?;
+        let jwks = match jwks {
+            Some(path) => Some(Jwks::from_json(&read(path)?)?),
+            None if policy.needs_jwks() => {
+                return Err(format!(
+                    "{}: a {} policy needs the issuer's key set (--jwks)",
+                    policy_path.display(),
+                    policy.platform()
+                ));
+            }
+            None => None,
+        };
+        Ok(Self { policy, jwks })
     }
 
     /// The member's evidence verifies and names exactly its identity and share-encryption key.
@@ -150,7 +162,7 @@ impl Attestation {
         let verified = verify(
             evidence,
             &self.policy,
-            &self.jwks,
+            self.jwks.as_ref(),
             &nonce,
             now,
             member.index,
@@ -203,10 +215,9 @@ fn run(command: Command) -> Result<(), String> {
             attestation_policy,
             jwks,
         } => {
-            let attestation = match (attestation_policy, jwks) {
-                (Some(policy), Some(jwks)) => Some(Attestation::load(&policy, &jwks)?),
-                _ => None,
-            };
+            let attestation = attestation_policy
+                .map(|policy| Attestation::load(&policy, jwks.as_deref()))
+                .transpose()?;
             split(
                 &keystore,
                 password_file.as_deref(),

@@ -20,7 +20,10 @@ pub mod nodes;
 pub mod route;
 
 use crate::{
-    attestation::verify::{Jwks, Policy, fetch_google_jwks},
+    attestation::{
+        check::{Policy, VcekCache},
+        verify::{Jwks, fetch_google_jwks},
+    },
     eth::network::{Network, NetworkJson},
 };
 use axum::{
@@ -58,7 +61,8 @@ pub struct Config {
     pub client_certificate: Option<(Vec<u8>, Vec<u8>)>,
     /// What a sealed node's attestation must show.
     pub policy: Option<Policy>,
-    /// A fixed key set for attestation tokens; without it, Google's, fetched and refreshed.
+    /// `gcp-tdx`: a fixed key set for attestation tokens; without it, Google's, fetched and
+    /// refreshed.
     pub jwks: Option<Jwks>,
     /// Use nodes without evidence (a plain vault, or `http://` with development keys).
     pub allow_unattested: bool,
@@ -83,6 +87,8 @@ pub struct Gateway {
     policy: Option<Policy>,
     fixed_jwks: Option<Jwks>,
     jwks: Mutex<Option<(Jwks, Instant)>>,
+    /// `sev-snp`: VCEKs fetched from AMD for nodes that do not attach theirs.
+    vceks: VcekCache,
     allow_unattested: bool,
     attest_every: Duration,
     pub(crate) metrics: Metrics,
@@ -122,6 +128,7 @@ impl Gateway {
             policy: config.policy,
             fixed_jwks: config.jwks,
             jwks: Mutex::new(None),
+            vceks: VcekCache::default(),
             allow_unattested: config.allow_unattested,
             attest_every: config.attest_every,
             metrics: Metrics::default(),
@@ -161,7 +168,7 @@ impl Gateway {
     /// Check one node now (`nodes::Node::check`), logging a change.
     pub async fn check(&self, node: &Node) {
         let was = node.usable();
-        let needs_jwks = node.is_sealed() && self.policy.is_some();
+        let needs_jwks = node.is_sealed() && self.policy.as_ref().is_some_and(Policy::needs_jwks);
         let jwks = if needs_jwks {
             match self.jwks().await {
                 Ok(jwks) => Some(jwks),
@@ -178,6 +185,7 @@ impl Gateway {
                 &self.network_json,
                 self.policy.as_ref(),
                 jwks.as_ref(),
+                &self.vceks,
                 self.allow_unattested,
             )
             .await;
@@ -188,8 +196,8 @@ impl Gateway {
                 node = %node.url,
                 index = ?checked.index,
                 attested = checked.attested,
-                rtmr1 = ?checked.rtmr1,
-                rtmr3 = ?checked.rtmr3,
+                measurement = ?checked.measurement,
+                configuration = ?checked.configuration,
                 "node usable"
             ),
             Ok(_) => tracing::debug!(node = %node.url, "node checked"),

@@ -6,7 +6,7 @@
 
 use clap::Parser;
 use eth_mpc_signer::{
-    attestation::verify::{Jwks, Policy},
+    attestation::{check::Policy, verify::Jwks},
     eth::network::NetworkArgs,
     gateway::{Config, Gateway, route::hedge_delay},
     tls,
@@ -66,12 +66,14 @@ struct Args {
     #[arg(long, requires = "tls_cert")]
     tls_key: Option<PathBuf>,
 
-    /// What a sealed node's attestation must show (docs/tee.md, the policy, with each node's
-    /// configuration in `rtmr3`).
+    /// What a sealed node's attestation must show (docs/tee.md, the policy): `gcp-tdx`, with
+    /// each node's configuration in `rtmr3`, or `sev-snp`, in `host_data` (an SEV-SNP node's VCEK
+    /// is fetched from AMD and kept if the node does not attach it).
     #[arg(long)]
     policy: Option<PathBuf>,
 
-    /// The attestation issuer's key set (JWKS); default: Google's, fetched and refreshed.
+    /// `gcp-tdx`: the attestation issuer's key set (JWKS); default: Google's, fetched and
+    /// refreshed.
     #[arg(long, requires = "policy")]
     jwks: Option<PathBuf>,
 
