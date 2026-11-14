@@ -5,8 +5,13 @@
 //! ends in one of:
 //! - **a signature that verifies** under the validator key of the path, for the signing root the
 //!   gateway computed itself (`web3signer::duty_request`): the answer;
-//! - **a final answer** (any other status but 502, 503 and 504: a refusal, a malformed request),
-//!   returned as the node gave it;
+//! - **a refusal** (any other status but 502, 503 and 504): not an answer on its own. Consensus
+//!   decides a duty once, so an honest network refuses it on every node. The gateway asks the
+//!   next node and returns the refusal that [REFUSAL_AGREEMENT] nodes gave the same status for;
+//!   with the nodes exhausted and no such agreement, the last refusal. A node whose refusal the
+//!   others contradict (they agreed on another status, or one of them signed) is marked faulty,
+//!   so one broken node cannot refuse a validator's duties for it;
+//! - **the gateway's own answer**, when it cannot check what a node signed: returned as it is;
 //! - **a failure** (no answer, a timeout, 502/503/504, or a signature that does not verify): the
 //!   next node is asked at once.
 //!
@@ -44,10 +49,19 @@ use std::{
 /// How often one request may ask the same node (a second time after it answered 502, 503 or 504).
 pub const MAX_TRIES: u32 = 2;
 
+/// How many nodes must give a refusal the same status before the gateway passes it to the
+/// validator client. One faulty node out of four is tolerated (`f = 1`), so two agreeing nodes
+/// cannot both be the faulty one.
+pub const REFUSAL_AGREEMENT: usize = 2;
+
 /// What an attempt's answer means.
 enum Outcome {
-    /// Return it.
+    /// A signature that verifies: the answer.
+    Signed(Answer),
+    /// The gateway's own answer: return it as it is.
     Final(Answer),
+    /// This node refused the request. Its status counts towards an agreement.
+    Refused(Answer),
     /// Ask the next node; keep it if nothing better comes.
     Retry(Option<Answer>),
 }
@@ -109,7 +123,7 @@ impl Gateway {
             _ => {
                 node.answered();
                 self.metrics.attempt(&node.url, "refused");
-                return Outcome::Final(answer);
+                return Outcome::Refused(answer);
             }
         }
         node.answered();
@@ -134,7 +148,7 @@ impl Gateway {
         };
         if valid {
             self.metrics.attempt(&node.url, "signed");
-            Outcome::Final(answer)
+            Outcome::Signed(answer)
         } else {
             attempt.invalid_signature = true;
             attempt.error = Some("the signature does not verify".into());
@@ -202,6 +216,25 @@ impl Gateway {
         let mut hedge_at = tokio::time::Instant::now() + self.hedge_after;
         let mut attempts = Vec::new();
         let mut kept: Option<Answer> = None;
+        // Which node refused, with which status, and the latest refusal itself: a refusal is
+        // returned once `REFUSAL_AGREEMENT` nodes gave that status, or, with none agreed and the
+        // nodes exhausted, as the last word.
+        let mut refusals: Vec<(usize, u16)> = Vec::new();
+        let mut refused: Option<Answer> = None;
+        // Every node whose refusal the others contradicted.
+        let contradicted = |refusals: &[(usize, u16)], agreed: Option<u16>| {
+            for (index, status) in refusals {
+                if agreed != Some(*status) {
+                    tracing::warn!(
+                        node = %order[*index].url,
+                        status = *status,
+                        agreed = ?agreed,
+                        "a node refused a request the others did not: marked faulty"
+                    );
+                    order[*index].failed(FAULTY_FOR);
+                }
+            }
+        };
         loop {
             let hedge_due = !queue.is_empty() && Instant::now() < deadline;
             let at = hedge_at;
@@ -231,7 +264,30 @@ impl Gateway {
                     let outcome = self.judge(node, result, expected, &mut attempt).await;
                     attempts.push(attempt);
                     match outcome {
+                        Outcome::Signed(answer) => {
+                            // A node that refused what another node signed was wrong: consensus
+                            // decides a duty once.
+                            contradicted(&refusals, None);
+                            return (answer, attempts);
+                        }
                         Outcome::Final(answer) => return (answer, attempts),
+                        Outcome::Refused(answer) => {
+                            let status = answer.status;
+                            refusals.push((index, status));
+                            let agreed = refusals
+                                .iter()
+                                .filter(|(_, other)| *other == status)
+                                .count();
+                            if agreed >= REFUSAL_AGREEMENT {
+                                contradicted(&refusals, Some(status));
+                                return (answer, attempts);
+                            }
+                            refused = Some(answer);
+                            if let Some(next) = next_node(&mut queue, &mut tries) {
+                                pending.push(ask(next, false));
+                                hedge_at = tokio::time::Instant::now() + self.hedge_after;
+                            }
+                        }
                         Outcome::Retry(answer) => {
                             if let Some(answer) = answer {
                                 kept = Some(answer);
@@ -252,8 +308,9 @@ impl Gateway {
                         hedge_at = tokio::time::Instant::now() + self.hedge_after;
                         continue;
                     }
-                    // No node gave a usable answer in time.
-                    let answer = kept.unwrap_or_else(|| {
+                    // No node gave a usable answer in time. A refusal that no two nodes agreed on
+                    // is still the nodes' own word on the request, and says more than a 503.
+                    let answer = refused.or(kept).unwrap_or_else(|| {
                         own(
                             StatusCode::SERVICE_UNAVAILABLE,
                             "no MPC node gave a signature that verifies",

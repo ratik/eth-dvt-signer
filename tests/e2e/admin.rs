@@ -133,7 +133,7 @@ fn admin_1_protected_operations_need_approvals() {
     let committee: Vec<String> = (0..NODES as u64).map(identity).collect();
     let reshare = json!({
         "public_key": key,
-        "ceremony_id": "validator-admin-reshare",
+        "ceremony_id": "approved.validator-admin-reshare",
         "from_round": round,
         "dealers": committee,
         "players": committee,

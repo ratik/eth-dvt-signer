@@ -1039,6 +1039,75 @@ pub(crate) mod reshare {
             }
         }
 
+        /// After a replacement (R2), a refresh (R1) deals to the keyholders of the generation it
+        /// refreshes, A, B, C and E. The committee is still A, B, C, D until R3, and R1 is not a
+        /// protected command: dealing to the committee would give D, the node R2 removed, a share
+        /// of the new generation without any approver. D therefore neither plays nor deals.
+        #[test]
+        fn a_refresh_after_a_replacement_deals_to_the_keyholders_not_the_committee() {
+            deterministic::Runner::seeded(0).start(|mut context| async move {
+                let signers = signers();
+                let mut ceremonies = Ceremonies::new(committee(&signers));
+                let (g0, shares0) = dkg(&mut context, &mut ceremonies, &signers);
+                let membership = membership(&signers, g0.round);
+                let ReshareOutcome::Started(round) = ceremonies.reshare(
+                    id("g1"),
+                    key_of(&g0),
+                    g0.round,
+                    Some(&membership),
+                    10,
+                    &Sha256::hash(&[b"b10"]),
+                ) else {
+                    panic!("the replacement did not start");
+                };
+                let started = ceremonies.by_round(round).unwrap().clone();
+                let dealers: Vec<(PrivateKey, Share)> = (0..3)
+                    .map(|node| (signers[node].clone(), shares0[node].clone()))
+                    .collect();
+                let (_, logs) =
+                    deal_replacement(&mut context, &started, &dealers, &new_keyholders(&signers));
+                for log in logs {
+                    ceremonies.record(round, log).unwrap();
+                }
+                ceremonies.advance(11, &mut context);
+                let g1 = ceremonies.by_round(round).unwrap().clone();
+                assert_eq!(g1.status, DkgStatus::Completed);
+
+                // A refresh of the new generation, with no membership: R1.
+                let ReshareOutcome::Started(refresh) = ceremonies.reshare(
+                    id("g2"),
+                    key_of(&g0),
+                    g1.round,
+                    None,
+                    20,
+                    &Sha256::hash(&[b"b20"]),
+                ) else {
+                    panic!("the refresh did not start");
+                };
+                let refresh = ceremonies.by_round(refresh).unwrap().clone();
+                let keyholders = committee(&new_keyholders(&signers));
+                assert_eq!(refresh.config.participants, keyholders, "its players");
+                assert_eq!(refresh.dealers(), &keyholders, "its dealers");
+                assert_eq!(refresh.config.threshold, 3);
+
+                let info = refresh.info();
+                assert!(
+                    Player::new(info.clone(), signers[3].clone()).is_err(),
+                    "D plays"
+                );
+                assert!(
+                    Dealer::start::<Faults>(
+                        &mut context,
+                        info,
+                        signers[3].clone(),
+                        Some(shares0[3].clone()),
+                    )
+                    .is_err(),
+                    "D deals"
+                );
+            });
+        }
+
         /// Membership rules, all deterministic: dealers must be keyholders of the generation
         /// refreshed and at least its threshold, the new generation has exactly the committee's
         /// size, the generation named must be the active one; a start is idempotent only for the

@@ -73,6 +73,15 @@ pub const MAX_PARTICIPANTS: NonZeroU32 = NonZeroU32::new(64).unwrap();
 /// Maximum length of a ceremony id.
 pub const MAX_CEREMONY_ID: usize = 64;
 
+/// The ceremony ids that only protected commands may start: an imported key's registration and a
+/// replacement of keyholders (R2). Both are approved before they land, and they name their id in
+/// advance, in public documents (the manifest, the approvers' draft). So no unprotected command
+/// may take an id of this form, which would otherwise let anyone take the id first and make the
+/// approved command land as a conflict, its approvals and nonce spent (audit H-11). A protected
+/// start must use one. This is a rule of the leader and the voters (`application::Rules`), not of
+/// the state machine: history from before it applies as it did.
+pub const RESERVED_PREFIX: &str = "approved.";
+
 /// `0x`-prefixed hex of the compressed group public key.
 pub fn format_key(key: &GroupKey) -> String {
     use commonware_codec::Encode as _;
@@ -99,6 +108,11 @@ impl CeremonyId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Whether only a protected command may start a ceremony of this id ([RESERVED_PREFIX]).
+    pub fn is_reserved(&self) -> bool {
+        self.0.starts_with(RESERVED_PREFIX)
     }
 }
 

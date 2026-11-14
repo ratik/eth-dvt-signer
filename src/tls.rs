@@ -17,6 +17,10 @@
 //! - as a client's leaf or intermediate, in the handshake;
 //! - as a CA of the client CA file: it no longer issues clients.
 //!
+//! A listed certificate is refused in every form it can take: ECDSA admits `(r, s)` and
+//! `(r, n - s)` alike, so the list is matched against [fingerprints], not against the DER as
+//! presented ([fingerprints] says why).
+//!
 //! The list is read again while the server runs. A change applies to new handshakes at once. A
 //! connection whose client it revokes is closed at its next read.
 
@@ -141,6 +145,177 @@ pub fn fingerprint(certificate: &[u8]) -> [u8; 32] {
     out
 }
 
+/// The orders of the curves an ECDSA certificate here can use (P-256, P-384, P-521). The
+/// certificate's own signature algorithm (`ecdsa-with-SHA256` and friends) does not name the
+/// curve, which belongs to its issuer's key, so [re_encoded] tries each: an order that is not
+/// the signature's gives a fingerprint that names no certificate, and matches nothing.
+static ORDERS: std::sync::LazyLock<Vec<Vec<u8>>> = std::sync::LazyLock::new(|| {
+    [
+        "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551",
+        "ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf\
+         581a0db248b0a77aecec196accc52973",
+        "01fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\
+         ffffa51868783bf2f966b7fcc0148f709a5d03bb5c9b8899c47aebb6fb71e9138\
+         6409",
+    ]
+    .iter()
+    .map(|order| hex::decode(order.replace([' ', '\n'], "")).expect("a curve order in hex"))
+    .collect()
+});
+
+/// Every fingerprint a revocation list may name `certificate` by: the SHA-256 of its DER as it
+/// is, and, when it carries an ECDSA signature, the SHA-256 of the same certificate signed
+/// `(r, n - s)` instead of `(r, s)`.
+///
+/// ECDSA accepts both forms, and neither webpki nor aws-lc prefers one. So the holder of a
+/// revoked certificate can re-encode its signature: the certificate still verifies under the
+/// operator's CA, its DER differs, and a list that named only the form the operator holds would
+/// admit it again. Matching every form closes that, and leaves the list's own format alone
+/// (docs/tee.md): a list made by `openssl x509 -fingerprint -sha256` keeps working, whichever
+/// form of the certificate it was made from.
+pub fn fingerprints(certificate: &[u8]) -> Vec<[u8; 32]> {
+    let mut out = vec![fingerprint(certificate)];
+    for order in ORDERS.iter() {
+        if let Some(other) = re_encoded(certificate, order) {
+            let other = fingerprint(&other);
+            if !out.contains(&other) {
+                out.push(other);
+            }
+        }
+    }
+    out
+}
+
+/// `certificate` with its ECDSA signature `(r, s)` replaced by the equally valid `(r, order - s)`,
+/// if it has such a signature and `s` is a non-zero value below `order`.
+///
+/// The bytes come from a client, so every step is bounds-checked and anything unexpected (another
+/// signature algorithm, a malformed value) gives `None` rather than a panic.
+fn re_encoded(certificate: &[u8], order: &[u8]) -> Option<Vec<u8>> {
+    const SEQUENCE: u8 = 0x30;
+    const INTEGER: u8 = 0x02;
+    const BIT_STRING: u8 = 0x03;
+
+    let (tag, body, _) = der::value(certificate, 0)?;
+    if tag != SEQUENCE {
+        return None;
+    }
+    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
+    let (_, _, after_tbs) = der::value(certificate, body.start)?;
+    let (_, _, after_algorithm) = der::value(certificate, after_tbs)?;
+    let (tag, signature, end) = der::value(certificate, after_algorithm)?;
+    if tag != BIT_STRING || end != body.end {
+        return None;
+    }
+    // The signature's bits are whole bytes: a zero count of unused bits, then the pair.
+    let bits = certificate.get(signature)?;
+    let pair_der = bits.strip_prefix(&[0])?;
+    // ECDSA-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }
+    let (tag, pair, end) = der::value(pair_der, 0)?;
+    if tag != SEQUENCE || end != pair_der.len() {
+        return None;
+    }
+    let (r_tag, _, after_r) = der::value(pair_der, pair.start)?;
+    let (s_tag, s, after_s) = der::value(pair_der, after_r)?;
+    if r_tag != INTEGER || s_tag != INTEGER || after_s != pair.end {
+        return None;
+    }
+
+    let mut content = pair_der.get(pair.start..after_r)?.to_vec();
+    content.extend_from_slice(&der::integer(&subtract(order, pair_der.get(s)?)?));
+    let mut bits = vec![0u8];
+    bits.extend_from_slice(&der::tagged(SEQUENCE, &content));
+    let mut rebuilt = certificate.get(body.start..after_algorithm)?.to_vec();
+    rebuilt.extend_from_slice(&der::tagged(BIT_STRING, &bits));
+    Some(der::tagged(SEQUENCE, &rebuilt))
+}
+
+/// `order - value`, both big-endian: `None` unless `value` is non-zero and below `order`.
+fn subtract(order: &[u8], value: &[u8]) -> Option<Vec<u8>> {
+    let value = &value[value.iter().position(|byte| *byte != 0)?..];
+    let width = order.len();
+    if value.len() > width {
+        return None;
+    }
+    let mut right = vec![0u8; width];
+    right[width - value.len()..].copy_from_slice(value);
+    // Equal widths, big-endian: the byte order is the numeric order.
+    if right.as_slice() >= order {
+        return None;
+    }
+    let mut out = vec![0u8; width];
+    let mut borrow = 0i16;
+    for index in (0..width).rev() {
+        let mut difference = i16::from(order[index]) - i16::from(right[index]) - borrow;
+        borrow = i16::from(difference < 0);
+        difference += borrow * 256;
+        out[index] = difference as u8;
+    }
+    Some(out)
+}
+
+/// As much DER as [re_encoded] needs, over bytes a client chose: every length is checked against
+/// what is there, and nothing panics.
+mod der {
+    /// A value's tag, the range of its content, and where the value ends.
+    pub fn value(bytes: &[u8], at: usize) -> Option<(u8, std::ops::Range<usize>, usize)> {
+        let tag = *bytes.get(at)?;
+        let first = *bytes.get(at.checked_add(1)?)?;
+        let (length, header) = if first < 0x80 {
+            (usize::from(first), 2)
+        } else {
+            // A definite length of up to 8 bytes; an indefinite one (0x80) is not DER.
+            let count = usize::from(first & 0x7f);
+            if count == 0 || count > 8 {
+                return None;
+            }
+            let mut length = 0usize;
+            for index in 0..count {
+                let byte = *bytes.get(at.checked_add(2)?.checked_add(index)?)?;
+                length = length.checked_mul(256)?.checked_add(usize::from(byte))?;
+            }
+            (length, 2 + count)
+        };
+        let start = at.checked_add(header)?;
+        let end = start.checked_add(length)?;
+        if end > bytes.len() {
+            return None;
+        }
+        Some((tag, start..end, end))
+    }
+
+    /// A value of `tag` holding `content`.
+    pub fn tagged(tag: u8, content: &[u8]) -> Vec<u8> {
+        let length = content.len();
+        let mut out = vec![tag];
+        if length < 0x80 {
+            out.push(length as u8);
+        } else {
+            let bytes = length.to_be_bytes();
+            let significant = &bytes[bytes.iter().position(|byte| *byte != 0).unwrap_or(0)..];
+            out.push(0x80 | significant.len() as u8);
+            out.extend_from_slice(significant);
+        }
+        out.extend_from_slice(content);
+        out
+    }
+
+    /// An INTEGER holding the non-negative big-endian `value`.
+    pub fn integer(value: &[u8]) -> Vec<u8> {
+        let from = value
+            .iter()
+            .position(|byte| *byte != 0)
+            .unwrap_or(value.len().saturating_sub(1));
+        let trimmed = &value[from..];
+        let mut content = Vec::with_capacity(trimmed.len() + 1);
+        if trimmed.first().is_some_and(|byte| byte & 0x80 != 0) {
+            content.push(0);
+        }
+        content.extend_from_slice(trimmed);
+        tagged(0x02, &content)
+    }
+}
+
 /// A revocation list: one certificate per line, the SHA-256 of its DER in hex, with or without
 /// colons. `openssl x509 -noout -fingerprint -sha256` prints such a line (after
 /// `sha256 Fingerprint=`), which is taken as it is. Blank lines and `#` comments are skipped.
@@ -256,7 +431,10 @@ fn client_verifier(
 ) -> Result<Arc<dyn ClientCertVerifier>, String> {
     let mut store = RootCertStore::empty();
     for root in roots {
-        if !revoked.contains(&fingerprint(root)) {
+        if !fingerprints(root)
+            .iter()
+            .any(|print| revoked.contains(print))
+        {
             store
                 .add(root.clone())
                 .map_err(|err| format!("client CA: {err}"))?;
@@ -323,7 +501,7 @@ impl ClientCertVerifier for Revoking {
         let revoked = self.revoked.current();
         if let Some(listed) = std::iter::once(end_entity)
             .chain(intermediates)
-            .map(|certificate| fingerprint(certificate))
+            .flat_map(|certificate| fingerprints(certificate))
             .find(|fingerprint| revoked.contains(fingerprint))
         {
             tracing::warn!(certificate = %hex::encode(listed), "TLS: a revoked client certificate refused");
@@ -555,7 +733,7 @@ impl ServerCertVerifier for AttestedServerKey {
 /// is closed at its next read.
 pub struct Connection {
     tls: TlsStream<TcpStream>,
-    /// The fingerprints of the certificates the client presented.
+    /// Every fingerprint the certificates the client presented can be named by ([fingerprints]).
     chain: Vec<[u8; 32]>,
     revoked: Revocations,
     closed: bool,
@@ -569,7 +747,7 @@ impl Connection {
             .peer_certificates()
             .unwrap_or_default()
             .iter()
-            .map(|certificate| fingerprint(certificate))
+            .flat_map(|certificate| fingerprints(certificate))
             .collect();
         Self {
             tls,

@@ -195,6 +195,17 @@ pub enum SignError {
     /// The client's signing root is not the one of the duty it sent.
     #[error("the supplied signing root does not match the duty (computed {})", format_root(.0))]
     RootMismatch(Root),
+    /// The authorization that came back is not this duty's. Waiters are keyed by the transaction
+    /// id its submitter chose, and that id travels in gossip, so another transaction in the
+    /// block that carried this one can take its place. Nothing is signed, and a retry (here or
+    /// on another node) gets its own authorization.
+    #[error(
+        "the authorization that came back is not this duty's (the duty's root is {}, the \
+         authorized one {}): retry",
+        format_root(.duty),
+        format_root(.authorized)
+    )]
+    WrongAuthorization { duty: Root, authorized: Root },
     /// Slashing protection (or another rule of the replicated state) refuses the duty.
     #[error("refused by slashing protection: {0}")]
     Refused(DutyRefusal),
@@ -797,6 +808,18 @@ async fn sign_duty<E: Clock, S: Sender<PublicKey = PublicKey>>(
             (receipt.signing_root, height, kind)
         }
     };
+    // The authorization must be this duty's. Every node computes a duty's signing root from the
+    // typed duty, so this coordinator can compare the two for nothing: the state machine's
+    // answer reaches it through a waiter keyed by the transaction id the submitter chose, which
+    // travels in gossip, and another transaction in the block that carried this one can take
+    // that place. The signature would then be valid, and of another duty.
+    let computed = request.signing_root();
+    if signing_root != computed {
+        return Err(SignError::WrongAuthorization {
+            duty: computed,
+            authorized: signing_root,
+        });
+    }
     hooks::crash_point("authorized");
     hooks::pause_point(context, "authorized").await;
 
@@ -1140,3 +1163,7 @@ pub async fn receive(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/signer/coordinator.rs"]
+mod tests;

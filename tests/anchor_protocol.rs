@@ -239,8 +239,11 @@ async fn exercise(store: &AnchorStore) {
         digest: Digest::from([1; 32]),
         marks: Marks::default(),
     });
-    store.put_acknowledgment(&document).await.unwrap();
-    store.put_acknowledgment(&document).await.unwrap();
+    assert_eq!(store.put_acknowledgment(&document).await.unwrap(), None);
+    assert_eq!(
+        store.put_acknowledgment(&document).await.unwrap(),
+        Some(document.clone())
+    );
     assert_eq!(store.acknowledgments().await.unwrap(), vec![document]);
 }
 

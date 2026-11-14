@@ -317,6 +317,73 @@ fn revoked_leaves_intermediates_and_cas_are_refused() {
     });
 }
 
+/// A CA and a client certificate it signs, both on `algorithm`.
+fn signed_on(
+    algorithm: &'static rcgen::SignatureAlgorithm,
+) -> (String, Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+    let ca_key = KeyPair::generate_for(algorithm).unwrap();
+    let mut authority = CertificateParams::new(Vec::<String>::new()).unwrap();
+    authority.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca_pem = authority.self_signed(&ca_key).unwrap().pem();
+    let issuer = Issuer::new(authority, ca_key);
+    let key = KeyPair::generate_for(algorithm).unwrap();
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    let certificate = params.signed_by(&key, &issuer).unwrap();
+    (
+        ca_pem,
+        vec![certificate.der().clone()],
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+    )
+}
+
+/// ECDSA accepts `(r, s)` and `(r, n - s)` alike, and neither webpki nor aws-lc prefers one. So
+/// the holder of a revoked certificate can present it with its signature re-encoded: the
+/// certificate still verifies under the operator's CA, and its DER, which the revocation list
+/// names it by, is another one. The list must refuse both forms.
+#[test]
+fn a_revoked_certificate_is_refused_however_its_signature_is_encoded() {
+    block_on(async {
+        for (curve, algorithm, order) in [
+            ("P-256", &rcgen::PKCS_ECDSA_P256_SHA256, 0),
+            ("P-384", &rcgen::PKCS_ECDSA_P384_SHA384, 1),
+        ] {
+            let made = make(&["127.0.0.1".to_string()]).unwrap();
+            let (client_ca, chain, key) = signed_on(algorithm);
+            let twin = re_encoded(&chain[0], &ORDERS[order])
+                .unwrap_or_else(|| panic!("{curve}: no ECDSA signature to re-encode"));
+            let twin = CertificateDer::from(twin);
+            assert_ne!(
+                fingerprint(&chain[0]),
+                fingerprint(&twin),
+                "{curve}: the re-encoded certificate has another DER"
+            );
+            let held = (chain.clone(), key.clone_key());
+            let presented = (vec![twin], key.clone_key());
+
+            // Both forms are clients of the operator's CA.
+            let open = pong_server(&made, &client_ca, Revocations::none()).await;
+            assert!(
+                reaches(&made, open, &held).await,
+                "{curve}: the certificate"
+            );
+            assert!(
+                reaches(&made, open, &presented).await,
+                "{curve}: the same certificate, re-encoded"
+            );
+
+            // Revoking the form the operator holds refuses both.
+            let revoked = Revocations::fixed(HashSet::from([fingerprint(&chain[0])]));
+            let closed = pong_server(&made, &client_ca, revoked).await;
+            assert!(!reaches(&made, closed, &held).await, "{curve}: revoked");
+            assert!(
+                !reaches(&made, closed, &presented).await,
+                "{curve}: revoked, and presented re-encoded"
+            );
+        }
+    });
+}
+
 #[test]
 fn a_changed_list_closes_open_connections_and_refuses_new_ones() {
     block_on(async {

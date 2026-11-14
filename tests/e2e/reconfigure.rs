@@ -322,7 +322,7 @@ fn r3_1_replace_a_lost_voter() {
 #[test]
 fn r3_2_e_votes_and_signs_without_c() {
     let r2 = replacement();
-    r2.replace_and_activate("validator-r3");
+    r2.replace_and_activate("approved.validator-r3");
     let network = &r2.network;
     let proposal = block(20, 1);
     let signature = signed(network, 0, &r2.key, &proposal);
@@ -355,7 +355,7 @@ fn r3_2_e_votes_and_signs_without_c() {
     signed(network, E, &r2.key, &next);
     let mut expected: Vec<u64> = [0, 1, E]
         .iter()
-        .map(|node| r2.index(*node, "validator-r3"))
+        .map(|node| r2.index(*node, "approved.validator-r3"))
         .collect();
     expected.sort_unstable();
     assert_eq!(r2.signers(E, &next), expected, "A, B and E signed");

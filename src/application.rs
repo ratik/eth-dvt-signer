@@ -340,19 +340,23 @@ pub struct Rules {
 
 impl Rules {
     /// Whether `transaction` may enter a new block, the nonce aside: not a bare protected
-    /// command, and if approved, approved here.
+    /// command, and if approved, approved here; a ceremony it starts has an id of its kind
+    /// (`Command::ceremony_id_rule`: reserved ids are the protected commands', and only theirs).
     fn authorized(&self, transaction: &Transaction) -> Result<(), String> {
         match &transaction.command {
             command if command.is_protected() => {
                 Err("a protected command without approvals".into())
             }
-            Command::Admin(authorized) => match &self.admin {
-                None => Err("a protected command, and this node has no approver set".into()),
-                Some(admin) => admin
-                    .verify(authorized)
-                    .map_err(|reason| format!("a protected command: {reason}")),
-            },
-            _ => Ok(()),
+            Command::Admin(authorized) => {
+                authorized.command.ceremony_id_rule()?;
+                match &self.admin {
+                    None => Err("a protected command, and this node has no approver set".into()),
+                    Some(admin) => admin
+                        .verify(authorized)
+                        .map_err(|reason| format!("a protected command: {reason}")),
+                }
+            }
+            command => command.ceremony_id_rule(),
         }
     }
 }

@@ -191,20 +191,60 @@ fn a_wrong_signature_is_not_passed_on() {
     });
 }
 
+/// A refusal is the network's word only once [route::REFUSAL_AGREEMENT] nodes gave it: consensus
+/// decides a duty once, so an honest network refuses it on every node. One node that refuses
+/// everything therefore cannot make a validator miss its duties, and is tried last afterwards.
 #[test]
-fn a_refusal_is_final_and_unavailability_fails_over() {
+fn one_node_refusing_everything_cannot_lose_a_duty() {
     run(async {
         let network = Network::MAINNET.to_json();
-        let (refusing, other) = (
+        let (faulty, honest, spare) = (
             fake(Behaviour::Status(412), network.clone()).await,
             fake(Behaviour::Sign(0), network.clone()).await,
+            fake(Behaviour::Sign(0), network).await,
         );
-        let gateway = start(&[&refusing, &other], Duration::from_secs(1)).await;
+        let gateway = start(&[&faulty, &honest, &spare], Duration::from_secs(1)).await;
+        let (answer, attempts) = sign(&gateway).await;
+        assert!(signed(&answer), "the honest nodes' signature");
+        assert_eq!(
+            attempts.iter().map(|a| a.status).collect::<Vec<_>>(),
+            vec![Some(412), Some(200)],
+            "the refusal did not end the request"
+        );
+        // A node that refused what another node signed is tried last from now on.
+        let (answer, attempts) = sign(&gateway).await;
+        assert!(signed(&answer));
+        assert_eq!(attempts.len(), 1, "an honest node is asked first");
+        assert_eq!(faulty.requests.load(Ordering::SeqCst), 1);
+    });
+}
+
+/// Every node refuses the duty: the refusal is the answer, as soon as two nodes agree on it.
+#[test]
+fn a_refusal_two_nodes_agree_on_is_the_answer() {
+    run(async {
+        let network = Network::MAINNET.to_json();
+        let (first, second, third) = (
+            fake(Behaviour::Status(412), network.clone()).await,
+            fake(Behaviour::Status(412), network.clone()).await,
+            fake(Behaviour::Status(412), network).await,
+        );
+        let gateway = start(&[&first, &second, &third], Duration::from_secs(1)).await;
         let (answer, attempts) = sign(&gateway).await;
         assert_eq!(answer.status, 412);
-        assert_eq!(attempts.len(), 1);
-        assert_eq!(other.requests.load(Ordering::SeqCst), 0);
+        assert_eq!(attempts.len(), route::REFUSAL_AGREEMENT);
+        assert_eq!(
+            third.requests.load(Ordering::SeqCst),
+            0,
+            "two nodes agreeing are enough"
+        );
+    });
+}
 
+#[test]
+fn unavailability_fails_over() {
+    run(async {
+        let network = Network::MAINNET.to_json();
         let (unavailable, available) = (
             fake(Behaviour::Status(503), network.clone()).await,
             fake(Behaviour::Sign(0), network).await,

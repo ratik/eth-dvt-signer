@@ -723,7 +723,7 @@ impl Ceremonies {
     /// Start a reshare of `validator`'s key, whose active generation is the ceremony `active`, as
     /// ceremony `id` in the block at `height`. With `membership`, its dealers and players as given
     /// (R2; checked here, deterministically); without it, the active generation's keyholders deal
-    /// to the committee (R1). One reshare of a key at a time: a later round of the same key that
+    /// to themselves (R1). One reshare of a key at a time: a later round of the same key that
     /// has not failed is either in progress, awaiting activation, or already the active generation
     /// (then `active` is it, and nothing later exists).
     pub fn reshare(
@@ -735,14 +735,28 @@ impl Ceremonies {
         height: u64,
         block: &Digest,
     ) -> ReshareOutcome {
-        let config = match membership {
-            Some(membership) => CeremonyConfig {
-                id,
-                version: PROTOCOL_VERSION,
-                threshold: self.committee.quorum::<Faults>(),
-                participants: membership.players.clone(),
-            },
-            None => CeremonyConfig::new(id, self.committee.clone()),
+        // R1 refreshes the shares of whoever holds them: the keyholders of the active generation.
+        // Until a keyholder is replaced (R2) they are the committee. After it, and until the
+        // committee follows (R3), they are the follower and not the replaced node, and dealing to
+        // the committee would hand that node a share of the new generation. Only a protected R2
+        // may change who holds a key (audit H-10). Without a generation to read (refused below,
+        // `NoGeneration`), the committee stands in for the id's comparison.
+        let players = match membership {
+            Some(membership) => membership.players.clone(),
+            None => self
+                .ceremonies
+                .get(&active)
+                .and_then(Ceremony::generation_output)
+                .map_or_else(
+                    || self.committee.clone(),
+                    |previous| previous.players().clone(),
+                ),
+        };
+        let config = CeremonyConfig {
+            id,
+            version: PROTOCOL_VERSION,
+            threshold: self.committee.quorum::<Faults>(),
+            participants: players,
         };
         let from = membership.map_or(active, |membership| membership.from);
         if let Some(&round) = self.ids.get(&config.id) {

@@ -888,6 +888,9 @@ async fn eth2_sign(
         | SignError::InsufficientSigners { .. }
         | SignError::Busy
         | SignError::Overloaded(_)
+        // Another transaction took this request's place in its block: a retry, here or on
+        // another node, gets its own authorization.
+        | SignError::WrongAuthorization { .. }
         | SignError::Stopped => StatusCode::SERVICE_UNAVAILABLE,
         SignError::AuthorizationTimeout | SignError::Timeout { .. } => StatusCode::GATEWAY_TIMEOUT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -1039,9 +1042,10 @@ async fn sign(State(api): State<Api>, body: Result<Json<SignBody>, JsonRejection
         }
         SignError::Protected { .. } => (StatusCode::PRECONDITION_FAILED, "REFUSED_BY_PROTECTION"),
         SignError::Timeout { .. } => (StatusCode::GATEWAY_TIMEOUT, "SIGNING_TIMEOUT"),
-        SignError::Busy | SignError::Overloaded(_) | SignError::Stopped => {
-            (StatusCode::SERVICE_UNAVAILABLE, "UNAVAILABLE")
-        }
+        SignError::Busy
+        | SignError::Overloaded(_)
+        | SignError::Stopped
+        | SignError::WrongAuthorization { .. } => (StatusCode::SERVICE_UNAVAILABLE, "UNAVAILABLE"),
         SignError::ValidatorKey => (StatusCode::FORBIDDEN, "VALIDATOR_KEY"),
         // Duty outcomes, never of a development request.
         SignError::Invalid
@@ -1180,6 +1184,18 @@ async fn dkg_start(
     Json(body): Json<StartBody>,
 ) -> Result<Json<CeremonyResponse>, ApiError> {
     let id = parse_id(body.ceremony_id)?;
+    // A reserved id is for the ceremonies of protected commands: refused here, as the leader and
+    // the voters refuse it (`Command::ceremony_id_rule`).
+    if id.is_reserved() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "ceremony id {} is reserved for protected commands (it starts with {})",
+                id.as_str(),
+                crate::dkg::RESERVED_PREFIX
+            ),
+        ));
+    }
     let mut config = api.dkg.config(id.clone());
     if let Some(threshold) = body.threshold {
         config.threshold = threshold;
@@ -1408,12 +1424,22 @@ async fn start_resharing(State(api): State<Api>, Json(body): Json<ReshareBody>) 
         Ok(membership) => membership,
         Err(error) => return generation_error(StatusCode::BAD_REQUEST, error, None),
     };
-    // New keyholders are a protected command; a refresh within the committee is not.
+    // A replacement (R2) takes a reserved id, a refresh (R1) never does: the same rule as the
+    // leader's and the voters' (`Command::ceremony_id_rule`), checked first for a clear answer.
+    let start = Command::StartResharing {
+        validator: key,
+        ceremony: id.clone(),
+        membership: membership.clone().map(Box::new),
+    };
+    if let Err(error) = start.ceremony_id_rule() {
+        return generation_error(StatusCode::BAD_REQUEST, error, None);
+    }
+    // New keyholders are a protected command; a refresh of the keyholders' shares is not.
     let endorsement = match (&membership, body.authorization.clone()) {
         (None, Some(_)) => {
             return generation_error(
                 StatusCode::BAD_REQUEST,
-                "a refresh within the committee takes no authorization".into(),
+                "a refresh of the keyholders' shares takes no authorization".into(),
                 None,
             );
         }
@@ -2106,10 +2132,14 @@ async fn register_import(State(api): State<Api>, body: Bytes) -> Result<Response
     };
     let manifest = crate::import::manifest::Manifest::from_json(&json)
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-    // The same checks consensus applies, first, for a clear answer.
+    // The same checks consensus applies, first, for a clear answer: the manifest's, and the
+    // reserved id an imported key's ceremony must have (`Command::ceremony_id_rule`).
     manifest
         .check(api.dkg.committee())
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+    Command::RegisterImportedKey(Box::new(manifest.clone()))
+        .ceremony_id_rule()
+        .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
     let id = manifest.ceremony.clone();
     let endorsement = authorize(
         &api,

@@ -136,6 +136,35 @@ fn the_store_writes_once_and_finds_the_latest_record() {
     });
 }
 
+/// The search for a node's latest record ends whatever is in that node's place, a record at
+/// `u64::MAX` included: doubling saturates there, so a faulty writer that fills it must not make
+/// the search ask for that one place for ever. One such node would otherwise stop every honest
+/// node from reading the anchor at start, and they would all run degraded, under the restart
+/// floor alone.
+#[test]
+fn the_search_for_the_latest_record_ends_on_a_record_at_the_last_place() {
+    block_on(async {
+        let store = AnchorStore::in_memory(&cluster());
+        let faulty = key(9).public_key();
+        // What a faulty writer can put there: anything, at any place.
+        store.put_raw(&faulty, 0, b"not a record".to_vec()).await;
+        for power in 0..64 {
+            store.put_raw(&faulty, 1u64 << power, Vec::new()).await;
+        }
+        store.put_raw(&faulty, u64::MAX, Vec::new()).await;
+        assert_eq!(
+            store.latest_sequence(&faulty).await.unwrap(),
+            Some(u64::MAX),
+            "the last place is the end of the search"
+        );
+        // Its chain is then left out: nothing there is a record of its place.
+        assert!(matches!(
+            store.latest(&faulty).await,
+            Err(AnchorError::Malformed { .. })
+        ));
+    });
+}
+
 #[test]
 fn the_store_refuses_a_record_out_of_its_place_or_chain() {
     block_on(async {
@@ -811,16 +840,32 @@ mod acknowledgment_tests {
         let store = AnchorStore::in_memory(&cluster());
         block_on(async {
             let document = signed(1, &[0, 1]);
-            store.put_acknowledgment(&document).await.unwrap();
-            // Again, with other approvals of the same acknowledgment: the same.
-            store.put_acknowledgment(&signed(1, &[1, 2])).await.unwrap();
+            assert_eq!(store.put_acknowledgment(&document).await.unwrap(), None);
+            // Again, with other approvals of the same acknowledgment: what is there comes back,
+            // for the caller to check. Its approvals are nobody's guarantee: anyone who can
+            // write to the anchor could have put it there, so a node goes by the document it
+            // verified itself and not by this one.
+            assert_eq!(
+                store.put_acknowledgment(&signed(1, &[1, 2])).await.unwrap(),
+                Some(document.clone())
+            );
+            // The same acknowledgment with no valid approval at all is still only what is
+            // there: the write reports it rather than failing, so squatting the place cannot
+            // keep a network stopped.
+            assert_eq!(
+                store
+                    .put_acknowledgment(&AcknowledgmentDocument::draft(&acknowledged(1)))
+                    .await
+                    .unwrap(),
+                Some(document.clone())
+            );
             // Another of the same generation is filed apart (its own hash).
             let mut other = AcknowledgmentDocument::draft(&Acknowledgment {
                 height: 121,
                 ..acknowledged(1)
             });
             other.sign(&approver(0)).unwrap();
-            store.put_acknowledgment(&other).await.unwrap();
+            assert_eq!(store.put_acknowledgment(&other).await.unwrap(), None);
             let listed = store.acknowledgments().await.unwrap();
             assert_eq!(listed.len(), 2);
             assert!(listed.contains(&document));

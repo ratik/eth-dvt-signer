@@ -710,6 +710,9 @@ impl SignedCommand {
         request: serde_json::Value,
     ) -> Result<Self, String> {
         let command = command(operation, &request)?;
+        // The ceremony an approved import or replacement starts takes a reserved id, which the
+        // network refuses otherwise: refused before anyone signs (`Command::ceremony_id_rule`).
+        command.ceremony_id_rule()?;
         Ok(Self {
             version: VERSION,
             cluster_id: format!("0x{}", hex::encode(cluster)),

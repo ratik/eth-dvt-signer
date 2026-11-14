@@ -18,8 +18,8 @@
 
 use crate::{
     anchor::{
-        AcknowledgmentDocument, AnchorError, AnchorStore, Marks, SignedRecord, Verdict, View,
-        Watch, keeper::Keeper,
+        Acknowledgment, AcknowledgmentDocument, AnchorError, AnchorStore, Marks, SignedRecord,
+        Verdict, View, Watch, keeper::Keeper,
     },
     application::{Application, Committed, MAX_IDLE, Mempool, Rules, Scheme},
     dkg::{self, DkgStatus, secrets::Secrets},
@@ -228,6 +228,10 @@ pub struct AnchorConfig {
 /// restart floor alone, the gate open).
 pub const ANCHOR_READ_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How long one node's records may take within that read. The nodes are read at once, so this
+/// bounds a single faulty or unreachable writer, not the whole read.
+pub const ANCHOR_NODE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// What the anchor answered at start; `None` if it did not answer in time.
 struct AnchorReading {
     store: Arc<AnchorStore>,
@@ -250,14 +254,22 @@ struct AnchorRead {
 /// floors, every configured node's latest record, and `me`'s own. A node whose records do not
 /// verify is left out (a faulty writer); this node's own then cannot be continued, which is an
 /// error. Acknowledgments that do not verify are left out.
-async fn read_anchor(
+async fn read_anchor<E: Clock>(
+    context: &E,
     store: &AnchorStore,
     administration: &crate::admin::Administration,
     nodes: &[PublicKey],
     me: &PublicKey,
+    local: Option<&Acknowledgment>,
 ) -> Result<AnchorRead, AnchorError> {
     let cluster = administration.cluster();
     let (mut generation, mut floor) = (0, Marks::default());
+    // This node's own acknowledgment, which it verified before writing it: it counts whatever
+    // the store holds at its place, so squatting that name cannot keep a network stopped.
+    if let Some(acknowledgment) = local {
+        generation = generation.max(acknowledgment.generation);
+        floor = floor.max(acknowledgment.marks);
+    }
     for document in store.acknowledgments().await? {
         match document.verify(administration.approvers(), cluster) {
             Ok(acknowledgment) => {
@@ -267,10 +279,19 @@ async fn read_anchor(
             Err(err) => warn!(%err, "anchor: ignoring an acknowledgment"),
         }
     }
+    // Every node at once, each with its own deadline: one node whose records hang, or whose
+    // place in the store a faulty writer filled, must not cost the anchor for everyone.
+    let reads = nodes.iter().map(|node| async move {
+        let read = select! {
+            read = store.latest(node) => read,
+            _ = context.sleep(ANCHOR_NODE_TIMEOUT) => Err(AnchorError::NodeTimeout(node.to_string())),
+        };
+        (node, read)
+    });
     let mut records = Vec::new();
     let mut own = None;
-    for node in nodes {
-        match store.latest(node).await {
+    for (node, read) in futures::future::join_all(reads).await {
+        match read {
             Ok(Some(record)) if record.record.cluster == *cluster => {
                 if node == me {
                     own = Some(record.clone());
@@ -279,7 +300,10 @@ async fn read_anchor(
             }
             Ok(Some(_)) => warn!(node = %node, "anchor: ignoring a record of another cluster"),
             Ok(None) => {}
-            Err(err @ AnchorError::Malformed { .. }) if node != me => {
+            // Another node's chain is left out whatever is wrong with it: the rules tolerate one
+            // faulty writer (docs/anchor.md). This node's own records are another matter, since
+            // without them it cannot continue its chain.
+            Err(err) if node != me => {
                 warn!(node = %node, %err, "anchor: ignoring a node's records");
             }
             Err(err) => return Err(err),
@@ -731,13 +755,22 @@ where
             let me = config.signer.public_key();
             // An acknowledgment of a rollback: checked, then written (or found there) before
             // anything is read; without the anchor, the node does not start.
+            let mut acknowledged = None;
             if let Some(document) = &anchor.acknowledgment {
                 let acknowledgment = document
                     .verify(administration.approvers(), &cluster)
                     .map_err(|err| StartError::Anchor(format!("acknowledgment: {err}")))?;
                 select! {
                     put = store.put_acknowledgment(document) => {
-                        put.map_err(|err| StartError::Anchor(format!("acknowledgment not written: {err}")))?;
+                        let there = put.map_err(|err| StartError::Anchor(format!("acknowledgment not written: {err}")))?;
+                        // Something was at its place already. It says the same thing, but its own
+                        // approvals are nobody's guarantee, so this node goes by the document it
+                        // verified itself and only warns.
+                        if let Some(there) = there
+                            && let Err(err) = there.verify(administration.approvers(), &cluster)
+                        {
+                            warn!(%err, "anchor: an acknowledgment that does not verify is at this one's place; going by the verified document");
+                        }
                     },
                     _ = context.sleep(ANCHOR_READ_TIMEOUT) => {
                         return Err(StartError::Anchor("acknowledgment not written: the anchor does not answer".into()));
@@ -748,9 +781,10 @@ where
                     marks = ?acknowledgment.marks,
                     "anchor: the approvers acknowledged a rollback"
                 );
+                acknowledged = Some(acknowledgment);
             }
             let records = select! {
-                read = read_anchor(&store, administration, &nodes, &me) => {
+                read = read_anchor(&context, &store, administration, &nodes, &me, acknowledged.as_ref()) => {
                     match read {
                         Ok(read) => Some(read),
                         Err(err) => {

@@ -65,7 +65,9 @@ CL_SERVICE = "cl-1-lighthouse-geth"
 EL_SERVICE = "el-1-geth-lighthouse"
 # The genesis validators' client (local keystores); the migration scenario moves one of its keys.
 ORIGINAL_VC = "vc-1-geth-lighthouse"
-MIGRATED_CEREMONY = "migrated-validator"
+# An imported key's ceremony id takes the reserved prefix: only an approved registration may
+# start such a ceremony (`dkg::RESERVED_PREFIX`, audit H-11).
+MIGRATED_CEREMONY = "approved.migrated-validator"
 NODES = 4
 # One non-voting slot after the committee (node 4, E): the replacement scenario starts it.
 FOLLOWERS = 1
@@ -1400,7 +1402,7 @@ def resharing(chain, key, index, migrated_key, observed=2, offline=1):
                  .get("share") == "retired")
         imported = None
         if migrated_key:
-            imported = reshare_key(migrated_key, f"{MIGRATED_CEREMONY}-g1")
+            imported = reshare_key(migrated_key, f"{MIGRATED_CEREMONY.removeprefix('approved.')}-g1")
             if imported["public_key"] != migrated_key:
                 raise Failure("reshare", "the migrated key changed")
         observe("resharing", index, observed, chain)
@@ -1440,7 +1442,8 @@ def reshare_to_e(key, ceremony, voters, keyholders, identities, players):
     for node in voters:
         with open(approvals(node), "a") as file:
             file.write(f"{key} {','.join(players)}\n")
-    name = f"{ceremony}-r2"
+    # A replacement (R2) is protected: its ceremony id takes the reserved prefix.
+    name = f"approved.{ceremony.removeprefix('approved.')}-r2"
     started = time.time()
     status, answer = http("POST", f"{node_url(0)}/validators/reshare", authorized("reshare", {
         "public_key": key, "ceremony_id": name, "from_round": before["round"],

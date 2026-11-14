@@ -192,6 +192,12 @@ Revoke a stolen operator certificate or a retired gateway with `--revoked-client
   `openssl x509 -in client.pem -noout -fingerprint -sha256 >> FILE` appends one.
 - **What is refused.** A listed leaf or intermediate is refused in the handshake. A listed CA of
   `--client-ca` no longer issues clients.
+- **In every form.** ECDSA accepts `(r, s)` and `(r, n - s)` alike, so the holder of a revoked
+  certificate can re-encode its signature: the certificate still verifies under the operator's
+  CA, and its DER, which the list names it by, is another one. The node therefore matches the
+  list against both forms (`tls::fingerprints`), whichever one the list was made from. There is
+  nothing to do about it in the list: a line `openssl` printed from the certificate the operator
+  holds refuses the other form too.
 - **When it applies.** The node reads the list again every 5 s (`tls::REVOCATIONS_RELOAD`). A
   change applies to new handshakes at once. A revoked client's open connection closes at its next
   read. If the file no longer reads or parses, the list in force stays, with a warning.
