@@ -184,6 +184,7 @@ measure() {
 		python3 "$lib/measure.py" uki "$uki"
 		python3 "$lib/measure.py" gpt "$disk"
 		python3 "$lib/measure.py" boot "$disk" "$esp/grub.efi" "$esp/grub.cfg" "$uki"
+		snp_measure "$out"
 		sed 's/^/esp.file /' "$esp/files"
 		echo "disk.sha256 $(sha256sum "$disk" | cut -d' ' -f1)"
 		echo "disk.tar.gz.sha256 $(sha256sum "$out/image/disk.tar.gz" | cut -d' ' -f1)"
@@ -197,8 +198,24 @@ measure() {
 			die "the UKI's os-release has an IMAGE_VERSION, TEE_IMAGE_VERSION is empty"
 	fi
 	log "measurements of $out:"
-	grep -E '^(image\.version|binary|tee-token|gotpm|uki\.(sha384|authenticode|kernel)|grub\.(authenticode|cmd)|roothash|gpt-event|gce\.|esp\.file|disk)' \
+	grep -E '^(image\.version|binary|tee-token|gotpm|uki\.(sha384|authenticode|kernel)|grub\.(authenticode|cmd)|roothash|gpt-event|gce\.|snp\.(measurement|vcpus)|esp\.file|disk)' \
 		"$out/measurements" >&2
+}
+
+# snp_measure OUT: the image as an SEV-SNP guest boots it (docs/tee.md, "The sev-snp platform"):
+# the UKI's kernel, initrd and command line in OUT/snp (a direct boot: QEMU puts their hashes in the
+# launch, `kernel-hashes=on`, and the AmdSev OVMF checks them), and the launch measurement of the
+# AmdSev OVMF with them, for TEE_SNP_VCPUS vCPUs of TEE_SNP_VCPU_TYPE. Prints `snp.*` lines.
+snp_measure() {
+	local out="$1" ovmf=/usr/share/ovmf-amdsev/OVMF.amdsev.fd
+	: "${TEE_SNP_VCPUS:?}" "${TEE_SNP_VCPU_TYPE:?}"
+	python3 "$lib/measure.py" snp-boot "$out/image/eth-mpc-signer.efi" "$out/snp"
+	install -m 0644 "$ovmf" "$out/snp/OVMF.amdsev.fd"
+	echo "snp.ovmf.sha256 $(sha256sum "$ovmf" | cut -d' ' -f1)"
+	echo "snp.vcpus $TEE_SNP_VCPUS $TEE_SNP_VCPU_TYPE"
+	echo "snp.measurement $(sev-snp-measure --mode snp --vcpus "$TEE_SNP_VCPUS" \
+		--vcpu-type "$TEE_SNP_VCPU_TYPE" --ovmf "$ovmf" --kernel "$out/snp/vmlinuz" \
+		--initrd "$out/snp/initrd" --append "$(cat "$out/snp/cmdline")" --output-format hex)"
 }
 
 compare() {
@@ -206,6 +223,7 @@ compare() {
 	[ -z "${OWNER:-}" ] || trap "chown -R '$OWNER' '$a' '$b'" EXIT
 	for key in binary.sha256 tee-token.sha256 gotpm.sha256 uki.sha384 uki.authenticode-sha384 \
 		grub.sha384 grub.authenticode-sha384 roothash gpt-event.sha384 gce.rtmr1 gce.rtmr2 \
+		snp.vmlinuz.sha256 snp.initrd.sha256 snp.cmdline.sha256 snp.measurement \
 		disk.sha256 disk.tar.gz.sha256; do
 		local va vb
 		va="$(sed -n "s/^$key //p" "$a/measurements")"
@@ -307,8 +325,11 @@ vm_tpm() {
 		>"$dir/setup.log" 2>&1 || die "swtpm_setup failed: $dir/setup.log"
 }
 
+# A VM whose directory holds `direct` (a path to an image's snp/, `snp_measure`) boots that
+# image's kernel, initrd and command line directly, as an SEV-SNP host launches it (here without
+# SNP), not through GRUB and the UKI.
 vm_start() {
-	local index="$1" dir="$run/vm$1" tpm=()
+	local index="$1" dir="$run/vm$1" tpm=() direct=() bootindex=",bootindex=0"
 	rm -f "$dir/console.sock" "$dir/monitor.sock"
 	echo "=== boot $(date -u +%FT%TZ) with configuration $(cat "$dir/config.current")" >>"$dir/serial.log"
 	if [ -d "$dir/tpm" ]; then
@@ -319,12 +340,20 @@ vm_start() {
 		tpm=(-chardev "socket,id=chrtpm,path=$dir/tpm/sock" -tpmdev emulator,id=tpm0,chardev=chrtpm
 			-device tpm-crb,tpmdev=tpm0)
 	fi
+	if [ -f "$dir/direct" ]; then
+		local boot
+		boot="$(cat "$dir/direct")"
+		direct=(-kernel "$boot/vmlinuz" -initrd "$boot/initrd" -append "$(cat "$boot/cmdline")")
+		# QEMU's direct boot takes boot index 0 itself.
+		bootindex=
+	fi
 	qemu-system-x86_64 -name "vm$index" -machine q35,accel=kvm -cpu host -smp 2 -m 1536 "${tpm[@]}" \
+		"${direct[@]}" \
 		-nodefaults -no-user-config -display none \
 		-drive if=pflash,format=raw,unit=0,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
 		-drive "if=pflash,format=raw,unit=1,file=$dir/vars.fd" \
 		-drive "if=none,id=os,format=qcow2,file=$dir/os.qcow2" \
-		-device virtio-blk-pci,drive=os,bootindex=0 \
+		-device "virtio-blk-pci,drive=os$bootindex" \
 		-drive "if=none,id=data,format=raw,file=$dir/data.raw" \
 		-device virtio-blk-pci,drive=data,serial=mpc-data \
 		-drive "if=none,id=config,format=raw,readonly=on,file=$dir/config-$(cat "$dir/config.current").img" \
@@ -790,6 +819,24 @@ test_vms() {
 	check "release VM $refusing: no statement" \
 		bash -c "! grep -aq 'eth-mpc-identity: ' '$run/vm$refusing/serial.log'"
 	vm_quit "$refusing"
+
+	# The SEV-SNP form of the release image: its kernel, initrd and command line booted directly
+	# (`snp_measure`), here without SNP. It boots the verity root and reads its configuration; with
+	# no SNP guest device, an `sev-snp` vault cannot be made, and the node prints no statement.
+	local direct=$((cluster + 5))
+	vm_disks "$direct" "$release"
+	echo "$release/snp" >"$run/vm$direct/direct"
+	vm_config "$direct" identity identity --id=0 --tls-san=127.0.0.1 --vault=sev-snp
+	vm_start "$direct"
+	check "direct-boot VM $direct: the release image's kernel, initrd and command line boot its verity root and read the configuration" \
+		wait_serial "$direct" "configuration digest (sha384 of the manifest above) $(cat "$run/vm$direct/config-identity.digest")" 300
+	check "direct-boot VM $direct: not an SNP guest, so no HOST_DATA check" \
+		bash -c "! grep -aq 'SEV-SNP HOST_DATA' '$run/vm$direct/serial.log'"
+	check "direct-boot VM $direct: without /dev/sev-guest the sev-snp vault refuses (console)" \
+		wait_serial "$direct" '/dev/sev-guest: No such file' 120
+	check "direct-boot VM $direct: no statement" \
+		bash -c "! grep -aq 'eth-mpc-identity: ' '$run/vm$direct/serial.log'"
+	vm_quit "$direct"
 	check "measure.py: the replay accepts the predicted boot, refuses each tampering, and agrees with the real GCE log" \
 		python3 "$lib/measure.py" selftest "$release/measurements" >"$run/replay-selftest.txt"
 

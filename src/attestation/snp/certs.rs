@@ -271,22 +271,46 @@ pub fn kds_url(product: Product, chip_id: &[u8], tcb: &Tcb) -> String {
     url
 }
 
+/// How often [fetch_vcek] asks KDS when it answers 429 or 503 (it rate-limits clients).
+const KDS_ATTEMPTS: u32 = 5;
+/// The longest wait between two attempts (a longer `Retry-After` is cut to it).
+const KDS_MAX_WAIT_SECS: u64 = 30;
+
 /// Fetch a VCEK (DER) from AMD's Key Distribution Service. It is checked by [verify_vcek] like
-/// any other: KDS is not trusted.
+/// any other: KDS is not trusted. KDS rate-limits its clients: on 429 or 503 the request is
+/// repeated after `Retry-After` (or 2, 4, 8, 16 s), at most [KDS_ATTEMPTS] times.
 pub async fn fetch_vcek(product: Product, chip_id: &[u8], tcb: &Tcb) -> Result<Vec<u8>, String> {
     let url = kds_url(product, chip_id, tcb);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
         .map_err(|err| err.to_string())?;
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|err| format!("{url}: {err}"))?;
-    if !response.status().is_success() {
-        return Err(format!("{url}: {}", response.status()));
-    }
+    let mut attempt = 0;
+    let response = loop {
+        attempt += 1;
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|err| format!("{url}: {err}"))?;
+        let status = response.status();
+        if status.is_success() {
+            break response;
+        }
+        let throttled = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status == reqwest::StatusCode::SERVICE_UNAVAILABLE;
+        if !throttled || attempt >= KDS_ATTEMPTS {
+            return Err(format!("{url}: {status} (attempt {attempt})"));
+        }
+        let wait = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()?.trim().parse::<u64>().ok())
+            .unwrap_or(1 << attempt)
+            .min(KDS_MAX_WAIT_SECS);
+        tracing::warn!(%url, %status, wait, attempt, "AMD KDS is throttling: retrying");
+        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+    };
     response
         .bytes()
         .await

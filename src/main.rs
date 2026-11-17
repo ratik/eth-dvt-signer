@@ -431,6 +431,37 @@ fn identity(args: IdentityArgs) -> ! {
     }
 }
 
+/// `eth-mpc-signer snp-host-data`: print the `HOST_DATA` this SEV-SNP guest was launched with (hex),
+/// from a fresh report of its secure processor. The image compares it with its configuration's
+/// digest before it starts the node (integration/tee/image, `config`).
+#[derive(Parser)]
+#[command(name = "eth-mpc-signer snp-host-data")]
+struct SnpHostDataArgs {
+    /// The guest device of the AMD secure processor.
+    #[arg(long, default_value = eth_mpc_signer::attestation::snp::device::DEFAULT_PATH)]
+    snp_device: PathBuf,
+}
+
+fn snp_host_data(args: SnpHostDataArgs) -> ! {
+    use eth_mpc_signer::attestation::snp::{
+        device::{Device as _, GuestDevice},
+        report::Report,
+    };
+    let report = GuestDevice::new(&args.snp_device)
+        .report(&[0u8; 64])
+        .and_then(|raw| Report::parse(&raw));
+    match report {
+        Ok(report) => {
+            println!("{}", hex::encode(report.host_data()));
+            std::process::exit(0);
+        }
+        Err(err) => {
+            eprintln!("snp-host-data: {}: {err}", args.snp_device.display());
+            std::process::exit(1);
+        }
+    }
+}
+
 /// The node's keys, from its vault (`--peers`) or derived from its index (development).
 struct NodeKeys {
     signer: PrivateKey,
@@ -498,6 +529,9 @@ fn main() {
             .with_ansi(std::io::stderr().is_terminal())
             .init();
         identity(IdentityArgs::parse_from(argv.iter().skip(1)));
+    }
+    if argv.get(1).is_some_and(|arg| arg == "snp-host-data") {
+        snp_host_data(SnpHostDataArgs::parse_from(argv.iter().skip(1)));
     }
     let args = Args::parse_from(argv);
     tracing_subscriber::fmt()

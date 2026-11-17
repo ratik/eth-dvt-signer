@@ -312,14 +312,64 @@ A node's configuration does not change in an upgrade, so neither does its RTMR3.
   (`--gcp-sts-endpoint`, `--gcp-kms-endpoint`, `--gcp-metadata-endpoint`) can point at a fake. A
   fake issuer's tokens are worthless to the real STS and KMS.
 
-## The `sev-snp` platform (work in progress)
+## The `sev-snp` platform
 
 An AMD SEV-SNP guest on a server the operator owns or rents as bare metal: EPYC Milan (7003),
 Genoa (9004) or Turin (9005), with SNP enabled in the BIOS. No cloud service holds or releases
-anything. What exists so far: the vault, the evidence, and its checks in `mpc-admin attest`,
-`mpc-keytool split` and `mpc-gateway`. Not yet: the image, moving the keys to a new image, a run
-on SNP hardware.
+anything: the chip derives the sealing key, and the operator launches the guest with
+`integration/tee/snp/launch.sh`.
 
+What exists: the vault, the evidence and its checks (`mpc-admin attest`, `mpc-keytool split`,
+`mpc-gateway`), the image's SNP boot (below), its launch measurement, the launch script. Tested:
+the E2E tests with a fake chip (TEE-7); the image's direct boot under QEMU without SNP
+(`integration/tee/README.md`); the vault and evidence on real AMD hardware, in a GCP SEV-SNP VM
+(`integration/tee/gcp/snp-guest.sh`, below). Not yet: a launch of our image on SNP hardware (a
+server we control), so its measured boot, HOST_DATA and the four-node cluster on SNP are untested.
+
+- **On GCP** (`integration/tee/gcp/snp-guest.sh BIN RUN`, run of 2026-11-17, 12 checks pass).
+  An N2D SEV-SNP VM (AMD Milan, Ubuntu 26.04, Linux 7.0) runs the release `eth-mpc-signer` as
+  root. Google launches this guest, so its measurement is Google's firmware's and its HOST_DATA is
+  zero; what it shows is the guest side on real hardware:
+  - the guest runs at VMPL 0 with `/dev/sev-guest`; `snp-host-data` reads HOST_DATA from a report;
+  - `identity --vault sev-snp` makes a sealed vault and opens it again, also after a reboot (the
+    same keys);
+  - a `dek.wrapped` edited to another TCB version does not open;
+  - `mpc-admin check-statement` accepts the statements (VCEK from AMD's KDS, chained to the
+    pinned Milan ARK and ASK; the report binds the keys) and refuses another measurement.
+
+  AMD's KDS rate-limits: it answered 429 in the first run. `fetch_vcek` now waits and asks again
+  (`Retry-After`, at most 5 times).
+- **Boot.** The guest boots the image's kernel, initrd and command line directly, not through
+  GRUB and the UKI: the build takes them out of the UKI (`measure.py snp-boot`) and appends
+  `root=/dev/mapper/root` (no boot loader tells the initrd its disk). QEMU puts their SHA-256 in
+  the launch (`kernel-hashes=on`), and the firmware, OVMF's AmdSev build, refuses a kernel,
+  initrd or command line with other hashes. The command line carries the dm-verity root hash, so
+  the launch measurement covers the firmware, the kernel, the initrd and the whole root. The
+  image's disk is attached read-only.
+- **Measurement.** Each build computes it with virtee's `sev-snp-measure` for
+  `TEE_SNP_VCPUS` vCPUs of QEMU's `TEE_SNP_VCPU_TYPE` (`integration/tee/versions.env`):
+  `snp.measurement` in the build's `measurements`, the policy's `measurements`. Another vCPU count
+  or model is another measurement. The firmware is Ubuntu's `ovmf-amdsev` package (Debian builds
+  no AmdSev OVMF), pinned by the SHA-256 of the package and of the file.
+- **Configuration.** The configuration disk is as for the QEMU harness (`args`, `peers`, ...).
+  `launch.sh` launches the guest with the first 32 bytes of the configuration's digest as
+  `HOST_DATA` (`attestation::config::host_data`; `mpc-admin config-rtmr3` prints it as
+  `host_data`). Every report carries `HOST_DATA`. The image's `config` asks the device for a
+  report (`eth-mpc-signer snp-host-data`) and does not start the node unless its `HOST_DATA` is
+  the configuration's digest. A client that pins a node's `host_data` thus pins its
+  configuration, as `rtmr3` does on TDX. The device is the node's (udev:
+  `60-eth-mpc-sev-guest.rules`).
+- **Launch** (`integration/tee/snp/launch.sh BUILD CONFIG DATA`). QEMU 9.1 or later on a host
+  kernel with SNP host support (Linux 6.11 or later, `kvm_amd` `sev_snp=1`), with `/dev/kvm` and
+  `/dev/sev`. The guest policy is `0x30000` by default: no debugging, no migration agent. The
+  mTLS API and the p2p port are forwarded from the host (`SNP_API_LISTEN`, `SNP_P2P_LISTEN`); the
+  peers file names the host's p2p address. The script prints the `HOST_DATA` and the expected
+  measurement.
+- **Image upgrade.** A new image is a new measurement, so a new sealing key: the old vault does
+  not open under it. The way to a new image is to replace the node: a new node of the new image
+  makes its vault, and resharing gives it a share (R2, [resharing.md](resharing.md)); then the
+  old node is retired. Moving a vault to a new image in place (as `gcp-tdx` does, `upgrade.sh`)
+  is not done for `sev-snp`.
 - **Sealing** (`vault/snp.rs`). The guest device (`/dev/sev-guest`, `--snp-device`) derives a key
   from the chip's VCEK secret with `GUEST_FIELD_SELECT` = policy, measurement and TCB version.
   That key wraps the vault's data key in `dek.wrapped` (`eth-mpc-signer/dek-sev-snp`), with the
@@ -329,8 +379,7 @@ on SNP hardware.
   - The TCB version mixed in is the one committed when the vault was made, recorded in
     `dek.wrapped`. After a firmware or microcode update the device still derives the key for it,
     so the vault opens. An edited version gives another key; edited fields are refused.
-  - An image update changes the measurement, hence the key: the keys must move to the new image
-    first (not done yet).
+  - An image update changes the measurement, hence the key (Image upgrade, above).
 - **Evidence.** For `GET /attestation?nonce=<hex>`, the node asks the device for a report whose
   `REPORT_DATA` is the binding (above), then 32 zero bytes. The evidence is the report (base64,
   `token`) and, with `--snp-vcek FILE`, the chip's VCEK (DER, base64, `vcek`).
@@ -353,7 +402,7 @@ on SNP hardware.
   {"platform": "sev-snp", "products": ["Genoa"],
    "measurements": ["<launch measurement, hex>"],
    "min_tcb": {"boot_loader": 9, "tee": 0, "snp": 23, "microcode": 72},
-   "host_data": {"0": ["<node 0's configuration digest>"]},
+   "host_data": {"0": ["<node 0's host_data, from mpc-admin config-rtmr3>"]},
    "chip_ids": {"0": ["<node 0's chip ID>"]}}
   ```
 
