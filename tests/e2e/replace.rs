@@ -328,7 +328,7 @@ fn r2_e2e_1_permanent_loss_of_d() {
     let network = &r2.network;
     let g0 = dkg_status(network, 0, VALIDATOR);
 
-    let started = r2.start(1, "validator-r2-g1");
+    let started = r2.start(1, "approved.validator-r2-g1");
     assert_eq!(started["from_round"], g0["round"], "{started}");
     let sorted = |mut identities: Vec<String>| {
         identities.sort();
@@ -347,7 +347,7 @@ fn r2_e2e_1_permanent_loss_of_d() {
     };
     assert_eq!(listed("dealers"), sorted(r2.dealers()), "{started}");
     assert_eq!(listed("players"), sorted(r2.keyholders()), "{started}");
-    r2.wait(&KEYHOLDERS, "validator-r2-g1", "ready");
+    r2.wait(&KEYHOLDERS, "approved.validator-r2-g1", "ready");
     // Not activated yet: the generation of A, B, C, D signs (with A, B, C).
     signed(network, 1, &r2.key, &block(12, 1));
     for node in KEYHOLDERS {
@@ -356,10 +356,10 @@ fn r2_e2e_1_permanent_loss_of_d() {
             (0, VALIDATOR.to_string())
         );
     }
-    r2.activate("validator-r2-g1", 1);
+    r2.activate("approved.validator-r2-g1", 1);
 
     // The same public key, byte for byte; every verification share and the generation changed.
-    let g1 = dkg_status(network, E, "validator-r2-g1");
+    let g1 = dkg_status(network, E, "approved.validator-r2-g1");
     assert_eq!(g1["public_key"], json!(r2.key));
     assert_eq!(g1["public_key"], g0["public_key"]);
     assert_ne!(g1["generation_id"], g0["generation_id"]);
@@ -374,7 +374,7 @@ fn r2_e2e_1_permanent_loss_of_d() {
     // Every new keyholder holds its share; A, B, C erased their old ones; E never had one.
     for node in KEYHOLDERS {
         assert_eq!(
-            dkg_status(network, node, "validator-r2-g1")["share"],
+            dkg_status(network, node, "approved.validator-r2-g1")["share"],
             "stored"
         );
     }
@@ -406,11 +406,11 @@ fn r2_e2e_1_permanent_loss_of_d() {
 fn r2_e2e_2_the_replacement_signs_in_place_of_c() {
     let r2 = replacement();
     let network = &r2.network;
-    r2.replace_and_activate("validator-r2-g1");
+    r2.replace_and_activate("approved.validator-r2-g1");
 
     let height = network.height(C).unwrap();
-    r2.signed_with_e("validator-r2-g1", &block(20, 1));
-    r2.signed_with_e("validator-r2-g1", &attestation(5, 6, 1));
+    r2.signed_with_e("approved.validator-r2-g1", &block(20, 1));
+    r2.signed_with_e("approved.validator-r2-g1", &attestation(5, 6, 1));
     // C voted for those authorizations (no quorum without it), and still follows.
     assert!(network.height(C).unwrap() > height);
     assert!(network.count(C, "test hook: not answering a signing request") > 0);
@@ -426,7 +426,7 @@ fn r2_e2e_2_the_replacement_signs_in_place_of_c() {
     // E back: the authorized duty is signed (the same authorization), with E's share.
     network.start_node(E);
     network.wait_for_ready(&[E]);
-    r2.signed_with_e("validator-r2-g1", &block(21, 1));
+    r2.signed_with_e("approved.validator-r2-g1", &block(21, 1));
 }
 
 /// R2-E2E-3: E restarts after the activation (and after missing blocks), recovers its share from
@@ -435,13 +435,13 @@ fn r2_e2e_2_the_replacement_signs_in_place_of_c() {
 fn r2_e2e_3_the_replacement_restarts() {
     let r2 = replacement();
     let network = &r2.network;
-    r2.replace_and_activate("validator-r2-g1");
-    r2.signed_with_e("validator-r2-g1", &block(30, 1));
+    r2.replace_and_activate("approved.validator-r2-g1");
+    r2.signed_with_e("approved.validator-r2-g1", &block(30, 1));
 
     network.restart_node(E);
     network.wait_for_ready(&[E]);
     assert!(network.log(E).contains("loaded key share"));
-    r2.signed_with_e("validator-r2-g1", &block(31, 1));
+    r2.signed_with_e("approved.validator-r2-g1", &block(31, 1));
 
     // Down while blocks are finalized, then back.
     network.stop_node(E);
@@ -450,7 +450,7 @@ fn r2_e2e_3_the_replacement_restarts() {
     }
     network.start_node(E);
     network.wait_for_ready(&[E]);
-    r2.signed_with_e("validator-r2-g1", &block(35, 1));
+    r2.signed_with_e("approved.validator-r2-g1", &block(35, 1));
 }
 
 /// E crashes at `point` of the replacement, restarts without the hook, and the replacement
@@ -464,11 +464,11 @@ fn e_crashes_at(point: &str) {
         }
     });
     let network = &r2.network;
-    let started = r2.start(0, "validator-r2-g1");
+    let started = r2.start(0, "approved.validator-r2-g1");
     if point == "after-apply-activation" {
-        r2.wait(&[0, 1, 2], "validator-r2-g1", "ready");
+        r2.wait(&[0, 1, 2], "approved.validator-r2-g1", "ready");
         let (status, activated) =
-            generation_call(network, 0, "activate", &r2.key, "validator-r2-g1");
+            generation_call(network, 0, "activate", &r2.key, "approved.validator-r2-g1");
         assert_eq!(status, 200, "{activated}");
     }
     assert!(!network.wait_exit(E).success());
@@ -476,21 +476,26 @@ fn e_crashes_at(point: &str) {
     // The generation of A, B, C, D still signs meanwhile, unless already replaced.
     if point != "after-apply-activation" {
         signed(network, 1, &r2.key, &block(40, 1));
-        let status = reshare_status(network, 0, "validator-r2-g1");
+        let status = reshare_status(network, 0, "approved.validator-r2-g1");
         assert_ne!(status["status"], "active", "{status}");
     }
     network.restart_node_with(E, Vec::new());
     network.wait_for_ready(&[E]);
     if point == "after-apply-activation" {
-        wait_generation(network, &KEYHOLDERS, &r2.key, (1, "validator-r2-g1"));
+        wait_generation(
+            network,
+            &KEYHOLDERS,
+            &r2.key,
+            (1, "approved.validator-r2-g1"),
+        );
     } else {
-        r2.activate("validator-r2-g1", 1);
+        r2.activate("approved.validator-r2-g1", 1);
     }
     assert_eq!(
-        reshare_status(network, E, "validator-r2-g1")["round"],
+        reshare_status(network, E, "approved.validator-r2-g1")["round"],
         started["round"]
     );
-    r2.signed_with_e("validator-r2-g1", &block(41, 1));
+    r2.signed_with_e("approved.validator-r2-g1", &block(41, 1));
 }
 
 /// Before receiving its new share (it crashes when it joins the ceremony).
@@ -537,7 +542,7 @@ fn r2_e2e_4_invalid_or_stale_membership() {
     let (d, f) = (seeded(D as u64), seeded(5));
     let post = |body: Value| network.approved(0, "reshare", body);
     let with = |dealers: Vec<&String>, players: Vec<&String>| {
-        let mut body = r2.body("validator-r2-bad", &[]);
+        let mut body = r2.body("approved.validator-r2-bad", &[]);
         body["dealers"] = json!(dealers);
         body["players"] = json!(players);
         body
@@ -562,7 +567,7 @@ fn r2_e2e_4_invalid_or_stale_membership() {
     }
     // Empty sets never reach consensus (a command with one would not decode).
     for field in ["dealers", "players"] {
-        let mut empty = r2.body("validator-r2-bad", &ids);
+        let mut empty = r2.body("approved.validator-r2-bad", &ids);
         empty[field] = json!([]);
         let (status, refused) = post(empty);
         assert_eq!(status, 400, "{refused}");
@@ -571,10 +576,10 @@ fn r2_e2e_4_invalid_or_stale_membership() {
             "{refused}"
         );
     }
-    let mut partial = r2.body("validator-r2-bad", &ids);
+    let mut partial = r2.body("approved.validator-r2-bad", &ids);
     partial.as_object_mut().unwrap().remove("dealers");
     assert_eq!(post(partial).0, 400);
-    let mut stale = r2.body("validator-r2-bad", &ids);
+    let mut stale = r2.body("approved.validator-r2-bad", &ids);
     stale["from_round"] = json!(99);
     let (status, refused) = post(stale);
     assert_eq!(status, 409, "{refused}");
@@ -592,7 +597,10 @@ fn r2_e2e_4_invalid_or_stale_membership() {
 
     // An unapproved replacement identity (F, approved by no operator): accepted by consensus,
     // dealt by nobody. No dealer log, no dealing; then aborted, the old generation signs.
-    let (status, started) = post(r2.body("validator-r2-f", &[a.clone(), b.clone(), c.clone(), f]));
+    let (status, started) = post(r2.body(
+        "approved.validator-r2-f",
+        &[a.clone(), b.clone(), c.clone(), f],
+    ));
     assert_eq!(status, 200, "{started}");
     let round = started["round"].as_u64().unwrap();
     for node in 0..3 {
@@ -607,7 +615,7 @@ fn r2_e2e_4_invalid_or_stale_membership() {
     network.wait_until("blocks after the start", || {
         network.height(0).is_some_and(|height| height >= at + 4)
     });
-    let status = reshare_status(network, 0, "validator-r2-f");
+    let status = reshare_status(network, 0, "approved.validator-r2-f");
     assert_eq!(status["status"], "in_progress", "{status}");
     assert_eq!(status["dealer_logs"], json!([]), "{status}");
     for node in 0..3 {
@@ -615,7 +623,7 @@ fn r2_e2e_4_invalid_or_stale_membership() {
             line.contains("submitting dealer log") && line.contains(&format!("round={round}"))
         }));
     }
-    let (code, aborted) = generation_call(network, 1, "abort", &r2.key, "validator-r2-f");
+    let (code, aborted) = generation_call(network, 1, "abort", &r2.key, "approved.validator-r2-f");
     assert_eq!(code, 200, "{aborted}");
     signed(network, 2, &r2.key, &block(50, 1));
 
@@ -624,7 +632,7 @@ fn r2_e2e_4_invalid_or_stale_membership() {
     // approvals, and with its approvals, for its used nonce (P0); through the API, `409`.
     let approved = network.signed(
         "reshare",
-        r2.body("validator-r2-g1", &r2.keyholders()),
+        r2.body("approved.validator-r2-g1", &r2.keyholders()),
         network.next_nonce(),
         &[0, 1],
     );
@@ -652,7 +660,7 @@ fn r2_e2e_4_invalid_or_stale_membership() {
                 .unwrap()
                 .try_into()
                 .unwrap(),
-            ceremony: eth_mpc_signer::dkg::CeremonyId::new("validator-r2-g1").unwrap(),
+            ceremony: eth_mpc_signer::dkg::CeremonyId::new("approved.validator-r2-g1").unwrap(),
             membership: Some(Box::new(membership)),
         },
     }
@@ -664,7 +672,7 @@ fn r2_e2e_4_invalid_or_stale_membership() {
     }
     .encode()
     .to_vec();
-    r2.wait(&KEYHOLDERS, "validator-r2-g1", "ready");
+    r2.wait(&KEYHOLDERS, "approved.validator-r2-g1", "ready");
     network.wait_until("node 0 to ignore the replays", || {
         peer.send_on(engine::MEMPOOL_CHANNEL, 0, d_ack.clone());
         peer.send_on(engine::MEMPOOL_CHANNEL, 0, bare.clone());
@@ -689,15 +697,15 @@ fn r2_e2e_4_invalid_or_stale_membership() {
             .any(|line| line.contains("applied reshare start") && line.contains("Exists")),
         "a replay applied"
     );
-    let status = reshare_status(network, 0, "validator-r2-g1");
+    let status = reshare_status(network, 0, "approved.validator-r2-g1");
     assert_eq!(
         status["ready_shares"].as_array().unwrap().len(),
         4,
         "{status}"
     );
-    r2.activate("validator-r2-g1", 1);
+    r2.activate("approved.validator-r2-g1", 1);
     // The replaced generation is no longer the active one: a new start naming it is stale.
-    let (status, refused) = r2.replace(0, "validator-r2-g2");
+    let (status, refused) = r2.replace(0, "approved.validator-r2-g2");
     assert_eq!(status, 409, "{refused}");
     assert!(
         refused["error"]
@@ -705,7 +713,7 @@ fn r2_e2e_4_invalid_or_stale_membership() {
             .unwrap()
             .contains("not the key's active generation")
     );
-    r2.signed_with_e("validator-r2-g1", &block(51, 1));
+    r2.signed_with_e("approved.validator-r2-g1", &block(51, 1));
 }
 
 /// R2-E2E-5: a replacement interrupted before its activation (E down mid-ceremony) is aborted;
@@ -720,20 +728,21 @@ fn r2_e2e_5_aborted_replacement() {
         }
     });
     let network = &r2.network;
-    r2.start(0, "validator-r2-g1");
+    r2.start(0, "approved.validator-r2-g1");
     assert!(!network.wait_exit(E).success());
     std::thread::sleep(Duration::from_secs(2));
-    let status = reshare_status(network, 0, "validator-r2-g1");
+    let status = reshare_status(network, 0, "approved.validator-r2-g1");
     assert_eq!(status["status"], "in_progress", "{status}");
-    let (code, early) = generation_call(network, 0, "activate", &r2.key, "validator-r2-g1");
+    let (code, early) =
+        generation_call(network, 0, "activate", &r2.key, "approved.validator-r2-g1");
     assert_eq!(
         (code, early["refusal"]["reason"].as_str()),
         (409, Some("not_completed")),
         "{early}"
     );
-    let (code, aborted) = generation_call(network, 1, "abort", &r2.key, "validator-r2-g1");
+    let (code, aborted) = generation_call(network, 1, "abort", &r2.key, "approved.validator-r2-g1");
     assert_eq!(code, 200, "{aborted}");
-    r2.wait(&[0, 1, 2], "validator-r2-g1", "aborted");
+    r2.wait(&[0, 1, 2], "approved.validator-r2-g1", "aborted");
 
     // The old generation, with A, B and C (D lost, E not a keyholder of it): C's share is needed.
     let body = block(60, 1);
@@ -749,10 +758,10 @@ fn r2_e2e_5_aborted_replacement() {
     // E back (it learns of the abort, its dealings of that round erased), then a new replacement.
     network.restart_node_with(E, Vec::new());
     network.wait_for_ready(&[E]);
-    r2.wait(&[E], "validator-r2-g1", "aborted");
-    r2.start(0, "validator-r2-g2");
-    r2.activate("validator-r2-g2", 1);
-    r2.signed_with_e("validator-r2-g2", &block(61, 1));
+    r2.wait(&[E], "approved.validator-r2-g1", "aborted");
+    r2.start(0, "approved.validator-r2-g2");
+    r2.activate("approved.validator-r2-g2", 1);
+    r2.signed_with_e("approved.validator-r2-g2", &block(61, 1));
 }
 
 /// R2-E2E-6: slashing protection across the replacement, for a DKG key (its whole history) and an
@@ -763,7 +772,7 @@ fn r2_e2e_6_slashing_protection_continuity() {
     let r2 = replacement();
     let network = &r2.network;
     let first = network.eth2_sign(0, &r2.key, &block(10, 1)).1["signature"].clone();
-    r2.replace_and_activate("validator-r2-g1");
+    r2.replace_and_activate("approved.validator-r2-g1");
     r2.c_signs(false);
     assert_eq!(signed(network, 1, &r2.key, &block(10, 1)), first);
     refused(network, 0, &r2.key, &block(10, 2), "double_proposal");
@@ -783,7 +792,7 @@ fn r2_e2e_6_slashing_protection_continuity() {
         "surrounded_by_signed",
     );
     r2.c_signs(true);
-    r2.signed_with_e("validator-r2-g1", &block(70, 1));
+    r2.signed_with_e("approved.validator-r2-g1", &block(70, 1));
     drop(r2);
 
     // Imported key, with an imported history (floors at slot 100, epochs 10 and 11).
@@ -845,13 +854,13 @@ fn r2_e2e_6_slashing_protection_continuity() {
         &block(102, 1),
     );
     let network = &r2.network;
-    r2.replace_and_activate("imported-r2");
+    r2.replace_and_activate("approved.imported-r2");
     let reshared = activation(network, 0, IMPORTED_KEY).unwrap();
     assert_eq!(reshared["origin"], "imported", "{reshared}");
     // Still the original key's signatures, now with E's share in C's place.
     let after = block(103, 1);
     assert_eq!(
-        r2.signed_with_e("imported-r2", &after),
+        r2.signed_with_e("approved.imported-r2", &after),
         json!(original_signature(&signing_root(&after)))
     );
     // The imported floors and the import state stay.

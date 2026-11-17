@@ -315,6 +315,13 @@ struct Args {
     #[arg(long)]
     approvers: Option<PathBuf>,
 
+    /// The trusted clock (`docs/ethereum-signing.md`, trusted time): a Roughtime configuration
+    /// (JSON, `eth-mpc-signer/roughtime`; `config/roughtime.json` lists public servers). The
+    /// node syncs before it starts, and signs nothing time-bound without the quorum's time.
+    /// Without it, the time checks use the host's clock, which the host can move.
+    #[arg(long)]
+    roughtime: Option<PathBuf>,
+
     /// The WORM anchor (`docs/anchor.md`): `s3://bucket/prefix`, `gs://bucket/prefix` or
     /// `file:///directory`, the same on every node, outside every node's data directory and
     /// backups. Each keyholder writes a record there before it signs past its previous one; a
@@ -668,8 +675,46 @@ fn main() {
     std::fs::set_permissions(&storage, std::fs::Permissions::from_mode(0o700))
         .expect("failed to restrict data directory permissions");
 
+    let roughtime = args.roughtime.as_ref().map(|path| {
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|err| refuse(format!("--roughtime {}: {err}", path.display())));
+        eth_mpc_signer::clock::Config::from_json(&text)
+            .unwrap_or_else(|err| refuse(format!("--roughtime {}: {err}", path.display())))
+    });
+    if roughtime.is_none() && kind.is_sealed() {
+        warn!(
+            "a sealed vault without --roughtime: the time checks use the host's clock, which the \
+             host can move (docs/ethereum-signing.md, trusted time)"
+        );
+    }
+
     let runtime = tokio::Runner::new(tokio::Config::new().with_storage_directory(&storage));
     runtime.start(|context| async move {
+        // The trusted clock: synced before anything time-bound starts (the restart floor is
+        // computed from its first sync), then kept in sync.
+        if let Some(config) = roughtime {
+            let clock = std::sync::Arc::new(eth_mpc_signer::clock::Clock::new(config));
+            let mut wait = std::time::Duration::from_secs(1);
+            loop {
+                match clock.sync().await {
+                    Ok(time) => {
+                        info!(
+                            ?time,
+                            quorum = clock.config().quorum,
+                            "trusted clock: synced"
+                        );
+                        break;
+                    }
+                    Err(err) => {
+                        warn!(%err, "trusted clock: no agreement yet, retrying");
+                        ::tokio::time::sleep(wait).await;
+                        wait = (wait * 3 / 2).min(std::time::Duration::from_secs(60));
+                    }
+                }
+            }
+            eth_mpc_signer::clock::install(clock.clone()).unwrap_or_else(|err| refuse(err));
+            ::tokio::spawn(clock.keep_synced());
+        }
         let NodeKeys {
             signer,
             share_key,

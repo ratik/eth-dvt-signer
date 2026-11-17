@@ -452,7 +452,7 @@ fn keytool_splits_a_keystore_into_four_encrypted_shares() {
     std::fs::write(path("password"), PASSWORD).unwrap();
     std::fs::write(path("wrong-password"), "wrong").unwrap();
 
-    let split = |password: &str, output: &str| {
+    let split_as = |ceremony: &str, password: &str, output: &str| {
         keytool(&[
             "split",
             "--keystore",
@@ -462,11 +462,25 @@ fn keytool_splits_a_keystore_into_four_encrypted_shares() {
             "--committee",
             &path("committee.json"),
             "--ceremony-id",
-            "imported-01",
+            ceremony,
             "--output",
             &path(output),
         ])
     };
+    let split = |password: &str, output: &str| split_as("approved.imported-01", password, output);
+
+    // An imported key's ceremony id must be reserved (audit H-11), and the tool says so before
+    // it reads the keystore: the envelopes bind the id, so a split the network would refuse
+    // would have to be made again.
+    let unreserved = split_as("imported-01", "password", "unreserved");
+    assert!(!unreserved.status.success());
+    assert!(
+        String::from_utf8_lossy(&unreserved.stderr).contains("must start with approved."),
+        "{}",
+        String::from_utf8_lossy(&unreserved.stderr)
+    );
+    assert!(!dir.join("unreserved").exists());
+
     let refused = split("wrong-password", "refused");
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("wrong password"));

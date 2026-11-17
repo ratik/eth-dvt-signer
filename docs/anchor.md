@@ -97,6 +97,12 @@ At start, before anything runs, a node reads the anchor (20 s at most, `ANCHOR_R
 It leaves out a record of another cluster, and a node whose records do not verify (a faulty
 writer). If its own records do not verify, it starts degraded.
 
+The nodes are read at once, each with its own deadline (10 s, `ANCHOR_NODE_TIMEOUT`), and a node
+is left out whatever went wrong with it: a malformed record, an error, or no answer in time.
+Otherwise one node would decide the anchor for everyone, which is what the rules below are built
+not to allow. A node's own place in the store is its own to fill, so what it writes there (junk,
+a record at the last possible sequence) must cost that node's chain only.
+
 The rules assume at most one faulty node (consensus's `f`, `anchor::FAULTY`). A signature needs
 three keyholders. Each of them writes a record that covers the duty before it gives its partial. So the
 records of at least two honest nodes cover every signed duty. The rules below use that: one faulty
@@ -291,6 +297,9 @@ Every node stops. Supervisors must not restart them in a loop. Then:
    - A node started with it checks the approvals. It writes the acknowledgment to
      `<cluster>/acknowledgments/<generation>-<hash>` (create-only), then continues in the new
      generation. If the anchor does not take the write within 20 s, the node does not start.
+   - The node goes by the document it checked itself, never by what is at that place. Anyone who
+     can write to the anchor can take the name first, with a copy that carries no valid approval,
+     and WORM means the name can never be reused. Such a copy only makes the node warn.
    - Readers compare only the records of the highest acknowledged generation. They keep the marks
      of every acknowledgment.
    - No block or attestation signed before the rollback can be signed again differently: the

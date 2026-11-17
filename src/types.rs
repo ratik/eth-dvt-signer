@@ -2,7 +2,7 @@
 
 use crate::{
     dkg::{
-        CeremonyConfig, CeremonyId, MAX_PARTICIPANTS,
+        CeremonyConfig, CeremonyId, MAX_PARTICIPANTS, RESERVED_PREFIX,
         ceremony::{Membership, ReadyAck, SignedLog},
     },
     eth::{
@@ -161,6 +161,38 @@ impl Command {
                     | Self::RegisterImportedKey(_)
                     | Self::SetRegistrationPolicy(_)
             ),
+        }
+    }
+
+    /// The ceremony this command starts, if it starts one.
+    pub fn started_ceremony(&self) -> Option<&CeremonyId> {
+        match self {
+            Self::StartCeremony(config) | Self::StartValidatorCeremony(config) => Some(&config.id),
+            Self::StartResharing { ceremony, .. } => Some(ceremony),
+            Self::RegisterImportedKey(manifest) => Some(&manifest.ceremony),
+            _ => None,
+        }
+    }
+
+    /// Whether the ceremony this command starts may have its id: a protected command starts only
+    /// a reserved one ([RESERVED_PREFIX]), and no other command starts one (audit H-11). The
+    /// leader and the voters check it (`application::Rules`); the state machine does not, so the
+    /// history from before it applies as it did.
+    pub fn ceremony_id_rule(&self) -> Result<(), String> {
+        let Some(id) = self.started_ceremony() else {
+            return Ok(());
+        };
+        match (self.is_protected(), id.is_reserved()) {
+            (true, false) => Err(format!(
+                "a protected command starts ceremony {}: its id must start with {RESERVED_PREFIX}",
+                id.as_str()
+            )),
+            (false, true) => Err(format!(
+                "ceremony id {} is reserved for protected commands (it starts with \
+                 {RESERVED_PREFIX})",
+                id.as_str()
+            )),
+            _ => Ok(()),
         }
     }
 

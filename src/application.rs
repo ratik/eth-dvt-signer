@@ -340,19 +340,23 @@ pub struct Rules {
 
 impl Rules {
     /// Whether `transaction` may enter a new block, the nonce aside: not a bare protected
-    /// command, and if approved, approved here.
+    /// command, and if approved, approved here; a ceremony it starts has an id of its kind
+    /// (`Command::ceremony_id_rule`: reserved ids are the protected commands', and only theirs).
     fn authorized(&self, transaction: &Transaction) -> Result<(), String> {
         match &transaction.command {
             command if command.is_protected() => {
                 Err("a protected command without approvals".into())
             }
-            Command::Admin(authorized) => match &self.admin {
-                None => Err("a protected command, and this node has no approver set".into()),
-                Some(admin) => admin
-                    .verify(authorized)
-                    .map_err(|reason| format!("a protected command: {reason}")),
-            },
-            _ => Ok(()),
+            Command::Admin(authorized) => {
+                authorized.command.ceremony_id_rule()?;
+                match &self.admin {
+                    None => Err("a protected command, and this node has no approver set".into()),
+                    Some(admin) => admin
+                        .verify(authorized)
+                        .map_err(|reason| format!("a protected command: {reason}")),
+                }
+            }
+            command => command.ceremony_id_rule(),
         }
     }
 }
@@ -633,7 +637,8 @@ where
             context.sleep(IDLE_POLL).await;
         }
 
-        let now = hooks::clock(context.current());
+        // No trusted time: no time-bound transaction (`clock::now_or_refuse`).
+        let now = crate::clock::now_or_refuse(context.current());
         let (registrations, selected): (Vec<_>, Vec<_>) = self
             .admissible(self.mempool.select(&in_flight), now)
             .into_iter()
@@ -677,7 +682,8 @@ where
             return false;
         };
         let (block, parent) = (block.inner_shared(), parent.inner_shared());
-        let now = hooks::clock(context.current());
+        // No trusted time: a block with a time-bound transaction gets no vote.
+        let now = crate::clock::now_or_refuse(context.current());
         for transaction in &block.transactions {
             // A duty under a domain this network's fork schedule does not give it (P0.3).
             if let Err(wrong) = self.rules.horizon.command_fork(&transaction.command) {

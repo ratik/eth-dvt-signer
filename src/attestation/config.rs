@@ -60,6 +60,7 @@ const FILE_FLAGS: &[&str] = &[
     "--approvers",
     "--approved-reshares",
     "--anchor-acknowledgment",
+    "--roughtime",
     "--share-encryption-key",
     "--gcp-token-socket",
 ];

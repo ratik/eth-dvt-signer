@@ -19,7 +19,7 @@ use std::{
 pub(crate) const PASSWORD: &str = "𝔱𝔢𝔰𝔱𝔭𝔞𝔰𝔰𝔴𝔬𝔯𝔡🔑";
 const SECRET: &str = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
 pub(crate) const PUBKEY: &str = "0x9612d7a727c9d0a22e185a1c768478dfe919cada9266988cb32359c11f2b7b27f4ae4040902382ae2910c15e2b420d07";
-pub(crate) const CEREMONY: &str = "imported-validator";
+pub(crate) const CEREMONY: &str = "approved.imported-validator";
 
 pub(crate) const ACKNOWLEDGED: &str = r#"{"previous_signer_stopped": true, "no_other_active_signer": true, "history_exported_after_stop": true, "automatic_restart_disabled": true}"#;
 
@@ -198,6 +198,15 @@ fn e2e_imp_1_an_imported_key_signs_only_once_safely_activated() {
     let (manifest, envelopes) = split(&network, &dir, CEREMONY, "shares");
     assert_eq!(manifest["validator_public_key"], PUBKEY);
 
+    // The manifest names its ceremony id in public, before the approvers sign. An unprotected
+    // ceremony cannot take that id first (audit H-11): it is reserved for protected commands.
+    let (code, answer) = network.post(
+        0,
+        "/dkg/start",
+        &json!({ "ceremony_id": CEREMONY, "validator": true }),
+    );
+    assert_eq!(code, 400, "the import's id taken first: {answer}");
+
     // Nothing to install into before the registration.
     let (code, answer) = network.post(0, "/keys/import/share", &envelopes[0]);
     assert_eq!(code, 404, "{answer}");
@@ -219,7 +228,7 @@ fn e2e_imp_1_an_imported_key_signs_only_once_safely_activated() {
     let (resplit, _) = split(&network, &dir, CEREMONY, "resplit");
     let (code, answer) = register(0, &resplit);
     assert_eq!(code, 409, "same id, other split: {answer}");
-    let (other_id, _) = split(&network, &dir, "imported-elsewhere", "other-id");
+    let (other_id, _) = split(&network, &dir, "approved.imported-elsewhere", "other-id");
     let (code, answer) = register(0, &other_id);
     assert_eq!(code, 409, "same key, other id: {answer}");
     let mut tampered = manifest.clone();

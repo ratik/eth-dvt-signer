@@ -5,7 +5,7 @@
 //! ```sh
 //! mpc-keytool share-key --out node-0.share-key.json            # on each node
 //! mpc-keytool split --keystore keystore.json --committee committee.json \
-//!     --ceremony-id imported-validator-01 --output validator-shares
+//!     --ceremony-id approved.imported-validator-01 --output validator-shares
 //! mpc-keytool inspect --manifest validator-shares/manifest.json
 //! ```
 //!
@@ -70,7 +70,9 @@ enum Command {
         /// The committee: every member's identity and share-encryption key.
         #[arg(long)]
         committee: PathBuf,
-        /// Ceremony id the key is registered under (unique in the network).
+        /// Ceremony id the key is registered under (unique in the network). It must start
+        /// with `approved.`: only protected commands may start such ceremonies, so nobody
+        /// can take the id first (docs/key-import.md).
         #[arg(long)]
         ceremony_id: String,
         /// Directory to create for `manifest.json` and `node-<index>.enc`.
@@ -250,6 +252,16 @@ fn split(
     output: &Path,
 ) -> Result<(), String> {
     let ceremony = CeremonyId::new(ceremony_id).map_err(|err| err.to_string())?;
+    // Checked before anything else: the envelopes bind the id, so a split under an id the
+    // network refuses would have to be made again, from the keystore.
+    if !ceremony.is_reserved() {
+        return Err(format!(
+            "--ceremony-id {}: an imported key's ceremony id must start with {} (only an \
+             approved registration may start such a ceremony, so nobody can take the id first)",
+            ceremony.as_str(),
+            eth_mpc_signer::dkg::RESERVED_PREFIX
+        ));
+    }
     // Before the keystore is even read: no share is made for keys that are not attested.
     let members = read_committee(committee, attestation)?;
     let identities: Set<PublicKey> = members

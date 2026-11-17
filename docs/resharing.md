@@ -5,8 +5,13 @@ Two operations use the same protocol:
 
 | Operation | Dealers | Players |
 | --- | --- | --- |
-| **R1**: refresh the shares within the committee | A, B, C, D | A, B, C, D |
+| **R1**: refresh the keyholders' shares | the keyholders | the same keyholders |
 | **R2**: replace a permanently lost keyholder ([below](#r2-replacing-a-lost-keyholder)) | A, B, C | A, B, C, E |
+
+Before any R2 the keyholders are the committee, A, B, C, D. After an R2 they are A, B, C, E
+until R3 makes E a voter, and an R1 then refreshes A, B, C, E: it never deals to the committee,
+which still names D. Dealing to the committee would give D, the node R2 removed, a share of
+the new generation, and R1 is not a protected command (audit H-10).
 
 A reshare:
 
@@ -400,7 +405,7 @@ anything before the replacement.
 ```json
 {
   "public_key": "0x<validator key>",
-  "ceremony_id": "validator-eth-r2",
+  "ceremony_id": "approved.validator-eth-r2",
   "from_round": 0,
   "dealers": ["0x<A>", "0x<B>", "0x<C>"],
   "players": ["0x<A>", "0x<B>", "0x<C>", "0x<E>"]
@@ -417,6 +422,7 @@ membership deterministically, from committed state only:
 | At least that generation's threshold of dealers (3) | `too_few_dealers` (`400`) |
 | Exactly as many players as the committee has members (4), each once; the threshold stays the committee's (3) | `player_count` (`400`). The API refuses a repeated or malformed identity |
 | The same id again: the same key, generation, dealers and players | otherwise `conflict` (`409`) |
+| The id starts with `approved.`, the prefix only protected commands may start (audit H-11); an R1 never takes it | `400`; leaders and voters refuse it |
 
 Players need not be committee members, and consensus membership is never derived from them. The
 cryptography is commonware's, unchanged:
@@ -435,7 +441,7 @@ dealing, and players refuse its messages.
 ### Local approval of new keyholders
 
 A reshare to new keyholders hands a key's shares to other identities. Two gates protect it. An R1
-refresh within the committee needs neither.
+refresh of the keyholders' own shares needs neither: it cannot change who holds the key.
 
 1. **The approvers (replicated).** A reshare to new keyholders is a protected operation
    ([administration.md](administration.md)). Honest leaders and voters accept the `StartResharing`

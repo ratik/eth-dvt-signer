@@ -151,3 +151,61 @@ fn registration_policy_encoding() {
     unsorted[22..42].copy_from_slice(&[1; 20]);
     assert!(Command::decode(commonware_codec::Copying(unsorted.as_slice())).is_err());
 }
+
+/// Reserved ceremony ids are the protected commands' (an imported key's registration, a
+/// replacement of keyholders), and theirs only: an unprotected start cannot take the id an
+/// approved one names in advance (audit H-11). A command that starts no ceremony is not concerned.
+#[test]
+fn reserved_ceremony_ids_are_the_protected_commands_only() {
+    use commonware_cryptography::{
+        Signer as _,
+        ed25519::{PrivateKey, PublicKey},
+    };
+    use commonware_utils::{TryCollect as _, ordered::Set};
+    let keys = |seeds: &[u64]| -> Set<PublicKey> {
+        seeds
+            .iter()
+            .map(|seed| PrivateKey::from_seed(*seed).public_key())
+            .try_collect()
+            .unwrap()
+    };
+    let id = |name: &str| CeremonyId::new(name).unwrap();
+    let dkg =
+        |name: &str| Command::StartCeremony(CeremonyConfig::new(id(name), keys(&[0, 1, 2, 3])));
+    let validator = |name: &str| {
+        Command::StartValidatorCeremony(CeremonyConfig::new(id(name), keys(&[0, 1, 2, 3])))
+    };
+    let replacement = Membership {
+        from: 3,
+        dealers: keys(&[0, 1, 2]),
+        players: keys(&[0, 1, 2, 4]),
+    };
+    let reshare = |name: &str, membership: Option<&Membership>| Command::StartResharing {
+        validator: [5; 48],
+        ceremony: id(name),
+        membership: membership.cloned().map(Box::new),
+    };
+
+    for allowed in [
+        dkg("key-1"),
+        validator("validator-1"),
+        reshare("g1", None),
+        reshare("approved.g1", Some(&replacement)),
+    ] {
+        assert!(allowed.ceremony_id_rule().is_ok(), "{allowed:?}");
+    }
+    for refused in [
+        dkg("approved.key-1"),
+        validator("approved.validator-1"),
+        reshare("approved.g1", None),
+        reshare("g1", Some(&replacement)),
+    ] {
+        assert!(refused.ceremony_id_rule().is_err(), "{refused:?}");
+    }
+    let sign = Command::Sign(SignRequest {
+        ceremony: id("approved.key-1"),
+        nonce: 1,
+        payload_hash: [0; 32],
+    });
+    assert!(sign.ceremony_id_rule().is_ok());
+}

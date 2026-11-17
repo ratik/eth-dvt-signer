@@ -195,12 +195,26 @@ pub enum SignError {
     /// The client's signing root is not the one of the duty it sent.
     #[error("the supplied signing root does not match the duty (computed {})", format_root(.0))]
     RootMismatch(Root),
+    /// The authorization that came back is not this duty's. Waiters are keyed by the transaction
+    /// id its submitter chose, and that id travels in gossip, so another transaction in the
+    /// block that carried this one can take its place. Nothing is signed, and a retry (here or
+    /// on another node) gets its own authorization.
+    #[error(
+        "the authorization that came back is not this duty's (the duty's root is {}, the \
+         authorized one {}): retry",
+        format_root(.duty),
+        format_root(.authorized)
+    )]
+    WrongAuthorization { duty: Root, authorized: Root },
     /// Slashing protection (or another rule of the replicated state) refuses the duty.
     #[error("refused by slashing protection: {0}")]
     Refused(DutyRefusal),
     /// The duty is new and beyond this node's time horizon (`eth::horizon`): not submitted.
     #[error("{0}")]
     Beyond(Beyond),
+    /// The duty is new and this node has no trusted time (`clock`): not submitted.
+    #[error("{0}")]
+    Clock(crate::clock::Unavailable),
     /// A voluntary exit or a deposit whose signing root is not approved, sent without the
     /// approvers' authorization (P0.2): not submitted.
     #[error(
@@ -745,7 +759,7 @@ async fn sign_duty<E: Clock, S: Sender<PublicKey = PublicKey>>(
     registration::check_duty(
         check.policy.as_ref(),
         &request.duty,
-        hooks::clock(context.current()),
+        crate::clock::now_or_refuse(context.current()),
         Horizon::ADMISSION,
     )
     .map_err(SignError::Registration)?;
@@ -764,12 +778,9 @@ async fn sign_duty<E: Clock, S: Sender<PublicKey = PublicKey>>(
             // A new authorization: nothing beyond the horizon is submitted (voters refuse it
             // too). A committed one above was decided already.
             if !hooks::no_horizon() {
+                let now = crate::clock::now(context.current()).map_err(SignError::Clock)?;
                 deps.horizon
-                    .duty(
-                        &request,
-                        hooks::clock(context.current()),
-                        Horizon::ADMISSION,
-                    )
+                    .duty(&request, now, Horizon::ADMISSION)
                     .map_err(SignError::Beyond)?;
             }
             let blockers = submission_readiness(context, &deps.executor)
@@ -797,6 +808,18 @@ async fn sign_duty<E: Clock, S: Sender<PublicKey = PublicKey>>(
             (receipt.signing_root, height, kind)
         }
     };
+    // The authorization must be this duty's. Every node computes a duty's signing root from the
+    // typed duty, so this coordinator can compare the two for nothing: the state machine's
+    // answer reaches it through a waiter keyed by the transaction id the submitter chose, which
+    // travels in gossip, and another transaction in the block that carried this one can take
+    // that place. The signature would then be valid, and of another duty.
+    let computed = request.signing_root();
+    if signing_root != computed {
+        return Err(SignError::WrongAuthorization {
+            duty: computed,
+            authorized: signing_root,
+        });
+    }
     hooks::crash_point("authorized");
     hooks::pause_point(context, "authorized").await;
 
@@ -1140,3 +1163,7 @@ pub async fn receive(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/signer/coordinator.rs"]
+mod tests;

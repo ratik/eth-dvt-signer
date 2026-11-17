@@ -314,6 +314,12 @@ impl TestNetwork {
         network
     }
 
+    /// Start node `id` without waiting for it to serve HTTP (a node that waits for something
+    /// first, such as its trusted clock's first sync).
+    pub fn launch(&self, id: usize) {
+        self.spawn(id);
+    }
+
     /// Start node `id` (never started, or stopped) on its storage; returns once it serves HTTP.
     pub fn start_node(&self, id: usize) {
         self.spawn(id);

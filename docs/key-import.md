@@ -89,7 +89,7 @@ The manifest, the encrypted shares and the share-encryption key file carry fixed
 | `mpc-keytool` command | What it does |
 | --- | --- |
 | `share-key --out FILE` | Creates a node's share-encryption key file. |
-| `split --keystore FILE --committee FILE --ceremony-id ID --output DIR` | Splits the keystore. Options: `--password-file FILE` (default: read from the terminal), `--attestation-policy FILE` (sealed nodes), with `--jwks FILE` for a `gcp-tdx` policy. |
+| `split --keystore FILE --committee FILE --ceremony-id ID --output DIR` | Splits the keystore. `ID` must start with `approved.` ([below](#the-ceremony-id)). Options: `--password-file FILE` (default: read from the terminal), `--attestation-policy FILE` (sealed nodes), with `--jwks FILE` for a `gcp-tdx` policy. |
 | `inspect --manifest FILE` | Checks a manifest offline and prints what it describes. |
 
 ### Committee (`committee.json`, input of `split`)
@@ -124,7 +124,7 @@ A sealed node makes its share-encryption key in its vault and refuses `--share-e
 | Field | Content |
 | --- | --- |
 | `format`, `version` | `eth-mpc-signer/key-import-manifest`, `1` |
-| `ceremony_id` | the id the key is registered under |
+| `ceremony_id` | the id the key is registered under, starting with `approved.` |
 | `import_id` | 16 random bytes: two splits of one key never share a digest |
 | `validator_public_key` | the keystore's public key (compressed G1) |
 | `protocol_version`, `threshold` | the network's (`3`) |
@@ -136,6 +136,22 @@ A sealed node makes its share-encryption key in its vault and refuses `--share-e
 Reading the file recomputes the derived fields, and refuses a file whose derived fields do not
 match. The manifest has no `genesis_validators_root`, on purpose. The history import and the
 activation bind the chain, and consensus checks it against the interchange.
+
+### The ceremony id
+
+An imported key's `ceremony_id` starts with `approved.` (`dkg::RESERVED_PREFIX`). The manifest is
+public, and it names the id before the approvers sign the registration. An id that any unprotected
+command could take first, a DKG start for example, would make the approved registration land as a
+`conflict`: its approvals and administrative nonce spent, and the keystore to split again, since
+the envelopes bind the id. So:
+
+- only a protected command (this registration, or a replacement of keyholders) starts a ceremony
+  whose id has the prefix, and leaders and voters refuse an unprotected one that would (audit H-11);
+- a protected command must use such an id: `mpc-keytool split` refuses another before it reads the
+  keystore, `mpc-admin draft` before anyone signs, and the node's API before it submits.
+
+The rule is the leader's and the voters', not the state machine's: an import registered under an
+id without the prefix before the rule applies as it did.
 
 ### Encrypted share (`node-<index>.enc`)
 
@@ -203,7 +219,7 @@ the gap is the time the operator takes.
 
    ```bash
    mpc-keytool split --keystore keystore.json --committee committee.json \
-     --ceremony-id validator-migrated --output ./validator-shares
+     --ceremony-id approved.validator-migrated --output ./validator-shares
    # Keystore password:          (read from the terminal; or --password-file FILE, never an argument)
    ```
 

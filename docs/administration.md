@@ -27,15 +27,20 @@ tag 15), `src/application.rs` (leaders and voters), `src/epochs.rs` (the termina
 | `sign-deposit` (P0.2) | `POST /api/v1/eth2/sign/{key}` (`DEPOSIT`) | `Duty` of a deposit | A key signs one deposit message, ever. The first deposit on chain sets its withdrawal credentials for good. |
 | `set-registration-policy` | `POST /eth/registration-policy` | `SetRegistrationPolicy` | Decides which fee recipients builder registrations may name: where relays pay for the validators' builder blocks. |
 
-Not protected: starting a DKG ceremony (`POST /dkg/start`), a refresh within the committee (R1:
-`POST /validators/reshare` without a membership), activating or aborting a reshare
+Not protected: starting a DKG ceremony (`POST /dkg/start`), a refresh of the keyholders' shares
+(R1: `POST /validators/reshare` without a membership; it deals to the active generation's
+keyholders, never to the committee, so it cannot change who holds a key, audit H-10), activating
+or aborting a reshare
 (`/validators/reshare/activate`, `/validators/reshare/abort`), a dry run of a history import, and
 signing every other duty. Any client of the plain HTTP API can call them. That API is bound to
 loopback and has no authentication. The optional mTLS listener (`--https-listen`) accepts only
 clients with a certificate from `--client-ca` ([tee.md](tee.md)). These operations change no
 trusted identity, and no slashing history except through signing itself. Misused, they deny
 service. They cannot make the network sign a slashable message, an exit or a deposit, or give a
-share to a new party.
+share to a new party. Nor can they take the ceremony id of a protected operation first: ids that
+start with `approved.` are the protected commands' to start, and only theirs, and an imported
+key's registration and a replacement of keyholders must use one (audit H-11,
+[key-import.md](key-import.md#the-ceremony-id)).
 
 ### Voluntary exits and deposits (P0.2)
 

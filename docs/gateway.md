@@ -40,13 +40,20 @@ consensus and refuse whatever their slashing protection and policies refuse.
      not pass the signature on (`502`).
    - So a faulty coordinator (one node, within `f = 1`) cannot make the validator publish a wrong
      signature and miss the duty.
-4. **Refusals are final.** The gateway returns any other status (for example 400, 403, 404, 412 or
-   500) as the node gave it. The refusal is the network's. This includes a duty that the
-   keyholders' restart floor or anchored marks refuse (`412` with `protection`): no other node
-   would sign it.
+4. **A refusal needs two nodes.** Any other status (for example 400, 403, 404, 412 or 500) is one
+   node's word, not the network's, so the gateway asks the next node and returns the refusal that
+   `route::REFUSAL_AGREEMENT` (2) nodes gave the same status for. Consensus decides a duty once,
+   so an honest network refuses it on every node, and the second node answers at once: a genuine
+   refusal costs one extra request. This includes a duty that the keyholders' restart floor or
+   anchored marks refuse (`412` with `protection`).
+   - **A node whose refusal the others contradict is marked faulty** for 60 s, as a bad signature
+     makes it: they agreed on another status, or one of them signed. So a faulty node (within
+     `f = 1`) that refuses everything costs one attempt per request, and then goes last.
+   - With the nodes exhausted and no two agreeing, the gateway returns the last refusal: it is
+     still the nodes' own word on the request, and says more than a 503.
 
-If no node gives a final answer in time, the gateway returns the last 502, 503 or 504 answer it
-got. Otherwise it answers itself:
+If no node gives a usable answer in time, the gateway returns the last refusal if there was one,
+else the last 502, 503 or 504 answer it got. Otherwise it answers itself:
 
 | Status | Error | When |
 | --- | --- | --- |
@@ -243,7 +250,9 @@ devnet report reads.
 - **Unit (`gateway::tests`, `tests/unit/gateway.rs`)**, against fake nodes:
   - the first node signs;
   - a wrong signature is not passed on, and the next node signs;
-  - a refusal is final, and a 503 fails over;
+  - one node refusing everything cannot lose a duty, and is tried last afterwards;
+  - a refusal two nodes agree on is the answer, and no third node is asked;
+  - a 503 fails over;
   - a slow node is hedged;
   - a node that answered 504 is asked once more, never more than twice;
   - a node of another chain is never used;

@@ -37,6 +37,8 @@ pub enum AnchorError {
     Exists { path: String },
     #[error("anchor directory {0}: {1}")]
     Directory(String, std::io::Error),
+    #[error("anchor: node {0}'s records did not arrive in time")]
+    NodeTimeout(String),
     #[error("the anchor does not answer (test hook)")]
     Unreachable,
 }
@@ -164,12 +166,18 @@ impl AnchorStore {
     }
 
     /// Write the approvers' acknowledgment `document` (already verified), only if nothing is at
-    /// its place; one already there with the same acknowledgment (other approvals, say) is the
-    /// same.
+    /// its place.
+    ///
+    /// `Ok(None)`: written. `Ok(Some(there))`: a document carrying the same acknowledgment was
+    /// there already, and is returned, because its own approvals are not checked here and anyone
+    /// who can write to the anchor can put it there. A node must therefore take the
+    /// acknowledgment from the document it verified itself, never from the store (the caller
+    /// does: `engine::read_anchor`), and the operator should hear that the place was taken.
+    /// `Err(Exists)`: another acknowledgment is at that place.
     pub async fn put_acknowledgment(
         &self,
         document: &AcknowledgmentDocument,
-    ) -> Result<(), AnchorError> {
+    ) -> Result<Option<AcknowledgmentDocument>, AnchorError> {
         if crate::hooks::anchor_unreachable() {
             return Err(AnchorError::Unreachable);
         }
@@ -188,19 +196,18 @@ impl AnchorStore {
             .put_opts(&path, PutPayload::from(bytes), options)
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(None),
             Err(object_store::Error::AlreadyExists { .. }) => {
-                let there = self.store.get(&path).await?.bytes().await?;
-                let same = std::str::from_utf8(&there)
+                let bytes = self.store.get(&path).await?.bytes().await?;
+                let there = std::str::from_utf8(&bytes)
                     .ok()
                     .and_then(|text| AcknowledgmentDocument::from_json(text).ok())
-                    .is_some_and(|there| there.acknowledgment() == document.acknowledgment());
-                if same {
-                    Ok(())
-                } else {
-                    Err(AnchorError::Exists {
+                    .filter(|there| there.acknowledgment() == document.acknowledgment());
+                match there {
+                    Some(there) => Ok(Some(there)),
+                    None => Err(AnchorError::Exists {
                         path: path.to_string(),
-                    })
+                    }),
                 }
             }
             Err(err) => Err(err.into()),
@@ -299,10 +306,16 @@ impl AnchorStore {
         if !self.exists(node, 0).await? {
             return Ok(None);
         }
-        // `low` exists, `high` does not.
+        // `low` exists, `high` does not. The probe doubles at most 64 times, a sequence being a
+        // `u64`, and a record at `u64::MAX` ends the search: doubling saturates there, so taking
+        // it as another step to double would ask for that one place for ever (a faulty writer
+        // only has to put something there).
         let (mut low, mut high) = (0u64, 1u64);
         while self.exists(node, high).await? {
             low = high;
+            if high == u64::MAX {
+                return Ok(Some(u64::MAX));
+            }
             high = high.saturating_mul(2);
         }
         while high - low > 1 {
