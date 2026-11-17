@@ -637,7 +637,8 @@ where
             context.sleep(IDLE_POLL).await;
         }
 
-        let now = hooks::clock(context.current());
+        // No trusted time: no time-bound transaction (`clock::now_or_refuse`).
+        let now = crate::clock::now_or_refuse(context.current());
         let (registrations, selected): (Vec<_>, Vec<_>) = self
             .admissible(self.mempool.select(&in_flight), now)
             .into_iter()
@@ -681,7 +682,8 @@ where
             return false;
         };
         let (block, parent) = (block.inner_shared(), parent.inner_shared());
-        let now = hooks::clock(context.current());
+        // No trusted time: a block with a time-bound transaction gets no vote.
+        let now = crate::clock::now_or_refuse(context.current());
         for transaction in &block.transactions {
             // A duty under a domain this network's fork schedule does not give it (P0.3).
             if let Err(wrong) = self.rules.horizon.command_fork(&transaction.command) {

@@ -5,6 +5,7 @@ pub mod admin;
 pub mod anchor;
 pub mod application;
 pub mod attestation;
+pub mod clock;
 pub mod dkg;
 pub mod engine;
 pub mod epochs;

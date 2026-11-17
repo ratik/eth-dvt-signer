@@ -502,6 +502,13 @@ keep (`eth::horizon::RestartFloor`).
   every process restarted. That shared keyholder's floor is at or above the duty's slot, so it
   refuses. This needs only that each node's clock does not run backwards across its own restart.
   The nodes' clocks may disagree.
+- **With the trusted clock** (`--roughtime`, [ethereum-signing.md](ethereum-signing.md#time-horizon)),
+  the host cannot move the clock back across a restart. The node computes its floor from its
+  first sync after it started, `L`: everything it signed before happened before that sync's
+  requests were sent, so before `L + 2·max_radius`, and its time was then at most
+  `max_age + 2·max_radius` ahead. Its floor is the slot started at
+  `L + 4·max_radius + max_age + 4 s` (70 s plus leeway with the defaults: a few more slots of
+  blocks refused after a restart, the same epoch of attestations).
 - **What it costs.** One node restarting costs nothing: the other three sign. When every node
   restarts at once (an R3 reconfiguration, a simultaneous upgrade, a power loss), each validator
   loses the current epoch's attestation if its slot was still ahead, and a proposal only in the

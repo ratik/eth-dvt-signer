@@ -1,0 +1,23 @@
+{
+  "format": "eth-mpc-signer/roughtime",
+  "version": 1,
+  "quorum": 5,
+  "max_age_seconds": 30,
+  "interval_seconds": 10,
+  "max_radius_seconds": 10,
+  "servers": [
+    {"name": "time.txryan.com", "operator": "txryan", "address": "time.txryan.com:2002", "public_key": "iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA="},
+    {"name": "rough.time.nl", "operator": "TimeNL", "address": "rough.time.nl:5319", "public_key": "v2CievhgKsxzlWPwIkYFUXeA51Akhkv5uhJCj1/kbiY="},
+    {"name": "roughtime.se", "operator": "roughtime.se", "address": "roughtime.se:2002", "public_key": "S3AzfZJ5CjSdkJ21ZJGbxqdYP/SoE8fXKY0+aicsehI="},
+    {"name": "sth1.roughtime.netnod.se", "operator": "Netnod", "address": "sth1.roughtime.netnod.se:2002", "public_key": "9l1JN4HakGnG44yyqyNNCb0HN0XfsysBbnl/kbZoZDc="},
+    {"name": "sth2.roughtime.netnod.se", "operator": "Netnod", "address": "sth2.roughtime.netnod.se:2002", "public_key": "T/xxX4ERUBAOpt64Z8phWamKsASZxJ0VWuiPm3GS/8g="},
+    {"name": "time.teax.dev", "operator": "teax.dev", "address": "time.teax.dev:2002", "public_key": "84pMADvKUcSOq5RNbVRjVrjiU16Dxo2XV2Qkm+4DRTg="},
+    {"name": "roughtime.sturdystatistics.com", "operator": "Sturdy Statistics", "address": "roughtime.sturdystatistics.com:2002", "public_key": "NqIjwLopQn6yQChtE21Mb97dAbAPe5UOuTa0tOakgD8="},
+    {"name": "fr.ntp.inutile.pro", "operator": "Inutile", "address": "fr.ntp.inutile.pro:2002", "public_key": "caVakKYAW26s2mDSfY21nI1ctN/w3kPBL8oGRAqLxRg="},
+    {"name": "es.ntp.inutile.pro", "operator": "Inutile", "address": "es.ntp.inutile.pro:2002", "public_key": "/z+14WcSjMU4evfyQoMKU8GGa5KSF9sW69tu3c+KBXs="},
+    {"name": "uk.ntp.inutile.pro", "operator": "Inutile", "address": "uk.ntp.inutile.pro:2002", "public_key": "bUjS5xMA6FBRQzhriEs71uyQu0+JDf/TeZ0IFNTdJZ0="},
+    {"name": "us.ntp.inutile.pro", "operator": "Inutile", "address": "us.ntp.inutile.pro:2002", "public_key": "V7hnCRDc7iR2uv0VrmGu37Yn3ovdHjcDW8oiFGC7hh4="},
+    {"name": "roughtime.alastyr.com", "operator": "Alastyr", "address": "roughtime.alastyr.com:2002", "public_key": "/2Al59PlwUTJHas/VS+FN6BhO9ify/wIjoH2Ezv4V7w="},
+    {"name": "roughtime.int08h.com", "operator": "int08h", "address": "roughtime.int08h.com:2002", "public_key": "AW5uAoTSTDfG5NfY1bTh08GUnOqlRb+HVhbJ3ODJvsE="}
+  ]
+}

@@ -891,7 +891,8 @@ async fn eth2_sign(
         // Another transaction took this request's place in its block: a retry, here or on
         // another node, gets its own authorization.
         | SignError::WrongAuthorization { .. }
-        | SignError::Stopped => StatusCode::SERVICE_UNAVAILABLE,
+        | SignError::Stopped
+        | SignError::Clock(_) => StatusCode::SERVICE_UNAVAILABLE,
         SignError::AuthorizationTimeout | SignError::Timeout { .. } => StatusCode::GATEWAY_TIMEOUT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -1045,6 +1046,7 @@ async fn sign(State(api): State<Api>, body: Result<Json<SignBody>, JsonRejection
         SignError::Busy
         | SignError::Overloaded(_)
         | SignError::Stopped
+        | SignError::Clock(_)
         | SignError::WrongAuthorization { .. } => (StatusCode::SERVICE_UNAVAILABLE, "UNAVAILABLE"),
         SignError::ValidatorKey => (StatusCode::FORBIDDEN, "VALIDATOR_KEY"),
         // Duty outcomes, never of a development request.
@@ -2346,7 +2348,7 @@ async fn import_history_inner(api: &Api, body: &Bytes) -> Result<Response, ApiEr
     if !crate::hooks::no_horizon()
         && let Err(beyond) = api.options.horizon.import(
             &import,
-            crate::hooks::clock(SystemTime::now()),
+            crate::clock::now_or_refuse(SystemTime::now()),
             Horizon::ADMISSION,
         )
     {

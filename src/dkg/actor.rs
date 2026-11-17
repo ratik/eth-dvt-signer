@@ -533,7 +533,17 @@ impl<
         let restart_floor = if switched_off {
             None
         } else {
-            horizon.restart_floor(crate::hooks::clock(context.current()))
+            // The trusted clock's first sync, with everything this node may have been ahead
+            // before it restarted (`clock::Clock::restart_time`); the main function syncs before
+            // it starts the node. Without one, the runtime's clock.
+            match crate::clock::installed() {
+                Some(clock) => match clock.restart_time() {
+                    Ok(time) => horizon.restart_floor(time),
+                    // Not synced (never, the node waits for it): the floor at the end of time.
+                    Err(_) => Some(crate::eth::horizon::RestartFloor { slot: u64::MAX }),
+                },
+                None => horizon.restart_floor(crate::hooks::clock(context.current())),
+            }
         };
         match restart_floor {
             Some(floor) => info!(
@@ -1367,7 +1377,8 @@ impl<
                     .duty_roots
                     .get(&(*validator, *payload_hash))
                     .ok_or(Refusal::NotAuthorized)?;
-                let now = crate::hooks::clock(self.context.current());
+                // No trusted time: no partial for a time-bound duty.
+                let now = crate::clock::now_or_refuse(self.context.current());
                 if let Err(beyond) = self.horizon.authorized(kind, period, now, Horizon::VOTE) {
                     warn!(?kind, period, %beyond, "not signing a duty beyond this node's horizon");
                     return Err(Refusal::BeyondHorizon);

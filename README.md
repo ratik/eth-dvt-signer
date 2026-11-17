@@ -125,7 +125,9 @@ Details: [docs/tee.md](docs/tee.md) (GCP), [docs/ethereum-devnet.md](docs/ethere
 - **No client roles or rate limits.** The plain HTTP API listens on `127.0.0.1` only. The mTLS
   API admits any certificate of the operator's CA (certificates can be revoked). Approvers gate
   the protected operations, but a threshold of compromised approver keys can still use them.
-- **Clocks.** The time horizon trusts each node's system clock. No trusted time source.
+- **Clocks.** With `--roughtime`, the time comes from a quorum of Roughtime servers (default 5 of
+  9 operators, `config/roughtime.json`); without it, from each node's system clock. Only 9
+  independent public operators answer today. Sealed images do not pass `--roughtime` yet.
 - **Rollback of every node.** It loses slashing history held in the nodes. The restart floor
   stops a double proposal or a double vote. Only the anchor also stops a surround vote and
   detects the rollback. The anchor tolerates one faulty node and lags by up to one record.

@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
 
 /// The validator key's ceremony.
-const VALIDATOR: &str = "validator-eth";
+pub(crate) const VALIDATOR: &str = "validator-eth";
 
 /// The chain of the fixtures (their `genesis_validators_root`).
 pub(crate) const CHAIN: &str = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
