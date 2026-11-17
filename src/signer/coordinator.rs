@@ -201,6 +201,9 @@ pub enum SignError {
     /// The duty is new and beyond this node's time horizon (`eth::horizon`): not submitted.
     #[error("{0}")]
     Beyond(Beyond),
+    /// The duty is new and this node has no trusted time (`clock`): not submitted.
+    #[error("{0}")]
+    Clock(crate::clock::Unavailable),
     /// A voluntary exit or a deposit whose signing root is not approved, sent without the
     /// approvers' authorization (P0.2): not submitted.
     #[error(
@@ -745,7 +748,7 @@ async fn sign_duty<E: Clock, S: Sender<PublicKey = PublicKey>>(
     registration::check_duty(
         check.policy.as_ref(),
         &request.duty,
-        hooks::clock(context.current()),
+        crate::clock::now_or_refuse(context.current()),
         Horizon::ADMISSION,
     )
     .map_err(SignError::Registration)?;
@@ -764,12 +767,9 @@ async fn sign_duty<E: Clock, S: Sender<PublicKey = PublicKey>>(
             // A new authorization: nothing beyond the horizon is submitted (voters refuse it
             // too). A committed one above was decided already.
             if !hooks::no_horizon() {
+                let now = crate::clock::now(context.current()).map_err(SignError::Clock)?;
                 deps.horizon
-                    .duty(
-                        &request,
-                        hooks::clock(context.current()),
-                        Horizon::ADMISSION,
-                    )
+                    .duty(&request, now, Horizon::ADMISSION)
                     .map_err(SignError::Beyond)?;
             }
             let blockers = submission_readiness(context, &deps.executor)

@@ -384,9 +384,37 @@ effect on every node. The check runs where a node decides what enters consensus:
 `leeway` is 2 s for the API and leaders, and 4 s for voters and keyholders. So voters still vote
 for a leader whose clock is up to 2 s ahead of theirs.
 
-**The clock trust assumption.** Each node's system clock (NTP or similar, run by its operator) is
-within about 2 s of the true time, except on at most one voter. No trusted time service,
-consensus timestamp or external clock is involved. What clock disagreement costs:
+**Trusted time (`--roughtime`, `src/clock`).** With `--roughtime FILE`, a node takes its time from
+a quorum of Roughtime servers of independent operators, never from the host's clock:
+
+- **A sync.** Every 10 s (`interval_seconds`) the node asks every server of the file at once, each
+  with a fresh nonce, and checks each answer: the server's long-term key signed the delegation,
+  the delegated key signed the time, and a Merkle proof ties it to this request (RFC 10049; the
+  drafts 07 and 12 that public servers still use). One answer counts per operator. At least
+  `quorum` operators (default 5 of 9, `config/roughtime.json`) must give intervals
+  `MIDP ± RADI` that share a point. The sync's time is the latest `MIDP − RADI` of that group. Two
+  disjoint groups of `quorum` operators that disagree are a conflict: no time.
+- **Between syncs.** The sync's time plus the time elapsed since, by the local monotonic clock, for
+  at most 30 s (`max_age_seconds`). Past that without a new sync, the node signs nothing
+  time-bound: its API answers `503`, it proposes and votes for no time-bound duty, and as a
+  keyholder it gives no partial for one.
+- **What the host can do.** Moving the host's clock changes nothing. Delaying or dropping packets
+  only makes the time older, or stops signing (fail closed). Speeding the monotonic clock up
+  gains at most `max_age`. So the node's time is never more than `max_age + 2·max_radius` (50 s
+  by default) ahead of the true time, with fewer than `quorum` lying operators.
+- **Start.** The node syncs before it serves anything: it retries until the quorum agrees. The
+  restart floor is computed from that first sync ([slashing-protection.md](slashing-protection.md#the-restart-floor)).
+- **Limits.** The default list holds every public server that answered on 2026-11-13: 13 servers
+  of 9 operators (`config/README.md`). Cloudflare's does not answer. A sealed node without
+  `--roughtime` starts with a warning; a client that pins its configuration sees whether the file
+  is part of it.
+
+Without `--roughtime` (development, local networks), the time checks use the host's clock, as
+follows.
+
+**The clock trust assumption (without `--roughtime`).** Each node's system clock (NTP or similar,
+run by its operator) is within about 2 s of the true time, except on at most one voter. What clock
+disagreement costs:
 
 - A node whose clock is behind refuses current duties itself (its API answers `412`) and votes
   against blocks that carry them. The other nodes still form a quorum.

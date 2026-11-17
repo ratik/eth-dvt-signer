@@ -10,6 +10,7 @@ mod admin;
 mod adversarial;
 mod anchor;
 mod bench;
+mod clock;
 mod concurrency;
 mod crash;
 mod eth2;
