@@ -737,6 +737,15 @@ What the evidence is:
   consensus-spec-tests at commit `bc5c1a7f`, vendored in `tests/vectors` (`tests/eth_vectors.rs`).
   For Gloas, 31 cases of seven containers from the release vectors of consensus-specs
   v1.7.0-beta.4 (`tests/fixtures/gloas`, `tests/unit/eth/gloas.rs`).
+- **BLS vectors.** Ethereum's BLS test vectors (`ethereum/bls12-381-tests` v0.1.2, vendored in
+  `tests/vectors/bls`, `tests/eth_bls_vectors.rs`). For each `sign` case, the key is split 3-of-4
+  by the dealer, and every three shares sign the vector's signature byte for byte; a zero key is
+  refused. The 29 `verify` cases run through the check of every returned signature, and the 28
+  `deserialization_G1` and `deserialization_G2` cases through the decoding of keys and
+  signatures. One deliberate difference: the point at infinity, a valid encoding in the vectors,
+  is refused as a key and as a signature, as a consensus client's `KeyValidate` refuses such a
+  key. The aggregation sets do not apply: partial signatures of one key are combined by
+  interpolation, not aggregated.
 - **Web3Signer roots.** The signer reproduces, from the parsed requests, the signing roots that
   Web3Signer's API specification publishes for its examples (`tests/eth_vectors.rs`,
   `tests/eth_web3signer.rs`).
