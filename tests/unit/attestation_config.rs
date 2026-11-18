@@ -24,6 +24,11 @@ fn the_digest_and_rtmr3_are_the_images() {
         hex::encode(rtmr3(&digest)),
         "0f95e1ec56ac436a2e02732fb1d65f1d052ebb894571bdfa6889d3f24c77c45daac784ffe0a1933d31936032fcd118cd"
     );
+    // SEV-SNP: the image compares the digest's first 64 hex digits with its report's HOST_DATA.
+    assert_eq!(
+        hex::encode(host_data(&digest)),
+        "6c8224fd1d93707876a8ac09eefece1e4733b2b53eddb43cf8ce94d91f1bf7bd"
+    );
 }
 
 #[test]

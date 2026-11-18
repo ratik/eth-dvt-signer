@@ -18,7 +18,8 @@
 use crate::{
     attestation::{
         Statement,
-        verify::{Jwks, Policy, verify},
+        check::{Policy, VcekCache, attach_vcek, verify},
+        verify::Jwks,
     },
     eth::network::NetworkJson,
     tls::{self, AnyServerKey, AttestedServerKey},
@@ -239,10 +240,11 @@ impl Node {
         network: &NetworkJson,
         policy: Option<&Policy>,
         jwks: Option<&Jwks>,
+        vceks: &VcekCache,
         allow_unattested: bool,
     ) -> Result<Checked, String> {
         let result = self
-            .check_inner(network, policy, jwks, allow_unattested)
+            .check_inner(network, policy, jwks, vceks, allow_unattested)
             .await;
         match &result {
             Ok(checked) => self.set_usable(true, checked.index, None),
@@ -256,6 +258,7 @@ impl Node {
         network: &NetworkJson,
         policy: Option<&Policy>,
         jwks: Option<&Jwks>,
+        vceks: &VcekCache,
         allow_unattested: bool,
     ) -> Result<Checked, String> {
         let mut checked = Checked::default();
@@ -286,26 +289,28 @@ impl Node {
                     .map_err(|err| format!("attestation: {err}"))?;
                 let statement: Statement =
                     serde_json::from_slice(&body).map_err(|err| format!("attestation: {err}"))?;
-                match (&statement.evidence, policy, jwks) {
-                    (Some(evidence), Some(policy), Some(jwks)) => {
+                match (&statement.evidence, policy) {
+                    (Some(evidence), Some(policy)) if jwks.is_some() || !policy.needs_jwks() => {
+                        let mut evidence = evidence.clone();
+                        attach_vcek(&mut evidence, policy, vceks).await?;
                         let verified = verify(
-                            evidence,
+                            &evidence,
                             policy,
                             jwks,
                             &nonce,
                             now_seconds(),
                             Some(statement.index),
                         )?;
-                        checked.rtmr1 = Some(verified.rtmr1);
-                        checked.rtmr3 = Some(verified.rtmr3);
+                        checked.measurement = Some(verified.measurement);
+                        checked.configuration = Some(verified.configuration);
                         checked.attested = true;
                     }
-                    (Some(_), _, _) if allow_unattested => {}
-                    (Some(_), _, _) => {
+                    (Some(_), _) if allow_unattested => {}
+                    (Some(_), _) => {
                         return Err("no policy or key set to check its evidence".into());
                     }
-                    (None, _, _) if allow_unattested => {}
-                    (None, _, _) => {
+                    (None, _) if allow_unattested => {}
+                    (None, _) => {
                         return Err(format!(
                             "no evidence (vault {}): not attested",
                             statement.vault
@@ -355,8 +360,10 @@ pub struct Checked {
     pub index: Option<u64>,
     /// Its attestation verified (not merely accepted unattested).
     pub attested: bool,
-    pub rtmr1: Option<String>,
-    pub rtmr3: Option<String>,
+    /// The attested image (`rtmr1/rtmr2`, or the SEV-SNP launch measurement).
+    pub measurement: Option<String>,
+    /// The attested configuration (`rtmr3`, or the SEV-SNP `HOST_DATA`).
+    pub configuration: Option<String>,
 }
 
 fn failure(err: reqwest::Error) -> Failure {

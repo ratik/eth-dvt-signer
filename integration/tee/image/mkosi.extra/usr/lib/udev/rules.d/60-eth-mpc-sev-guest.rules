@@ -1,0 +1,3 @@
+# The SEV-SNP guest device (reports and derived keys of the AMD secure processor) is the node's:
+# its sealed vault (`--vault sev-snp`) asks it for the sealing key and for each attestation.
+KERNEL=="sev-guest", GROUP="mpc", MODE="0660"

@@ -76,6 +76,7 @@ const REFUSED_FLAGS: &[&str] = &[
     "--gcp-metadata-endpoint",
     "--gotpm",
     "--data-dir",
+    "--snp-fake-chip",
 ];
 
 /// Refuse a configuration that a client must not pin, whatever its digest. Its `args`, read as
@@ -138,6 +139,15 @@ pub fn rtmr3(digest: &[u8; 48]) -> [u8; 48] {
     let mut input = [0u8; 96];
     input[48..].copy_from_slice(digest);
     sha384(&input)
+}
+
+/// The `HOST_DATA` an SEV-SNP host launches the node with for the configuration of `digest`: its
+/// first 32 bytes (`HOST_DATA` holds 32). The image refuses to start the node unless its report's
+/// `HOST_DATA` is this, so a client that pins it pins the configuration, as RTMR3 does on TDX.
+pub fn host_data(digest: &[u8; 48]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest[..32]);
+    out
 }
 
 /// The configuration in `dir`: its regular files (not symbolic links, not in subdirectories), as

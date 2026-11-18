@@ -16,10 +16,14 @@
 //! - Every item is generated inside the vault: no plaintext copy of a sealed key exists outside the
 //!   node's memory.
 //!
+//! **Sealed** (`--vault sev-snp`): the same, with the data key wrapped by a key the AMD secure
+//! processor derives for this image on this chip ([snp], docs/tee.md). No key-release service.
+//!
 //! An item is written once and never replaced. The node refuses to start when an item does not
 //! open: modified, swapped between names, or written by another vault.
 
 pub mod gcp;
+pub mod snp;
 
 use crate::{
     attestation::{Evidence, Keys},
@@ -67,6 +71,7 @@ pub type Tls = (Zeroizing<Vec<u8>>, String);
 pub enum Kind {
     Plain,
     Gcp(gcp::Config),
+    Snp(snp::Config),
 }
 
 impl Kind {
@@ -74,6 +79,7 @@ impl Kind {
         match self {
             Self::Plain => "plain",
             Self::Gcp(_) => "gcp-tdx",
+            Self::Snp(_) => crate::attestation::snp::SEV_SNP,
         }
     }
 
@@ -90,7 +96,9 @@ pub enum Error {
         "the vault in {0} has no {1}: initialize it with `eth-mpc-signer identity` before starting"
     )]
     Missing(String, &'static str),
-    #[error("the vault in {0} is sealed: start the node with its platform (--vault gcp-tdx)")]
+    #[error(
+        "the vault in {0} is sealed: start the node with its platform (--vault gcp-tdx or sev-snp)"
+    )]
     Sealed(String),
     #[error("the vault in {0} is not sealed: it cannot be opened with --vault {1}")]
     NotSealed(String, &'static str),
@@ -181,11 +189,17 @@ impl Cipher {
     }
 }
 
+/// The platform of a sealed vault.
+pub enum Platform {
+    Gcp(gcp::Platform),
+    Snp(snp::Platform),
+}
+
 /// A node's vault, opened.
 pub struct Vault {
     dir: PathBuf,
     cipher: Option<Cipher>,
-    platform: Option<gcp::Platform>,
+    platform: Option<Platform>,
 }
 
 impl Vault {
@@ -227,7 +241,28 @@ impl Vault {
                 Ok(Self {
                     dir: dir.to_path_buf(),
                     cipher: Some(Cipher::new(key)),
-                    platform: Some(platform),
+                    platform: Some(Platform::Gcp(platform)),
+                })
+            }
+            Kind::Snp(config) => {
+                let platform = snp::Platform::new(config.clone());
+                let key = match wrapped {
+                    Some(blob) => platform.unwrap(&blob).map_err(Error::Platform)?,
+                    None if has_items => return Err(Error::NotSealed(display, kind.name())),
+                    None if create => {
+                        create_private_dir(dir)?;
+                        let mut key = Zeroizing::new([0u8; 32]);
+                        UnwrapErr(rand::rngs::SysRng).fill_bytes(key.as_mut_slice());
+                        let blob = platform.wrap(&key).map_err(Error::Platform)?;
+                        write_new(&dir.join(DEK), &blob)?;
+                        key
+                    }
+                    None => return Err(Error::Missing(display, DEK)),
+                };
+                Ok(Self {
+                    dir: dir.to_path_buf(),
+                    cipher: Some(Cipher::new(key)),
+                    platform: Some(Platform::Snp(platform)),
                 })
             }
         }
@@ -243,15 +278,22 @@ impl Vault {
     }
 
     /// The platform of a sealed vault (attestation).
-    pub const fn platform(&self) -> Option<&gcp::Platform> {
+    pub const fn platform(&self) -> Option<&Platform> {
         self.platform.as_ref()
     }
 
     /// The platform's evidence that `keys` are this vault's, for the client's `nonce`; `None`
     /// for a plain vault.
     pub async fn attest(&self, keys: &Keys, nonce: &[u8]) -> Result<Option<Evidence>, Error> {
-        let Some(platform) = &self.platform else {
-            return Ok(None);
+        let platform = match &self.platform {
+            None => return Ok(None),
+            Some(Platform::Snp(platform)) => {
+                return platform
+                    .attest(keys, nonce)
+                    .map(Some)
+                    .map_err(Error::Platform);
+            }
+            Some(Platform::Gcp(platform)) => platform,
         };
         let token = platform
             .token(
@@ -269,6 +311,7 @@ impl Vault {
                 crate::import::hex0x(nonce)
             },
             token,
+            vcek: None,
         }))
     }
 

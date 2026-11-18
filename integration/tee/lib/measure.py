@@ -7,6 +7,8 @@
                                 GRUB's and the kernel's measurements, and the events and values
                                 of RTMR1 and RTMR2 this boot chain gives on GCE (below)
   measure.py extract DISK TYPE OUT   copy the partition of GPT type TYPE (root, esp...) to OUT
+  measure.py snp-boot UKI OUT    the UKI's kernel, initrd and command line as OUT/vmlinuz, initrd,
+                                cmdline: the direct boot of an SEV-SNP guest (snp_boot)
   measure.py rtmr3 DIGEST       RTMR3 after one extension with DIGEST (hex SHA-384) from zero
   measure.py console SERIAL OUT [MEASUREMENTS]
                                 the measure mode's output (README) in a serial console log: the
@@ -425,6 +427,35 @@ def decode_register(value):
     return None
 
 
+def snp_boot(path, out):
+    """The UKI's kernel, initrd and command line as files, for a direct boot (SEV-SNP: QEMU
+    measures their hashes into the launch measurement, `kernel-hashes=on`). The command line is
+    the UKI's, plus `SNP_CMDLINE_EXTRA`; what systemd-stub adds at boot (its credentials and
+    sysexts, its measurements) does not happen without it."""
+    sections = dict(pe_sections(open(path, "rb").read()))
+    for name in (".linux", ".initrd", ".cmdline"):
+        if name not in sections:
+            sys.exit(f"{path}: no {name} section")
+    if ".ucode" in sections:
+        sys.exit(f"{path}: a .ucode section (an early initrd) is not supported")
+    os.makedirs(out, exist_ok=True)
+    cmdline = sections[".cmdline"].rstrip(b"\0").decode().strip()
+    cmdline = f"{cmdline} {SNP_CMDLINE_EXTRA}"
+    for name, data in (("vmlinuz", sections[".linux"]), ("initrd", sections[".initrd"]),
+                       ("cmdline", cmdline.encode())):
+        with open(os.path.join(out, name), "wb") as file:
+            file.write(data)
+        print(f"snp.{name}.sha256 {hashlib.sha256(data).hexdigest()}")
+    print(f"snp.cmdline {cmdline}")
+
+
+# Appended to the UKI's command line for a direct boot. Without systemd-stub no boot loader tells
+# the initrd its disk (LoaderDevicePartUUID), so the root is named: the verity device that
+# systemd-veritysetup-generator opens from `roothash=` (its data and hash partitions are found by
+# the partition UUIDs the root hash gives).
+SNP_CMDLINE_EXTRA = "root=/dev/mapper/root"
+
+
 def uki_cmdline(path):
     for name, raw in pe_sections(open(path, "rb").read()):
         if name == ".cmdline":
@@ -787,7 +818,7 @@ def selftest(measurements, fixture=None):
 if __name__ == "__main__":
     command, *rest = sys.argv[1:] or ["help"]
     {"uki": uki, "gpt": gpt, "boot": boot, "extract": extract, "rtmr3": rtmr3, "console": console,
-     "replay": replay, "grub-rule": grub_rule_command, "tpm-replay": tpm_replay,
+     "replay": replay, "grub-rule": grub_rule_command, "snp-boot": snp_boot, "tpm-replay": tpm_replay,
      "selftest": selftest}.get(
         command, lambda *_: sys.exit(__doc__)
     )(*rest)
