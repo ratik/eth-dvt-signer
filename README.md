@@ -194,3 +194,7 @@ What each test covers: [docs/internals.md](docs/internals.md#tests).
 | [ethereum-devnet.md](docs/ethereum-devnet.md) | The devnet integration and its results |
 | [audit.md](docs/audit.md) | Known limits, findings and their tests |
 | [security-review.md](docs/security-review.md) | Security review |
+
+## License
+
+Licensed under the [MIT license](LICENSE).
