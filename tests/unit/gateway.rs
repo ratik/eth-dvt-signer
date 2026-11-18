@@ -334,6 +334,7 @@ fn the_log_has_the_proxys_shape() {
         status: 200,
         attempts: &attempts,
         body: &body,
+        root: None,
     }
     .to_json();
     assert_eq!(record["type"], "ATTESTATION");
@@ -348,6 +349,28 @@ fn the_log_has_the_proxys_shape() {
     assert_eq!(record["attempts"][0]["ms"], 12.35);
     assert!(record["attempts"][0].get("hedged").is_none());
     assert_eq!(record["client"], "Lighthouse/v8.3.2");
+    assert_eq!(record["client_signing_root"], record["signing_root"]);
+
+    // The root the gateway computed wins over the client's, which stays apart (a client need not
+    // send one: Nimbus does not).
+    let record = Entry {
+        id: 8,
+        ts: 1.5,
+        ms: 13.0,
+        method: "POST",
+        path: &path,
+        client: Some("Nimbus/v26.10.2"),
+        status: 200,
+        attempts: &attempts,
+        body: &body,
+        root: Some([0xab; 32]),
+    }
+    .to_json();
+    assert_eq!(record["signing_root"], format!("0x{}", "ab".repeat(32)));
+    assert_eq!(
+        record["client_signing_root"],
+        "0x548c9a015f4c96cb8b1ddbbdfca85846f85bf9f344a434c140f378cdfb5341f0"
+    );
 }
 
 /// Every node answers 504 at first (consensus is waiting for a stopped leader): each is asked once

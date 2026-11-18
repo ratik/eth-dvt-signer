@@ -172,6 +172,7 @@ The guarantees come from different places. Do not confuse them:
 | Quorum rollback of slashing history | `e2e_eth_l1_whole_network_rollback_signs_a_double_proposal` (without the restart floor) | **Fail** (known, L-1) | A double proposal is signed. |
 | Quorum rollback of slashing history, with the restart floor | `floor::floor_1` | Pass | Every keyholder refuses the conflicting proposal. Later slots sign. |
 | Real validator duties on a beacon chain | devnet runs B, C and D (`integration/ethereum/scripts/run.sh`) | Pass | A DKG key, activated by a deposit that the MPC network signed. Lighthouse v8.3.2 signs only through the Web3Signer API, with no keystore. Attestations have a correct target and head in the beacon state. Blocks are canonical and finalized (§6). |
+| Real validator duties with other validator clients | devnet runs X (Teku 26.10.3) and Z (Nimbus 26.10.2), `IT_VC` | Pass | The full run with each client in place of Lighthouse: 27 of 27 epochs attested with the correct head, every proposal canonical, every request type signed, every security check passed. Run Y found that Nimbus's `AGGREGATE_AND_PROOF_V2` (fork name in lower case) was refused; fixed ([ethereum-devnet.md](ethereum-devnet.md#other-validator-clients-runs-x-to-z)). |
 | One deposit message per validator key | E2E-ETH-10, `slashing::tests` | Pass | An identical retry gets the same signature. Other credentials: `too_many_roots`. Another key's message: `deposit_for_another_key`. |
 
 Not covered precisely:

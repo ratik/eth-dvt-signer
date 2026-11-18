@@ -2,10 +2,12 @@
 //! failover proxy's shape (`integration/ethereum/scripts/proxy.py`), which the devnet report reads:
 //! `id`, `ts`, `method`, `path`, `client`, `status`, `ms`, `attempts` (`backend`, `status` or
 //! `error`, `ms`, `hedged`, `invalid_signature`), and for a signing request its `type`, `slot`,
-//! `epoch`, `validator`, `signing_root` and `fork_version`. With `--requests DIR`, each signing
+//! `epoch`, `validator`, `signing_root` (the gateway's own, else the client's), `client_signing_root`
+//! and `fork_version`. With `--requests DIR`, each signing
 //! request's body and answer are kept too, for the devnet's security checks (duty data only,
 //! nothing secret).
 
+use crate::eth::types::Root;
 use serde_json::{Map, Value, json};
 use std::{
     fs::{File, OpenOptions},
@@ -63,6 +65,9 @@ pub struct Entry<'a> {
     pub status: u16,
     pub attempts: &'a [Attempt],
     pub body: &'a [u8],
+    /// The signing root the gateway computed from the request, if it could: a client need not
+    /// send its own (`signingRoot` is optional; Nimbus sends none).
+    pub root: Option<Root>,
 }
 
 impl Entry<'_> {
@@ -80,6 +85,15 @@ impl Entry<'_> {
             Value::Array(self.attempts.iter().map(Attempt::to_json).collect()),
         );
         record.extend(describe(self.path, self.body));
+        if let Some(client) = record.get("signing_root").cloned() {
+            record.insert("client_signing_root".into(), client);
+        }
+        if let Some(root) = self.root {
+            record.insert(
+                "signing_root".into(),
+                json!(format!("0x{}", hex::encode(root))),
+            );
+        }
         Value::Object(record)
     }
 }

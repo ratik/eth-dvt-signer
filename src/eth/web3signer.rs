@@ -165,9 +165,16 @@ struct DepositRequest {
     genesis_fork_version: Version,
 }
 
+/// A fork name of a request's `version`, in upper case: clients differ (Nimbus v26.10 sends a
+/// `BLOCK_V2` as `FULU` but an `AGGREGATE_AND_PROOF_V2` as `electra`).
+fn fork_name<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    String::deserialize(deserializer).map(|name| name.to_ascii_uppercase())
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BeaconBlockRequest {
+    #[serde(deserialize_with = "fork_name")]
     version: String,
     block_header: Option<BeaconBlockHeader>,
     block: Option<Value>,
@@ -176,6 +183,7 @@ struct BeaconBlockRequest {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Versioned {
+    #[serde(deserialize_with = "fork_name")]
     version: String,
     data: Value,
 }
@@ -204,7 +212,7 @@ fn gloas<T: DeserializeOwned>(body: &Value, kind: &str, name: &str) -> Result<T,
         .get(name)
         .ok_or_else(|| ParseError::Invalid(format!("missing `{name}`")))?;
     match value.get("version").and_then(Value::as_str) {
-        Some(GLOAS) => {}
+        Some(version) if version.eq_ignore_ascii_case(GLOAS) => {}
         Some(version) => {
             return Err(ParseError::Unsupported(format!("{kind} version {version}")));
         }

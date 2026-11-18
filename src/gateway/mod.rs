@@ -24,7 +24,10 @@ use crate::{
         check::{Policy, VcekCache},
         verify::{Jwks, fetch_google_jwks},
     },
-    eth::network::{Network, NetworkJson},
+    eth::{
+        network::{Network, NetworkJson},
+        web3signer::duty_request,
+    },
 };
 use axum::{
     Router,
@@ -299,6 +302,9 @@ async fn sign(
     let (answer, attempts) = gateway
         .sign(&path, &identifier, forwarded, body.clone())
         .await;
+    let root = duty_request(&identifier, &body, Some(&gateway.network))
+        .ok()
+        .map(|(request, _)| request.signing_root());
     let kind = serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
         .and_then(|request| request.get("type")?.as_str().map(str::to_string))
@@ -320,6 +326,7 @@ async fn sign(
             status: answer.status,
             attempts: &attempts,
             body: &body,
+            root,
         }
         .to_json(),
     );
@@ -347,6 +354,7 @@ async fn public_keys(State(gateway): State<Arc<Gateway>>, headers: HeaderMap) ->
             status: answer.status,
             attempts: &attempts,
             body: &[],
+            root: None,
         }
         .to_json(),
     );
