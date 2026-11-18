@@ -179,6 +179,7 @@ What each test covers: [docs/internals.md](docs/internals.md#tests).
 | [architecture.md](docs/architecture.md) | Modules, data flow, signing path, test harness |
 | [internals.md](docs/internals.md) | Model, DKG, signing path, storage, development API, test catalog, benchmarks |
 | [ethereum-signing.md](docs/ethereum-signing.md) | The Web3Signer API, duties, status codes, time horizon, fork schedule |
+| [remote-signing-api.md](docs/remote-signing-api.md) | Conformance with the remote-signing API specification v1.4.0 |
 | [slashing-protection.md](docs/slashing-protection.md) | Slashing rules, the restart floor |
 | [anchor.md](docs/anchor.md) | The WORM anchor in S3 or GCS |
 | [administration.md](docs/administration.md) | Approvers and protected operations |

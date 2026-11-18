@@ -416,6 +416,13 @@ pub fn parse_request(body: &[u8]) -> Result<Request, ParseError> {
                     .into(),
             ));
         }
+        "BUILDER_REQUEST_AUTH" => {
+            return Err(ParseError::Unsupported(
+                "BUILDER_REQUEST_AUTH: not implemented (opaque data under the builder domain; a \
+                 validator client sends it only with external builders configured)"
+                    .into(),
+            ));
+        }
         "BLOCK" => {
             return Err(ParseError::Unsupported(
                 "BLOCK (deprecated): use BLOCK_V2 with a block header".into(),

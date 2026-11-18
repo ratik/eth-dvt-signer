@@ -1,0 +1,1304 @@
+components:
+  schemas:
+    Signing:
+      type: "object"
+      properties:
+        fork_info:
+          type: object
+          properties:
+            fork:
+              $ref: '#/components/schemas/Fork'
+              description: Fork information
+            genesis_validators_root:
+              type: "string"
+              description: Genesis Validators Root in hex string format.
+              example: '0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673'
+          required:
+            - fork
+            - genesis_validators_root
+        signingRoot:
+          type: "string"
+          description: 'signing root for optional verification if field present'
+          example: '0xaa2e0c465c1a45d7b6637fcce4ad6ceb71fc12064b548078d619a411f0de8adc'
+      required:
+        - fork_info
+    SigningResponse:
+      type: "object"
+      properties:
+        signature:
+          type: "string"
+          description: "Hex encoded string of signature"
+          example: '0xb3baa751d0a9132cfe93e4e3d5ff9075111100e3789dca219ade5a24d27e19d16b3353149da1833e9b691bb38634e8dc04469be7032132906c927d7e1a49b414730612877bc6b2810c8f202daf793d1ab0d6b5cb21d52f9e52e883859887a5d9'
+    AggregationSlotSigning:
+      allOf:
+        - $ref: '#/components/schemas/Signing'
+        - type: "object"
+          properties:
+            type:
+              type: "string"
+              description: Signing Request type
+              enum:
+                - 'AGGREGATION_SLOT'
+            aggregation_slot:
+              type: "object"
+              properties:
+                slot:
+                  type: string
+                  format: "uint64"
+          required:
+            - type
+            - aggregation_slot
+    AggregateAndProofSigning:
+      description: '** DEPRECATED ** See AggregateAndProofSigningV2.'
+      allOf:
+        - $ref: '#/components/schemas/Signing'
+        - type: object
+          properties:
+            type:
+              type: "string"
+              description: Signing Request type
+              enum:
+                - 'AGGREGATE_AND_PROOF'
+            aggregate_and_proof:
+              $ref: "#/components/schemas/AggregateAndProofPhase0"
+          required:
+            - type
+            - aggregate_and_proof
+    AggregateAndProofSigningV2:
+      allOf:
+        - $ref: '#/components/schemas/Signing'
+        - $ref: '#/components/schemas/AggregateAndProofRequest'
+        - type: object
+          properties:
+            type:
+              type: "string"
+              description: Signing Request type
+              enum:
+                - 'AGGREGATE_AND_PROOF_V2'
+          required:
+            - type
+    AggregateAndProofRequest:
+      type: object
+      properties:
+        aggregate_and_proof:
+          oneOf:
+            - $ref: '#/components/schemas/AggregateAndProofRequestPhase0'
+            - $ref: '#/components/schemas/AggregateAndProofRequestAltair'
+            - $ref: '#/components/schemas/AggregateAndProofRequestBellatrix'
+            - $ref: '#/components/schemas/AggregateAndProofRequestCapella'
+            - $ref: '#/components/schemas/AggregateAndProofRequestDeneb'
+            - $ref: '#/components/schemas/AggregateAndProofRequestElectra'
+            - $ref: '#/components/schemas/AggregateAndProofRequestFulu'
+            - $ref: '#/components/schemas/AggregateAndProofRequestGloas'
+          discriminator:
+            propertyName: version
+            mapping:
+              PHASE0: '#/components/schemas/AggregateAndProofRequestPhase0'
+              ALTAIR: '#/components/schemas/AggregateAndProofRequestAltair'
+              BELLATRIX: '#/components/schemas/AggregateAndProofRequestBellatrix'
+              CAPELLA: '#/components/schemas/AggregateAndProofRequestCapella'
+              DENEB: '#/components/schemas/AggregateAndProofRequestDeneb'
+              ELECTRA: '#/components/schemas/AggregateAndProofRequestElectra'
+              FULU: '#/components/schemas/AggregateAndProofRequestFulu'
+              GLOAS: '#/components/schemas/AggregateAndProofRequestGloas'
+      required:
+        - aggregate_and_proof
+    AggregateAndProofRequestPhase0:
+      type: object
+      properties:
+        version:
+          type: string
+          enum:
+            - PHASE0
+          description: 'version to identify AggregateAndProof request type.'
+        data:
+          $ref: "#/components/schemas/AggregateAndProofPhase0"
+      required:
+        - version
+        - data
+    AggregateAndProofRequestAltair:
+      type: object
+      properties:
+        version:
+          type: string
+          enum:
+            - ALTAIR
+          description: 'version to identify AggregateAndProof request type.'
+        data:
+          $ref: "#/components/schemas/AggregateAndProofPhase0"
+      required:
+        - version
+        - data
+    AggregateAndProofRequestBellatrix:
+      type: object
+      properties:
+        version:
+          type: string
+          enum:
+            - BELLATRIX
+          description: 'version to identify AggregateAndProof request type.'
+        data:
+          $ref: "#/components/schemas/AggregateAndProofPhase0"
+      required:
+        - version
+        - data
+    AggregateAndProofRequestCapella:
+      type: object
+      properties:
+        version:
+          type: string
+          enum:
+            - CAPELLA
+          description: 'version to identify AggregateAndProof request type.'
+        data:
+          $ref: "#/components/schemas/AggregateAndProofPhase0"
+      required:
+        - version
+        - data
+    AggregateAndProofRequestDeneb:
+      type: object
+      properties:
+        version:
+          type: string
+          enum:
+            - DENEB
+          description: 'version to identify AggregateAndProof request type.'
+        data:
+          $ref: "#/components/schemas/AggregateAndProofPhase0"
+      required:
+        - version
+        - data
+    AggregateAndProofRequestElectra:
+      type: object
+      properties:
+        version:
+          type: string
+          enum:
+            - ELECTRA
+          description: 'version to identify AggregateAndProof request type.'
+        data:
+          $ref: "#/components/schemas/AggregateAndProofElectra"
+      required:
+        - version
+        - data
+    AggregateAndProofRequestFulu:
+      type: object
+      properties:
+        version:
+          type: string
+          enum:
+            - FULU
+          description: 'version to identify AggregateAndProof request type.'
+        data:
+          $ref: "#/components/schemas/AggregateAndProofElectra"
+      required:
+        - version
+        - data
+    AggregateAndProofRequestGloas:
+      type: object
+      properties:
+        version:
+          type: string
+          enum:
+            - GLOAS
+          description: 'version to identify AggregateAndProof request type.'
+        data:
+          $ref: "#/components/schemas/AggregateAndProofElectra"
+      required:
+        - version
+        - data
+    AttestationSigning:
+      allOf:
+        - $ref: '#/components/schemas/Signing'
+        - type: object
+          properties:
+            type:
+              type: "string"
+              description: Signing Request type
+              enum:
+                - 'ATTESTATION'
+            attestation:
+              $ref: "#/components/schemas/AttestationData"
+          required:
+            - type
+            - attestation
+    BlockSigning:
+      description: '** DEPRECATED ** See BeaconBlockSigning.'
+      allOf:
+        - $ref: '#/components/schemas/Signing'
+        - type: object
+          properties:
+            type:
+              type: "string"
+              description: Signing Request type
+              enum:
+                - 'BLOCK'
+            block:
+              $ref: "#/components/schemas/BeaconBlock"
+          required:
+            - type
+            - block
+    DepositSigning:
+      type: object
+      properties:
+        type:
+          type: "string"
+          description: 'Signing Request type'
+          enum:
+            - 'DEPOSIT'
+        signingRoot:
+          description: 'signing root for optional verification if field present'
+          type: "string"
+        deposit:
+          type: object
+          properties:
+            pubkey:
+              type: "string"
+            withdrawal_credentials:
+              type: "string"
+            amount:
+              type: "string"
+            genesis_fork_version:
+              type: "string"
+              description: Bytes4 hexadecimal
+      required:
+        - type
+        - deposit
+    RandaoRevealSigning:
+      allOf:
+        - $ref: '#/components/schemas/Signing'
+        - type: object
+          properties:
+            type:
+              type: "string"
+              description: Signing Request type
+              enum:
+                - 'RANDAO_REVEAL'
+            randao_reveal:
+              $ref: "#/components/schemas/RandaoReveal"
+          required:
+            - type
+            - randao_reveal
+    VoluntaryExitSigning:
+      allOf:
+        - $ref: '#/components/schemas/Signing'
+        - type: object
+          properties:
+            type:
+              type: "string"
+              description: Signing Request type
+              enum:
+                - 'VOLUNTARY_EXIT'
+            voluntary_exit:
+              $ref: "#/components/schemas/VoluntaryExit"
+          required:
+            - type
+            - voluntary_exit
+    SyncCommitteeMessageSigning:
+      allOf:
+        - $ref: '#/components/schemas/Signing'
+        - type: object
+          properties:
+            type:
+              type: "string"
+              description: Signing Request type
+              enum:
+                - 'SYNC_COMMITTEE_MESSAGE'
+            sync_committee_message:
+              $ref: "#/components/schemas/SyncCommitteeMessage"
+          required:
+            - type
+            - sync_committee_message
+    SyncCommitteeSelectionProofSigning:
+      allOf:
+        - $ref: '#/components/schemas/Signing'
+        - type: object
+          properties:
+            type:
+              type: "string"
+              description: Signing Request type
+              enum:
+                - 'SYNC_COMMITTEE_SELECTION_PROOF'
+            sync_aggregator_selection_data:
+              $ref: "#/components/schemas/SyncAggregatorSelectionData"
+          required:
+            - type
+            - sync_aggregator_selection_data
+    SyncCommitteeContributionAndProofSigning:
+      allOf:
+        - $ref: '#/components/schemas/Signing'
+        - type: object
+          properties:
+            type:
+              type: "string"
+              description: Signing Request type
+              enum:
+                - 'SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF'
+            contribution_and_proof:
+              $ref: "#/components/schemas/ContributionAndProof"
+          required:
+            - type
+            - contribution_and_proof
+    ValidatorRegistrationSigning:
+      allOf:
+        - type: object
+          properties:
+            type:
+              type: "string"
+              description: Signing Request type
+              enum:
+                - 'VALIDATOR_REGISTRATION'
+            signingRoot:
+              description: 'signing root for optional verification if field present'
+              type: "string"
+            validator_registration:
+              "$ref": "#/components/schemas/ValidatorRegistration"
+          required:
+            - type
+            - validator_registration
+    ExecutionPayloadBidSigning:
+      allOf:
+        - $ref: '#/components/schemas/Signing'
+        - $ref: '#/components/schemas/ExecutionPayloadBidRequest'
+        - type: object
+          properties:
+            type:
+              type: "string"
+              description: Signing Request type
+              enum:
+                - 'EXECUTION_PAYLOAD_BID'
+          required:
+            - type
+    ExecutionPayloadBidRequest:
+      type: object
+      properties:
+        execution_payload_bid:
+          oneOf:
+            - $ref: '#/components/schemas/ExecutionPayloadBidRequestGloas'
+          discriminator:
+            propertyName: version
+            mapping:
+              GLOAS: '#/components/schemas/ExecutionPayloadBidRequestGloas'
+      required:
+        - execution_payload_bid
+    ExecutionPayloadBidRequestGloas:
+      type: object
+      properties:
+        version:
+          type: string
+          enum:
+            - GLOAS
+          description: 'version to identify ExecutionPayloadBid request type.'
+        data:
+          $ref: "#/components/schemas/ExecutionPayloadBidGloas"
+      required:
+        - version
+        - data
+    ExecutionPayloadEnvelopeSigning:
+      allOf:
+        - $ref: '#/components/schemas/Signing'
+        - $ref: '#/components/schemas/ExecutionPayloadEnvelopeRequest'
+        - type: object
+          properties:
+            type:
+              type: "string"
+              description: Signing Request type
+              enum:
+                - 'EXECUTION_PAYLOAD_ENVELOPE'
+          required:
+            - type
+    ExecutionPayloadEnvelopeRequest:
+      type: object
+      properties:
+        execution_payload_envelope:
+          oneOf:
+            - $ref: '#/components/schemas/ExecutionPayloadEnvelopeRequestGloas'
+          discriminator:
+            propertyName: version
+            mapping:
+              GLOAS: '#/components/schemas/ExecutionPayloadEnvelopeRequestGloas'
+      required:
+        - execution_payload_envelope
+    ExecutionPayloadEnvelopeRequestGloas:
+      type: object
+      properties:
+        version:
+          type: string
+          enum:
+            - GLOAS
+          description: 'version to identify ExecutionPayloadEnvelope request type.'
+        data:
+          $ref: "#/components/schemas/ExecutionPayloadEnvelopeGloas"
+      required:
+        - version
+        - data
+    PayloadAttestationMessageSigning:
+      allOf:
+        - $ref: '#/components/schemas/Signing'
+        - $ref: '#/components/schemas/PayloadAttestationMessageRequest'
+        - type: object
+          properties:
+            type:
+              type: "string"
+              description: Signing Request type
+              enum:
+                - 'PAYLOAD_ATTESTATION_MESSAGE'
+          required:
+            - type
+    PayloadAttestationMessageRequest:
+      type: object
+      properties:
+        payload_attestation_message:
+          oneOf:
+            - $ref: '#/components/schemas/PayloadAttestationMessageRequestGloas'
+          discriminator:
+            propertyName: version
+            mapping:
+              GLOAS: '#/components/schemas/PayloadAttestationMessageRequestGloas'
+      required:
+        - payload_attestation_message
+    PayloadAttestationMessageRequestGloas:
+      type: object
+      properties:
+        version:
+          type: string
+          enum:
+            - GLOAS
+          description: 'version to identify PayloadAttestationMessage request type.'
+        data:
+          $ref: "#/components/schemas/PayloadAttestationDataGloas"
+      required:
+        - version
+        - data
+    ProposerPreferencesSigning:
+      allOf:
+        - $ref: '#/components/schemas/Signing'
+        - $ref: '#/components/schemas/ProposerPreferencesRequest'
+        - type: object
+          properties:
+            type:
+              type: "string"
+              description: Signing Request type
+              enum:
+                - 'PROPOSER_PREFERENCES'
+          required:
+            - type
+    ProposerPreferencesRequest:
+      type: object
+      properties:
+        proposer_preferences:
+          oneOf:
+            - $ref: '#/components/schemas/ProposerPreferencesRequestGloas'
+          discriminator:
+            propertyName: version
+            mapping:
+              GLOAS: '#/components/schemas/ProposerPreferencesRequestGloas'
+      required:
+        - proposer_preferences
+    ProposerPreferencesRequestGloas:
+      type: object
+      properties:
+        version:
+          type: string
+          enum:
+            - GLOAS
+          description: 'version to identify ProposerPreferences request type.'
+        data:
+          $ref: "#/components/schemas/ProposerPreferencesGloas"
+      required:
+        - version
+        - data
+    BuilderRequestAuthSigning:
+      allOf:
+        - $ref: '#/components/schemas/BuilderRequestAuthRequest'
+        - type: object
+          properties:
+            type:
+              type: "string"
+              description: Signing Request type
+              enum:
+                - 'BUILDER_REQUEST_AUTH'
+            signingRoot:
+              type: "string"
+              description: 'signing root for optional verification if field present'
+          required:
+            - type
+    BuilderRequestAuthRequest:
+      type: object
+      properties:
+        builder_request_auth:
+          oneOf:
+            - $ref: '#/components/schemas/BuilderRequestAuthRequestGloas'
+          discriminator:
+            propertyName: version
+            mapping:
+              GLOAS: '#/components/schemas/BuilderRequestAuthRequestGloas'
+      required:
+        - builder_request_auth
+    BuilderRequestAuthRequestGloas:
+      type: object
+      properties:
+        version:
+          type: string
+          enum:
+            - GLOAS
+          description: 'version to identify BuilderRequestAuth request type.'
+        data:
+          $ref: "#/components/schemas/BuilderRequestAuthGloas"
+      required:
+        - version
+        - data
+    RandaoReveal:
+      type: "object"
+      properties:
+        epoch:
+          type: string
+          format: "uint64"
+    AttestationData:
+      type: "object"
+      properties:
+        slot:
+          type: "string"
+          format: "uint64"
+        index:
+          type: "string"
+          format: "uint64"
+        beacon_block_root:
+          type: "string"
+        source:
+          $ref: "#/components/schemas/Checkpoint"
+        target:
+          $ref: "#/components/schemas/Checkpoint"
+    Checkpoint:
+      type: "object"
+      properties:
+        epoch:
+          type: "string"
+        root:
+          type: "string"
+    Fork:
+      type: "object"
+      properties:
+        previous_version:
+          pattern: "^0x[a-fA-F0-9]{8}$"
+          type: "string"
+          description: 'Previous version of fork'
+          example: '0x00000001'
+        current_version:
+          pattern: "^0x[a-fA-F0-9]{8}$"
+          type: "string"
+          description: 'Current version of fork'
+          example: '0x00000001'
+        epoch:
+          type: "string"
+          description: 'Epoch value in String format'
+          format: "uint64"
+          example: '1'
+    BeaconBlock:
+      type: "object"
+      properties:
+        slot:
+          type: "string"
+          format: "uint64"
+        proposer_index:
+          type: "string"
+          format: "uint64"
+        parent_root:
+          type: "string"
+        state_root:
+          type: "string"
+        body:
+          $ref: "#/components/schemas/BeaconBlockBody"
+    BeaconBlockBody:
+      type: "object"
+      properties:
+        randao_reveal:
+          type: "string"
+        eth1_data:
+          "$ref": "#/components/schemas/Eth1Data"
+        graffiti:
+          type: "string"
+          description: "Bytes32 hexadecimal"
+        proposer_slashings:
+          type: "array"
+          items:
+            $ref: "#/components/schemas/ProposerSlashing"
+        attester_slashings:
+          type: "array"
+          items:
+            $ref: "#/components/schemas/AttesterSlashing"
+        attestations:
+          type: "array"
+          items:
+            $ref: "#/components/schemas/AttestationPhase0"
+        deposits:
+          type: "array"
+          items:
+            $ref: "#/components/schemas/Deposit"
+        voluntary_exits:
+          type: "array"
+          items:
+            $ref: "#/components/schemas/SignedVoluntaryExit"
+    Eth1Data:
+      type: "object"
+      properties:
+        deposit_root:
+          type: "string"
+        deposit_count:
+          type: "string"
+          format: "uint64"
+        block_hash:
+          type: "string"
+    ProposerSlashing:
+      type: "object"
+      properties:
+        signed_header_1:
+          "$ref": "#/components/schemas/SignedBeaconBlockHeader"
+        signed_header_2:
+          "$ref": "#/components/schemas/SignedBeaconBlockHeader"
+    AttesterSlashing:
+      type: "object"
+      properties:
+        attestation_1:
+          "$ref": "#/components/schemas/IndexedAttestation"
+        attestation_2:
+          "$ref": "#/components/schemas/IndexedAttestation"
+    AttestationPhase0:
+      type: "object"
+      properties:
+        aggregation_bits:
+          type: "string"
+        data:
+          $ref: "#/components/schemas/AttestationData"
+        signature:
+          type: "string"
+    AttestationElectra:
+      type: "object"
+      properties:
+        aggregation_bits:
+          type: "string"
+        data:
+          $ref: "#/components/schemas/AttestationData"
+        signature:
+          type: "string"
+        committee_bits:
+          type: "string"
+    Deposit:
+      type: "object"
+      properties:
+        proof:
+          type: "array"
+          items:
+            type: "string"
+        data:
+          $ref: "#/components/schemas/DepositData"
+    SignedVoluntaryExit:
+      type: "object"
+      properties:
+        message:
+          $ref: "#/components/schemas/VoluntaryExit"
+        signature:
+          type: "string"
+    SignedBeaconBlockHeader:
+      type: "object"
+      properties:
+        message:
+          $ref: "#/components/schemas/BeaconBlockHeader"
+        signature:
+          type: "string"
+    IndexedAttestation:
+      type: object
+      properties:
+        attesting_indices:
+          type: array
+          items:
+            type: string
+            format: uint64
+        data:
+          "$ref": "#/components/schemas/AttestationData"
+        signature:
+          type: string
+    DepositData:
+      type: "object"
+      properties:
+        pubkey:
+          type: "string"
+        withdrawal_credentials:
+          type: "string"
+        amount:
+          type: "string"
+        signature:
+          type: "string"
+    VoluntaryExit:
+      type: object
+      properties:
+        epoch:
+          type: string
+          format: uint64
+        validator_index:
+          type: string
+          format: uint64
+    BeaconBlockHeader:
+      type: object
+      properties:
+        slot:
+          type: string
+          format: uint64
+        proposer_index:
+          type: string
+          format: uint64
+        parent_root:
+          type: string
+          description: Bytes32 hexadecimal
+        state_root:
+          type: string
+          description: Bytes32 hexadecimal
+        body_root:
+          type: string
+          description: Bytes32 hexadecimal
+    AggregateAndProofPhase0:
+      type: object
+      properties:
+        aggregator_index:
+          type: string
+          format: uint64
+        aggregate:
+          "$ref": "#/components/schemas/AttestationPhase0"
+        selection_proof:
+          type: string
+          description: Bytes96 hexadecimal
+    AggregateAndProofElectra:
+      type: object
+      properties:
+        aggregator_index:
+          type: string
+          format: uint64
+        aggregate:
+          "$ref": "#/components/schemas/AttestationElectra"
+        selection_proof:
+          type: string
+          description: Bytes96 hexadecimal
+    SyncCommitteeMessage:
+      type: object
+      properties:
+        beacon_block_root:
+          type: string
+          description: Bytes32 hexadecimal
+        slot:
+          type: string
+          format: uint64
+    SyncAggregatorSelectionData:
+      type: object
+      properties:
+        slot:
+          type: string
+          format: uint64
+        subcommittee_index:
+          type: string
+          format: uint64
+    ContributionAndProof:
+      type: object
+      properties:
+        aggregator_index:
+          type: string
+          format: uint64
+        selection_proof:
+          type: string
+          description: Bytes96 hexadecimal
+        contribution:
+          "$ref": "#/components/schemas/SyncCommitteeContribution"
+    SyncCommitteeContribution:
+      type: object
+      properties:
+        slot:
+          type: string
+          format: uint64
+        beacon_block_root:
+          type: string
+          description: Bytes32 hexadecimal
+        subcommittee_index:
+          type: string
+          format: uint64
+        aggregation_bits:
+          type: string
+          description: SSZ hexadecimal
+        signature:
+          type: string
+          description: Bytes96 hexadecimal
+    ValidatorRegistration:
+      type: object
+      properties:
+        fee_recipient:
+          type: string
+          description: Bytes20 hexadecimal
+        gas_limit:
+          type: string
+          format: uint64
+        timestamp:
+          type: string
+          format: uint64
+        pubkey:
+          type: string
+    ExecutionPayloadBidGloas:
+      type: object
+      description: >-
+        SSZ container signed by a builder using DOMAIN_BEACON_BUILDER (0x0B000000)
+        in Gloas for proposing an execution payload bid.
+      properties:
+        parent_block_hash:
+          type: string
+          description: Bytes32 hexadecimal
+        parent_block_root:
+          type: string
+          description: Bytes32 hexadecimal
+        block_hash:
+          type: string
+          description: Bytes32 hexadecimal
+        prev_randao:
+          type: string
+          description: Bytes32 hexadecimal
+        fee_recipient:
+          type: string
+          description: Bytes20 hexadecimal
+        gas_limit:
+          type: string
+          format: uint64
+        builder_index:
+          type: string
+          format: uint64
+        slot:
+          type: string
+          format: uint64
+        value:
+          type: string
+          format: uint64
+        execution_payment:
+          type: string
+          format: uint64
+        blob_kzg_commitments:
+          type: array
+          items:
+            type: string
+            description: Bytes48 hexadecimal
+        execution_requests_root:
+          type: string
+          description: Bytes32 hexadecimal
+    ExecutionPayloadEnvelopeGloas:
+      type: object
+      description: >-
+        SSZ container signed by a builder, or by a proposer for self-builds, using
+        DOMAIN_BEACON_BUILDER (0x0B000000) in Gloas when revealing the actual execution
+        payload.
+      properties:
+        payload:
+          $ref: '#/components/schemas/ExecutionPayloadGloas'
+        execution_requests:
+          $ref: '#/components/schemas/ExecutionRequestsGloas'
+        builder_index:
+          type: string
+          format: uint64
+        beacon_block_root:
+          type: string
+          description: Bytes32 hexadecimal
+        parent_beacon_block_root:
+          type: string
+          description: Bytes32 hexadecimal
+    ExecutionPayloadGloas:
+      type: object
+      description: >-
+        Gloas execution payload. Extends the Deneb execution payload with
+        block_access_list and slot_number fields.
+      properties:
+        parent_hash:
+          type: string
+          description: Bytes32 hexadecimal
+        fee_recipient:
+          type: string
+          description: Bytes20 hexadecimal
+        state_root:
+          type: string
+          description: Bytes32 hexadecimal
+        receipts_root:
+          type: string
+          description: Bytes32 hexadecimal
+        logs_bloom:
+          type: string
+          description: Bytes256 hexadecimal
+        prev_randao:
+          type: string
+          description: Bytes32 hexadecimal
+        block_number:
+          type: string
+          format: uint64
+        gas_limit:
+          type: string
+          format: uint64
+        gas_used:
+          type: string
+          format: uint64
+        timestamp:
+          type: string
+          format: uint64
+        extra_data:
+          type: string
+          description: SSZ hexadecimal
+        base_fee_per_gas:
+          type: string
+          description: UInt256 decimal
+        block_hash:
+          type: string
+          description: Bytes32 hexadecimal
+        transactions:
+          type: array
+          items:
+            type: string
+            description: SSZ hexadecimal
+        withdrawals:
+          type: array
+          description: List of validator withdrawals (Capella+).
+          items:
+            type: object
+            properties:
+              index:
+                type: string
+                format: uint64
+              validator_index:
+                type: string
+                format: uint64
+              address:
+                type: string
+                description: Bytes20 hexadecimal
+              amount:
+                type: string
+                format: uint64
+        blob_gas_used:
+          type: string
+          format: uint64
+        excess_blob_gas:
+          type: string
+          format: uint64
+        block_access_list:
+          type: string
+          description: SSZ hexadecimal
+        slot_number:
+          type: string
+          format: uint64
+    ExecutionRequestsGloas:
+      type: object
+      description: >-
+        Gloas execution requests. Extends the Electra execution requests
+        (deposits, withdrawals, consolidations) with builder_deposits and
+        builder_exits.
+      properties:
+        deposits:
+          type: array
+          items:
+            type: object
+            properties:
+              pubkey:
+                type: string
+                description: Bytes48 hexadecimal
+              withdrawal_credentials:
+                type: string
+                description: Bytes32 hexadecimal
+              amount:
+                type: string
+                format: uint64
+              signature:
+                type: string
+                description: Bytes96 hexadecimal
+              index:
+                type: string
+                format: uint64
+        withdrawals:
+          type: array
+          items:
+            type: object
+            properties:
+              source_address:
+                type: string
+                description: Bytes20 hexadecimal
+              validator_pubkey:
+                type: string
+                description: Bytes48 hexadecimal
+              amount:
+                type: string
+                format: uint64
+        consolidations:
+          type: array
+          items:
+            type: object
+            properties:
+              source_address:
+                type: string
+                description: Bytes20 hexadecimal
+              source_pubkey:
+                type: string
+                description: Bytes48 hexadecimal
+              target_pubkey:
+                type: string
+                description: Bytes48 hexadecimal
+        builder_deposits:
+          type: array
+          items:
+            type: object
+            properties:
+              pubkey:
+                type: string
+                description: Bytes48 hexadecimal
+              withdrawal_credentials:
+                type: string
+                description: Bytes32 hexadecimal
+              amount:
+                type: string
+                format: uint64
+              signature:
+                type: string
+                description: Bytes96 hexadecimal
+        builder_exits:
+          type: array
+          items:
+            type: object
+            properties:
+              source_address:
+                type: string
+                description: Bytes20 hexadecimal
+              pubkey:
+                type: string
+                description: Bytes48 hexadecimal
+    PayloadAttestationDataGloas:
+      type: object
+      description: >-
+        The data component of a PayloadAttestationMessage, signed by a PTC
+        validator using DOMAIN_PTC_ATTESTER (0x0C000000).
+      properties:
+        beacon_block_root:
+          type: string
+          description: Bytes32 hexadecimal
+          example: '0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2'
+        slot:
+          type: string
+          format: uint64
+          example: '1'
+        payload_present:
+          type: boolean
+          description: Whether the execution payload for this slot is present
+        blob_data_available:
+          type: boolean
+          description: Whether blob data is available for this slot
+    ProposerPreferencesGloas:
+      type: object
+      description: >-
+        Container signed by a proposer using DOMAIN_PROPOSER_PREFERENCES
+        (0x0D000000) to advertise their preferences (fee_recipient,
+        target_gas_limit) for an upcoming proposal slot.
+      properties:
+        dependent_root:
+          type: string
+          description: Bytes32 hexadecimal
+        proposal_slot:
+          type: string
+          format: uint64
+        validator_index:
+          type: string
+          format: uint64
+        fee_recipient:
+          type: string
+          description: Bytes20 hexadecimal
+        target_gas_limit:
+          type: string
+          format: uint64
+    BuilderRequestAuthGloas:
+      type: object
+      description: >-
+        Proposer-signed, out-of-protocol builder-API authentication message
+        (builder-specs, Gloas), used to authenticate per-request builder-API
+        calls (e.g. getExecutionPayloadBid, submitBuilderPreferences). Signed
+        with DOMAIN_BUILDER_REQUEST_AUTH (0x0B000001) computed from the genesis
+        fork version and a zero genesis_validators_root (no fork_info required),
+        not the proposer's current fork.
+      properties:
+        data:
+          type: string
+          description: >-
+            SSZ hexadecimal (max 4096 bytes, non-empty). Opaque authentication
+            data agreed with the builder out of band.
+        slot:
+          type: string
+          format: uint64
+          description: The proposal slot this request is authorized for.
+    BeaconBlockSigning:
+      allOf:
+        - $ref: '#/components/schemas/Signing'
+        - $ref: '#/components/schemas/BeaconBlockRequest'
+        - type: object
+          properties:
+            type:
+              type: "string"
+              description: Signing Request type
+              enum:
+                - 'BLOCK_V2'
+          required:
+            - type
+
+    BeaconBlockRequest:
+      type: object
+      properties:
+        beacon_block:
+          oneOf:
+            - $ref: '#/components/schemas/BlockRequestPhase0'
+            - $ref: '#/components/schemas/BlockRequestAltair'
+            - $ref: '#/components/schemas/BlockRequestBellatrix'
+            - $ref: '#/components/schemas/BlockRequestCapella'
+            - $ref: '#/components/schemas/BlockRequestDeneb'
+            - $ref: '#/components/schemas/BlockRequestElectra'
+            - $ref: '#/components/schemas/BlockRequestFulu'
+            - $ref: '#/components/schemas/BlockRequestGloas'
+          discriminator:
+            propertyName: version
+            mapping:
+              PHASE0: '#/components/schemas/BlockRequestPhase0'
+              ALTAIR: '#/components/schemas/BlockRequestAltair'
+              BELLATRIX: '#/components/schemas/BlockRequestBellatrix'
+              CAPELLA: '#/components/schemas/BlockRequestCapella'
+              DENEB: '#/components/schemas/BlockRequestDeneb'
+              ELECTRA: '#/components/schemas/BlockRequestElectra'
+              FULU: '#/components/schemas/BlockRequestFulu'
+              GLOAS: '#/components/schemas/BlockRequestGloas'
+      required:
+        - beacon_block
+    BlockRequestPhase0:
+      type: object
+      properties:
+        version:
+          type: string
+          enum:
+            - PHASE0
+          description: 'version to identify block request type.'
+        block:
+          $ref: "#/components/schemas/BeaconBlock"
+      required:
+        - version
+        - block
+    BlockRequestAltair:
+      type: object
+      properties:
+        version:
+          type: string
+          enum:
+            - ALTAIR
+          description: 'version to identify block request type.'
+        block:
+          $ref: "#/components/schemas/BeaconBlockAltair"
+      required:
+        - version
+        - block
+    BlockRequestBellatrix:
+      type: object
+      properties:
+        version:
+          type: string
+          enum:
+            - BELLATRIX
+          description: 'version to identify block request type.'
+        block_header:
+          $ref: "#/components/schemas/BeaconBlockHeader"
+      required:
+        - version
+        - block_header
+    BlockRequestCapella:
+      type: object
+      properties:
+        version:
+          type: string
+          enum:
+            - CAPELLA
+          description: 'version to identify block request type.'
+        block_header:
+          $ref: "#/components/schemas/BeaconBlockHeader"
+      required:
+        - version
+        - block_header
+    BlockRequestDeneb:
+      type: object
+      properties:
+        version:
+          type: string
+          enum:
+            - DENEB
+          description: 'version to identify block request type.'
+        block_header:
+          $ref: "#/components/schemas/BeaconBlockHeader"
+      required:
+        - version
+        - block_header
+    BlockRequestElectra:
+      type: object
+      properties:
+        version:
+          type: string
+          enum:
+            - ELECTRA
+          description: 'version to identify block request type.'
+        block_header:
+          $ref: "#/components/schemas/BeaconBlockHeader"
+      required:
+        - version
+        - block_header
+    BlockRequestFulu:
+      type: object
+      properties:
+        version:
+          type: string
+          enum:
+            - FULU
+          description: 'version to identify block request type.'
+        block_header:
+          $ref: "#/components/schemas/BeaconBlockHeader"
+      required:
+        - version
+        - block_header
+    BlockRequestGloas:
+      type: object
+      properties:
+        version:
+          type: string
+          enum:
+            - GLOAS
+          description: 'version to identify block request type.'
+        block_header:
+          $ref: "#/components/schemas/BeaconBlockHeader"
+      required:
+        - version
+        - block_header
+    BeaconBlockAltair:
+      type: "object"
+      properties:
+        slot:
+          type: "string"
+          format: "uint64"
+        proposer_index:
+          type: "string"
+          format: "uint64"
+        parent_root:
+          type: "string"
+        state_root:
+          type: "string"
+        body:
+          $ref: "#/components/schemas/BeaconBlockBodyAltair"
+    BeaconBlockBodyAltair:
+      allOf:
+        - $ref: "#/components/schemas/BeaconBlockBody"
+        - type: object
+          properties:
+            sync_aggregate:
+              $ref: "#/components/schemas/SyncAggregate"
+    SyncAggregate:
+      type: object
+      properties:
+        sync_committee_bits:
+          type: string
+          description: SSZ hexadecimal
+        sync_committee_signature:
+          type: string
+          description: Bytes96 hexadecimal
