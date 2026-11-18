@@ -55,6 +55,9 @@
 //! - `POST /keys/import` `{"manifest": <manifest.json>, "authorization": {..}}`: registers the
 //!   imported key's public data through consensus (protected, below; idempotent; `409` if the id
 //!   or the key is already registered).
+//! - `POST /keys/import/batch` `{"manifests": [<manifest.json>, ..], "authorization": {..}}`: up
+//!   to 128 imported keys registered all or none, under one set of approvals (`409` or `400`
+//!   naming the first manifest refused, and nothing registered).
 //! - `POST /keys/import/share` (a `node-<index>.enc`): this node opens, verifies and stores its own
 //!   share, then acknowledges it through consensus. Never returns the share.
 //! - `GET /keys/import/{ceremony_id}`: registration, acknowledged shares, history and activation.
@@ -425,6 +428,7 @@ pub fn router(
         .route("/identity", get(identity))
         .route("/attestation", get(attestation))
         .route("/keys/import", post(register_import))
+        .route("/keys/import/batch", post(register_import_batch))
         .route("/keys/import/share", post(install_share))
         .route("/keys/import/{ceremony_id}", get(import_status))
         .route(
@@ -2301,6 +2305,87 @@ async fn register_import(State(api): State<Api>, body: Bytes) -> Result<Response
             ),
         )),
         ImportOutcome::Invalid(invalid) => Err((StatusCode::BAD_REQUEST, invalid.to_string())),
+    }
+}
+
+/// `POST /keys/import/batch`: `{"manifests": [...], "authorization"}`, 1 to
+/// `MAX_BATCH_REGISTRATIONS` manifests registered all or none, under one set of approvals.
+async fn register_import_batch(
+    State(api): State<Api>,
+    Json(mut body): Json<serde_json::Value>,
+) -> Result<Response, ApiError> {
+    let authorization = match body
+        .as_object_mut()
+        .and_then(|object| object.remove("authorization"))
+    {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            serde_json::from_value::<AuthorizationJson>(value)
+                .map_err(|err| (StatusCode::BAD_REQUEST, format!("authorization: {err}")))?,
+        ),
+    };
+    // The command approvers signed, built from the same request (`admin::command`).
+    let batch =
+        crate::admin::batch_registration(&body).map_err(|err| (StatusCode::BAD_REQUEST, err))?;
+    // The checks consensus applies to each manifest, first, for a clear answer.
+    for manifest in &batch.manifests {
+        manifest.check(api.dkg.committee()).map_err(|err| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("manifest {}: {err}", manifest.ceremony),
+            )
+        })?;
+    }
+    let command = Command::RegisterImportedKeys(Box::new(batch.clone()));
+    command
+        .ceremony_id_rule()
+        .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
+    let endorsement = authorize(&api, &command, authorization).await?;
+    let receipt = tokio::time::timeout(
+        SUBMIT_TIMEOUT,
+        api.client.register_import_batch(batch, Some(endorsement)),
+    )
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::GATEWAY_TIMEOUT,
+            "batch registration not finalized in time (it may still be)".to_string(),
+        )
+    })?
+    .map_err(unavailable)?;
+    use crate::dkg::ceremony::{BatchImportOutcome, ImportOutcome};
+    match receipt.outcome {
+        BatchImportOutcome::Registered {
+            registered,
+            existing,
+        } => Ok(Json(serde_json::json!({
+            "registered": registered.len(),
+            "already_registered": existing,
+            "rounds": registered,
+            "height": receipt.height,
+        }))
+        .into_response()),
+        BatchImportOutcome::Refused { ceremony, outcome } => {
+            let (status, reason) = match outcome {
+                ImportOutcome::Conflict(round) => (
+                    StatusCode::CONFLICT,
+                    format!("the ceremony id is already used (round {round}) by another ceremony"),
+                ),
+                ImportOutcome::KeyExists(round) => (
+                    StatusCode::CONFLICT,
+                    format!(
+                        "this validator key is already registered (round {round}): a key is \
+                         registered once, and its slashing history is never reset"
+                    ),
+                ),
+                ImportOutcome::Invalid(invalid) => (StatusCode::BAD_REQUEST, invalid.to_string()),
+                other => (StatusCode::INTERNAL_SERVER_ERROR, format!("{other:?}")),
+            };
+            Err((
+                status,
+                format!("manifest {ceremony}: {reason}; nothing of the batch was registered"),
+            ))
+        }
     }
 }
 

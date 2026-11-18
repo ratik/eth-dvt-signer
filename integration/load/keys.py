@@ -13,10 +13,12 @@ loopback (`--eth-network hoodi`, approvers 2 of 3, development consensus keys), 
 
 Every protected operation uses the network's next administrative nonce, so they go one at a
 time. With --activate-batch K, the activations go K keys per approved operation
-(`POST /validators/activate/batch`) instead of one. A sampler records every 10 s the size of each node's data directory, the nodes' RSS and the
-keys done (samples.jsonl). The summary is summary.json.
+(`POST /validators/activate/batch`) instead of one; with --register-batch R, the registrations
+of imported keys R per operation (`POST /keys/import/batch`). A sampler records every 10 s the
+size of each node's data directory, the nodes' RSS and the keys done (samples.jsonl). The summary is summary.json.
 
   keys.py WORK --dkg N --import N [--concurrency C] [--batch B] [--activate-batch K]
+                [--register-batch R]
 """
 import argparse
 import concurrent.futures
@@ -41,6 +43,7 @@ START = time.time()
 PROGRESS = {"phase": "setup", "dkg_done": 0, "dkg_active": 0, "import_registered": 0,
             "import_active": 0}
 ACTIVATE_BATCH = 0
+REGISTER_BATCH = 0
 
 
 def log(message):
@@ -372,14 +375,22 @@ def import_phase(network, count, concurrency, batch, gvr, summary):
 
     t0 = time.time()
     installs = []
-    for index, manifest in enumerate(manifests):
-        answer = network.submit("register-import", f"{node(index % NODES)}/keys/import",
-                                {"manifest": manifest}, register)
-        keys.append(manifest["validator_public_key"])
-        installs += [pool.submit(install, index, i) for i in range(NODES)]
-        PROGRESS["import_registered"] = index + 1
-        if (index + 1) % 100 == 0:
-            log(f"import: {index + 1} registered")
+    per_batch = REGISTER_BATCH or 1
+    for start in range(0, count, per_batch):
+        group = list(enumerate(manifests))[start:start + per_batch]
+        if REGISTER_BATCH:
+            network.submit("register-import-batch", f"{node(start % NODES)}/keys/import/batch",
+                           {"manifests": [manifest for _, manifest in group]}, register)
+        else:
+            network.submit("register-import", f"{node(start % NODES)}/keys/import",
+                           {"manifest": group[0][1]}, register)
+        for index, manifest in group:
+            keys.append(manifest["validator_public_key"])
+            installs += [pool.submit(install, index, i) for i in range(NODES)]
+        done = start + len(group)
+        PROGRESS["import_registered"] = done
+        if done % 100 < per_batch:
+            log(f"import: {done} registered")
     for future in installs:
         future.result()
     register_s = time.time() - t0
@@ -424,9 +435,12 @@ def main():
                         help="DKG only: do not activate the generated keys")
     parser.add_argument("--activate-batch", type=int, default=0,
                         help="keys per approved activation (0: one activation per key)")
+    parser.add_argument("--register-batch", type=int, default=0,
+                        help="imported keys per approved registration (0: one per key)")
     args = parser.parse_args()
-    global ACTIVATE_BATCH
+    global ACTIVATE_BATCH, REGISTER_BATCH
     ACTIVATE_BATCH = args.activate_batch
+    REGISTER_BATCH = args.register_batch
     os.makedirs(args.work, exist_ok=True)
     network = Network(args.work)
     stop = threading.Event()

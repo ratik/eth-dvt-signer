@@ -228,6 +228,20 @@ pub enum ImportOutcome {
     Invalid(Invalid),
 }
 
+/// What a batch of imported-key registrations decided: all or none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BatchImportOutcome {
+    /// Every manifest is registered: `registered` new rounds, in the batch's order, and `existing`
+    /// manifests already registered as they are (idempotent).
+    Registered { registered: Vec<u64>, existing: u32 },
+    /// Nothing is registered: the first manifest refused, by its ceremony id, and why
+    /// (`Conflict`, `KeyExists` or `Invalid`).
+    Refused {
+        ceremony: CeremonyId,
+        outcome: ImportOutcome,
+    },
+}
+
 /// Who deals a reshare and who holds the new generation (`StartResharing`, R2). Without it, the
 /// active generation's keyholders deal to the committee (R1).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -718,6 +732,70 @@ impl Ceremonies {
         self.ceremonies.insert(round, ceremony);
         self.changed.insert(round);
         ImportOutcome::Registered(round)
+    }
+
+    /// Register every manifest of a batch in the block at `height`, as the next rounds in order,
+    /// or none: each is checked as [Self::import] checks one, then all are registered. A manifest
+    /// already registered as it is counts as registered.
+    pub fn import_batch(&mut self, manifests: &[Manifest], height: u64) -> BatchImportOutcome {
+        // The validator keys of the ceremonies, once for the whole batch; the batch's own ids and
+        // keys join them as they are checked, so a batch never names one twice.
+        let mut ids: BTreeMap<&CeremonyId, u64> = BTreeMap::new();
+        let mut keys: BTreeMap<Vec<u8>, u64> = self
+            .ceremonies
+            .values()
+            .filter_map(|ceremony| {
+                let key = ceremony.public_key()?;
+                Some((key.encode().to_vec(), ceremony.round))
+            })
+            .collect();
+        let mut existing = 0;
+        let mut new = Vec::new();
+        for manifest in manifests {
+            let refused = |outcome| BatchImportOutcome::Refused {
+                ceremony: manifest.ceremony.clone(),
+                outcome,
+            };
+            if let Some(&round) = self.ids.get(&manifest.ceremony) {
+                match self.ceremonies[&round].imported() {
+                    Some(imported) if &imported.manifest == manifest => {
+                        existing += 1;
+                        continue;
+                    }
+                    _ => return refused(ImportOutcome::Conflict(round)),
+                }
+            }
+            if let Some(&round) = ids.get(&manifest.ceremony) {
+                return refused(ImportOutcome::Conflict(round));
+            }
+            if let Some(&round) = keys.get(manifest.validator.as_slice()) {
+                return refused(ImportOutcome::KeyExists(round));
+            }
+            let sharing = match manifest.check(&self.committee) {
+                Ok(sharing) => sharing,
+                Err(invalid) => return refused(ImportOutcome::Invalid(invalid)),
+            };
+            let round = (self.ceremonies.len() + new.len()) as u64;
+            match Ceremony::new_imported(manifest.clone(), sharing, round, height) {
+                Ok(ceremony) => {
+                    ids.insert(&manifest.ceremony, round);
+                    keys.insert(manifest.validator.to_vec(), round);
+                    new.push(ceremony);
+                }
+                Err(invalid) => return refused(ImportOutcome::Invalid(invalid)),
+            }
+        }
+        let registered = new.iter().map(|ceremony| ceremony.round).collect();
+        for ceremony in new {
+            let round = ceremony.round;
+            self.ids.insert(ceremony.config.id.clone(), round);
+            self.ceremonies.insert(round, ceremony);
+            self.changed.insert(round);
+        }
+        BatchImportOutcome::Registered {
+            registered,
+            existing,
+        }
     }
 
     /// Start a reshare of `validator`'s key, whose active generation is the ceremony `active`, as

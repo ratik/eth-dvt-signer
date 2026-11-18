@@ -21,6 +21,7 @@ tag 15), `src/application.rs` (leaders and voters), `src/epochs.rs` (the termina
 | `activate` | `POST /validators/activate` | `ActivateValidator`, or `ActivateImportedValidator` with an `acknowledgment` | Binds a key to a chain for good. A wrong chain bricks the key. For an imported key, it records the operator's statement that the previous signer is stopped. |
 | `activate-batch` | `POST /validators/activate/batch` | `ActivateValidators` | As `activate`, for up to 1 024 keys of one chain at once, all or none, with one set of approvals and one nonce. |
 | `register-import` | `POST /keys/import` | `RegisterImportedKey` | Fixes the imported key's public sharing. A key is registered once, so fake commitments would block that key's import for good. |
+| `register-import-batch` | `POST /keys/import/batch` | `RegisterImportedKeys` | As `register-import`, for up to 128 manifests at once, all or none, with one set of approvals and one nonce. |
 | `reshare` with `from_round`, `dealers`, `players` (R2) | `POST /validators/reshare` | `StartResharing` with a membership | Hands key shares to new keyholders. |
 | `reconfigure` (R3) | `POST /consensus/reconfigure` | `Reconfigure` | Changes the consensus voters. |
 | `import-history` (P0.1) | `POST /slashing-protection/import` (not a dry run) | `ImportSlashingProtection` | Raises an imported key's slashing-protection floors for good. Floors chosen by an attacker would refuse the key's real duties. |
@@ -363,6 +364,7 @@ What `draft` takes per operation (`--request` takes JSON or `@file`):
 | `activate` | `--request` with `public_key`, `genesis_validators_root`; add `acknowledgment` for an imported key |
 | `activate-batch` | `--request` with `genesis_validators_root` and `validators`: a list of `{"public_key"}`, each with `acknowledgment` for an imported key |
 | `register-import` | `--request '{"manifest": ...}'` |
+| `register-import-batch` | `--request '{"manifests": [...]}'`: up to 128 manifests, each id and key once |
 | `reshare` | `--request` with `public_key`, `ceremony_id`, `from_round`, `dealers`, `players` |
 | `reconfigure` | `--request` with `remove`, `add`; `epoch` defaults to the next one |
 | `import-history` | `--interchange FILE`, and optionally `--validator KEY` (repeatable), instead of `--request` |
@@ -445,6 +447,9 @@ mpc-admin --nodes ... resume
   (each key's activation is written as a single activation writes it). Upgrade every node before
   the first batch: an older node cannot decode a block that carries one. Until then, nothing
   changes, and single activations keep working.
+- **Batch registration.** A command tag (18, `RegisterImportedKeys`); the state format is unchanged
+  (each key is written as a single registration writes it). As for batch activation, upgrade every
+  node before the first batch.
 - **P0.3.** The cluster id binds the Ethereum network's identity, so approvals drafted before the
   upgrade must be drafted and signed again. The administrative record gains the network identity
   (value tag 15; a tag 13 record reads as "no network recorded"). A node started for another network

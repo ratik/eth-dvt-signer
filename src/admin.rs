@@ -46,7 +46,10 @@ use crate::{
     },
     import::manifest::{Manifest, ManifestJson},
     slashing::{Acknowledgment, ChainIdentity},
-    types::{Approval, Authorized, BatchActivation, Command, MAX_APPROVALS, Reconfiguration},
+    types::{
+        Approval, Authorized, BatchActivation, BatchRegistration, Command, MAX_APPROVALS,
+        Reconfiguration,
+    },
 };
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::{
@@ -401,12 +404,13 @@ pub struct AuthorizationJson {
 
 /// The protected operations, by the name `mpc-admin` drafts them under, and the endpoint each
 /// one is submitted to with its body (`{public_key}`: the request's key).
-pub const KINDS: [(&str, &str); 9] = [
+pub const KINDS: [(&str, &str); 10] = [
     ("reconfigure", "/consensus/reconfigure"),
     ("reshare", "/validators/reshare"),
     ("activate", "/validators/activate"),
     ("activate-batch", "/validators/activate/batch"),
     ("register-import", "/keys/import"),
+    ("register-import-batch", "/keys/import/batch"),
     ("import-history", "/slashing-protection/import"),
     ("sign-exit", SIGN_ENDPOINT),
     ("sign-deposit", SIGN_ENDPOINT),
@@ -657,6 +661,9 @@ pub fn command(kind: &str, body: &serde_json::Value) -> Result<Command, String> 
             let manifest = Manifest::from_json(&json).map_err(|err| err.to_string())?;
             Ok(Command::RegisterImportedKey(Box::new(manifest)))
         }
+        "register-import-batch" => Ok(Command::RegisterImportedKeys(Box::new(batch_registration(
+            body,
+        )?))),
         "import-history" => {
             if body.get("dry_run").and_then(serde_json::Value::as_bool) == Some(true) {
                 return Err("a dry run changes nothing and takes no approvals".into());
@@ -677,9 +684,39 @@ pub fn command(kind: &str, body: &serde_json::Value) -> Result<Command, String> 
         }
         other => Err(format!(
             "unknown operation {other} (reconfigure, reshare, activate, activate-batch, \
-             register-import, import-history, sign-exit, sign-deposit, set-registration-policy)"
+             register-import, register-import-batch, import-history, sign-exit, sign-deposit, set-registration-policy)"
         )),
     }
+}
+
+/// The request of `POST /keys/import/batch` (and of `mpc-admin`'s `register-import-batch`),
+/// without `authorization`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchRegistrationJson {
+    manifests: Vec<ManifestJson>,
+}
+
+/// The batch registration `body` asks for (its `authorization` aside): 1 to
+/// `MAX_BATCH_REGISTRATIONS` manifests, each id and key once.
+pub fn batch_registration(body: &serde_json::Value) -> Result<BatchRegistration, String> {
+    let mut body = body.clone();
+    if let Some(object) = body.as_object_mut() {
+        object.remove("authorization");
+    }
+    let json: BatchRegistrationJson =
+        serde_json::from_value(body).map_err(|err| format!("batch registration: {err}"))?;
+    let manifests = json
+        .manifests
+        .iter()
+        .map(|manifest| {
+            Manifest::from_json(manifest)
+                .map_err(|err| format!("manifest {}: {err}", manifest.ceremony_id))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let batch = BatchRegistration { manifests };
+    batch.check()?;
+    Ok(batch)
 }
 
 /// The request of `POST /validators/activate/batch` (and of `mpc-admin`'s `activate-batch`),
@@ -1119,6 +1156,21 @@ pub fn describe(command: &Command) -> String {
             validator(&manifest.validator),
             manifest.ceremony,
             hex::encode(manifest.digest())
+        ),
+        Command::RegisterImportedKeys(batch) => format!(
+            "register {} imported keys, all or none: {}",
+            batch.manifests.len(),
+            batch
+                .manifests
+                .iter()
+                .map(|manifest| format!(
+                    "{} as ceremony {} (manifest digest 0x{})",
+                    validator(&manifest.validator),
+                    manifest.ceremony,
+                    hex::encode(manifest.digest())
+                ))
+                .collect::<Vec<_>>()
+                .join("; ")
         ),
         Command::Duty(request) => match &request.duty {
             Duty::VoluntaryExit(exit) => format!(

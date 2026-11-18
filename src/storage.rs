@@ -23,8 +23,9 @@ use crate::{
     dkg::{
         CeremonyId, DkgStatus,
         ceremony::{
-            AbortOutcome, Ceremonies, Ceremony, GenerationOutcome, GenerationRefusal, Ignored,
-            ImportOutcome, Origin, ReadyIgnored, ReshareOutcome, StartOutcome,
+            AbortOutcome, BatchImportOutcome, Ceremonies, Ceremony, GenerationOutcome,
+            GenerationRefusal, Ignored, ImportOutcome, Origin, ReadyIgnored, ReshareOutcome,
+            StartOutcome,
         },
     },
     encoded::Encoded,
@@ -636,6 +637,7 @@ pub enum Effect {
     ActivateBatch(BatchActivationOutcome),
     /// The outcome of an imported key's registration.
     Register(ImportOutcome),
+    RegisterBatch(BatchImportOutcome),
     /// The share index acknowledged as ready, or why the acknowledgement was ignored.
     Ready(Result<u32, ReadyIgnored>),
     /// The outcome of a slashing-protection history import.
@@ -1338,6 +1340,35 @@ impl<E: Context> Store<E> {
                             duties.extend(self.protection.duties_of(id));
                         }
                         Effect::ActivateBatch(outcome)
+                    }
+                    Command::RegisterImportedKeys(batch) => {
+                        // As one registration each, all or none (checked before any is applied).
+                        let outcome = self.ceremonies.import_batch(&batch.manifests, height);
+                        if let BatchImportOutcome::Registered { registered, .. } = &outcome {
+                            let validators: Vec<_> = registered
+                                .iter()
+                                .map(|&round| {
+                                    let ceremony = self.ceremonies.by_round(round);
+                                    let imported = ceremony.and_then(|c| c.imported());
+                                    (round, imported.expect("registered").manifest.validator)
+                                })
+                                .collect();
+                            for (round, validator) in validators {
+                                let (_, records) = self
+                                    .protection
+                                    .register_imported(round, validator)
+                                    .expect("a new key");
+                                metadata.put_value(
+                                    key(VALIDATOR_ROUND_PREFIX, round, 0),
+                                    Value::Number(1),
+                                );
+                                designated.push(round);
+                                for record in records {
+                                    persist(&mut metadata, &self.protection, record);
+                                }
+                            }
+                        }
+                        Effect::RegisterBatch(outcome)
                     }
                     Command::StartResharing {
                         validator,

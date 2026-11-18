@@ -534,7 +534,7 @@ plus the node index). The plain HTTP API binds to `127.0.0.1` only. The mTLS lis
 | `GET /status`, `GET /ready`, `GET /upcheck` | node status and readiness ([recovery.md](recovery.md#5-readiness)) |
 | `GET /api/v1/eth2/publicKeys`, `POST /api/v1/eth2/sign/{key}`, `GET /validators`, `GET /eth/network` | Web3Signer API and validator keys ([ethereum-signing.md](ethereum-signing.md)) |
 | `POST /validators/activate`, `POST /validators/activate/batch`, `GET /admin`, `GET`/`POST /eth/registration-policy` | protected operations ([administration.md](administration.md)) |
-| `POST /keys/import`, `POST /keys/import/share`, `GET /keys/import/{id}`, `POST /slashing-protection/import`, `GET /slashing-protection/export/{public_key}` | key import and EIP-3076 ([key-import.md](key-import.md)) |
+| `POST /keys/import`, `POST /keys/import/batch`, `POST /keys/import/share`, `GET /keys/import/{id}`, `POST /slashing-protection/import`, `GET /slashing-protection/export/{public_key}` | key import and EIP-3076 ([key-import.md](key-import.md)) |
 | `POST /validators/reshare`, `POST /validators/reshare/activate`, `POST /validators/reshare/abort`, `GET /validators/reshare/{id}` | resharing ([resharing.md](resharing.md)) |
 | `GET /consensus`, `POST /consensus/reconfigure`, `POST /consensus/sync` | consensus epochs ([reconfiguration.md](reconfiguration.md)) |
 | `GET /identity`, `GET /attestation` | node keys and attestation ([tee.md](tee.md)) |
@@ -696,7 +696,7 @@ storage. It needs the `test-hooks` feature.
 | `eth2.rs` | E2E-ETH-1 to E2E-ETH-10: every duty through the Web3Signer API, slashing refusals, restarts, crashes around a duty, failed requests, a lagging node, rollbacks, the authorization binding, deposits; `e2e_eth_l1` reproduces L-1 (ignored, fails) |
 | `crash.rs`, `concurrency.rs`, `adversarial.rs`, `limits.rs`, `lifecycle.rs`, `rollback.rs`, `lag.rs` | the audit scenarios: crash boundaries, concurrency and cancellation, byzantine traffic, limits, process lifecycle and corrupted storage, rollback, lag ([audit.md](audit.md), [recovery.md](recovery.md#9-tests)) |
 | `readiness.rs` | recovery scenarios R1 and R6 ([recovery.md](recovery.md#9-tests)) |
-| `import.rs` | E2E-IMP-1, E2E-IMP-2: the whole key import ([key-import.md](key-import.md)) |
+| `import.rs` | E2E-IMP-1 to E2E-IMP-3: the whole key import, and a batch registration ([key-import.md](key-import.md)) |
 | `reshare.rs` | E2E-RSH-1 to E2E-RSH-5, and 10 crash points ([resharing.md](resharing.md)) |
 | `follower.rs`, `replace.rs` | FOL-1 to FOL-5 and R2-E2E-1 to R2-E2E-6, with E restarted at four points ([resharing.md](resharing.md#tests)) |
 | `reconfigure.rs` | R3-1 to R3-9 ([reconfiguration.md](reconfiguration.md#tests)) |

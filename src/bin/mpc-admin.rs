@@ -182,12 +182,13 @@ enum Command {
     /// signed offline.
     Draft {
         /// `reconfigure`, `reshare`, `activate`, `activate-batch`, `register-import`,
-        /// `import-history`, `sign-exit`, `sign-deposit` or `set-registration-policy`.
+        /// `register-import-batch`, `import-history`, `sign-exit`, `sign-deposit` or `set-registration-policy`.
         operation: String,
         /// The endpoint's request (JSON, or `@file`), without `authorization`. For
         /// `activate-batch`, `{"genesis_validators_root", "validators": [{"public_key",
         /// "acknowledgment"}]}` (`acknowledgment` for imported keys only). For
-        /// `register-import`, `{"manifest": <manifest.json>}`. For `reconfigure`, `epoch`
+        /// `register-import`, `{"manifest": <manifest.json>}`; for `register-import-batch`,
+        /// `{"manifests": [<manifest.json>, ..]}` (up to 128). For `reconfigure`, `epoch`
         /// defaults to the next one. For `import-history`, `--interchange` instead; for
         /// `sign-exit` and `sign-deposit`, their fields.
         #[arg(long)]

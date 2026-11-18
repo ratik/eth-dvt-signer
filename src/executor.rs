@@ -10,8 +10,8 @@ use crate::{
     dkg::{
         self, CeremonyConfig, CeremonyId, DkgStatus,
         ceremony::{
-            AbortOutcome, Ceremony, GenerationOutcome, ImportOutcome, Membership, ReadyAck,
-            ReshareOutcome, SignedLog, StartOutcome,
+            AbortOutcome, BatchImportOutcome, Ceremony, GenerationOutcome, ImportOutcome,
+            Membership, ReadyAck, ReshareOutcome, SignedLog, StartOutcome,
         },
         format_key,
     },
@@ -32,8 +32,8 @@ use crate::{
     state::Authorization,
     storage::{Effect, Store},
     types::{
-        BatchActivation, Block, Command, Outcome, Reconfiguration, SignRequest, Transaction,
-        format_hash,
+        BatchActivation, BatchRegistration, Block, Command, Outcome, Reconfiguration, SignRequest,
+        Transaction, format_hash,
     },
 };
 use commonware_codec::{DecodeExt as _, Encode as _};
@@ -139,6 +139,13 @@ pub struct AbortReceipt {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegisterReceipt {
     pub outcome: ImportOutcome,
+    pub height: u64,
+}
+
+/// Final answer for a submitted batch of imported-key registrations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BatchRegisterReceipt {
+    pub outcome: BatchImportOutcome,
     pub height: u64,
 }
 
@@ -328,6 +335,12 @@ pub enum Message {
         manifest: Box<Manifest>,
         endorsement: Option<Endorsement>,
         response: oneshot::Sender<RegisterReceipt>,
+    },
+    /// Register a batch of imported keys, all or none (through consensus).
+    RegisterImportBatch {
+        batch: Box<BatchRegistration>,
+        endorsement: Option<Endorsement>,
+        response: oneshot::Sender<BatchRegisterReceipt>,
     },
     /// This node's acknowledgement of its imported share (sent by the DKG actor, no answer).
     SubmitReady {
@@ -556,6 +569,24 @@ impl Client {
         receiver.await.map_err(|_| Stopped)
     }
 
+    /// Register every manifest of `batch`, all or none, and wait until consensus decided it
+    /// (protected, as [Client::activate_validator]).
+    pub async fn register_import_batch(
+        &self,
+        batch: BatchRegistration,
+        endorsement: Option<Endorsement>,
+    ) -> Result<BatchRegisterReceipt, Stopped> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(Message::RegisterImportBatch {
+                batch: Box::new(batch),
+                endorsement,
+                response,
+            })
+            .map_err(|_| Stopped)?;
+        receiver.await.map_err(|_| Stopped)
+    }
+
     /// Import a slashing-protection history and wait until consensus decided it.
     /// A protected command (as [Client::activate_validator]).
     pub async fn import_history(
@@ -750,6 +781,7 @@ enum Waiter {
     Activate(oneshot::Sender<ActivationReceipt>),
     ActivateBatch(oneshot::Sender<BatchActivationReceipt>),
     Register(oneshot::Sender<RegisterReceipt>),
+    RegisterBatch(oneshot::Sender<BatchRegisterReceipt>),
     History(oneshot::Sender<HistoryReceipt>),
     Reshare(oneshot::Sender<ReshareReceipt>),
     Generation(oneshot::Sender<GenerationReceipt>),
@@ -932,6 +964,17 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                         self.submit(endorse(Command::RegisterImportedKey(manifest), endorsement));
                     info!(id, %ceremony, %validator, "submitted imported key registration");
                     self.waiters.insert(id, Waiter::Register(response));
+                }
+                Message::RegisterImportBatch {
+                    batch,
+                    endorsement,
+                    response,
+                } => {
+                    let keys = batch.manifests.len();
+                    let id =
+                        self.submit(endorse(Command::RegisterImportedKeys(batch), endorsement));
+                    info!(id, keys, "submitted batch of imported key registrations");
+                    self.waiters.insert(id, Waiter::RegisterBatch(response));
                 }
                 Message::SubmitReady { ack } => {
                     let round = ack.round;
@@ -1563,6 +1606,18 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                     );
                     if let Some(Waiter::Register(waiter)) = waiter {
                         let _ = waiter.send(RegisterReceipt { outcome, height });
+                    }
+                }
+                (Command::RegisterImportedKeys(batch), Effect::RegisterBatch(outcome)) => {
+                    info!(
+                        height,
+                        id = transaction.id,
+                        keys = batch.manifests.len(),
+                        ?outcome,
+                        "applied batch of imported key registrations"
+                    );
+                    if let Some(Waiter::RegisterBatch(waiter)) = waiter {
+                        let _ = waiter.send(BatchRegisterReceipt { outcome, height });
                     }
                 }
                 (Command::ShareReady(ack), Effect::Ready(outcome)) => match outcome {
