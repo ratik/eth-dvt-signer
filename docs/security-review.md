@@ -3,7 +3,8 @@
 Scope: consensus-backed authorization, Ethereum validator duties and their slashing protection, the
 signing protocol, the coordinator and the keyholder, as this repository implements them. The
 adversarial test campaign, its findings and fixes, and the fault-model table are in
-[audit.md](audit.md).
+[audit.md](audit.md). The short version, with the list of what the design trusts:
+[threat-model.md](threat-model.md).
 
 ## Assumptions
 
