@@ -81,6 +81,22 @@ curl -s localhost:8080/api/v1/eth2/publicKeys   # ["0xa1b2.."]
 - **Immutable.** The same activation again returns the existing one (`200`, nothing new). An
   activation for another chain gets `409` (`refusal.reason: other_chain`), at any time. Consensus
   orders two conflicting activations sent at once: it applies the first and refuses the second.
+- **Many keys at once.** `POST /validators/activate/batch` activates up to 1 024 keys for one
+  chain with one approval (`mpc-admin draft activate-batch`): DKG keys, and imported keys each
+  with its `acknowledgment`. Each key is checked as a single activation checks it, all in one
+  block. The batch is all or none: on the first refused key nothing changes, and the answer
+  (`409`; `404` for an unknown key) names it (`public_key`, `refusal`). Keys already activated for
+  the chain count as `already_activated`. Like any protected command, a refused batch uses its
+  nonce. Protected operations go one per nonce, so activating keys one by one takes about 0.5 to
+  0.8 s each ([load-test.md](load-test.md)); a batch takes one block.
+
+  ```bash
+  mpc-admin --nodes ... draft activate-batch --output batch.json --request '{
+    "genesis_validators_root": "0x0470..",
+    "validators": [{"public_key": "0xa1b2.."}, {"public_key": "0xc3d4.."}]}'
+  # each approver signs batch.json; then mpc-admin submit
+  # {"activated": 2, "already_activated": 0, "height": 57}
+  ```
 - **Data of an earlier version.** An earlier version pinned a validator's chain implicitly, with
   its first signed duty. This version reads such a validator as not activated: it signs nothing,
   and its recorded roots are not signed again, until an explicit activation. That activation must

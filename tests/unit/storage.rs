@@ -1459,44 +1459,17 @@ mod validator {
     pub(super) mod imported {
         use super::*;
         use crate::{
-            dkg::{
-                PROTOCOL_VERSION,
-                ceremony::{ImportOutcome, ReadyAck, ReadyIgnored},
-            },
-            import::{
-                dealer,
-                manifest::{MANIFEST_VERSION, Manifest, Member},
-            },
+            dkg::ceremony::{ImportOutcome, ReadyAck, ReadyIgnored},
+            import::manifest::Manifest,
             slashing::{
                 Acknowledgment, HistoryImport, HistoryOutcome, HistoryRefusal, HistorySummary,
                 ImportedAttestation, ImportedBlock,
             },
         };
-        use commonware_cryptography::bls12381::primitives::group::{Private, Scalar};
-        use rand::{SeedableRng as _, rngs::StdRng};
 
         /// A manifest for the key `seed`, split among `committee`.
         pub(crate) fn manifest(ceremony: &str, committee: &Set<PublicKey>, seed: u64) -> Manifest {
-            let secret = Private::new(Scalar::from_u64(seed + 1000));
-            let split =
-                dealer::split(&secret, committee, &mut StdRng::seed_from_u64(seed)).unwrap();
-            Manifest {
-                version: MANIFEST_VERSION,
-                ceremony: id(ceremony),
-                import_id: [seed as u8; 16],
-                validator: split.sharing.public().encode().as_ref().try_into().unwrap(),
-                protocol_version: PROTOCOL_VERSION,
-                threshold: 3,
-                members: committee
-                    .iter()
-                    .enumerate()
-                    .map(|(index, identity)| Member {
-                        identity: identity.clone(),
-                        share_key: [index as u8 + 1; 32],
-                    })
-                    .collect(),
-                commitments: split.commitments,
-            }
+            crate::import::manifest::for_test(ceremony, committee, seed)
         }
 
         fn register(manifest: &Manifest) -> Transaction {
@@ -1639,6 +1612,231 @@ mod validator {
                     .unwrap();
                 assert_eq!(store.admin().nonce, 3);
                 assert_eq!(floors(&store), imported);
+            });
+        }
+
+        /// A batch activation of a DKG key and an imported key is all or none: refused for the
+        /// imported key whose shares are not acknowledged, it activates neither; once they are,
+        /// it activates both in one block; repeated, it changes nothing; a restart keeps both.
+        #[test]
+        fn a_batch_activation_is_all_or_none() {
+            use crate::{
+                slashing::{ActivationRefusal, BatchActivationOutcome},
+                types::BatchActivation,
+            };
+            deterministic::Runner::default().start(|mut context| async move {
+                let signers = signers();
+                let committee = committee(&signers);
+                let block = Sha256::hash(&[b"block"]);
+                let mut store = Store::init(context.child("first"), "node", committee.clone())
+                    .await
+                    .unwrap();
+                let generated = super::complete_validator(&mut context, &mut store, &signers).await;
+                let manifest = manifest("imported", &committee, 1);
+                let imported = manifest.validator;
+                let batch = |validators| {
+                    tx(Command::ActivateValidators(Box::new(BatchActivation {
+                        chain: chain(9),
+                        validators,
+                    })))
+                };
+                let both = || batch(vec![(generated, None), (imported, Some(ACKNOWLEDGED))]);
+                let acks = signers[..3]
+                    .iter()
+                    .map(|signer| {
+                        tx(Command::ShareReady(Box::new(ReadyAck::sign(
+                            signer,
+                            1,
+                            manifest.digest(),
+                        ))))
+                    })
+                    .collect();
+                let mut effects = Vec::new();
+                for (height, transactions) in [
+                    (3, vec![register(&manifest)]),
+                    (4, vec![history(imported, 9, 100, 10, 11)]),
+                    (5, vec![both()]),
+                    (6, acks),
+                    (7, vec![both()]),
+                    (8, vec![both()]),
+                    // An imported key without its acknowledgment is refused, as alone.
+                    (9, vec![batch(vec![(generated, None), (imported, None)])]),
+                ] {
+                    let applied = store
+                        .apply_block(height, &block, &transactions, &mut context)
+                        .await
+                        .unwrap();
+                    effects.push(applied.effects.into_iter().next().unwrap());
+                    if height == 5 {
+                        // Refused for the imported key: the DKG key is not activated either.
+                        let protection = store.protection();
+                        assert!(
+                            protection
+                                .validator_of(&generated)
+                                .unwrap()
+                                .1
+                                .activation
+                                .is_none()
+                        );
+                        assert!(
+                            protection
+                                .validator_of(&imported)
+                                .unwrap()
+                                .1
+                                .activation
+                                .is_none()
+                        );
+                    }
+                }
+                assert_eq!(
+                    effects[2],
+                    Effect::ActivateBatch(BatchActivationOutcome::Refused {
+                        key: imported,
+                        refusal: ActivationRefusal::SharesNotReady {
+                            ready: 0,
+                            required: 3
+                        },
+                    })
+                );
+                assert_eq!(
+                    effects[4],
+                    Effect::ActivateBatch(BatchActivationOutcome::Activated {
+                        activated: 2,
+                        already: 0
+                    })
+                );
+                assert_eq!(
+                    effects[5],
+                    Effect::ActivateBatch(BatchActivationOutcome::Activated {
+                        activated: 0,
+                        already: 2
+                    })
+                );
+                // Already activated for the chain, the imported key is so with or without it.
+                assert_eq!(
+                    effects[6],
+                    Effect::ActivateBatch(BatchActivationOutcome::Activated {
+                        activated: 0,
+                        already: 2
+                    })
+                );
+                drop(store);
+
+                let store = Store::init(context.child("second"), "node", committee)
+                    .await
+                    .unwrap();
+                let protection = store.protection();
+                for key in [generated, imported] {
+                    let (_, validator) = protection.validator_of(&key).unwrap();
+                    let activation = validator.activation.unwrap();
+                    assert_eq!((activation.chain, activation.height), (chain(9), 7));
+                }
+                let (id, _) = protection.validator_of(&imported).unwrap();
+                assert_eq!(protection.imported(id).unwrap().acknowledged, Some(7));
+            });
+        }
+
+        /// A batch registration is all or none: a manifest whose key is registered refuses the
+        /// whole batch; a valid batch registers its new keys as the next rounds and counts the
+        /// manifests already registered; repeated, it changes nothing; a manifest whose id is
+        /// taken by another refuses it; two manifests with one key refuse it; a restart keeps
+        /// the keys.
+        #[test]
+        fn a_batch_registration_is_all_or_none() {
+            use crate::{dkg::ceremony::BatchImportOutcome, types::BatchRegistration};
+            deterministic::Runner::default().start(|mut context| async move {
+                let signers = signers();
+                let committee = committee(&signers);
+                let block = Sha256::hash(&[b"block"]);
+                let mut store = Store::init(context.child("first"), "node", committee.clone())
+                    .await
+                    .unwrap();
+                let first = manifest("first", &committee, 1);
+                let second = manifest("second", &committee, 2);
+                let third = manifest("third", &committee, 3);
+                // The key of `first` under another id; another key under the id of `second`.
+                let again = manifest("again", &committee, 1);
+                let taken = manifest("second", &committee, 4);
+                let fourth = manifest("fourth", &committee, 5);
+                let twice = manifest("twice", &committee, 5);
+                let batch = |manifests: &[&Manifest]| {
+                    tx(Command::RegisterImportedKeys(Box::new(BatchRegistration {
+                        manifests: manifests.iter().map(|&manifest| manifest.clone()).collect(),
+                    })))
+                };
+                let mut effects = Vec::new();
+                for (height, transaction) in [
+                    (3, register(&first)),
+                    (4, batch(&[&second, &again])),
+                    (5, batch(&[&first, &second, &third])),
+                    (6, batch(&[&first, &second, &third])),
+                    (7, batch(&[&taken])),
+                    (8, batch(&[&fourth, &twice])),
+                ] {
+                    let applied = store
+                        .apply_block(height, &block, &[transaction], &mut context)
+                        .await
+                        .unwrap();
+                    effects.push(applied.effects.into_iter().next().unwrap());
+                    if height == 4 {
+                        // Refused for `again`: `second` is not registered either.
+                        assert!(store.protection().validator_of(&second.validator).is_none());
+                        assert!(store.ceremonies().get(&second.ceremony).is_none());
+                    }
+                }
+                assert_eq!(effects[0], Effect::Register(ImportOutcome::Registered(0)));
+                assert_eq!(
+                    effects[1],
+                    Effect::RegisterBatch(BatchImportOutcome::Refused {
+                        ceremony: again.ceremony.clone(),
+                        outcome: ImportOutcome::KeyExists(0),
+                    })
+                );
+                assert_eq!(
+                    effects[2],
+                    Effect::RegisterBatch(BatchImportOutcome::Registered {
+                        registered: vec![1, 2],
+                        existing: 1,
+                    })
+                );
+                assert_eq!(
+                    effects[3],
+                    Effect::RegisterBatch(BatchImportOutcome::Registered {
+                        registered: vec![],
+                        existing: 3,
+                    })
+                );
+                assert_eq!(
+                    effects[4],
+                    Effect::RegisterBatch(BatchImportOutcome::Refused {
+                        ceremony: taken.ceremony.clone(),
+                        outcome: ImportOutcome::Conflict(1),
+                    })
+                );
+                // Not decodable, but a batch in memory is checked as well.
+                assert_eq!(
+                    effects[5],
+                    Effect::RegisterBatch(BatchImportOutcome::Refused {
+                        ceremony: twice.ceremony.clone(),
+                        outcome: ImportOutcome::KeyExists(3),
+                    })
+                );
+                assert!(store.protection().validator_of(&fourth.validator).is_none());
+                drop(store);
+
+                let store = Store::init(context.child("second"), "node", committee)
+                    .await
+                    .unwrap();
+                for (manifest, round) in [(&first, 0), (&second, 1), (&third, 2)] {
+                    let (_, validator) = store
+                        .protection()
+                        .validator_of(&manifest.validator)
+                        .unwrap();
+                    assert_eq!(validator.round, round);
+                    let ceremony = store.ceremonies().by_round(round).unwrap();
+                    assert_eq!(&ceremony.imported().unwrap().manifest, manifest);
+                }
+                assert!(store.ceremonies().by_round(3).is_none());
             });
         }
 

@@ -62,6 +62,7 @@ use crate::eth::{
     registration::Terms,
     types::{Root, hex_bytes},
 };
+use crate::types::BatchActivation;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -527,6 +528,19 @@ pub enum ActivationOutcome {
     Refused(ActivationRefusal),
 }
 
+/// Result of [Protection::activate_batch].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchActivationOutcome {
+    /// Every key of the batch is activated for its chain: `activated` by this batch, `already`
+    /// before it.
+    Activated { activated: u32, already: u32 },
+    /// Nothing changed: `key`, the first refused, and why.
+    Refused {
+        key: ValidatorKey,
+        refusal: ActivationRefusal,
+    },
+}
+
 /// Result of [Protection::authorize].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
@@ -627,25 +641,38 @@ impl Protection {
         chain: ChainIdentity,
         height: u64,
     ) -> (ActivationOutcome, Vec<Record>) {
+        match self.check_activation(key, chain) {
+            Ok(id) => (
+                ActivationOutcome::Activated,
+                self.set_activation(id, chain, height),
+            ),
+            Err(outcome) => (outcome, Vec::new()),
+        }
+    }
+
+    /// What [Self::activate] decides for `key`, without changing anything: the validator id to
+    /// activate, or the outcome (already activated, or refused).
+    fn check_activation(
+        &self,
+        key: &ValidatorKey,
+        chain: ChainIdentity,
+    ) -> Result<u64, ActivationOutcome> {
+        let refused = |refusal| Err(ActivationOutcome::Refused(refusal));
         let Some(&id) = self.by_key.get(key) else {
-            return (
-                ActivationOutcome::Refused(ActivationRefusal::UnknownValidator),
-                Vec::new(),
-            );
+            return refused(ActivationRefusal::UnknownValidator);
         };
-        let refused = |refusal| (ActivationOutcome::Refused(refusal), Vec::new());
+        let validator = &self.validators[&id];
         if self.imported.contains_key(&id) {
-            return match self.validators[&id].activation {
+            return match validator.activation {
                 Some(activation) if activation.chain == chain => {
-                    (ActivationOutcome::AlreadyActivated(activation), Vec::new())
+                    Err(ActivationOutcome::AlreadyActivated(activation))
                 }
                 _ => refused(ActivationRefusal::ImportedKey),
             };
         }
-        let validator = self.validators.get_mut(&id).expect("indexed validator");
         match (validator.activation, validator.legacy_chain) {
             (Some(activation), _) if activation.chain == chain => {
-                (ActivationOutcome::AlreadyActivated(activation), Vec::new())
+                Err(ActivationOutcome::AlreadyActivated(activation))
             }
             (Some(activation), _) => refused(ActivationRefusal::OtherChain {
                 genesis_validators_root: activation.chain.genesis_validators_root,
@@ -655,12 +682,72 @@ impl Protection {
                     genesis_validators_root: recorded,
                 })
             }
-            (None, _) => {
-                validator.activation = Some(Activation { chain, height });
+            (None, _) => Ok(id),
+        }
+    }
+
+    /// Activate the checked validator `id` for `chain` (an imported key: acknowledged too).
+    fn set_activation(&mut self, id: u64, chain: ChainIdentity, height: u64) -> Vec<Record> {
+        let validator = self.validators.get_mut(&id).expect("indexed validator");
+        validator.activation = Some(Activation { chain, height });
+        match self.imported.get_mut(&id) {
+            Some(imported) => {
+                imported.acknowledged = Some(height);
+                vec![Record::Validator(id), Record::Imported(id)]
+            }
+            None => {
                 validator.legacy_chain = None;
-                (ActivationOutcome::Activated, vec![Record::Validator(id)])
+                vec![Record::Validator(id)]
             }
         }
+    }
+
+    /// Activate every key of `batch` in the block at `height`, all or none: each is checked as
+    /// [Self::activate] (no acknowledgment) or [Self::activate_imported] (with one) would check
+    /// it, `shares` holding each key's `(ready, required)` share acknowledgments in the batch's
+    /// order. Keys already activated for the chain stay as they are. On the first refusal nothing
+    /// changes. Also returns the ids of the DKG keys it activated.
+    pub fn activate_batch(
+        &mut self,
+        batch: &BatchActivation,
+        shares: &[(u32, u32)],
+        height: u64,
+    ) -> (BatchActivationOutcome, Vec<Record>, Vec<u64>) {
+        debug_assert_eq!(batch.validators.len(), shares.len());
+        let chain = batch.chain;
+        let mut pending = Vec::new();
+        let mut already = 0;
+        for ((key, acknowledgment), &shares) in batch.validators.iter().zip(shares) {
+            let checked = match acknowledgment {
+                None => self.check_activation(key, chain),
+                Some(acknowledgment) => {
+                    self.check_imported_activation(key, chain, *acknowledgment, shares)
+                }
+            };
+            match checked {
+                Ok(id) => pending.push((id, acknowledgment.is_none())),
+                Err(ActivationOutcome::AlreadyActivated(_)) => already += 1,
+                Err(ActivationOutcome::Refused(refusal)) => {
+                    let outcome = BatchActivationOutcome::Refused { key: *key, refusal };
+                    return (outcome, Vec::new(), Vec::new());
+                }
+                Err(ActivationOutcome::Activated) => unreachable!("a check activates nothing"),
+            }
+        }
+        let activated = pending.len() as u32;
+        let mut records = Vec::new();
+        let mut generated = Vec::new();
+        for (id, dkg) in pending {
+            records.extend(self.set_activation(id, chain, height));
+            if dkg {
+                generated.push(id);
+            }
+        }
+        (
+            BatchActivationOutcome::Activated { activated, already },
+            records,
+            generated,
+        )
     }
 
     /// The imported key of ceremony `round` (registered by consensus) now signs for `key`, not yet
@@ -839,19 +926,37 @@ impl Protection {
         key: &ValidatorKey,
         chain: ChainIdentity,
         acknowledgment: Acknowledgment,
-        (ready, required): (u32, u32),
+        shares: (u32, u32),
         height: u64,
     ) -> (ActivationOutcome, Vec<Record>) {
-        let refused = |refusal| (ActivationOutcome::Refused(refusal), Vec::new());
+        match self.check_imported_activation(key, chain, acknowledgment, shares) {
+            Ok(id) => (
+                ActivationOutcome::Activated,
+                self.set_activation(id, chain, height),
+            ),
+            Err(outcome) => (outcome, Vec::new()),
+        }
+    }
+
+    /// What [Self::activate_imported] decides for `key`, without changing anything (as
+    /// [Self::check_activation]).
+    fn check_imported_activation(
+        &self,
+        key: &ValidatorKey,
+        chain: ChainIdentity,
+        acknowledgment: Acknowledgment,
+        (ready, required): (u32, u32),
+    ) -> Result<u64, ActivationOutcome> {
+        let refused = |refusal| Err(ActivationOutcome::Refused(refusal));
         let Some(&id) = self.by_key.get(key) else {
             return refused(ActivationRefusal::UnknownValidator);
         };
-        let Some(imported) = self.imported.get(&id).copied() else {
+        let Some(imported) = self.imported.get(&id) else {
             return refused(ActivationRefusal::NotImported);
         };
         match self.validators[&id].activation {
             Some(activation) if activation.chain == chain => {
-                return (ActivationOutcome::AlreadyActivated(activation), Vec::new());
+                return Err(ActivationOutcome::AlreadyActivated(activation));
             }
             Some(activation) => {
                 return refused(ActivationRefusal::OtherChain {
@@ -875,13 +980,7 @@ impl Protection {
         if !acknowledgment.complete() {
             return refused(ActivationRefusal::NotAcknowledged);
         }
-        let validator = self.validators.get_mut(&id).expect("indexed validator");
-        validator.activation = Some(Activation { chain, height });
-        self.imported.get_mut(&id).expect("checked").acknowledged = Some(height);
-        (
-            ActivationOutcome::Activated,
-            vec![Record::Validator(id), Record::Imported(id)],
-        )
+        Ok(id)
     }
 
     /// Validator `id`'s history as an EIP-3076 interchange holds it, safe for another signer that

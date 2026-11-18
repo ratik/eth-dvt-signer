@@ -239,6 +239,14 @@ the gap is the time the operator takes.
 
    `submit` posts `POST /keys/import` with `{"manifest": .., "authorization": ..}`. The answer is the
    import's state, as `GET /keys/import/validator-migrated` gives it on any node.
+
+   Many keys: `draft register-import-batch` with `{"manifests": [<manifest.json>, ..]}` registers
+   up to 128 of them with one approval, in one block, all or none (`POST /keys/import/batch`). Each
+   manifest is checked as a single registration checks it; on the first refused one nothing is
+   registered, and the answer (`409`, or `400` for an invalid manifest) names it. Manifests
+   already registered as they are count as `already_registered`:
+   `{"registered": 2, "already_registered": 0, "rounds": [7, 8], "height": 41}`. Then install
+   each key's shares as below.
 6. **Install each share on its own node:**
 
    ```bash
@@ -280,6 +288,11 @@ the gap is the time the operator takes.
    # each approver: mpc-admin sign --command activate.json --key <key> --output activate-<name>.json
    mpc-admin --nodes ... submit --command activate-alice.json --command activate-bob.json
    ```
+
+   Many keys: `draft activate-batch` with `"validators": [{"public_key": "0x..",
+   "acknowledgment": {..}}, ..]` activates up to 1 024 of them with one approval, all or none
+   ([ethereum-signing.md](ethereum-signing.md#validator-keys-and-activation)). Their histories can
+   be imported in one approved `import-history` too.
 10. **Point the validator client at the network** (Web3Signer API), and check that it attests in the
     beacon chain. `GET /slashing-protection/export/{public_key}` gives the history the network holds,
     for an audit. It is not a way to move the key out. The network has no command that stops it

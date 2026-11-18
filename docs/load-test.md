@@ -79,9 +79,10 @@ in one container with no network, `--eth-network hoodi`, test approvers (2 of 3)
 - No request failed in either run. The load of the neighbour cost about 4 % of the total time.
 - `mpc-admin draft` and the two approvals take 15–35 ms per operation. The time is in consensus.
 - **The limit is the admin nonce.** Each protected operation (activation, registration) carries
-  the next nonce, so they go one at a time, about 0.3 s per block plus the round trip. A
-  batched activation (many keys per approved operation, as the history import already is)
-  would make the setup of thousands of keys take minutes, not an hour.
+  the next nonce, so they go one at a time, about 0.3 s per block plus the round trip. The
+  batched activation (`POST /validators/activate/batch`, up to 1 024 keys per approved
+  operation) and the batched registration (`POST /keys/import/batch`, up to 128 manifests)
+  remove them from the setup time (section 4.3).
 - **DKG:** at most 4 ceremonies at a time (`dkg::MAX_ACTIVE`). The rate of ceremonies fell from
   3.1/s to 2.0/s while the completed ceremonies grew from 0 to 3 000, in both runs and with low
   CPU pressure, so it is not the neighbour. Section 4.2 has the cause and the fix. The rates of
@@ -91,8 +92,8 @@ in one container with no network, `--eth-network hoodi`, test approvers (2 of 3)
   included (the activations add about 5 MB of blocks).
 - **Memory:** RSS 280 MB at the start, 510–550 MB per node at 6 400 validators.
 - For 6 400 imported keys on GCP the setup is expected to take about 2.5 h with one activation
-  per key. It must not run in the VM budget of section 6 before a batched activation exists;
-  until then, run the ramp with fewer keys (for example 1 600, `A` up to 50) or accept the time.
+  per key; with batched registrations and activations (section 4.3) about 5 minutes on the test
+  host.
 
 ### 4.2 Why DKG slowed down with the number of keys (found and fixed)
 
@@ -152,6 +153,38 @@ Found on the way:
   the deadline needs a lower bound in time.
 - **Restart time grows with the keys.** At 6 400 keys a node decodes its state in 5.7 s and its
   secret store in 2 s at start (point checks).
+
+### 4.3 Batched activation and registration (measured)
+
+On 2026-11-18, branch `feat/batch-activate` on top of the fixes of section 4.2, idle test host:
+
+- `k6400-batch`: `run-keys.sh run k6400-batch --dkg 3200 --import 3200 --batch 100
+  --activate-batch 1024`, up to 1 024 keys per activation (4 requests per phase);
+- `k6400-batch2`: the same with `--register-batch 128`, up to 128 manifests per registration
+  (`POST /keys/import/batch`, 25 requests).
+
+| Step | k6400-idle | k6400-batch | k6400-batch2 |
+| --- | --- | --- | --- |
+| 3 200 DKG ceremonies (4 at a time) | 1 301 s | 1 021 s | 1 026 s |
+| 3 200 DKG activations | 1 593 s (3 200 ops) | **1.7 s** (4 ops) | 1.8 s |
+| 3 200 `mpc-keytool split` | 45 s | 43 s | 43 s |
+| 3 200 registrations and 12 800 share installs | 1 895 s (3 200 ops) | 1 646 s (3 200 ops) | **104 s** (25 ops) |
+| Slashing history, 32 batches of 100 | 16 s | 14 s | 13 s |
+| 3 200 import activations | 2 448 s (3 200 ops) | **2.5 s** (4 ops) | 2.4 s |
+| **Total, 6 400 validators** | **7 301 s** | **2 732 s** | **1 194 s** |
+
+- A batch takes about as long as one key: one block, one admin nonce. A batch activation of
+  1 024 keys: submit p50 408–538 ms. A batch registration of 128 manifests: submit p50 799 ms,
+  draft p50 343 ms (`mpc-admin` reads and describes 128 manifests). The 3 200 registrations took
+  48 s; the share installs, 4 at a time per key, ran behind them and ended 56 s later (install
+  p50 60 ms).
+- **The DKG is now the limit:** 86 % of the time, 4 ceremonies at a time (`dkg::MAX_ACTIVE`).
+  The setup of 3 200 imported keys takes about 2.7 minutes.
+- **State on disk per node:** 42.5 MB with 6 400 validators (52.9 MB one key per operation,
+  45.9 MB with batch activations): fewer blocks and finalizations; the replicated state and the
+  secret store have the same size.
+- **Memory:** RSS 440–480 MB per node at 6 400 validators (510–550 MB before).
+- No request failed.
 
 ## 5. Duty mix per slot
 

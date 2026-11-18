@@ -209,3 +209,157 @@ fn reserved_ceremony_ids_are_the_protected_commands_only() {
     });
     assert!(sign.ceremony_id_rule().is_ok());
 }
+
+/// The batch activation command: tag 17, protected, round trip with and without an
+/// acknowledgment; an empty batch, a repeated key, too many keys and unknown acknowledgment bits
+/// do not decode; the largest batch fits a block many times over.
+#[test]
+fn batch_activation_encoding() {
+    use crate::slashing::{Acknowledgment, ChainIdentity};
+    let acknowledgment = Acknowledgment::from_bits(0b1111).unwrap();
+    let batch = |validators: Vec<(ValidatorKey, Option<Acknowledgment>)>| {
+        Command::ActivateValidators(Box::new(BatchActivation {
+            chain: ChainIdentity {
+                genesis_validators_root: [9; 32],
+            },
+            validators,
+        }))
+    };
+    let command = batch(vec![([1; 48], None), ([2; 48], Some(acknowledgment))]);
+    assert!(command.is_protected());
+    let bytes = command.encode();
+    assert_eq!(bytes[0], 17);
+    assert_eq!(bytes.len(), command.encode_size());
+    assert_eq!(Command::decode(bytes.clone()).unwrap(), command);
+
+    // Encoded by hand, as a faulty leader could: refused when decoding.
+    let raw = |count: u32, entries: &[(u8, Option<u8>)]| {
+        let mut bytes = vec![17u8];
+        bytes.extend_from_slice(&[9; 32]);
+        UInt(count).write(&mut bytes);
+        for (key, bits) in entries {
+            bytes.extend_from_slice(&[*key; 48]);
+            match bits {
+                Some(bits) => bytes.extend_from_slice(&[1, *bits]),
+                None => bytes.push(0),
+            }
+        }
+        bytes
+    };
+    assert!(
+        Command::decode(commonware_codec::Copying(
+            raw(2, &[(1, None), (2, Some(0b1111))]).as_slice()
+        ))
+        .is_ok()
+    );
+    assert!(Command::decode(commonware_codec::Copying(raw(0, &[]).as_slice())).is_err());
+    assert!(
+        Command::decode(commonware_codec::Copying(
+            raw(2, &[(1, None), (1, None)]).as_slice()
+        ))
+        .is_err()
+    );
+    assert!(
+        Command::decode(commonware_codec::Copying(
+            raw(1, &[(1, Some(0b10000))]).as_slice()
+        ))
+        .is_err()
+    );
+    assert!(
+        Command::decode(commonware_codec::Copying(
+            raw(MAX_BATCH_ACTIVATIONS as u32 + 1, &[]).as_slice()
+        ))
+        .is_err()
+    );
+
+    let largest = batch(
+        (0..MAX_BATCH_ACTIVATIONS)
+            .map(|index| {
+                let mut key = [0; 48];
+                key[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                (key, Some(acknowledgment))
+            })
+            .collect(),
+    );
+    assert!(largest.encode_size() * 8 < MAX_BLOCK_BYTES);
+    assert_eq!(Command::decode(largest.encode()).unwrap(), largest);
+}
+
+/// The batch registration command: tag 18, protected, its ceremony ids reserved, round trip; an
+/// empty batch, a repeated id, a repeated key and too many manifests do not decode; the largest
+/// batch of a committee of 4 fits a block 4 times.
+#[test]
+fn batch_registration_encoding() {
+    use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
+    use commonware_utils::TryCollect as _;
+    let committee: commonware_utils::ordered::Set<_> = (0..4u64)
+        .map(|seed| PrivateKey::from_seed(seed).public_key())
+        .try_collect()
+        .unwrap();
+    let manifest =
+        |ceremony: &str, seed: u64| crate::import::manifest::for_test(ceremony, &committee, seed);
+    let batch = |manifests: Vec<Manifest>| {
+        Command::RegisterImportedKeys(Box::new(BatchRegistration { manifests }))
+    };
+    let command = batch(vec![manifest("approved.a", 1), manifest("approved.b", 2)]);
+    assert!(command.is_protected());
+    assert!(command.ceremony_id_rule().is_ok());
+    assert!(
+        batch(vec![manifest("approved.a", 1), manifest("b", 2)])
+            .ceremony_id_rule()
+            .is_err()
+    );
+    let bytes = command.encode();
+    assert_eq!(bytes[0], 18);
+    assert_eq!(bytes.len(), command.encode_size());
+    assert_eq!(Command::decode(bytes.clone()).unwrap(), command);
+
+    // Encoded by hand, as a faulty leader could: refused when decoding.
+    let raw = |count: u32, manifests: &[Manifest]| {
+        let mut bytes = vec![18u8];
+        UInt(count).write(&mut bytes);
+        for manifest in manifests {
+            manifest.write(&mut bytes);
+        }
+        bytes
+    };
+    let decodes = |bytes: Vec<u8>| Command::decode(commonware_codec::Copying(bytes.as_slice()));
+    assert!(
+        decodes(raw(
+            2,
+            &[manifest("approved.a", 1), manifest("approved.b", 2)]
+        ))
+        .is_ok()
+    );
+    assert!(decodes(raw(0, &[])).is_err());
+    assert!(
+        decodes(raw(
+            2,
+            &[manifest("approved.a", 1), manifest("approved.a", 2)]
+        ))
+        .is_err()
+    );
+    assert!(
+        decodes(raw(
+            2,
+            &[manifest("approved.a", 1), manifest("approved.b", 1)]
+        ))
+        .is_err()
+    );
+    assert!(decodes(raw(MAX_BATCH_REGISTRATIONS as u32 + 1, &[])).is_err());
+
+    let one = manifest("approved.x", 1);
+    let largest = batch(
+        (0..MAX_BATCH_REGISTRATIONS)
+            .map(|index| {
+                let mut manifest = one.clone();
+                manifest.ceremony =
+                    CeremonyId::new(format!("approved.load-import-{index}")).unwrap();
+                manifest.validator[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                manifest
+            })
+            .collect(),
+    );
+    assert!(largest.encode_size() * 4 < MAX_BLOCK_BYTES);
+    assert_eq!(Command::decode(largest.encode()).unwrap(), largest);
+}

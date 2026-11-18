@@ -23,8 +23,9 @@ use crate::{
     dkg::{
         CeremonyId, DkgStatus,
         ceremony::{
-            AbortOutcome, Ceremonies, Ceremony, GenerationOutcome, GenerationRefusal, Ignored,
-            ImportOutcome, Origin, ReadyIgnored, ReshareOutcome, StartOutcome,
+            AbortOutcome, BatchImportOutcome, Ceremonies, Ceremony, GenerationOutcome,
+            GenerationRefusal, Ignored, ImportOutcome, Origin, ReadyIgnored, ReshareOutcome,
+            StartOutcome,
         },
     },
     encoded::Encoded,
@@ -35,9 +36,9 @@ use crate::{
         types::Root,
     },
     slashing::{
-        Activation, ActivationOutcome, Approved, Attested, Bound, ChainIdentity, Decision,
-        DutyAuthorization, Floors, HistoryOutcome, ImportedValidator, Protection, Record,
-        Refusal as DutyRefusal, Registered, Signed, Validator,
+        Activation, ActivationOutcome, Approved, Attested, BatchActivationOutcome, Bound,
+        ChainIdentity, Decision, DutyAuthorization, Floors, HistoryOutcome, ImportedValidator,
+        Protection, Record, Refusal as DutyRefusal, Registered, Signed, Validator,
     },
     state::{self, Authorization, State},
     types::{Authorized, Command, Outcome, PayloadHash, Transaction},
@@ -632,8 +633,11 @@ pub enum Effect {
     Duty(Decision, Root),
     /// The outcome of a validator activation (DKG or imported key).
     Activate(ActivationOutcome),
+    /// The outcome of a batch of validator activations.
+    ActivateBatch(BatchActivationOutcome),
     /// The outcome of an imported key's registration.
     Register(ImportOutcome),
+    RegisterBatch(BatchImportOutcome),
     /// The share index acknowledged as ready, or why the acknowledgement was ignored.
     Ready(Result<u32, ReadyIgnored>),
     /// The outcome of a slashing-protection history import.
@@ -1304,6 +1308,67 @@ impl<E: Context> Store<E> {
                             persist(&mut metadata, &self.protection, record);
                         }
                         Effect::Activate(outcome)
+                    }
+                    Command::ActivateValidators(batch) => {
+                        // The share acknowledgments of each imported key, as for one activation.
+                        let shares: Vec<(u32, u32)> = batch
+                            .validators
+                            .iter()
+                            .map(|(validator, _)| {
+                                self.protection
+                                    .validator_of(validator)
+                                    .and_then(|(_, validator)| {
+                                        self.ceremonies.by_round(validator.round)
+                                    })
+                                    .and_then(|ceremony| {
+                                        let imported = ceremony.imported()?;
+                                        Some((
+                                            imported.ready.len() as u32,
+                                            ceremony.config.threshold,
+                                        ))
+                                    })
+                                    .unwrap_or((0, u32::MAX))
+                            })
+                            .collect();
+                        let (outcome, records, generated) =
+                            self.protection.activate_batch(batch, &shares, height);
+                        for record in records {
+                            persist(&mut metadata, &self.protection, record);
+                        }
+                        // Records an earlier version wrote become signable with the activation.
+                        for id in generated {
+                            duties.extend(self.protection.duties_of(id));
+                        }
+                        Effect::ActivateBatch(outcome)
+                    }
+                    Command::RegisterImportedKeys(batch) => {
+                        // As one registration each, all or none (checked before any is applied).
+                        let outcome = self.ceremonies.import_batch(&batch.manifests, height);
+                        if let BatchImportOutcome::Registered { registered, .. } = &outcome {
+                            let validators: Vec<_> = registered
+                                .iter()
+                                .map(|&round| {
+                                    let ceremony = self.ceremonies.by_round(round);
+                                    let imported = ceremony.and_then(|c| c.imported());
+                                    (round, imported.expect("registered").manifest.validator)
+                                })
+                                .collect();
+                            for (round, validator) in validators {
+                                let (_, records) = self
+                                    .protection
+                                    .register_imported(round, validator)
+                                    .expect("a new key");
+                                metadata.put_value(
+                                    key(VALIDATOR_ROUND_PREFIX, round, 0),
+                                    Value::Number(1),
+                                );
+                                designated.push(round);
+                                for record in records {
+                                    persist(&mut metadata, &self.protection, record);
+                                }
+                            }
+                        }
+                        Effect::RegisterBatch(outcome)
                     }
                     Command::StartResharing {
                         validator,

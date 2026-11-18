@@ -740,3 +740,123 @@ fn a_registration_policy_approval_binds_every_field() {
             .contains("none (no registration is signed)")
     );
 }
+
+/// `activate-batch`: drafted from its request, described for approvers (DKG keys, imported keys
+/// by acknowledgment), submitted to its endpoint; the node builds the same command from the body
+/// it receives, approvals included; an empty batch or a key named twice is refused before
+/// anyone signs.
+#[test]
+fn a_batch_activation_document() {
+    use crate::slashing::{Acknowledgment, ChainIdentity};
+    let admin = admin();
+    let complete = serde_json::json!({
+        "previous_signer_stopped": true,
+        "no_other_active_signer": true,
+        "history_exported_after_stop": true,
+        "automatic_restart_disabled": true,
+    });
+    let public = |byte: u8| format!("0x{}", hex::encode([byte; 48]));
+    let request = serde_json::json!({
+        "genesis_validators_root": format!("0x{}", hex::encode([1u8; 32])),
+        "validators": [
+            {"public_key": public(7)},
+            {"public_key": public(8), "acknowledgment": complete},
+        ],
+    });
+    let expected = Command::ActivateValidators(Box::new(BatchActivation {
+        chain: ChainIdentity {
+            genesis_validators_root: [1; 32],
+        },
+        validators: vec![
+            ([7; 48], None),
+            ([8; 48], Some(Acknowledgment::from_bits(0b1111).unwrap())),
+        ],
+    }));
+    let mut draft = SignedCommand::draft(admin.cluster(), "activate-batch", 4, request).unwrap();
+    assert_eq!(draft.command().unwrap(), expected);
+    assert_eq!(draft.endpoint().unwrap(), "/validators/activate/batch");
+    assert!(
+        draft
+            .description
+            .starts_with("activate 2 validators, all or none")
+    );
+    assert!(draft.description.contains("1 DKG keys: 0x0707"));
+    assert!(draft.description.contains("1 imported keys"));
+
+    draft.sign(&key(100)).unwrap();
+    draft.sign(&key(102)).unwrap();
+    let body = draft.body().unwrap();
+    assert_eq!(command("activate-batch", &body).unwrap(), expected);
+
+    let refused = |validators: serde_json::Value| {
+        SignedCommand::draft(
+            admin.cluster(),
+            "activate-batch",
+            4,
+            serde_json::json!({
+                "genesis_validators_root": format!("0x{}", hex::encode([1u8; 32])),
+                "validators": validators,
+            }),
+        )
+        .is_err()
+    };
+    assert!(refused(serde_json::json!([])));
+    assert!(refused(
+        serde_json::json!([{"public_key": public(7)}, {"public_key": public(7)}])
+    ));
+    assert!(refused(
+        serde_json::json!([{"public_key": public(7), "extra": 1}])
+    ));
+}
+
+/// A batch registration as approvers review it: the endpoint, one line per key with its ceremony
+/// and manifest digest, and the command a node builds from the request it receives, approvals
+/// included; an empty list, a repeated manifest or an unknown field is refused before anyone
+/// signs.
+#[test]
+fn a_batch_registration_document() {
+    use crate::{import::manifest::for_test, types::BatchRegistration};
+    use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
+    use commonware_utils::{TryCollect as _, ordered::Set};
+    let admin = admin();
+    let committee: Set<_> = (0..4u64)
+        .map(|seed| PrivateKey::from_seed(seed).public_key())
+        .try_collect()
+        .unwrap();
+    let first = for_test("approved.first", &committee, 1);
+    let second = for_test("approved.second", &committee, 2);
+    let json = |manifest: &crate::import::manifest::Manifest| {
+        serde_json::to_value(manifest.to_json().unwrap()).unwrap()
+    };
+    let request = serde_json::json!({"manifests": [json(&first), json(&second)]});
+    let expected = Command::RegisterImportedKeys(Box::new(BatchRegistration {
+        manifests: vec![first.clone(), second.clone()],
+    }));
+    let mut draft =
+        SignedCommand::draft(admin.cluster(), "register-import-batch", 4, request).unwrap();
+    assert_eq!(draft.command().unwrap(), expected);
+    assert_eq!(draft.endpoint().unwrap(), "/keys/import/batch");
+    assert!(
+        draft
+            .description
+            .starts_with("register 2 imported keys, all or none")
+    );
+    assert!(draft.description.contains("as ceremony approved.second"));
+    assert!(draft.description.contains(&hex::encode(second.digest())));
+
+    draft.sign(&key(100)).unwrap();
+    draft.sign(&key(102)).unwrap();
+    let body = draft.body().unwrap();
+    assert_eq!(command("register-import-batch", &body).unwrap(), expected);
+
+    let refused = |request: serde_json::Value| {
+        SignedCommand::draft(admin.cluster(), "register-import-batch", 4, request).is_err()
+    };
+    assert!(refused(serde_json::json!({"manifests": []})));
+    assert!(refused(
+        serde_json::json!({"manifests": [json(&first), json(&first)]})
+    ));
+    assert!(refused(
+        serde_json::json!({"manifests": [json(&first)], "extra": 1})
+    ));
+}

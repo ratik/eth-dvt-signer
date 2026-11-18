@@ -857,3 +857,77 @@ fn stale_node_cannot_authorize_another_chain() {
         assert!(ethereum_verify(&key, &block.signing_root(), &signed));
     });
 }
+
+/// A batch activation through consensus: refused as a whole for an unknown key (nothing
+/// activated, its nonce used), then two keys activated in one block, on every node, and they
+/// sign; repeated, it changes nothing.
+#[test]
+fn a_batch_activation_activates_every_key_or_none() {
+    use eth_mpc_signer::{slashing::BatchActivationOutcome, types::BatchActivation};
+    runner(Duration::from_secs(900)).start(|context| async move {
+        let cluster = start_network(&context, RETENTION).await;
+        let first = inactive_validator(&context, &cluster, "batch-a").await;
+        let second = inactive_validator(&context, &cluster, "batch-b").await;
+        let submit = |validators: Vec<ValidatorKey>| {
+            let cluster = &cluster;
+            async move {
+                let batch = BatchActivation {
+                    chain: chain(),
+                    validators: validators.into_iter().map(|key| (key, None)).collect(),
+                };
+                let nonce = cluster.next_nonce().await;
+                let endorsement =
+                    cluster.endorse(nonce, &Command::ActivateValidators(Box::new(batch.clone())));
+                let receipt = cluster.clients[1]
+                    .activate_batch(batch, Some(endorsement))
+                    .await
+                    .unwrap();
+                (nonce, receipt)
+            }
+        };
+
+        let unknown = [0x55; 48];
+        let (nonce, refused) = submit(vec![first, unknown, second]).await;
+        assert_eq!(
+            refused.outcome,
+            BatchActivationOutcome::Refused {
+                key: unknown,
+                refusal: ActivationRefusal::UnknownValidator
+            }
+        );
+        let validators = cluster.clients[0].validators().await.unwrap();
+        assert!(validators.iter().all(|entry| entry.activation.is_none()));
+        assert_eq!(cluster.next_nonce().await, nonce + 1);
+
+        let (_, receipt) = submit(vec![first, second]).await;
+        assert_eq!(
+            receipt.outcome,
+            BatchActivationOutcome::Activated {
+                activated: 2,
+                already: 0
+            }
+        );
+        for key in [first, second] {
+            let activation = wait_activated(&context, &cluster, key).await;
+            assert_eq!(
+                activation,
+                Activation {
+                    chain: chain(),
+                    height: receipt.height
+                }
+            );
+            let block = proposal(key, 64, 1);
+            let signed = sign(&cluster, 2, &block).await.unwrap();
+            assert!(ethereum_verify(&key, &block.signing_root(), &signed));
+        }
+
+        let (_, again) = submit(vec![second, first]).await;
+        assert_eq!(
+            again.outcome,
+            BatchActivationOutcome::Activated {
+                activated: 0,
+                already: 2
+            }
+        );
+    });
+}

@@ -645,3 +645,70 @@ fn e2e_imp_2_nodes_without_keys_and_dkg_keys() {
     let (_, validators) = network.get(0, "/validators");
     assert_eq!(validators[0]["origin"], "dkg");
 }
+
+/// E2E-IMP-3: a batch registration (`POST /keys/import/batch`) on real processes: two manifests
+/// of one key are refused before any approval and register nothing; the batch of one registers
+/// it, under one approval; repeated, it registers nothing new; the key under another id is refused
+/// by consensus; the key's shares then install as after a single registration. (All or none
+/// across several keys: the storage unit tests.)
+#[test]
+fn e2e_imp_3_a_batch_registration() {
+    let (network, dir) = import_network();
+    let (manifest, envelopes) = split(&network, &dir, CEREMONY, "shares");
+    let (elsewhere, _) = split(&network, &dir, "approved.imported-elsewhere", "elsewhere");
+    let register = |manifests: Value| {
+        network.approved(
+            0,
+            "register-import-batch",
+            json!({ "manifests": manifests }),
+        )
+    };
+
+    let (code, answer) = register(json!([manifest, elsewhere]));
+    assert_eq!(code, 400, "one key under two ids: {answer}");
+    for node in network.all() {
+        assert_eq!(
+            network.get(node, &format!("/keys/import/{CEREMONY}")).0,
+            404
+        );
+    }
+
+    let (code, answer) = register(json!([manifest]));
+    assert_eq!(
+        (code, &answer["registered"], &answer["already_registered"]),
+        (200, &json!(1), &json!(0)),
+        "{answer}"
+    );
+    let (code, answer) = register(json!([manifest]));
+    assert_eq!(
+        (code, &answer["registered"], &answer["already_registered"]),
+        (200, &json!(0), &json!(1)),
+        "{answer}"
+    );
+    let (code, answer) = register(json!([elsewhere]));
+    assert_eq!(code, 409, "the key under another id: {answer}");
+    assert!(
+        answer
+            .to_string()
+            .contains("nothing of the batch was registered"),
+        "{answer}"
+    );
+
+    for (node, envelope) in envelopes.iter().enumerate() {
+        network.wait_until(&format!("registration on node {node}"), || {
+            network.get(node, &format!("/keys/import/{CEREMONY}")).0 == 200
+        });
+        let (code, answer) = network.post(node, "/keys/import/share", envelope);
+        assert_eq!(code, 200, "node {node}: {answer}");
+    }
+    for node in network.all() {
+        network.wait_until(&format!("four acknowledged shares on node {node}"), || {
+            status(&network, node)["ready_shares"]
+                .as_array()
+                .unwrap()
+                .len()
+                == NODES
+        });
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}

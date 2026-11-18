@@ -41,6 +41,12 @@
 //!   needs `"acknowledgment": {"previous_signer_stopped": true, "no_other_active_signer": true,
 //!   "history_exported_after_stop": true, "automatic_restart_disabled": true}`, its slashing-
 //!   protection history imported for that chain, and enough keyholders holding a verified share.
+//! - `POST /validators/activate/batch` `{"genesis_validators_root": "0x..", "validators":
+//!   [{"public_key": "0x..", "acknowledgment": {..}}, ..], "authorization": {..}}`: activates up to
+//!   1 024 keys for one chain with one set of approvals, all or none (protected). Each key is
+//!   checked as `POST /validators/activate` checks it; `acknowledgment` only for imported keys.
+//!   `200` `{"activated", "already_activated", "height"}`; on the first refused key nothing
+//!   changes: `409` (`404` for an unknown key) with `public_key` and `refusal`.
 //!
 //! Imported keys (docs/key-import.md):
 //!
@@ -49,6 +55,9 @@
 //! - `POST /keys/import` `{"manifest": <manifest.json>, "authorization": {..}}`: registers the
 //!   imported key's public data through consensus (protected, below; idempotent; `409` if the id
 //!   or the key is already registered).
+//! - `POST /keys/import/batch` `{"manifests": [<manifest.json>, ..], "authorization": {..}}`: up
+//!   to 128 imported keys registered all or none, under one set of approvals (`409` or `400`
+//!   naming the first manifest refused, and nothing registered).
 //! - `POST /keys/import/share` (a `node-<index>.enc`): this node opens, verifies and stores its own
 //!   share, then acknowledges it through consensus. Never returns the share.
 //! - `GET /keys/import/{ceremony_id}`: registration, acknowledged shares, history and activation.
@@ -125,8 +134,8 @@ use crate::{
     readiness::{Readiness, Reason, State as ReadinessState},
     signer::coordinator::{self, SignError},
     slashing::{
-        Acknowledgment, ActivationOutcome, ActivationRefusal, ChainIdentity, Floors,
-        HistoryOutcome, HistoryRefusal, Refusal as DutyRefusal,
+        Acknowledgment, ActivationOutcome, ActivationRefusal, BatchActivationOutcome,
+        ChainIdentity, Floors, HistoryOutcome, HistoryRefusal, Refusal as DutyRefusal,
     },
     types::Command,
 };
@@ -152,7 +161,7 @@ use commonware_utils::{
     ordered::{Quorum as _, Set},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
@@ -411,6 +420,7 @@ pub fn router(
         .route("/dkg/public-key/{ceremony_id}", get(dkg_public_key))
         .route("/validators", get(validators))
         .route("/validators/activate", post(activate_validator))
+        .route("/validators/activate/batch", post(activate_batch))
         .route("/validators/reshare", post(start_resharing))
         .route("/validators/reshare/activate", post(activate_generation))
         .route("/validators/reshare/abort", post(abort_resharing))
@@ -418,6 +428,7 @@ pub fn router(
         .route("/identity", get(identity))
         .route("/attestation", get(attestation))
         .route("/keys/import", post(register_import))
+        .route("/keys/import/batch", post(register_import_batch))
         .route("/keys/import/share", post(install_share))
         .route("/keys/import/{ceremony_id}", get(import_status))
         .route(
@@ -546,6 +557,124 @@ async fn committed_validator(
         .iter()
         .find(|validator| &validator.key == key)
         .map(ValidatorResponse::from))
+}
+
+#[derive(Serialize)]
+struct BatchActivationResponse {
+    /// Keys this batch activated.
+    activated: u32,
+    /// Keys of the batch that were activated for the chain before it.
+    already_activated: u32,
+    /// Height of the block that decided it (none: every key was activated before).
+    height: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct BatchActivationError {
+    error: String,
+    /// The first refused key: nothing of the batch changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    public_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refusal: Option<ActivationRefusal>,
+}
+
+fn batch_error(status: StatusCode, error: String) -> Response {
+    let body = BatchActivationError {
+        error,
+        public_key: None,
+        refusal: None,
+    };
+    (status, Json(body)).into_response()
+}
+
+/// `POST /validators/activate/batch`: activate many keys for one chain, all or none, with one set
+/// of approvals (the module's list).
+async fn activate_batch(
+    State(api): State<Api>,
+    Json(mut body): Json<serde_json::Value>,
+) -> Response {
+    let authorization = match body
+        .as_object_mut()
+        .and_then(|object| object.remove("authorization"))
+    {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => match serde_json::from_value::<AuthorizationJson>(value) {
+            Ok(authorization) => Some(authorization),
+            Err(err) => {
+                return batch_error(StatusCode::BAD_REQUEST, format!("authorization: {err}"));
+            }
+        },
+    };
+    // The command approvers signed, built from the same request (`admin::command`).
+    let batch = match crate::admin::batch_activation(&body) {
+        Ok(batch) => batch,
+        Err(error) => return batch_error(StatusCode::BAD_REQUEST, error),
+    };
+    // The committed state first: a batch whose every key is activated for its chain needs no
+    // consensus (a retry after a timeout, say).
+    let committed: HashMap<_, _> = match api.client.validators().await {
+        Ok(validators) => validators
+            .into_iter()
+            .filter_map(|validator| Some((validator.key, validator.activation?)))
+            .collect(),
+        Err(err) => return batch_error(StatusCode::SERVICE_UNAVAILABLE, err.to_string()),
+    };
+    if batch.validators.iter().all(|(key, _)| {
+        committed
+            .get(key)
+            .is_some_and(|activation| activation.chain == batch.chain)
+    }) {
+        return Json(BatchActivationResponse {
+            activated: 0,
+            already_activated: batch.validators.len() as u32,
+            height: None,
+        })
+        .into_response();
+    }
+    let command = Command::ActivateValidators(Box::new(batch.clone()));
+    let endorsement = match authorize(&api, &command, authorization).await {
+        Ok(endorsement) => endorsement,
+        Err((status, error)) => return batch_error(status, error),
+    };
+    let receipt = match tokio::time::timeout(
+        SUBMIT_TIMEOUT,
+        api.client.activate_batch(batch, Some(endorsement)),
+    )
+    .await
+    {
+        Ok(Ok(receipt)) => receipt,
+        Ok(Err(err)) => return batch_error(StatusCode::SERVICE_UNAVAILABLE, err.to_string()),
+        Err(_) => {
+            return batch_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "batch activation not finalized in time (it may still be)".into(),
+            );
+        }
+    };
+    match receipt.outcome {
+        BatchActivationOutcome::Activated { activated, already } => Json(BatchActivationResponse {
+            activated,
+            already_activated: already,
+            height: Some(receipt.height),
+        })
+        .into_response(),
+        BatchActivationOutcome::Refused { key, refusal } => {
+            let status = match refusal {
+                ActivationRefusal::UnknownValidator => StatusCode::NOT_FOUND,
+                _ => StatusCode::CONFLICT,
+            };
+            let body = BatchActivationError {
+                error: format!(
+                    "0x{}: {refusal}; nothing of the batch was activated",
+                    hex::encode(key)
+                ),
+                public_key: Some(format!("0x{}", hex::encode(key))),
+                refusal: Some(refusal),
+            };
+            (status, Json(body)).into_response()
+        }
+    }
 }
 
 async fn activate_validator(State(api): State<Api>, Json(body): Json<ActivateBody>) -> Response {
@@ -2176,6 +2305,87 @@ async fn register_import(State(api): State<Api>, body: Bytes) -> Result<Response
             ),
         )),
         ImportOutcome::Invalid(invalid) => Err((StatusCode::BAD_REQUEST, invalid.to_string())),
+    }
+}
+
+/// `POST /keys/import/batch`: `{"manifests": [...], "authorization"}`, 1 to
+/// `MAX_BATCH_REGISTRATIONS` manifests registered all or none, under one set of approvals.
+async fn register_import_batch(
+    State(api): State<Api>,
+    Json(mut body): Json<serde_json::Value>,
+) -> Result<Response, ApiError> {
+    let authorization = match body
+        .as_object_mut()
+        .and_then(|object| object.remove("authorization"))
+    {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            serde_json::from_value::<AuthorizationJson>(value)
+                .map_err(|err| (StatusCode::BAD_REQUEST, format!("authorization: {err}")))?,
+        ),
+    };
+    // The command approvers signed, built from the same request (`admin::command`).
+    let batch =
+        crate::admin::batch_registration(&body).map_err(|err| (StatusCode::BAD_REQUEST, err))?;
+    // The checks consensus applies to each manifest, first, for a clear answer.
+    for manifest in &batch.manifests {
+        manifest.check(api.dkg.committee()).map_err(|err| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("manifest {}: {err}", manifest.ceremony),
+            )
+        })?;
+    }
+    let command = Command::RegisterImportedKeys(Box::new(batch.clone()));
+    command
+        .ceremony_id_rule()
+        .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
+    let endorsement = authorize(&api, &command, authorization).await?;
+    let receipt = tokio::time::timeout(
+        SUBMIT_TIMEOUT,
+        api.client.register_import_batch(batch, Some(endorsement)),
+    )
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::GATEWAY_TIMEOUT,
+            "batch registration not finalized in time (it may still be)".to_string(),
+        )
+    })?
+    .map_err(unavailable)?;
+    use crate::dkg::ceremony::{BatchImportOutcome, ImportOutcome};
+    match receipt.outcome {
+        BatchImportOutcome::Registered {
+            registered,
+            existing,
+        } => Ok(Json(serde_json::json!({
+            "registered": registered.len(),
+            "already_registered": existing,
+            "rounds": registered,
+            "height": receipt.height,
+        }))
+        .into_response()),
+        BatchImportOutcome::Refused { ceremony, outcome } => {
+            let (status, reason) = match outcome {
+                ImportOutcome::Conflict(round) => (
+                    StatusCode::CONFLICT,
+                    format!("the ceremony id is already used (round {round}) by another ceremony"),
+                ),
+                ImportOutcome::KeyExists(round) => (
+                    StatusCode::CONFLICT,
+                    format!(
+                        "this validator key is already registered (round {round}): a key is \
+                         registered once, and its slashing history is never reset"
+                    ),
+                ),
+                ImportOutcome::Invalid(invalid) => (StatusCode::BAD_REQUEST, invalid.to_string()),
+                other => (StatusCode::INTERNAL_SERVER_ERROR, format!("{other:?}")),
+            };
+            Err((
+                status,
+                format!("manifest {ceremony}: {reason}; nothing of the batch was registered"),
+            ))
+        }
     }
 }
 

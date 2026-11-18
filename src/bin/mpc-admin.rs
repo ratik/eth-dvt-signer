@@ -181,11 +181,14 @@ enum Command {
     /// Draft a protected operation for the network's cluster and next nonce (`GET /admin`), to be
     /// signed offline.
     Draft {
-        /// `reconfigure`, `reshare`, `activate`, `register-import`, `import-history`,
-        /// `sign-exit`, `sign-deposit` or `set-registration-policy`.
+        /// `reconfigure`, `reshare`, `activate`, `activate-batch`, `register-import`,
+        /// `register-import-batch`, `import-history`, `sign-exit`, `sign-deposit` or `set-registration-policy`.
         operation: String,
         /// The endpoint's request (JSON, or `@file`), without `authorization`. For
-        /// `register-import`, `{"manifest": <manifest.json>}`. For `reconfigure`, `epoch`
+        /// `activate-batch`, `{"genesis_validators_root", "validators": [{"public_key",
+        /// "acknowledgment"}]}` (`acknowledgment` for imported keys only). For
+        /// `register-import`, `{"manifest": <manifest.json>}`; for `register-import-batch`,
+        /// `{"manifests": [<manifest.json>, ..]}` (up to 128). For `reconfigure`, `epoch`
         /// defaults to the next one. For `import-history`, `--interchange` instead; for
         /// `sign-exit` and `sign-deposit`, their fields.
         #[arg(long)]

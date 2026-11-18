@@ -445,3 +445,29 @@ impl Manifest {
         Ok(manifest)
     }
 }
+
+/// A manifest for the key of `seed`, split among `committee` (threshold 3), for tests.
+#[cfg(test)]
+pub(crate) fn for_test(ceremony: &str, committee: &Set<PublicKey>, seed: u64) -> Manifest {
+    use commonware_cryptography::bls12381::primitives::group::{Private, Scalar};
+    use rand::{SeedableRng as _, rngs::StdRng};
+    let secret = Private::new(Scalar::from_u64(seed + 1000));
+    let split = dealer::split(&secret, committee, &mut StdRng::seed_from_u64(seed)).unwrap();
+    Manifest {
+        version: MANIFEST_VERSION,
+        ceremony: CeremonyId::new(ceremony).unwrap(),
+        import_id: [seed as u8; 16],
+        validator: split.sharing.public().encode().as_ref().try_into().unwrap(),
+        protocol_version: PROTOCOL_VERSION,
+        threshold: 3,
+        members: committee
+            .iter()
+            .enumerate()
+            .map(|(index, identity)| Member {
+                identity: identity.clone(),
+                share_key: [index as u8 + 1; 32],
+            })
+            .collect(),
+        commitments: split.commitments,
+    }
+}

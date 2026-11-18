@@ -136,6 +136,13 @@ pub enum Command {
     /// Replace the policy builder registrations must meet (`eth::registration`): from the next
     /// transaction on, every registration is checked against it.
     SetRegistrationPolicy(Box<RegistrationPolicy>),
+    /// Activate many validator keys for one Ethereum chain, all or none: each as
+    /// `ActivateValidator` or, with the operator's acknowledgment, `ActivateImportedValidator`
+    /// would. One set of approvals and one administrative nonce for the whole batch.
+    ActivateValidators(Box<BatchActivation>),
+    /// Register many imported keys, all or none: each as `RegisterImportedKey` would. One set of
+    /// approvals and one administrative nonce for the whole batch.
+    RegisterImportedKeys(Box<BatchRegistration>),
 }
 
 impl Command {
@@ -158,19 +165,26 @@ impl Command {
                     }
                     | Self::ActivateValidator { .. }
                     | Self::ActivateImportedValidator { .. }
+                    | Self::ActivateValidators(_)
+                    | Self::RegisterImportedKeys(_)
                     | Self::RegisterImportedKey(_)
                     | Self::SetRegistrationPolicy(_)
             ),
         }
     }
 
-    /// The ceremony this command starts, if it starts one.
-    pub fn started_ceremony(&self) -> Option<&CeremonyId> {
+    /// The ceremonies this command starts (a batch registration starts one per key).
+    pub fn started_ceremonies(&self) -> Vec<&CeremonyId> {
         match self {
-            Self::StartCeremony(config) | Self::StartValidatorCeremony(config) => Some(&config.id),
-            Self::StartResharing { ceremony, .. } => Some(ceremony),
-            Self::RegisterImportedKey(manifest) => Some(&manifest.ceremony),
-            _ => None,
+            Self::StartCeremony(config) | Self::StartValidatorCeremony(config) => vec![&config.id],
+            Self::StartResharing { ceremony, .. } => vec![ceremony],
+            Self::RegisterImportedKey(manifest) => vec![&manifest.ceremony],
+            Self::RegisterImportedKeys(batch) => batch
+                .manifests
+                .iter()
+                .map(|manifest| &manifest.ceremony)
+                .collect(),
+            _ => Vec::new(),
         }
     }
 
@@ -179,21 +193,27 @@ impl Command {
     /// leader and the voters check it (`application::Rules`); the state machine does not, so the
     /// history from before it applies as it did.
     pub fn ceremony_id_rule(&self) -> Result<(), String> {
-        let Some(id) = self.started_ceremony() else {
-            return Ok(());
-        };
-        match (self.is_protected(), id.is_reserved()) {
-            (true, false) => Err(format!(
-                "a protected command starts ceremony {}: its id must start with {RESERVED_PREFIX}",
-                id.as_str()
-            )),
-            (false, true) => Err(format!(
-                "ceremony id {} is reserved for protected commands (it starts with \
-                 {RESERVED_PREFIX})",
-                id.as_str()
-            )),
-            _ => Ok(()),
+        let protected = self.is_protected();
+        for id in self.started_ceremonies() {
+            match (protected, id.is_reserved()) {
+                (true, false) => {
+                    return Err(format!(
+                        "a protected command starts ceremony {}: its id must start with \
+                         {RESERVED_PREFIX}",
+                        id.as_str()
+                    ));
+                }
+                (false, true) => {
+                    return Err(format!(
+                        "ceremony id {} is reserved for protected commands (it starts with \
+                         {RESERVED_PREFIX})",
+                        id.as_str()
+                    ));
+                }
+                _ => {}
+            }
         }
+        Ok(())
     }
 
     /// Whether the command asks for a builder registration (`eth::registration`).
@@ -241,6 +261,175 @@ pub struct Reconfiguration {
 
 /// Most validators one history import may name.
 pub const MAX_IMPORT_VALIDATORS: usize = 1024;
+
+/// Most validators one batch activation may name.
+pub const MAX_BATCH_ACTIVATIONS: usize = 1024;
+
+/// A batch of validator activations for one chain ([Command::ActivateValidators]): between 1 and
+/// [MAX_BATCH_ACTIVATIONS] keys, each once, in the order given. A key with an acknowledgment is an
+/// imported key (the operator's acknowledgment of its migration); one without is a DKG key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BatchActivation {
+    pub chain: ChainIdentity,
+    pub validators: Vec<(ValidatorKey, Option<Acknowledgment>)>,
+}
+
+impl BatchActivation {
+    /// Whether the batch may be encoded: 1 to [MAX_BATCH_ACTIVATIONS] keys, each once.
+    pub fn check(&self) -> Result<(), &'static str> {
+        if self.validators.is_empty() || self.validators.len() > MAX_BATCH_ACTIVATIONS {
+            return Err("a batch activation names 1 to 1024 validators");
+        }
+        let mut keys = std::collections::BTreeSet::new();
+        if !self.validators.iter().all(|(key, _)| keys.insert(*key)) {
+            return Err("a batch activation names a validator twice");
+        }
+        Ok(())
+    }
+}
+
+impl Write for BatchActivation {
+    fn write(&self, buf: &mut impl BufMut) {
+        buf.put_slice(&self.chain.genesis_validators_root);
+        UInt(self.validators.len() as u32).write(buf);
+        for (key, acknowledgment) in &self.validators {
+            buf.put_slice(key);
+            match acknowledgment {
+                Some(acknowledgment) => {
+                    1u8.write(buf);
+                    acknowledgment.to_bits().write(buf);
+                }
+                None => 0u8.write(buf),
+            }
+        }
+    }
+}
+
+impl Read for BatchActivation {
+    type Cfg = ();
+
+    fn read_cfg(buf: &mut impl Buf, _: &()) -> Result<Self, Error> {
+        let genesis_validators_root = <[u8; 32]>::read(buf)?;
+        let count = u32::from(UInt::<u32>::read(buf)?) as usize;
+        if count == 0 || count > MAX_BATCH_ACTIVATIONS {
+            return Err(Error::Invalid("BatchActivation", "validator count"));
+        }
+        let validators = (0..count)
+            .map(|_| {
+                let key = <[u8; 48]>::read(buf)?;
+                let acknowledgment = match u8::read(buf)? {
+                    0 => None,
+                    1 => Some(
+                        Acknowledgment::from_bits(u8::read(buf)?)
+                            .ok_or(Error::Invalid("BatchActivation", "acknowledgment"))?,
+                    ),
+                    tag => return Err(Error::InvalidEnum(tag)),
+                };
+                Ok((key, acknowledgment))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let batch = Self {
+            chain: ChainIdentity {
+                genesis_validators_root,
+            },
+            validators,
+        };
+        // One encoding per batch: each key once.
+        batch
+            .check()
+            .map_err(|_| Error::Invalid("BatchActivation", "a validator named twice"))?;
+        Ok(batch)
+    }
+}
+
+impl EncodeSize for BatchActivation {
+    fn encode_size(&self) -> usize {
+        32 + UInt(self.validators.len() as u32).encode_size()
+            + self
+                .validators
+                .iter()
+                .map(|(_, acknowledgment)| 48 + 1 + usize::from(acknowledgment.is_some()))
+                .sum::<usize>()
+    }
+}
+
+/// Most imported keys one batch registration may name.
+pub const MAX_BATCH_REGISTRATIONS: usize = 128;
+
+/// Most bytes one batch registration may take encoded: a quarter of a block, whatever the size of
+/// the committee (a manifest grows with it).
+pub const MAX_BATCH_REGISTRATION_BYTES: usize = MAX_BLOCK_BYTES / 4;
+
+/// A batch of imported-key registrations ([Command::RegisterImportedKeys]): between 1 and
+/// [MAX_BATCH_REGISTRATIONS] manifests, at most [MAX_BATCH_REGISTRATION_BYTES] encoded, each
+/// ceremony id and each validator key once, in the order given (the order of their rounds).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BatchRegistration {
+    pub manifests: Vec<Manifest>,
+}
+
+impl BatchRegistration {
+    /// Whether the batch may be encoded: its count, its size, and each id and key once.
+    pub fn check(&self) -> Result<(), &'static str> {
+        if self.manifests.is_empty() || self.manifests.len() > MAX_BATCH_REGISTRATIONS {
+            return Err("a batch registration names 1 to 128 imported keys");
+        }
+        if self.encode_size() > MAX_BATCH_REGISTRATION_BYTES {
+            return Err("a batch registration takes at most 128 KiB encoded");
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        let mut keys = std::collections::BTreeSet::new();
+        for manifest in &self.manifests {
+            if !ids.insert(&manifest.ceremony) {
+                return Err("a batch registration names a ceremony id twice");
+            }
+            if !keys.insert(manifest.validator) {
+                return Err("a batch registration names a validator key twice");
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Write for BatchRegistration {
+    fn write(&self, buf: &mut impl BufMut) {
+        UInt(self.manifests.len() as u32).write(buf);
+        for manifest in &self.manifests {
+            manifest.write(buf);
+        }
+    }
+}
+
+impl Read for BatchRegistration {
+    type Cfg = ();
+
+    fn read_cfg(buf: &mut impl Buf, _: &()) -> Result<Self, Error> {
+        let count = u32::from(UInt::<u32>::read(buf)?) as usize;
+        if count == 0 || count > MAX_BATCH_REGISTRATIONS {
+            return Err(Error::Invalid("BatchRegistration", "manifest count"));
+        }
+        let manifests = (0..count)
+            .map(|_| Manifest::read(buf))
+            .collect::<Result<Vec<_>, Error>>()?;
+        let batch = Self { manifests };
+        // One encoding per batch: its size, and each id and key once.
+        batch
+            .check()
+            .map_err(|_| Error::Invalid("BatchRegistration", "size or duplicate"))?;
+        Ok(batch)
+    }
+}
+
+impl EncodeSize for BatchRegistration {
+    fn encode_size(&self) -> usize {
+        UInt(self.manifests.len() as u32).encode_size()
+            + self
+                .manifests
+                .iter()
+                .map(EncodeSize::encode_size)
+                .sum::<usize>()
+    }
+}
 
 fn write_optional_root(root: &Option<[u8; 32]>, buf: &mut impl BufMut) {
     match root {
@@ -451,6 +640,14 @@ impl Write for Command {
                 16u8.write(buf);
                 policy.write(buf);
             }
+            Self::ActivateValidators(batch) => {
+                17u8.write(buf);
+                batch.write(buf);
+            }
+            Self::RegisterImportedKeys(batch) => {
+                18u8.write(buf);
+                batch.write(buf);
+            }
         }
     }
 }
@@ -570,6 +767,12 @@ impl Read for Command {
             16 => Ok(Self::SetRegistrationPolicy(Box::new(
                 RegistrationPolicy::read(buf)?,
             ))),
+            17 => Ok(Self::ActivateValidators(Box::new(BatchActivation::read(
+                buf,
+            )?))),
+            18 => Ok(Self::RegisterImportedKeys(Box::new(
+                BatchRegistration::read(buf)?,
+            ))),
             tag => Err(Error::InvalidEnum(tag)),
         }
     }
@@ -617,6 +820,8 @@ impl EncodeSize for Command {
                         .sum::<usize>()
             }
             Self::SetRegistrationPolicy(policy) => policy.encode_size(),
+            Self::ActivateValidators(batch) => batch.encode_size(),
+            Self::RegisterImportedKeys(batch) => batch.encode_size(),
         }
     }
 }
