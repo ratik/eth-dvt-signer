@@ -35,8 +35,10 @@ devnet and with sealed nodes on GCP Confidential VMs.
   ([docs/slashing-protection.md](docs/slashing-protection.md#the-restart-floor),
   [docs/anchor.md](docs/anchor.md))
 - **Sealed nodes (optional).** A node can run in a GCP Confidential VM (Intel TDX). Its keys are
-  encrypted with a data key that Cloud KMS releases only to an attested image. Clients check each
-  node's attestation and configuration. ([docs/tee.md](docs/tee.md))
+  encrypted with a data key that Cloud KMS releases only to an attested image. Or it can run as an
+  AMD SEV-SNP guest on the operator's own EPYC server: the chip derives the sealing key for the
+  measured image. Clients check each node's attestation and configuration.
+  ([docs/tee.md](docs/tee.md))
 - **Gateway.** `mpc-gateway` gives a validator client one Web3Signer endpoint for the whole
   network. It checks every node's attestation, fails over between nodes, and verifies every
   signature before it returns it. ([docs/gateway.md](docs/gateway.md))
@@ -142,8 +144,11 @@ Details: [docs/tee.md](docs/tee.md) (GCP), [docs/ethereum-devnet.md](docs/ethere
 - **Storage.** Authorizations and slashing history are kept forever, and each block rewrites the
   state partition. No state sync: a node behind the retained history is restored by hand.
 - **Key import** is a trusted-dealer split: whoever keeps the original keystore can still sign.
-- **Sealed nodes** run on GCP only. The cloud's KMS and IAM admins can still release a node's key
-  outside the TEE: give each node its own project or account.
+- **Sealed nodes** on GCP: the cloud's KMS and IAM admins can still release a node's key outside
+  the TEE, so give each node its own project or account. On SEV-SNP the vault and its evidence
+  were tested on real AMD hardware (a GCP SEV-SNP VM), but our image has not yet been launched on
+  an SNP server of our own: its measured boot and HOST_DATA check are untested on hardware. An
+  image upgrade on SEV-SNP replaces the node (R2).
 
 Every known limit and finding, with its tests: [docs/audit.md](docs/audit.md). Security review:
 [docs/security-review.md](docs/security-review.md).
@@ -182,7 +187,7 @@ What each test covers: [docs/internals.md](docs/internals.md#tests).
 | [resharing.md](docs/resharing.md) | New shares (R1) and a replaced keyholder (R2) |
 | [reconfiguration.md](docs/reconfiguration.md) | A replaced consensus voter (R3) |
 | [recovery.md](docs/recovery.md) | Readiness, restarts, restoring a node |
-| [tee.md](docs/tee.md) | Sealed nodes on GCP Confidential VMs |
+| [tee.md](docs/tee.md) | Sealed nodes: GCP Confidential VMs (TDX), SEV-SNP on the operator's servers |
 | [gateway.md](docs/gateway.md) | `mpc-gateway` for validator clients |
 | [ethereum-devnet.md](docs/ethereum-devnet.md) | The devnet integration and its results |
 | [audit.md](docs/audit.md) | Known limits, findings and their tests |

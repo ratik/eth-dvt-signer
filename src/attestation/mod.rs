@@ -8,11 +8,15 @@
 //! - the share-encryption key, which `mpc-keytool split` encrypts to;
 //! - the TLS key, which validator clients pin.
 
+/// Checking evidence of any platform against its policy.
+pub mod check;
 /// The configuration a sealed node's image measures into RTMR3.
 pub mod config;
 /// A fake of Google's attestation, STS and KMS (`test-hooks` builds): never in a deployment.
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod fake;
+/// AMD SEV-SNP: reports, AMD's certificates, the guest device.
+pub mod snp;
 /// A fake issuer for tests (`test-hooks` builds): never in a deployment.
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod testing;
@@ -90,8 +94,11 @@ pub struct Evidence {
     pub keys: Keys,
     /// The client's nonce, `0x`-hex (empty when the node attested its keys on its own).
     pub nonce: String,
-    /// The platform's token (a JWT for `gcp-tdx`).
+    /// The platform's token: a JWT for `gcp-tdx`, the attestation report (base64) for `sev-snp`.
     pub token: String,
+    /// `sev-snp`: the chip's VCEK (DER, base64), if the node has it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vcek: Option<String>,
 }
 
 /// The longest client nonce `GET /attestation` accepts.
@@ -103,7 +110,7 @@ pub const MAX_NONCE: usize = 64;
 #[serde(deny_unknown_fields)]
 pub struct Statement {
     pub index: u64,
-    /// `plain`, `gcp-tdx`, or `development` (keys derived from the node index).
+    /// `plain`, `gcp-tdx`, `sev-snp`, or `development` (keys derived from the node index).
     pub vault: String,
     pub keys: Keys,
     /// The mTLS listener's certificate, then the node CA that clients pin (PEM).

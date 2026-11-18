@@ -25,7 +25,7 @@ Each run writes `IT_HOME/tee/runs/<time>/`:
 | File | Content |
 | --- | --- |
 | `summary` | every check, `pass` or `FAIL` |
-| `expected-measurements` | the main values of the release and debug `measurements` (below): binaries, UKI, GRUB, kernel, root hash, GPT, predicted RTMR1 and RTMR2 |
+| `expected-measurements` | the main values of the release and debug `measurements` (below): binaries, UKI, GRUB, kernel, root hash, GPT, predicted RTMR1 and RTMR2, the SEV-SNP launch measurement |
 | `measurements` | each VM's configuration digests and their RTMR3 on TDX |
 | `reproducibility` | the two release builds compared |
 | `release-a/`, `release-b/`, `debug/`, `release-fake/` | `image/` (disk, UKI, initrd, package manifest, `disk.tar.gz`), `esp/` (the ESP's files as the disk holds them), `measurements`, `mkosi.log` |
@@ -49,7 +49,8 @@ tools' build, four image builds (about 2 minutes each with a warm package cache)
 1. **Tools.** It builds `eth-mpc-tee-tools:<hash>` from `tools/Dockerfile` (the hash covers it and
    `versions.env`): Debian trixie, every package from one snapshot, mkosi 25.3, systemd 257
    (repart, ukify, stub), GRUB 2.12 (`grub-mkimage`, the x86_64-efi modules), QEMU 10, OVMF,
-   swtpm, OpenSSL, Go 1.26.
+   swtpm, OpenSSL, Go 1.26; for SEV-SNP, Ubuntu's AmdSev OVMF and virtee's `sev-snp-measure`
+   (each by SHA-256, `versions.env`).
 2. **Signer.** In `RUST_IMAGE` it builds `eth-mpc-signer` and `tee-token` with default features,
    twice: first into the kept target directory, then from scratch into a tmpfs at the same path.
    - It builds `tee-fake-gcp`, `mpc-admin` and `mpc-keytool` with `test-hooks`, for the harness.
@@ -118,6 +119,10 @@ tools' build, four image builds (about 2 minutes each with a warm package cache)
        login (`Enter username`), which nobody has: no GRUB shell;
      - a VM of the release image given the fake's vault flags makes no vault. Its node refuses the
        endpoints (`only in a test build`) and prints no statement;
+     - a VM boots the release image's SEV-SNP form: its kernel, initrd and command line directly,
+       as `snp/launch.sh` does, here without SNP. It opens the verity root and reads its
+       configuration; with no `/dev/sev-guest`, its `--vault=sev-snp` refuses and it prints no
+       statement;
      - `measure.py selftest` runs the replay without site packages. It accepts a synthetic CCEL
        log of the predicted boot and refuses each tampering: another UKI, no GRUB commands, a
        non-`EV_IPL` event in RTMR2, a GRUB command whose digest is not its text's, two kernel
@@ -345,6 +350,11 @@ Other commands of `measure.py`:
   firmware as one C3 VM measured it on 2026-11-10. The first measure-mode boot of a new image
   confirms the values, and the key-release condition takes them from its token.
 - `esp.file`: the files on the ESP.
+- `snp.vmlinuz.sha256`, `snp.initrd.sha256`, `snp.cmdline.sha256`, `snp.cmdline`: the image's
+  SEV-SNP boot, the UKI's kernel, initrd and command line (plus `root=/dev/mapper/root`) in the
+  build's `snp/`; `snp.ovmf.sha256`: the AmdSev OVMF; `snp.vcpus`, `snp.measurement`: the launch
+  measurement of that boot for that many vCPUs of that CPU model (`sev-snp-measure`), the
+  `sev-snp` policy's `measurements` (docs/tee.md).
 - `disk.tar.gz.sha256`: GCE's import file.
 
 Measurements of the run of 2026-11-10 (`20261110T182701Z`; trixie; the signer and `tee-token` of

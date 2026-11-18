@@ -1967,6 +1967,7 @@ dependencies = [
  "futures",
  "hex",
  "hpke",
+ "libc",
  "object_store",
  "pbkdf2",
  "prometheus-client",
@@ -1992,6 +1993,7 @@ dependencies = [
  "tree_hash_derive",
  "typenum",
  "unicode-normalization",
+ "x509-parser",
  "zeroize",
 ]
 

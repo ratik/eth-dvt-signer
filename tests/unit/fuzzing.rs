@@ -314,6 +314,7 @@ fn write_tee_seeds() {
             keys: keys.clone(),
             nonce: String::new(),
             token: token.clone(),
+            vcek: None,
         }),
     };
     seed(
