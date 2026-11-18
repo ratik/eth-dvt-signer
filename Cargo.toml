@@ -3,6 +3,7 @@ name = "eth-mpc-signer"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95.0"
+license = "MIT"
 description = "Ethereum MPC signer built on commonware: BLS12-381 DKG and consensus-authorized threshold signing"
 publish = false
 # The fuzz targets are a crate of their own (nightly, `cargo fuzz`).
