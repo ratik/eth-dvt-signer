@@ -151,7 +151,8 @@ Details: [docs/tee.md](docs/tee.md) (GCP), [docs/ethereum-devnet.md](docs/ethere
   an SNP server of our own: its measured boot and HOST_DATA check are untested on hardware. An
   image upgrade on SEV-SNP replaces the node (R2).
 
-Every known limit and finding, with its tests: [docs/audit.md](docs/audit.md). Security review:
+What the design protects and trusts, in short: [docs/threat-model.md](docs/threat-model.md). Every
+known limit and finding, with its tests: [docs/audit.md](docs/audit.md). Security review:
 [docs/security-review.md](docs/security-review.md).
 
 ## Tests
@@ -192,6 +193,7 @@ What each test covers: [docs/internals.md](docs/internals.md#tests).
 | [tee.md](docs/tee.md) | Sealed nodes: GCP Confidential VMs (TDX), SEV-SNP on the operator's servers |
 | [gateway.md](docs/gateway.md) | `mpc-gateway` for validator clients |
 | [ethereum-devnet.md](docs/ethereum-devnet.md) | The devnet integration and its results |
+| [threat-model.md](docs/threat-model.md) | Short threat model, and what the design trusts |
 | [audit.md](docs/audit.md) | Known limits, findings and their tests |
 | [security-review.md](docs/security-review.md) | Security review |
 
