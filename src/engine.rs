@@ -198,7 +198,8 @@ pub struct Config<B, P> {
     pub allow_missing_consensus_journal: bool,
     /// This node's share-encryption key, to install shares of imported keys (`import`).
     pub share_key: Option<crate::import::envelope::ShareKey>,
-    /// The sealed vault's cipher (`vault`, docs/tee.md): `registry-secrets` is encrypted with it.
+    /// The sealed vault's cipher (`vault`, docs/tee.md): `registry-secrets` and
+    /// `registry-secrets-pending` are encrypted with it.
     pub secrets_cipher: Option<crate::vault::Cipher>,
     /// The operator's approvals of reshares to new keyholders (`dkg::approval`), if any.
     pub approved_reshares: Option<std::path::PathBuf>,
@@ -710,6 +711,7 @@ where
         &[
             format!("{prefix}-state"),
             format!("{prefix}-secrets"),
+            format!("{prefix}-secrets-pending"),
             format!("{prefix}-marshal-application-metadata"),
             format!("{prefix}-finalizations-metadata"),
             format!("{prefix}-blocks-metadata"),

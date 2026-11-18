@@ -12,9 +12,11 @@ use crate::dkg::{
 use commonware_cryptography::{Hasher as _, Sha256, Signer as _};
 use commonware_math::algebra::Random as _;
 use commonware_parallel::Sequential;
-use commonware_runtime::{Blob as _, Runner as _, Storage as _, Supervisor as _, deterministic};
+use commonware_runtime::{Blob as _, Runner as _, Storage as _, deterministic};
 
 const PARTITION: &str = "secrets";
+/// Where the seeds and dealings are.
+const PENDING: &str = "secrets-pending";
 
 /// A completed ceremony and node 0's share of it.
 fn completed(context: &mut deterministic::Context) -> (Ceremony, KeyShare) {
@@ -98,13 +100,10 @@ fn interrupted_write_never_exposes_a_partial_share() {
         secrets.put_share(key_share.clone()).await.unwrap();
         drop(secrets);
 
-        // Tear the copy holding the share (the one with the higher version), as a crash
-        // halfway through its write would.
-        let newest = newest_copy(&context).await;
-        let (blob, len) = context.open(PARTITION, newest).await.unwrap();
-        blob.resize(len / 2).await.unwrap();
-        blob.sync().await.unwrap();
-        drop(blob);
+        // A crash halfway through the share's write: the share's copy (the one with the higher
+        // version) is torn, and the seed was never dropped (its removal comes after).
+        tear_newest_copy(&context, PARTITION).await;
+        tear_newest_copy(&context, PENDING).await;
 
         // The previous complete state comes back: the seed, no share at all.
         let secrets = Secrets::init(context.child("b"), PARTITION.into(), None)
@@ -136,11 +135,20 @@ fn interrupted_write_never_exposes_a_partial_share() {
     });
 }
 
-/// Name of the metadata copy with the highest version.
-async fn newest_copy(context: &deterministic::Context) -> &'static [u8] {
+/// Cut the copy of `partition` with the highest version in half, as a crash halfway through its
+/// write would.
+async fn tear_newest_copy(context: &deterministic::Context, partition: &str) {
+    let newest = newest_copy(context, partition).await;
+    let (blob, len) = context.open(partition, newest).await.unwrap();
+    blob.resize(len / 2).await.unwrap();
+    blob.sync().await.unwrap();
+}
+
+/// Name of the metadata copy of `partition` with the highest version.
+async fn newest_copy(context: &deterministic::Context, partition: &str) -> &'static [u8] {
     let mut newest = (0, b"left".as_slice());
     for name in [b"left".as_slice(), b"right"] {
-        let (blob, len) = context.open(PARTITION, name).await.unwrap();
+        let (blob, len) = context.open(partition, name).await.unwrap();
         if len < 8 {
             continue;
         }
@@ -182,7 +190,8 @@ fn a_sealed_store_holds_no_share_in_the_clear_and_opens_only_with_its_cipher() {
         drop(secrets);
 
         // Neither the share's secret scalar nor the seed is on disk in the clear.
-        let disk = stored_bytes(&context, PARTITION).await;
+        let mut disk = stored_bytes(&context, PARTITION).await;
+        disk.extend(stored_bytes(&context, PENDING).await);
         let scalar = key_share.share.private.encode();
         assert!(
             !disk
@@ -221,7 +230,7 @@ fn a_sealed_store_holds_no_share_in_the_clear_and_opens_only_with_its_cipher() {
         ));
         // A sealed value moved to another partition does not open there (the associated data
         // names the partition and key).
-        let (_, len) = context.open(PARTITION, b"left").await.unwrap();
+        let len = stored_bytes(&context, PARTITION).await.len();
         for name in [b"left".as_slice(), b"right"] {
             let (from, len) = context.open(PARTITION, name).await.unwrap();
             let bytes = from
@@ -262,6 +271,122 @@ fn a_plain_store_is_refused_by_a_sealed_node() {
             )
             .await,
             Err(Error::ClearInSealedStore)
+        ));
+    });
+}
+
+/// Interrupted after the share's write, before the seed and dealings are dropped: the next start
+/// drops them, and keeps the share.
+#[test]
+fn a_share_stored_drops_its_seed_at_start() {
+    deterministic::Runner::default().start(|mut context| async move {
+        let (_, key_share) = completed(&mut context);
+        let mut secrets = Secrets::init(context.child("a"), PARTITION.into(), None)
+            .await
+            .unwrap();
+        secrets
+            .put_seed(0, Summary::random(&mut context))
+            .await
+            .unwrap();
+        secrets.put_share(key_share.clone()).await.unwrap();
+        drop(secrets);
+        // Undo the seed's removal (the write after the share's).
+        tear_newest_copy(&context, PENDING).await;
+
+        let secrets = Secrets::init(context.child("b"), PARTITION.into(), None)
+            .await
+            .unwrap();
+        assert_eq!(secrets.share(0), Some(&key_share));
+        assert!(secrets.seed(0).is_none());
+        drop(secrets);
+        let pending = Metadata::<_, Key, Stored>::init(
+            context.child("pending"),
+            Config {
+                partition: PENDING.into(),
+                codec_config: (),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(pending.keys().count(), 0);
+    });
+}
+
+/// A store written before the seeds and dealings moved: they move to `<partition>-pending` at
+/// start, and the shares stay.
+#[test]
+fn seeds_and_dealings_move_out_of_an_older_store() {
+    deterministic::Runner::default().start(|mut context| async move {
+        let (_, key_share) = completed(&mut context);
+        let seed = Summary::random(&mut context);
+        let config = |partition: &str| Config {
+            partition: partition.into(),
+            codec_config: (),
+        };
+        // The older layout: everything in one partition.
+        let mut older = Metadata::<_, Key, Stored>::init(context.child("older"), config(PARTITION))
+            .await
+            .unwrap();
+        older.put(
+            Key::new(SEED_PREFIX, 1),
+            Stored::Clear(Encoded::new(&Value::Seed(seed))),
+        );
+        older.put(
+            Key::new(SHARE_PREFIX, 0),
+            Stored::Clear(Encoded::new(&Value::Share(Box::new(key_share.clone())))),
+        );
+        drop(older.sync().await.unwrap());
+
+        let secrets = Secrets::init(context.child("a"), PARTITION.into(), None)
+            .await
+            .unwrap();
+        assert_eq!(secrets.seed(1), Some(seed));
+        assert_eq!(secrets.share(0), Some(&key_share));
+        drop(secrets);
+        let keys = |metadata: &Metadata<_, Key, Stored>| -> Vec<Key> {
+            metadata.keys().cloned().collect()
+        };
+        let main = Metadata::<_, Key, Stored>::init(context.child("main"), config(PARTITION))
+            .await
+            .unwrap();
+        assert_eq!(keys(&main), vec![Key::new(SHARE_PREFIX, 0)]);
+        let pending = Metadata::<_, Key, Stored>::init(context.child("pending"), config(PENDING))
+            .await
+            .unwrap();
+        assert_eq!(keys(&pending), vec![Key::new(SEED_PREFIX, 1)]);
+        drop((main, pending));
+
+        // And again: nothing more moves.
+        let secrets = Secrets::init(context.child("b"), PARTITION.into(), None)
+            .await
+            .unwrap();
+        assert_eq!(secrets.seed(1), Some(seed));
+        assert_eq!(secrets.share(0), Some(&key_share));
+    });
+}
+
+/// A share in the partition of seeds and dealings is refused.
+#[test]
+fn a_share_among_the_pending_values_is_refused() {
+    deterministic::Runner::default().start(|mut context| async move {
+        let (_, key_share) = completed(&mut context);
+        let mut pending = Metadata::<_, Key, Stored>::init(
+            context.child("pending"),
+            Config {
+                partition: PENDING.into(),
+                codec_config: (),
+            },
+        )
+        .await
+        .unwrap();
+        pending.put(
+            Key::new(SHARE_PREFIX, 0),
+            Stored::Clear(Encoded::new(&Value::Share(Box::new(key_share)))),
+        );
+        drop(pending.sync().await.unwrap());
+        assert!(matches!(
+            Secrets::init(context.child("a"), PARTITION.into(), None).await,
+            Err(Error::Misplaced)
         ));
     });
 }

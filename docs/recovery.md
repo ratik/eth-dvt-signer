@@ -210,7 +210,7 @@ node:
 1. Stop the lagging node and a healthy one. With one node already down, consensus pauses until the
    healthy node is back.
 2. In the lagging node's `<data-dir>/node-<id>`, replace every partition with the healthy node's
-   copy, **except** its own `registry-secrets` (its key shares), its consensus journals
+   copy, **except** its own secret store (`registry-secrets`, `registry-secrets-pending`), its consensus journals
    (`registry-consensus`, `registry-consensus-<e>`) and its `vault` directory.
 3. Restart both.
 

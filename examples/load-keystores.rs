@@ -21,7 +21,11 @@ fn main() {
     let mut rng = rand::rng();
     let password = eip2335::process_password("load");
     for index in 0..count {
-        let secret: [u8; 32] = Scalar::random(&mut rng).encode().as_ref().try_into().unwrap();
+        let secret: [u8; 32] = Scalar::random(&mut rng)
+            .encode()
+            .as_ref()
+            .try_into()
+            .unwrap();
         let salt: [u8; 32] = rng.random();
         let iv: [u8; 16] = rng.random();
         let mut key = [0u8; 32];

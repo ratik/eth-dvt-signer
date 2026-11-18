@@ -374,6 +374,7 @@ fn tee_1_sealed_nodes_attest_their_keys_sign_over_mtls_and_keep_nothing_in_the_c
         }
         // The shares are sealed too: every value of `registry-secrets` carries the sealed tag.
         assert!(node.join("registry-secrets").exists());
+        assert!(node.join("registry-secrets-pending").exists());
     }
 }
 

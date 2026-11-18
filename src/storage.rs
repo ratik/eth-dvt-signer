@@ -27,6 +27,7 @@ use crate::{
             ImportOutcome, Origin, ReadyIgnored, ReshareOutcome, StartOutcome,
         },
     },
+    encoded::Encoded,
     epochs::{EpochRecord, Epochs},
     eth::{
         duty::{DutyKind, ValidatorKey},
@@ -55,6 +56,25 @@ use rand_core::CryptoRng;
 
 /// Version of the on-disk layout.
 pub const FORMAT_VERSION: u64 = 2;
+
+/// [Metadata] of [Value]s held encoded ([Encoded]): a full rewrite copies bytes instead of
+/// encoding every value again.
+trait Values {
+    /// Put `value` under `key`, encoded once.
+    fn put_value(&mut self, key: Key, value: Value);
+    /// The value under `key` as read at start (`None` for a key put since).
+    fn get_value(&self, key: &Key) -> Option<&Value>;
+}
+
+impl<E: Context> Values for Metadata<E, Key, Encoded<Value>> {
+    fn put_value(&mut self, key: Key, value: Value) {
+        let _ = self.put(key, Encoded::new(&value));
+    }
+
+    fn get_value(&self, key: &Key) -> Option<&Value> {
+        self.get(key).and_then(Encoded::decoded)
+    }
+}
 
 /// `prefix || a || b` (big endian).
 type Key = FixedBytes<17>;
@@ -657,7 +677,7 @@ pub struct Applied {
 /// committed state.
 pub struct Store<E: Context> {
     // `Metadata::sync` consumes the store, so it is temporarily taken out while syncing.
-    metadata: Option<Metadata<E, Key, Value>>,
+    metadata: Option<Metadata<E, Key, Encoded<Value>>>,
     state: State,
     ceremonies: Ceremonies,
     protection: Protection,
@@ -679,12 +699,12 @@ fn group_key(ceremony: &Ceremony) -> Option<ValidatorKey> {
 
 /// Persist what `record` designates, as `protection` now holds it.
 fn persist<E: Context>(
-    metadata: &mut Metadata<E, Key, Value>,
+    metadata: &mut Metadata<E, Key, Encoded<Value>>,
     protection: &Protection,
     record: Record,
 ) {
-    let _ = match record {
-        Record::Validator(id) => metadata.put(
+    match record {
+        Record::Validator(id) => metadata.put_value(
             key(VALIDATOR_PREFIX, id, 0),
             Value::Validator(
                 protection
@@ -693,11 +713,11 @@ fn persist<E: Context>(
                     .clone(),
             ),
         ),
-        Record::Proposal { id, slot } => metadata.put(
+        Record::Proposal { id, slot } => metadata.put_value(
             key(PROPOSAL_PREFIX, id, slot),
             Value::Signed(*protection.proposal(id, slot).expect("recorded proposal")),
         ),
-        Record::Attestation { id, target } => metadata.put(
+        Record::Attestation { id, target } => metadata.put_value(
             key(ATTESTATION_PREFIX, id, target),
             Value::Attested(
                 *protection
@@ -705,17 +725,17 @@ fn persist<E: Context>(
                     .expect("recorded attestation"),
             ),
         ),
-        Record::Bounded { id, kind, period } => metadata.put(
+        Record::Bounded { id, kind, period } => metadata.put_value(
             key(BOUNDED_PREFIX + kind as u8, id, period),
             Value::Roots(protection.bounded(id, kind, period).to_vec()),
         ),
-        Record::Imported(id) => metadata.put(
+        Record::Imported(id) => metadata.put_value(
             key(IMPORTED_PREFIX, id, 0),
             Value::ImportedValidator(*protection.imported(id).expect("recorded import")),
         ),
         Record::Approval { id, root } => {
             let approved = *protection.approval(id, &root).expect("recorded approval");
-            metadata.put(
+            metadata.put_value(
                 key(APPROVAL_PREFIX, id, approved.nonce),
                 Value::Approval(root, approved),
             )
@@ -724,14 +744,14 @@ fn persist<E: Context>(
             let registered = *protection
                 .registration(id, &root)
                 .expect("recorded registration");
-            metadata.put(
+            metadata.put_value(
                 key(REGISTRATION_PREFIX, id, registered.sequence),
                 Value::Registration(root, registered),
             )
         }
         Record::Bound { id, root } => {
             let bound = *protection.bound(id, &root).expect("recorded policy terms");
-            metadata.put(
+            metadata.put_value(
                 key(BOUND_PREFIX, id, bound.sequence),
                 Value::Bound(root, bound),
             )
@@ -747,7 +767,7 @@ impl<E: Context> Store<E> {
         if matches!(context.scan(&legacy).await, Ok(blobs) if !blobs.is_empty()) {
             return Err(Error::Legacy(legacy));
         }
-        let mut metadata = Metadata::<E, Key, Value>::init(
+        let mut metadata = Metadata::<E, Key, Encoded<Value>>::init(
             context,
             Config {
                 partition: format!("{prefix}-state"),
@@ -756,19 +776,21 @@ impl<E: Context> Store<E> {
         )
         .await?;
         if metadata.keys().next().is_none() {
-            metadata.put(format_version(), Value::Number(FORMAT_VERSION));
+            // A new store: only its format version, put here (and so not readable as read).
+            metadata.put_value(format_version(), Value::Number(FORMAT_VERSION));
             metadata = metadata.sync().await?;
-        }
-        match metadata.get(&format_version()) {
-            Some(Value::Number(FORMAT_VERSION)) => {}
-            Some(Value::Number(other)) => return Err(Error::Format(Some(*other))),
-            _ => return Err(Error::Format(None)),
+        } else {
+            match metadata.get_value(&format_version()) {
+                Some(Value::Number(FORMAT_VERSION)) => {}
+                Some(Value::Number(other)) => return Err(Error::Format(Some(*other))),
+                _ => return Err(Error::Format(None)),
+            }
         }
 
         let mut stored = Vec::new();
         for key in metadata.keys() {
             if let ((EPOCH_PREFIX, epoch, 0), Some(Value::Epoch(record))) =
-                (parse(key), metadata.get(key))
+                (parse(key), metadata.get_value(key))
             {
                 if record.epoch != epoch {
                     return Err(Error::Corrupt(format!(
@@ -788,7 +810,7 @@ impl<E: Context> Store<E> {
         let mut policy = None;
         let mut height = 0;
         for stored in metadata.keys() {
-            match (parse(stored), metadata.get(stored)) {
+            match (parse(stored), metadata.get_value(stored)) {
                 (
                     (AUTHORIZATION_PREFIX, round, nonce),
                     Some(Value::Authorization(authorization)),
@@ -800,7 +822,8 @@ impl<E: Context> Store<E> {
                 ((META_PREFIX, 3, 0), Some(Value::RegistrationPolicy(stored))) => {
                     policy = Some(stored.as_ref().clone());
                 }
-                ((META_PREFIX, 1, 0), Some(Value::Number(_))) => {}
+                // The format version, checked above (put just now in a new store).
+                ((META_PREFIX, 1, 0), _) => {}
                 ((CEREMONY_PREFIX, _, 0), Some(Value::Ceremony(ceremony)))
                 | ((CEREMONY_PREFIX, _, 0), Some(Value::ImportedCeremony(ceremony)))
                 | ((CEREMONY_PREFIX, _, 0), Some(Value::ReshareCeremony(ceremony))) => {
@@ -890,7 +913,7 @@ impl<E: Context> Store<E> {
         &mut self,
         authorized: &Authorized,
         height: u64,
-        metadata: &mut Metadata<E, Key, Value>,
+        metadata: &mut Metadata<E, Key, Encoded<Value>>,
     ) {
         let Some(administration) = &self.administration else {
             panic!(
@@ -916,7 +939,7 @@ impl<E: Context> Store<E> {
             approvers: administration.approvers().digest(),
             network: administration.network().unwrap_or(Digest::EMPTY),
         };
-        let _ = metadata.put(admin_record(), Value::Admin(self.admin));
+        metadata.put_value(admin_record(), Value::Admin(self.admin));
     }
 
     /// Validator keys and their history must agree with each other and with the ceremonies: a
@@ -1127,7 +1150,7 @@ impl<E: Context> Store<E> {
                         if let (Outcome::Accepted, Some(round), Some(authorization)) =
                             (outcome, round, authorization)
                         {
-                            metadata.put(
+                            metadata.put_value(
                                 key(AUTHORIZATION_PREFIX, round, request.nonce),
                                 Value::Authorization(authorization),
                             );
@@ -1154,8 +1177,10 @@ impl<E: Context> Store<E> {
                         match self.ceremonies.start(config.clone(), height, digest) {
                             StartOutcome::Started(round) => {
                                 self.protection.designate(round);
-                                metadata
-                                    .put(key(VALIDATOR_ROUND_PREFIX, round, 0), Value::Number(1));
+                                metadata.put_value(
+                                    key(VALIDATOR_ROUND_PREFIX, round, 0),
+                                    Value::Number(1),
+                                );
                                 designated.push(round);
                                 Effect::Start(StartOutcome::Started(round))
                             }
@@ -1237,7 +1262,8 @@ impl<E: Context> Store<E> {
                                 .protection
                                 .register_imported(round, manifest.validator)
                                 .expect("a new key");
-                            metadata.put(key(VALIDATOR_ROUND_PREFIX, round, 0), Value::Number(1));
+                            metadata
+                                .put_value(key(VALIDATOR_ROUND_PREFIX, round, 0), Value::Number(1));
                             designated.push(round);
                             for record in records {
                                 persist(&mut metadata, &self.protection, record);
@@ -1304,7 +1330,8 @@ impl<E: Context> Store<E> {
                         if let ReshareOutcome::Started(round) = outcome {
                             // The new generation signs only validator duties, like the key's others.
                             self.protection.designate(round);
-                            metadata.put(key(VALIDATOR_ROUND_PREFIX, round, 0), Value::Number(1));
+                            metadata
+                                .put_value(key(VALIDATOR_ROUND_PREFIX, round, 0), Value::Number(1));
                             designated.push(round);
                         }
                         Effect::Reshare(outcome)
@@ -1337,7 +1364,7 @@ impl<E: Context> Store<E> {
                                  ({refusal}): refusing to continue"
                                 )
                             });
-                        metadata.put(
+                        metadata.put_value(
                             key(EPOCH_PREFIX, next.epoch, 0),
                             Value::Epoch(Box::new(next.clone())),
                         );
@@ -1346,7 +1373,7 @@ impl<E: Context> Store<E> {
                     }
                     Command::SetRegistrationPolicy(policy) => {
                         // Only a valid policy decodes (`Policy::read`).
-                        metadata.put(
+                        metadata.put_value(
                             registration_policy(),
                             Value::RegistrationPolicy(policy.clone()),
                         );
@@ -1370,7 +1397,7 @@ impl<E: Context> Store<E> {
                 Origin::Imported(_) => Value::ImportedCeremony(Box::new(ceremony.clone())),
                 Origin::Reshare(_) => Value::ReshareCeremony(Box::new(ceremony.clone())),
             };
-            metadata.put(key(CEREMONY_PREFIX, ceremony.round, 0), value);
+            metadata.put_value(key(CEREMONY_PREFIX, ceremony.round, 0), value);
             // A completed validator DKG ceremony: its key now signs validator duties. (An imported
             // key is registered with its registration, above; a reshare signs once activated.) A
             // ceremony changed again later, such as a generation its key moved away from, does
@@ -1388,7 +1415,7 @@ impl<E: Context> Store<E> {
                 persist(&mut metadata, &self.protection, Record::Validator(id));
             }
         }
-        metadata.put(applied_height(), Value::Number(height));
+        metadata.put_value(applied_height(), Value::Number(height));
 
         self.metadata = Some(metadata.sync().await?);
         self.height = height;
@@ -1413,7 +1440,7 @@ impl<E: Context> Store<E> {
         &mut self,
         validator: &ValidatorKey,
         round: u64,
-        metadata: &mut Metadata<E, Key, Value>,
+        metadata: &mut Metadata<E, Key, Encoded<Value>>,
     ) -> GenerationOutcome {
         use GenerationRefusal::*;
         let Some((id, active)) = self

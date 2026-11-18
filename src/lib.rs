@@ -7,6 +7,7 @@ pub mod application;
 pub mod attestation;
 pub mod clock;
 pub mod dkg;
+pub mod encoded;
 pub mod engine;
 pub mod epochs;
 pub mod eth;

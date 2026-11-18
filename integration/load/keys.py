@@ -252,7 +252,7 @@ def timings():
     return {"draft": [], "approve": [], "submit": []}
 
 
-def dkg_phase(network, count, concurrency, gvr, summary):
+def dkg_phase(network, count, concurrency, gvr, summary, activate=True):
     PROGRESS["phase"] = "dkg"
     concurrency = min(concurrency, 4)  # dkg::MAX_ACTIVE ceremonies at once
     durations = []
@@ -282,7 +282,7 @@ def dkg_phase(network, count, concurrency, gvr, summary):
 
     times = timings()
     t0 = time.time()
-    for done, key in enumerate(keys, 1):
+    for done, key in enumerate(keys if activate else [], 1):
         network.submit("activate", f"{node(done % NODES)}/validators/activate",
                        {"public_key": key, "genesis_validators_root": gvr}, times)
         PROGRESS["dkg_active"] = done
@@ -407,6 +407,8 @@ def main():
     parser.add_argument("--import", dest="imports", type=int, default=0)
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--batch", type=int, default=100)
+    parser.add_argument("--no-activate", dest="activate", action="store_false",
+                        help="DKG only: do not activate the generated keys")
     args = parser.parse_args()
     os.makedirs(args.work, exist_ok=True)
     network = Network(args.work)
@@ -420,7 +422,7 @@ def main():
                                   args=(network, f"{args.work}/samples.jsonl", stop), daemon=True)
         thread.start()
         if args.dkg:
-            dkg_phase(network, args.dkg, args.concurrency, gvr, summary)
+            dkg_phase(network, args.dkg, args.concurrency, gvr, summary, args.activate)
             summary["after_dkg_bytes"] = [tree_size(f"{network.data}/node-{i}")
                                           for i in range(NODES)]
         if args.imports:

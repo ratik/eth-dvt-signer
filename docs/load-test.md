@@ -84,9 +84,8 @@ in one container with no network, `--eth-network hoodi`, test approvers (2 of 3)
   would make the setup of thousands of keys take minutes, not an hour.
 - **DKG:** at most 4 ceremonies at a time (`dkg::MAX_ACTIVE`). The rate of ceremonies fell from
   3.1/s to 2.0/s while the completed ceremonies grew from 0 to 3 000, in both runs and with low
-  CPU pressure, so it is not the neighbour. The cause is not found yet; the per-block scans of
-  all ceremonies in `Ceremonies::advance` and `Ceremonies::import` are O(n), but small. The
-  rates of registrations and activations did not fall from 3 200 to 6 400 keys.
+  CPU pressure, so it is not the neighbour. Section 4.2 has the cause and the fix. The rates of
+  registrations and activations did not fall from 3 200 to 6 400 keys.
 - **State on disk per node:** 0.23 MB empty, 34.7 MB after 3 200 DKG keys, 52.9 MB with
   6 400 validators: about 10.8 KB per DKG key and 5.7 KB per imported key, block history
   included (the activations add about 5 MB of blocks).
@@ -94,6 +93,65 @@ in one container with no network, `--eth-network hoodi`, test approvers (2 of 3)
 - For 6 400 imported keys on GCP the setup is expected to take about 2.5 h with one activation
   per key. It must not run in the VM budget of section 6 before a batched activation exists;
   until then, run the ramp with fewer keys (for example 1 600, `A` up to 50) or accept the time.
+
+### 4.2 Why DKG slowed down with the number of keys (found and fixed)
+
+Runs of 3 200 DKG ceremonies only (`keys.py --dkg 3200 --no-activate`), on the test host, branch
+`perf/dkg-slowdown`. `run-keys.sh` with `TMPFS=1|secrets|state|stores` keeps all storage or one
+partition of each node in memory, to separate the disk from the rest. Times per ceremony are
+node 0's, from its log (start applied → completed); the rate is the driver's.
+
+| Run | Total | Rate, first → last 3 min | Ceremony on the node, first → last 400 | Block interval p50 |
+| --- | --- | --- | --- | --- |
+| on disk (before) | 1 288 s | 2.96 → 2.13 /s | 780 → 1 182 ms | 238 → 265 ms |
+| secret store in memory | 927 s | 4.07 → 2.88 /s | 520 → 824 ms | |
+| state in memory | 1 121 s | 3.33 → 2.43 /s | 646 → 1 047 ms | 200 → 230 ms |
+| both in memory | 850 s | 4.30 → 3.36 /s | 487 → 725 ms | 145 → 202 ms |
+| **on disk, fixed** | **1 021 s** | **3.35 → 2.96 /s** | **642 → 708 ms** | 228 → 240 ms |
+
+The cause:
+
+- The replicated state (`registry-state`) and the secret store (`registry-secrets`) are
+  `commonware-storage` `Metadata` stores. A `sync` that adds a key or changes the size of a value
+  writes a new copy of the whole store with fsync, and encodes every value for it. The state is
+  synced once a block and adds keys in most blocks. The secret store was synced 6 times a
+  ceremony on every node (the seed, 4 acknowledged dealings, the share), one after the other in
+  the DKG actor.
+- Encoding a BLS12-381 point that the node computed (a DKG output) costs a field inversion: 3.8 µs,
+  against 0.11 µs for a point decoded from bytes (`encoded::tests::point_encode_cost`). So each
+  rewrite cost about 9 µs per stored share: with the stores in memory, one secret-store `sync`
+  took 0.9 ms with 33 shares and 28 ms with 3 075, and the DKG actor was busy 6 % and then 56 % of
+  the time (temporary timing in the actor). A test that read a store back from disk saw cheap
+  rewrites: decoded points are already affine.
+- The fsync of the rewritten copy (about 8 ms plus 1.8 ms per MB on the test host,
+  `examples/metadata-sync.rs`) is about a third of the total time, but grows less.
+
+The fixes:
+
+1. Values held encoded (`crate::encoded::Encoded`): a value is encoded once, when it is put, and a
+   rewrite copies its bytes. The bytes are the same as before: the stores are unchanged on disk.
+   Used for the state and for the plain secret store (a sealed store already held bytes).
+2. The seeds and acknowledged dealings in a partition of their own (`registry-secrets-pending`):
+   5 of the 6 writes of a ceremony now rewrite only the material of the ceremonies in progress
+   (about 4 KB a copy after 3 200 ceremonies), not every share (2 MB a copy). The share is
+   written first, then the seed and dealings are dropped; a node stopped in between drops them
+   at its next start. An older store's seeds and dealings move there at start. The recovery procedure keeps both
+   partitions ([recovery.md](recovery.md), §6).
+
+What is left: each block still rewrites the whole state with fsync (7.8 MB a copy after 3 200
+DKG keys here), and each share still rewrites the share partition once. Both grow with the number of keys
+(block interval 228 → 240 ms in the fixed run). A store that does not rewrite everything on each
+commit is the change for much larger key counts.
+
+Found on the way:
+
+- **The DKG deadline is in blocks.** `DEADLINE_BLOCKS` = 32. With all storage in memory, empty
+  blocks came every ~5 ms, and a ceremony failed 36 ms after its start, before the dealers had
+  exchanged their dealings (`dkg3200-tmpfs`, ceremony 640). On the test host's disk, 32 blocks
+  are about 7 s. Fast disks and short round trips (GCP nodes in one region) make blocks faster:
+  the deadline needs a lower bound in time.
+- **Restart time grows with the keys.** At 6 400 keys a node decodes its state in 5.7 s and its
+  secret store in 2 s at start (point checks).
 
 ## 5. Duty mix per slot
 

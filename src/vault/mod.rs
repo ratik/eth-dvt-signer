@@ -9,8 +9,9 @@
 //! `registry-secrets`.
 //!
 //! **Sealed** (`--vault gcp-tdx`):
-//! - Each item, and each value of `registry-secrets`, is encrypted with XChaCha20-Poly1305 under a
-//!   random data key (DEK). The associated data names the item, so items cannot be swapped.
+//! - Each item, and each value of `registry-secrets` and `registry-secrets-pending`, is encrypted
+//!   with XChaCha20-Poly1305 under a random data key (DEK). The associated data names the item, so
+//!   items cannot be swapped.
 //! - The DEK exists on disk only wrapped (`dek.wrapped`) by a Cloud KMS key. KMS releases it only
 //!   to an attested image ([gcp], docs/tee.md).
 //! - Every item is generated inside the vault: no plaintext copy of a sealed key exists outside the
@@ -237,7 +238,7 @@ impl Vault {
         self.cipher.is_some()
     }
 
-    /// The cipher of `registry-secrets`, for a sealed vault.
+    /// The cipher of `registry-secrets` and `registry-secrets-pending`, for a sealed vault.
     pub fn cipher(&self) -> Option<Cipher> {
         self.cipher.clone()
     }

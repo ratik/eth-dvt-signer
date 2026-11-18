@@ -141,9 +141,9 @@ fn full_network_restart() {
 }
 
 /// A node behind by more than the retained history cannot backfill from its peers. It is restored
-/// from a stopped healthy node's copy of every partition except its own key share
-/// (`registry-secrets`) and consensus journal (`registry-consensus`), as docs/recovery.md (§6)
-/// describes.
+/// from a stopped healthy node's copy of every partition except its own secret store
+/// (`registry-secrets`, `registry-secrets-pending`) and consensus journal (`registry-consensus`),
+/// as docs/recovery.md (§6) describes.
 #[test]
 fn lagging_node_restored_from_peer_copy() {
     let (network, key) = network_with_key();
@@ -156,7 +156,15 @@ fn lagging_node_restored_from_peer_copy() {
     network.stop_node(0);
     network.snapshot(0, "healthy");
     network.restart_node(0);
-    network.restore_keeping(3, "healthy", &["registry-secrets", "registry-consensus"]);
+    network.restore_keeping(
+        3,
+        "healthy",
+        &[
+            "registry-secrets",
+            "registry-secrets-pending",
+            "registry-consensus",
+        ],
+    );
     network.restart_node(3);
     network.wait_for_ready(&network.all());
 
