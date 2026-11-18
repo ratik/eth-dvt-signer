@@ -339,7 +339,7 @@ The node refuses these with `400` and never signs them:
 | `BLOCK` (deprecated), `BLOCK_V2` with a whole block | Phase 0 and Altair block bodies are not implemented. |
 | `AGGREGATE_AND_PROOF_V2` with another version | Unknown container. |
 | `EXECUTION_PAYLOAD_BID` | A builder's message: validators never sign bids. |
-| `BUILDER_REQUEST_AUTH` | Not implemented (Lighthouse sends it only with external builders configured). |
+| `BUILDER_REQUEST_AUTH` | Not implemented: opaque data under the builder domain needs a policy of what may be signed (Lighthouse sends it only with external builders configured; [remote-signing-api.md](remote-signing-api.md#refused-request-types)). |
 | Heze and later types, a Gloas object of another `version` | Not implemented. |
 
 Any other unknown `type` is refused as well.
@@ -601,8 +601,9 @@ verify every signature with blst like a consensus client: POP ciphersuite, subgr
 | Authorization or partial collection timed out | 504 | `{"error": ".."}`, with `refusals` for a partial timeout |
 | Anything else | 500 | `{"error": ".."}` |
 
-`400`, `404`, `412` and `500` are the codes of Web3Signer's specification. The other codes are
-this signer's own. `503` and `504` are transient: no signature was returned, and the client may
+`400`, `404`, `412` and `500` are the codes of Web3Signer's specification and of the
+remote-signing API specification v1.4.0. The other codes are this signer's own
+([remote-signing-api.md](remote-signing-api.md#status-codes)). `503` and `504` are transient: no signature was returned, and the client may
 retry ([Retries and failures](#retries-and-failures)).
 
 The `refusal` reasons:
@@ -741,9 +742,22 @@ What the evidence is:
   consensus-spec-tests at commit `bc5c1a7f`, vendored in `tests/vectors` (`tests/eth_vectors.rs`).
   For Gloas, 31 cases of seven containers from the release vectors of consensus-specs
   v1.7.0-beta.4 (`tests/fixtures/gloas`, `tests/unit/eth/gloas.rs`).
+- **BLS vectors.** Ethereum's BLS test vectors (`ethereum/bls12-381-tests` v0.1.2, vendored in
+  `tests/vectors/bls`, `tests/eth_bls_vectors.rs`). For each `sign` case, the key is split 3-of-4
+  by the dealer, and every three shares sign the vector's signature byte for byte; a zero key is
+  refused. The 29 `verify` cases run through the check of every returned signature, and the 28
+  `deserialization_G1` and `deserialization_G2` cases through the decoding of keys and
+  signatures. One deliberate difference: the point at infinity, a valid encoding in the vectors,
+  is refused as a key and as a signature, as a consensus client's `KeyValidate` refuses such a
+  key. The aggregation sets do not apply: partial signatures of one key are combined by
+  interpolation, not aggregated.
 - **Web3Signer roots.** The signer reproduces, from the parsed requests, the signing roots that
   Web3Signer's API specification publishes for its examples (`tests/eth_vectors.rs`,
   `tests/eth_web3signer.rs`).
+- **Remote-signing API specification.** Every request example of `ethereum/remote-signing-api`
+  v1.4.0 has an expected outcome: signed with its root reproduced, or refused with a reason. Four
+  of its examples are defective (`tests/eth_remote_signing_api.rs`,
+  [remote-signing-api.md](remote-signing-api.md)).
 - **Independent implementation.** `tests/fixtures/web3signer/ssz_roots.py` is a Python SSZ
   implementation that shares no code with the signer. It reproduces every Web3Signer root above,
   and the fixture roots that Web3Signer does not publish.

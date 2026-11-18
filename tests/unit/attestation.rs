@@ -46,6 +46,7 @@ fn evidence(
             hex0x(nonce)
         },
         token: issuer.sign(&claims),
+        vcek: None,
     }
 }
 

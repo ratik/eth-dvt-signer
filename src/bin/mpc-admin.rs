@@ -120,13 +120,18 @@ enum Command {
     /// Each node's consensus epoch, height, role and administrative nonce.
     Status,
     /// Check every node's attestation (`GET /attestation` with a fresh nonce) against a policy:
-    /// a measured image on a TDX Confidential VM holds its keys (docs/tee.md). Writes the committee
-    /// file `mpc-keytool split` takes, with the evidence, and the node CAs clients pin.
+    /// a measured image on a TDX Confidential VM or an SEV-SNP guest holds its keys
+    /// (docs/tee.md). Writes the committee file `mpc-keytool split` takes, with the evidence (an
+    /// SEV-SNP node's with its VCEK, fetched from AMD if the node did not attach it), and the node
+    /// CAs clients pin.
     Attest {
-        /// The policy (JSON): issuer, audience, hardware, debug state, allowed measurements.
+        /// The policy (JSON): `gcp-tdx` (issuer, audience, hardware, debug state, allowed
+        /// measurements) or `sev-snp` (`"platform": "sev-snp"`, products, measurements, minimum
+        /// TCB version).
         #[arg(long)]
         policy: PathBuf,
-        /// The issuer's key set (JWKS, JSON); default: Google Cloud Attestation's, fetched.
+        /// `gcp-tdx`: the issuer's key set (JWKS, JSON); default: Google Cloud Attestation's,
+        /// fetched.
         #[arg(long)]
         jwks: Option<PathBuf>,
         /// Accept nodes without a sealed vault (no evidence): listed, and written without it.
@@ -142,10 +147,26 @@ enum Command {
     },
     /// Offline: the RTMR3 a sealed node's token carries when it runs with the configuration in
     /// DIR (the files of its instance metadata `mpc-<name>`, as the image reads them), for the
-    /// policy's `rtmr3` (docs/tee.md). Prints the configuration's digest and RTMR3. Refuses a
+    /// policy's `rtmr3` (docs/tee.md). Prints the configuration's digest, RTMR3, and the
+    /// `HOST_DATA` an SEV-SNP host launches the node with (the policy's `host_data`). Refuses a
     /// configuration no client should pin: the sealed vault's test endpoints, or a file flag that
     /// names a file outside the configuration (`attestation::config::check_args`).
     ConfigRtmr3 { dir: PathBuf },
+    /// Check a node's statement (`eth-mpc-signer identity` output, or a saved
+    /// `GET /attestation` answer) against a policy, without asking the node: its evidence binds
+    /// its keys (and the nonce it answered). Prints what the evidence shows: the measurement, the
+    /// configuration and the machine (an SEV-SNP chip ID), to write a policy from. An SEV-SNP
+    /// node's VCEK is fetched from AMD if the statement carries none.
+    CheckStatement {
+        /// The statement (JSON).
+        statement: PathBuf,
+        /// The policy (JSON, as for `attest`).
+        #[arg(long)]
+        policy: PathBuf,
+        /// `gcp-tdx`: the issuer's key set (JWKS); default: Google's, fetched.
+        #[arg(long)]
+        jwks: Option<PathBuf>,
+    },
     /// Offline: create a new approver key (owner-only file) and print its public key. Never
     /// overwrites a file.
     ApproverKey {
@@ -381,8 +402,14 @@ fn main() -> ExitCode {
                 .map(|digest| {
                     println!("digest {}", hex::encode(digest));
                     println!("rtmr3 {}", hex::encode(config::rtmr3(&digest)));
+                    println!("host_data {}", hex::encode(config::host_data(&digest)));
                 })
         }
+        Command::CheckStatement {
+            statement,
+            policy,
+            jwks,
+        } => check_statement(&statement, &policy, jwks.as_deref()),
         Command::ApproverKey { output } => approver_key(&output),
         Command::ApproverPublicKey { key } => {
             load_key(&key).map(|key| println!("{}", format_key(&key.public_key())))
@@ -1978,6 +2005,81 @@ fn last_certificate(chain: &str) -> Option<String> {
         .map(|block| format!("{}\n", block.trim()))
 }
 
+fn check_statement(statement: &Path, policy: &Path, jwks: Option<&Path>) -> Result<(), String> {
+    use eth_mpc_signer::attestation::{
+        Statement,
+        check::{Policy, VcekCache, attach_vcek, verify},
+        verify::{Jwks, fetch_google_jwks},
+    };
+    let read = |path: &Path| {
+        std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))
+    };
+    let statement: Statement = serde_json::from_str(&read(statement)?)
+        .map_err(|err| format!("{}: {err}", statement.display()))?;
+    let policy =
+        Policy::from_json(&read(policy)?).map_err(|err| format!("{}: {err}", policy.display()))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| err.to_string())?;
+    let jwks = match (jwks, policy.needs_jwks()) {
+        (Some(path), _) => Some(Jwks::from_json(&read(path)?)?),
+        (None, true) => Some(runtime.block_on(fetch_google_jwks())?),
+        (None, false) => None,
+    };
+    let mut evidence = statement
+        .evidence
+        .clone()
+        .ok_or_else(|| format!("no evidence (vault {})", statement.vault))?;
+    if evidence.keys != statement.keys {
+        return Err("the evidence names other keys than the statement".into());
+    }
+    let nonce = match evidence.nonce.as_str() {
+        "" => Vec::new(),
+        nonce => eth_mpc_signer::import::unhex(nonce).ok_or("evidence: the nonce is not hex")?,
+    };
+    if let Ok((report, _)) = eth_mpc_signer::attestation::snp::decode(&evidence) {
+        // What the report says before any check: to write a policy from (never to trust).
+        println!(
+            "report (not checked yet): version {}, measurement {}, host_data {}, chip {}, \
+             reported TCB {:#018x}, CPUID {:02x?}, policy {:#x}, VMPL {}",
+            report.version(),
+            hex::encode(report.measurement()),
+            hex::encode(report.host_data()),
+            hex::encode(report.chip_id()),
+            report.reported_tcb_raw(),
+            report.cpuid(),
+            report.policy(),
+            report.vmpl()
+        );
+    }
+    runtime.block_on(attach_vcek(&mut evidence, &policy, &VcekCache::default()))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|err| err.to_string())?
+        .as_secs();
+    let verified = verify(
+        &evidence,
+        &policy,
+        jwks.as_ref(),
+        &nonce,
+        now,
+        Some(statement.index),
+    )?;
+    println!(
+        "node {}: attested ({}), identity {}",
+        statement.index,
+        verified.describe(),
+        statement.keys.identity
+    );
+    println!("measurement {}", verified.measurement);
+    println!("configuration {}", verified.configuration);
+    if let Some(machine) = &verified.machine {
+        println!("machine {machine}");
+    }
+    Ok(())
+}
+
 fn attest(
     nodes: &[Node],
     policy: &Path,
@@ -1988,7 +2090,8 @@ fn attest(
 ) -> Result<(), String> {
     use eth_mpc_signer::attestation::{
         Statement,
-        verify::{Jwks, Policy, fetch_google_jwks, verify},
+        check::{Policy, VcekCache, attach_vcek, verify},
+        verify::{Jwks, fetch_google_jwks},
     };
     use rand_core::Rng as _;
     let read = |path: &Path| {
@@ -1996,14 +2099,16 @@ fn attest(
     };
     let policy =
         Policy::from_json(&read(policy)?).map_err(|err| format!("{}: {err}", policy.display()))?;
-    let jwks = match jwks {
-        Some(path) => Jwks::from_json(&read(path)?)?,
-        None => tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|err| err.to_string())?
-            .block_on(fetch_google_jwks())?,
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| err.to_string())?;
+    let jwks = match (jwks, policy.needs_jwks()) {
+        (Some(path), _) => Some(Jwks::from_json(&read(path)?)?),
+        (None, true) => Some(runtime.block_on(fetch_google_jwks())?),
+        (None, false) => None,
     };
+    let vceks = VcekCache::default();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|err| err.to_string())?
@@ -2024,7 +2129,7 @@ fn attest(
                     .map_err(|err| format!("attestation: {err}")),
                 _ => Err(format!("{status}: {body}")),
             });
-        let (statement, leaf) = match answer {
+        let (mut statement, leaf) = match answer {
             Ok(answer) => answer,
             Err(err) => {
                 failures.push(format!("{}: {err}", node.name));
@@ -2038,7 +2143,25 @@ fn attest(
                 statement.vault
             )),
             Some(evidence) => {
-                verify(evidence, &policy, &jwks, &nonce, now, Some(statement.index)).map(Some)
+                // An SEV-SNP node's VCEK, from AMD if it did not attach it: the committee keeps
+                // it, so that `mpc-keytool split` checks the evidence offline.
+                let mut evidence = evidence.clone();
+                runtime
+                    .block_on(attach_vcek(&mut evidence, &policy, &vceks))
+                    .and_then(|()| {
+                        verify(
+                            &evidence,
+                            &policy,
+                            jwks.as_ref(),
+                            &nonce,
+                            now,
+                            Some(statement.index),
+                        )
+                    })
+                    .map(|verified| {
+                        statement.evidence = Some(evidence);
+                        Some(verified)
+                    })
             }
         }
         .and_then(|verified| {
@@ -2058,15 +2181,11 @@ fn attest(
             Ok(verified) => {
                 match &verified {
                     Some(verified) => println!(
-                        "{}: node {} attested ({}, instance {}, rtmr1 {}…, rtmr2 {}…, rtmr3 {}…{}), identity {}",
+                        "{}: node {} attested ({}{}), identity {}",
                         node.name,
                         statement.index,
-                        statement.vault,
-                        verified.instance.as_deref().unwrap_or("?"),
-                        &verified.rtmr1[..verified.rtmr1.len().min(12)],
-                        &verified.rtmr2[..verified.rtmr2.len().min(12)],
-                        &verified.rtmr3[..verified.rtmr3.len().min(12)],
-                        if policy.rtmr3.is_some() {
+                        verified.describe(),
+                        if policy.pins_configuration() {
                             ", its configuration"
                         } else {
                             ", configuration not checked"

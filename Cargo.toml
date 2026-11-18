@@ -80,6 +80,10 @@ aws-lc-rs = "1.18"
 base64 = "0.23"
 chacha20poly1305 = "0.11"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+# The `sev-snp` platform (`attestation::snp`, `vault::snp`): AMD's certificates (X.509, RSA-PSS) and
+# the guest device's ioctls. Both crates are already in the tree.
+libc = "0.2"
+x509-parser = { version = "0.18", default-features = false }
 # The mTLS listener (`tls`): TLS 1.3 with a required client certificate, its key made in the vault.
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }

@@ -181,7 +181,13 @@ tee_qemu() {
 		log "building $tools"
 		docker build -q -t "$tools" --build-arg BASE="$TEE_TOOLS_BASE" \
 			--build-arg SNAPSHOT="$TEE_SNAPSHOT" --build-arg MKOSI_VERSION="$TEE_MKOSI_VERSION" \
-			--build-arg GO_PACKAGE="$TEE_GO_PACKAGE" "$repo/integration/tee/tools" >/dev/null
+			--build-arg GO_PACKAGE="$TEE_GO_PACKAGE" \
+			--build-arg OVMF_AMDSEV_URL="$TEE_OVMF_AMDSEV_URL" \
+			--build-arg OVMF_AMDSEV_DEB_SHA256="$TEE_OVMF_AMDSEV_DEB_SHA256" \
+			--build-arg OVMF_AMDSEV_SHA256="$TEE_OVMF_AMDSEV_SHA256" \
+			--build-arg SNP_MEASURE_URL="$TEE_SNP_MEASURE_URL" \
+			--build-arg SNP_MEASURE_SHA256="$TEE_SNP_MEASURE_SHA256" \
+			"$repo/integration/tee/tools" >/dev/null
 	fi
 	name="$(date -u +%Y%m%dT%H%M%SZ)"
 	run="$IT_HOME/tee/runs/$name"
@@ -278,6 +284,7 @@ tee_qemu() {
 			-v "$IT_HOME/tee/cache:/it/tee/cache" -v "$run:/it/out" -v "$repo:/it/src:ro" \
 			-e TEE_SNAPSHOT="$TEE_SNAPSHOT" -e TEE_SOURCE_DATE_EPOCH="$TEE_SOURCE_DATE_EPOCH" \
 			-e TEE_IMAGE_VERSION="${TEE_IMAGE_VERSION:-}" \
+			-e TEE_SNP_VCPUS="$TEE_SNP_VCPUS" -e TEE_SNP_VCPU_TYPE="$TEE_SNP_VCPU_TYPE" \
 			-e BINARY="/it/out/eth-mpc-signer-$binary" "${helpers[@]}" \
 			-e OWNER="$(id -u):$(id -g)" "$tools" \
 			bash /it/src/integration/tee/qemu.sh build "${build%-*}" "/it/out/$build" || return 1
@@ -298,7 +305,7 @@ tee_qemu() {
 		"$nodes" || status=1
 	{
 		for build in release-a debug; do
-			sed -n -E "s/^(image\.version|binary\.sha256|tee-token\.sha256|gotpm\.sha256|uki\.sha384|uki\.authenticode-sha384|grub\.authenticode-sha384|kernel\.authenticode-sha384|roothash|gpt-event\.sha384|gce\.rtmr1|gce\.rtmr2|disk\.tar\.gz\.sha256) /${build%-a} \1 /p" \
+			sed -n -E "s/^(image\.version|binary\.sha256|tee-token\.sha256|gotpm\.sha256|uki\.sha384|uki\.authenticode-sha384|grub\.authenticode-sha384|kernel\.authenticode-sha384|roothash|gpt-event\.sha384|gce\.rtmr1|gce\.rtmr2|snp\.measurement|snp\.vcpus|disk\.tar\.gz\.sha256) /${build%-a} \1 /p" \
 				"$run/$build/measurements"
 		done
 		echo "GCE image: <build>/image/disk.tar.gz, guest OS features UEFI_COMPATIBLE,TDX_CAPABLE,GVNIC"
