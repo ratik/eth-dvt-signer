@@ -79,9 +79,9 @@ in one container with no network, `--eth-network hoodi`, test approvers (2 of 3)
 - No request failed in either run. The load of the neighbour cost about 4 % of the total time.
 - `mpc-admin draft` and the two approvals take 15–35 ms per operation. The time is in consensus.
 - **The limit is the admin nonce.** Each protected operation (activation, registration) carries
-  the next nonce, so they go one at a time, about 0.3 s per block plus the round trip. A
-  batched activation (many keys per approved operation, as the history import already is)
-  would make the setup of thousands of keys take minutes, not an hour.
+  the next nonce, so they go one at a time, about 0.3 s per block plus the round trip. The
+  batched activation (`POST /validators/activate/batch`, up to 1 024 keys per approved
+  operation) removes the activations from the setup time (section 4.3).
 - **DKG:** at most 4 ceremonies at a time (`dkg::MAX_ACTIVE`). The rate of ceremonies fell from
   3.1/s to 2.0/s while the completed ceremonies grew from 0 to 3 000, in both runs and with low
   CPU pressure, so it is not the neighbour. Section 4.2 has the cause and the fix. The rates of
@@ -91,8 +91,8 @@ in one container with no network, `--eth-network hoodi`, test approvers (2 of 3)
   included (the activations add about 5 MB of blocks).
 - **Memory:** RSS 280 MB at the start, 510–550 MB per node at 6 400 validators.
 - For 6 400 imported keys on GCP the setup is expected to take about 2.5 h with one activation
-  per key. It must not run in the VM budget of section 6 before a batched activation exists;
-  until then, run the ramp with fewer keys (for example 1 600, `A` up to 50) or accept the time.
+  per key, and about 1 h with batched activations (section 4.3): the registrations are then most
+  of the time.
 
 ### 4.2 Why DKG slowed down with the number of keys (found and fixed)
 
@@ -152,6 +152,33 @@ Found on the way:
   the deadline needs a lower bound in time.
 - **Restart time grows with the keys.** At 6 400 keys a node decodes its state in 5.7 s and its
   secret store in 2 s at start (point checks).
+
+### 4.3 Batched activation (measured)
+
+`run-keys.sh run k6400-batch --dkg 3200 --import 3200 --batch 100 --activate-batch 1024` on
+2026-11-18, branch `feat/batch-activate` on top of the fixes of section 4.2, idle test host.
+Each activation request carries up to 1 024 keys (`keys.py --activate-batch K`); 4 requests per
+phase.
+
+| Step | k6400-idle | k6400-batch |
+| --- | --- | --- |
+| 3 200 DKG ceremonies (4 at a time) | 1 301 s | 1 021 s (section 4.2 fix) |
+| 3 200 DKG activations | 1 593 s (3 200 operations) | **1.7 s** (4 operations, submit p50 408 ms) |
+| 3 200 `mpc-keytool split` | 45 s | 43 s |
+| 3 200 registrations and 12 800 share installs | 1 895 s | 1 646 s (share install p50 33 ms) |
+| Slashing history, 32 batches of 100 | 16 s | 14 s |
+| 3 200 import activations | 2 448 s (3 200 operations) | **2.5 s** (4 operations, submit p50 538 ms) |
+| **Total, 6 400 validators** | **7 301 s** | **2 732 s** |
+
+- A batch of 1 024 keys takes about as long as one key: one block, one admin nonce. The
+  activations went from 4 041 s to 4 s.
+- The registrations are now the limit: one protected operation per imported key, 1.9/s. A
+  batched registration would make the import of thousands of keys take minutes too.
+- **State on disk per node:** 45.9 MB with 6 400 validators, against 52.9 MB: the 6 400
+  activation blocks and their finalizations (about 7 MB) are gone; the replicated state and the
+  secret store have the same size.
+- **Memory:** RSS 440–475 MB per node at 6 400 validators (510–550 MB before).
+- No request failed.
 
 ## 5. Duty mix per slot
 

@@ -136,6 +136,10 @@ pub enum Command {
     /// Replace the policy builder registrations must meet (`eth::registration`): from the next
     /// transaction on, every registration is checked against it.
     SetRegistrationPolicy(Box<RegistrationPolicy>),
+    /// Activate many validator keys for one Ethereum chain, all or none: each as
+    /// `ActivateValidator` or, with the operator's acknowledgment, `ActivateImportedValidator`
+    /// would. One set of approvals and one administrative nonce for the whole batch.
+    ActivateValidators(Box<BatchActivation>),
 }
 
 impl Command {
@@ -158,6 +162,7 @@ impl Command {
                     }
                     | Self::ActivateValidator { .. }
                     | Self::ActivateImportedValidator { .. }
+                    | Self::ActivateValidators(_)
                     | Self::RegisterImportedKey(_)
                     | Self::SetRegistrationPolicy(_)
             ),
@@ -241,6 +246,97 @@ pub struct Reconfiguration {
 
 /// Most validators one history import may name.
 pub const MAX_IMPORT_VALIDATORS: usize = 1024;
+
+/// Most validators one batch activation may name.
+pub const MAX_BATCH_ACTIVATIONS: usize = 1024;
+
+/// A batch of validator activations for one chain ([Command::ActivateValidators]): between 1 and
+/// [MAX_BATCH_ACTIVATIONS] keys, each once, in the order given. A key with an acknowledgment is an
+/// imported key (the operator's acknowledgment of its migration); one without is a DKG key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BatchActivation {
+    pub chain: ChainIdentity,
+    pub validators: Vec<(ValidatorKey, Option<Acknowledgment>)>,
+}
+
+impl BatchActivation {
+    /// Whether the batch may be encoded: 1 to [MAX_BATCH_ACTIVATIONS] keys, each once.
+    pub fn check(&self) -> Result<(), &'static str> {
+        if self.validators.is_empty() || self.validators.len() > MAX_BATCH_ACTIVATIONS {
+            return Err("a batch activation names 1 to 1024 validators");
+        }
+        let mut keys = std::collections::BTreeSet::new();
+        if !self.validators.iter().all(|(key, _)| keys.insert(*key)) {
+            return Err("a batch activation names a validator twice");
+        }
+        Ok(())
+    }
+}
+
+impl Write for BatchActivation {
+    fn write(&self, buf: &mut impl BufMut) {
+        buf.put_slice(&self.chain.genesis_validators_root);
+        UInt(self.validators.len() as u32).write(buf);
+        for (key, acknowledgment) in &self.validators {
+            buf.put_slice(key);
+            match acknowledgment {
+                Some(acknowledgment) => {
+                    1u8.write(buf);
+                    acknowledgment.to_bits().write(buf);
+                }
+                None => 0u8.write(buf),
+            }
+        }
+    }
+}
+
+impl Read for BatchActivation {
+    type Cfg = ();
+
+    fn read_cfg(buf: &mut impl Buf, _: &()) -> Result<Self, Error> {
+        let genesis_validators_root = <[u8; 32]>::read(buf)?;
+        let count = u32::from(UInt::<u32>::read(buf)?) as usize;
+        if count == 0 || count > MAX_BATCH_ACTIVATIONS {
+            return Err(Error::Invalid("BatchActivation", "validator count"));
+        }
+        let validators = (0..count)
+            .map(|_| {
+                let key = <[u8; 48]>::read(buf)?;
+                let acknowledgment = match u8::read(buf)? {
+                    0 => None,
+                    1 => Some(
+                        Acknowledgment::from_bits(u8::read(buf)?)
+                            .ok_or(Error::Invalid("BatchActivation", "acknowledgment"))?,
+                    ),
+                    tag => return Err(Error::InvalidEnum(tag)),
+                };
+                Ok((key, acknowledgment))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let batch = Self {
+            chain: ChainIdentity {
+                genesis_validators_root,
+            },
+            validators,
+        };
+        // One encoding per batch: each key once.
+        batch
+            .check()
+            .map_err(|_| Error::Invalid("BatchActivation", "a validator named twice"))?;
+        Ok(batch)
+    }
+}
+
+impl EncodeSize for BatchActivation {
+    fn encode_size(&self) -> usize {
+        32 + UInt(self.validators.len() as u32).encode_size()
+            + self
+                .validators
+                .iter()
+                .map(|(_, acknowledgment)| 48 + 1 + usize::from(acknowledgment.is_some()))
+                .sum::<usize>()
+    }
+}
 
 fn write_optional_root(root: &Option<[u8; 32]>, buf: &mut impl BufMut) {
     match root {
@@ -451,6 +547,10 @@ impl Write for Command {
                 16u8.write(buf);
                 policy.write(buf);
             }
+            Self::ActivateValidators(batch) => {
+                17u8.write(buf);
+                batch.write(buf);
+            }
         }
     }
 }
@@ -570,6 +670,9 @@ impl Read for Command {
             16 => Ok(Self::SetRegistrationPolicy(Box::new(
                 RegistrationPolicy::read(buf)?,
             ))),
+            17 => Ok(Self::ActivateValidators(Box::new(BatchActivation::read(
+                buf,
+            )?))),
             tag => Err(Error::InvalidEnum(tag)),
         }
     }
@@ -617,6 +720,7 @@ impl EncodeSize for Command {
                         .sum::<usize>()
             }
             Self::SetRegistrationPolicy(policy) => policy.encode_size(),
+            Self::ActivateValidators(batch) => batch.encode_size(),
         }
     }
 }

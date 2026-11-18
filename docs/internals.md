@@ -533,7 +533,7 @@ plus the node index). The plain HTTP API binds to `127.0.0.1` only. The mTLS lis
 | `POST /sign`, `GET /authorizations/{ceremony_id}/{nonce}` | development signing (`dev-api` only, below) |
 | `GET /status`, `GET /ready`, `GET /upcheck` | node status and readiness ([recovery.md](recovery.md#5-readiness)) |
 | `GET /api/v1/eth2/publicKeys`, `POST /api/v1/eth2/sign/{key}`, `GET /validators`, `GET /eth/network` | Web3Signer API and validator keys ([ethereum-signing.md](ethereum-signing.md)) |
-| `POST /validators/activate`, `GET /admin`, `GET`/`POST /eth/registration-policy` | protected operations ([administration.md](administration.md)) |
+| `POST /validators/activate`, `POST /validators/activate/batch`, `GET /admin`, `GET`/`POST /eth/registration-policy` | protected operations ([administration.md](administration.md)) |
 | `POST /keys/import`, `POST /keys/import/share`, `GET /keys/import/{id}`, `POST /slashing-protection/import`, `GET /slashing-protection/export/{public_key}` | key import and EIP-3076 ([key-import.md](key-import.md)) |
 | `POST /validators/reshare`, `POST /validators/reshare/activate`, `POST /validators/reshare/abort`, `GET /validators/reshare/{id}` | resharing ([resharing.md](resharing.md)) |
 | `GET /consensus`, `POST /consensus/reconfigure`, `POST /consensus/sync` | consensus epochs ([reconfiguration.md](reconfiguration.md)) |

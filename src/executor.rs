@@ -25,12 +25,16 @@ use crate::{
     import::manifest::Manifest,
     readiness::Progress,
     slashing::{
-        Acknowledgment, Activation, ActivationOutcome, ChainIdentity, Decision, Exported,
-        HistoryImport, HistoryOutcome, HistoryRefusal, ImportedValidator, Validator,
+        Acknowledgment, Activation, ActivationOutcome, BatchActivationOutcome, ChainIdentity,
+        Decision, Exported, HistoryImport, HistoryOutcome, HistoryRefusal, ImportedValidator,
+        Validator,
     },
     state::Authorization,
     storage::{Effect, Store},
-    types::{Block, Command, Outcome, Reconfiguration, SignRequest, Transaction, format_hash},
+    types::{
+        BatchActivation, Block, Command, Outcome, Reconfiguration, SignRequest, Transaction,
+        format_hash,
+    },
 };
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_consensus::{
@@ -208,6 +212,14 @@ pub struct ActivationReceipt {
     pub height: u64,
 }
 
+/// Final answer for a submitted batch of validator activations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BatchActivationReceipt {
+    pub outcome: BatchActivationOutcome,
+    /// Height of the block that decided it.
+    pub height: u64,
+}
+
 /// Final answer for a submitted ceremony start.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StartReceipt {
@@ -341,6 +353,12 @@ pub enum Message {
         acknowledgment: Acknowledgment,
         endorsement: Option<Endorsement>,
         response: oneshot::Sender<ActivationReceipt>,
+    },
+    /// Activate a batch of validator keys, all or none (through consensus).
+    ActivateBatch {
+        batch: Box<BatchActivation>,
+        endorsement: Option<Endorsement>,
+        response: oneshot::Sender<BatchActivationReceipt>,
     },
     /// The committed state of the imported key of ceremony `id`.
     ImportStatus {
@@ -595,6 +613,24 @@ impl Client {
         receiver.await.map_err(|_| Stopped)
     }
 
+    /// Activate every key of `batch`, all or none, and wait until consensus decided it
+    /// (protected, as [Client::activate_validator]).
+    pub async fn activate_batch(
+        &self,
+        batch: BatchActivation,
+        endorsement: Option<Endorsement>,
+    ) -> Result<BatchActivationReceipt, Stopped> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(Message::ActivateBatch {
+                batch: Box::new(batch),
+                endorsement,
+                response,
+            })
+            .map_err(|_| Stopped)?;
+        receiver.await.map_err(|_| Stopped)
+    }
+
     /// Start a reshare of `validator`'s key as ceremony `ceremony` (dealt and held as `membership`
     /// says, or within the committee); wait until consensus decided. With a membership, a
     /// protected command (as [Client::activate_validator]).
@@ -712,6 +748,7 @@ enum Waiter {
     Start(oneshot::Sender<StartReceipt>),
     Duty(oneshot::Sender<Result<DutyReceipt, Overloaded>>),
     Activate(oneshot::Sender<ActivationReceipt>),
+    ActivateBatch(oneshot::Sender<BatchActivationReceipt>),
     Register(oneshot::Sender<RegisterReceipt>),
     History(oneshot::Sender<HistoryReceipt>),
     Reshare(oneshot::Sender<ReshareReceipt>),
@@ -994,6 +1031,22 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                         "submitted imported validator activation"
                     );
                     self.waiters.insert(id, Waiter::Activate(response));
+                }
+                Message::ActivateBatch {
+                    batch,
+                    endorsement,
+                    response,
+                } => {
+                    let validators = batch.validators.len();
+                    let genesis_validators_root = format_root(&batch.chain.genesis_validators_root);
+                    let id = self.submit(endorse(Command::ActivateValidators(batch), endorsement));
+                    info!(
+                        id,
+                        validators,
+                        %genesis_validators_root,
+                        "submitted batch of validator activations"
+                    );
+                    self.waiters.insert(id, Waiter::ActivateBatch(response));
                 }
                 Message::ImportStatus { id, response } => {
                     let status = self.store.ceremonies().get(&id).map(|ceremony| {
@@ -1598,6 +1651,19 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
                     );
                     if let Some(Waiter::Activate(waiter)) = waiter {
                         let _ = waiter.send(ActivationReceipt { outcome, height });
+                    }
+                }
+                (Command::ActivateValidators(batch), Effect::ActivateBatch(outcome)) => {
+                    info!(
+                        height,
+                        id = transaction.id,
+                        validators = batch.validators.len(),
+                        genesis_validators_root = %format_root(&batch.chain.genesis_validators_root),
+                        ?outcome,
+                        "applied batch of validator activations"
+                    );
+                    if let Some(Waiter::ActivateBatch(waiter)) = waiter {
+                        let _ = waiter.send(BatchActivationReceipt { outcome, height });
                     }
                 }
                 (Command::SetRegistrationPolicy(policy), Effect::RegistrationPolicy(digest)) => {

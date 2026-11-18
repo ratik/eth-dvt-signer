@@ -1642,6 +1642,127 @@ mod validator {
             });
         }
 
+        /// A batch activation of a DKG key and an imported key is all or none: refused for the
+        /// imported key whose shares are not acknowledged, it activates neither; once they are,
+        /// it activates both in one block; repeated, it changes nothing; a restart keeps both.
+        #[test]
+        fn a_batch_activation_is_all_or_none() {
+            use crate::{
+                slashing::{ActivationRefusal, BatchActivationOutcome},
+                types::BatchActivation,
+            };
+            deterministic::Runner::default().start(|mut context| async move {
+                let signers = signers();
+                let committee = committee(&signers);
+                let block = Sha256::hash(&[b"block"]);
+                let mut store = Store::init(context.child("first"), "node", committee.clone())
+                    .await
+                    .unwrap();
+                let generated = super::complete_validator(&mut context, &mut store, &signers).await;
+                let manifest = manifest("imported", &committee, 1);
+                let imported = manifest.validator;
+                let batch = |validators| {
+                    tx(Command::ActivateValidators(Box::new(BatchActivation {
+                        chain: chain(9),
+                        validators,
+                    })))
+                };
+                let both = || batch(vec![(generated, None), (imported, Some(ACKNOWLEDGED))]);
+                let acks = signers[..3]
+                    .iter()
+                    .map(|signer| {
+                        tx(Command::ShareReady(Box::new(ReadyAck::sign(
+                            signer,
+                            1,
+                            manifest.digest(),
+                        ))))
+                    })
+                    .collect();
+                let mut effects = Vec::new();
+                for (height, transactions) in [
+                    (3, vec![register(&manifest)]),
+                    (4, vec![history(imported, 9, 100, 10, 11)]),
+                    (5, vec![both()]),
+                    (6, acks),
+                    (7, vec![both()]),
+                    (8, vec![both()]),
+                    // An imported key without its acknowledgment is refused, as alone.
+                    (9, vec![batch(vec![(generated, None), (imported, None)])]),
+                ] {
+                    let applied = store
+                        .apply_block(height, &block, &transactions, &mut context)
+                        .await
+                        .unwrap();
+                    effects.push(applied.effects.into_iter().next().unwrap());
+                    if height == 5 {
+                        // Refused for the imported key: the DKG key is not activated either.
+                        let protection = store.protection();
+                        assert!(
+                            protection
+                                .validator_of(&generated)
+                                .unwrap()
+                                .1
+                                .activation
+                                .is_none()
+                        );
+                        assert!(
+                            protection
+                                .validator_of(&imported)
+                                .unwrap()
+                                .1
+                                .activation
+                                .is_none()
+                        );
+                    }
+                }
+                assert_eq!(
+                    effects[2],
+                    Effect::ActivateBatch(BatchActivationOutcome::Refused {
+                        key: imported,
+                        refusal: ActivationRefusal::SharesNotReady {
+                            ready: 0,
+                            required: 3
+                        },
+                    })
+                );
+                assert_eq!(
+                    effects[4],
+                    Effect::ActivateBatch(BatchActivationOutcome::Activated {
+                        activated: 2,
+                        already: 0
+                    })
+                );
+                assert_eq!(
+                    effects[5],
+                    Effect::ActivateBatch(BatchActivationOutcome::Activated {
+                        activated: 0,
+                        already: 2
+                    })
+                );
+                // Already activated for the chain, the imported key is so with or without it.
+                assert_eq!(
+                    effects[6],
+                    Effect::ActivateBatch(BatchActivationOutcome::Activated {
+                        activated: 0,
+                        already: 2
+                    })
+                );
+                drop(store);
+
+                let store = Store::init(context.child("second"), "node", committee)
+                    .await
+                    .unwrap();
+                let protection = store.protection();
+                for key in [generated, imported] {
+                    let (_, validator) = protection.validator_of(&key).unwrap();
+                    let activation = validator.activation.unwrap();
+                    assert_eq!((activation.chain, activation.height), (chain(9), 7));
+                }
+                let (id, _) = protection.validator_of(&imported).unwrap();
+                assert_eq!(protection.imported(id).unwrap().acknowledged, Some(7));
+            });
+        }
+
         /// Register an imported key at height 1, its history at 2, 3 acknowledgements at 3, and
         /// activate it at 4 (for the chain of [fork]). Returns its key.
         pub(super) async fn activated<E: Context + CryptoRng>(

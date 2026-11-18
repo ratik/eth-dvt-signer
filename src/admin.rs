@@ -46,7 +46,7 @@ use crate::{
     },
     import::manifest::{Manifest, ManifestJson},
     slashing::{Acknowledgment, ChainIdentity},
-    types::{Approval, Authorized, Command, MAX_APPROVALS, Reconfiguration},
+    types::{Approval, Authorized, BatchActivation, Command, MAX_APPROVALS, Reconfiguration},
 };
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::{
@@ -56,6 +56,7 @@ use commonware_cryptography::{
 };
 use commonware_utils::{TryCollect as _, ordered::Set};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Domain separation of approvers' signatures from every other Ed25519 signature.
 pub const NAMESPACE: &[u8] = b"_ETH_MPC_SIGNER_ADMIN";
@@ -400,10 +401,11 @@ pub struct AuthorizationJson {
 
 /// The protected operations, by the name `mpc-admin` drafts them under, and the endpoint each
 /// one is submitted to with its body (`{public_key}`: the request's key).
-pub const KINDS: [(&str, &str); 8] = [
+pub const KINDS: [(&str, &str); 9] = [
     ("reconfigure", "/consensus/reconfigure"),
     ("reshare", "/validators/reshare"),
     ("activate", "/validators/activate"),
+    ("activate-batch", "/validators/activate/batch"),
     ("register-import", "/keys/import"),
     ("import-history", "/slashing-protection/import"),
     ("sign-exit", SIGN_ENDPOINT),
@@ -646,6 +648,9 @@ pub fn command(kind: &str, body: &serde_json::Value) -> Result<Command, String> 
                 }),
             }
         }
+        "activate-batch" => Ok(Command::ActivateValidators(Box::new(batch_activation(
+            body,
+        )?))),
         "register-import" => {
             let json: ManifestJson = serde_json::from_value(body["manifest"].clone())
                 .map_err(|err| format!("manifest: {err}"))?;
@@ -671,10 +676,56 @@ pub fn command(kind: &str, body: &serde_json::Value) -> Result<Command, String> 
             Ok(Command::SetRegistrationPolicy(Box::new(policy)))
         }
         other => Err(format!(
-            "unknown operation {other} (reconfigure, reshare, activate, register-import, \
-             import-history, sign-exit, sign-deposit, set-registration-policy)"
+            "unknown operation {other} (reconfigure, reshare, activate, activate-batch, \
+             register-import, import-history, sign-exit, sign-deposit, set-registration-policy)"
         )),
     }
+}
+
+/// The request of `POST /validators/activate/batch` (and of `mpc-admin`'s `activate-batch`),
+/// without `authorization`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchActivationJson {
+    genesis_validators_root: String,
+    validators: Vec<BatchEntryJson>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchEntryJson {
+    public_key: String,
+    /// Required for an imported key, refused for any other (as in `POST /validators/activate`).
+    #[serde(default)]
+    acknowledgment: Option<Acknowledgment>,
+}
+
+/// The batch activation `body` asks for (its `authorization` aside): 1 to
+/// `MAX_BATCH_ACTIVATIONS` keys, each once.
+pub fn batch_activation(body: &serde_json::Value) -> Result<BatchActivation, String> {
+    let mut body = body.clone();
+    if let Some(object) = body.as_object_mut() {
+        object.remove("authorization");
+    }
+    let json: BatchActivationJson =
+        serde_json::from_value(body).map_err(|err| format!("batch activation: {err}"))?;
+    let chain = ChainIdentity {
+        genesis_validators_root: unhex(&json.genesis_validators_root)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or("genesis_validators_root must be 32 bytes of 0x-hex")?,
+    };
+    let validators = json
+        .validators
+        .into_iter()
+        .map(|entry| {
+            let key = parse_identifier(&entry.public_key)
+                .map_err(|err| format!("{}: {err}", entry.public_key))?;
+            Ok((key, entry.acknowledgment))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let batch = BatchActivation { chain, validators };
+    batch.check()?;
+    Ok(batch)
 }
 
 /// A protected operation as approvers review and sign it offline, and as `mpc-admin` submits it
@@ -998,6 +1049,43 @@ pub fn describe(command: &Command) -> String {
             validator(key),
             hex::encode(chain.genesis_validators_root)
         ),
+        Command::ActivateValidators(batch) => {
+            // DKG keys, then imported keys grouped by the operator's acknowledgment.
+            let mut generated = Vec::new();
+            let mut imported: BTreeMap<u8, Vec<String>> = BTreeMap::new();
+            for (key, acknowledgment) in &batch.validators {
+                match acknowledgment {
+                    None => generated.push(validator(key)),
+                    Some(acknowledgment) => imported
+                        .entry(acknowledgment.to_bits())
+                        .or_default()
+                        .push(validator(key)),
+                }
+            }
+            let mut parts = Vec::new();
+            if !generated.is_empty() {
+                parts.push(format!(
+                    "{} DKG keys: {}",
+                    generated.len(),
+                    generated.join(", ")
+                ));
+            }
+            for (bits, keys) in imported {
+                let acknowledgment = Acknowledgment::from_bits(bits).expect("encoded bits");
+                parts.push(format!(
+                    "{} imported keys (operator acknowledgment: {acknowledgment:?}): {}",
+                    keys.len(),
+                    keys.join(", ")
+                ));
+            }
+            format!(
+                "activate {} validators, all or none, for the chain with genesis validators root \
+                 0x{}: {}",
+                batch.validators.len(),
+                hex::encode(batch.chain.genesis_validators_root),
+                parts.join("; ")
+            )
+        }
         Command::ImportSlashingProtection(import) => {
             let blocks = import.validators.iter().filter_map(|(_, s)| s.block);
             let attestations = import.validators.iter().filter_map(|(_, s)| s.attestation);

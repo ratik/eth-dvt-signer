@@ -35,9 +35,9 @@ use crate::{
         types::Root,
     },
     slashing::{
-        Activation, ActivationOutcome, Approved, Attested, Bound, ChainIdentity, Decision,
-        DutyAuthorization, Floors, HistoryOutcome, ImportedValidator, Protection, Record,
-        Refusal as DutyRefusal, Registered, Signed, Validator,
+        Activation, ActivationOutcome, Approved, Attested, BatchActivationOutcome, Bound,
+        ChainIdentity, Decision, DutyAuthorization, Floors, HistoryOutcome, ImportedValidator,
+        Protection, Record, Refusal as DutyRefusal, Registered, Signed, Validator,
     },
     state::{self, Authorization, State},
     types::{Authorized, Command, Outcome, PayloadHash, Transaction},
@@ -632,6 +632,8 @@ pub enum Effect {
     Duty(Decision, Root),
     /// The outcome of a validator activation (DKG or imported key).
     Activate(ActivationOutcome),
+    /// The outcome of a batch of validator activations.
+    ActivateBatch(BatchActivationOutcome),
     /// The outcome of an imported key's registration.
     Register(ImportOutcome),
     /// The share index acknowledged as ready, or why the acknowledgement was ignored.
@@ -1304,6 +1306,38 @@ impl<E: Context> Store<E> {
                             persist(&mut metadata, &self.protection, record);
                         }
                         Effect::Activate(outcome)
+                    }
+                    Command::ActivateValidators(batch) => {
+                        // The share acknowledgments of each imported key, as for one activation.
+                        let shares: Vec<(u32, u32)> = batch
+                            .validators
+                            .iter()
+                            .map(|(validator, _)| {
+                                self.protection
+                                    .validator_of(validator)
+                                    .and_then(|(_, validator)| {
+                                        self.ceremonies.by_round(validator.round)
+                                    })
+                                    .and_then(|ceremony| {
+                                        let imported = ceremony.imported()?;
+                                        Some((
+                                            imported.ready.len() as u32,
+                                            ceremony.config.threshold,
+                                        ))
+                                    })
+                                    .unwrap_or((0, u32::MAX))
+                            })
+                            .collect();
+                        let (outcome, records, generated) =
+                            self.protection.activate_batch(batch, &shares, height);
+                        for record in records {
+                            persist(&mut metadata, &self.protection, record);
+                        }
+                        // Records an earlier version wrote become signable with the activation.
+                        for id in generated {
+                            duties.extend(self.protection.duties_of(id));
+                        }
+                        Effect::ActivateBatch(outcome)
                     }
                     Command::StartResharing {
                         validator,

@@ -280,6 +280,11 @@ the gap is the time the operator takes.
    # each approver: mpc-admin sign --command activate.json --key <key> --output activate-<name>.json
    mpc-admin --nodes ... submit --command activate-alice.json --command activate-bob.json
    ```
+
+   Many keys: `draft activate-batch` with `"validators": [{"public_key": "0x..",
+   "acknowledgment": {..}}, ..]` activates up to 1 024 of them with one approval, all or none
+   ([ethereum-signing.md](ethereum-signing.md#validator-keys-and-activation)). Their histories can
+   be imported in one approved `import-history` too.
 10. **Point the validator client at the network** (Web3Signer API), and check that it attests in the
     beacon chain. `GET /slashing-protection/export/{public_key}` gives the history the network holds,
     for an audit. It is not a way to move the key out. The network has no command that stops it
