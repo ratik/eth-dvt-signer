@@ -45,17 +45,23 @@ Nimbus on a local devnet, and with sealed nodes on GCP Confidential VMs.
 
 ## How it works
 
-```
-validator client ──Web3Signer API──> mpc-gateway ──mTLS──> node (coordinator)
-                                                              │
-         1. consensus authorizes the duty: signing root, slashing protection, fork schedule
-                                                              │
-         2. the coordinator asks every keyholder for a partial signature
-            each keyholder signs only a duty that is committed in its own state
-                                                              │
-         3. three valid partials -> one BLS signature -> checked against the validator key
-                                                              │
-validator client <──────────── signature (checked again by the gateway) ───────┘
+```mermaid
+sequenceDiagram
+    participant VC as validator client
+    participant GW as mpc-gateway
+    participant C as node (coordinator)
+    participant K as keyholders
+
+    VC->>GW: sign request (Web3Signer API)
+    GW->>C: duty (mTLS)
+    Note over C,K: 1. consensus authorizes the duty:<br/>signing root, slashing protection, fork schedule
+    C->>K: 2. request a partial signature
+    Note over K: each keyholder signs only a duty<br/>that is committed in its own state
+    K-->>C: partial signatures
+    Note over C: 3. three valid partials → one BLS signature<br/>→ checked against the validator key
+    C-->>GW: signature
+    Note over GW: checks the signature again
+    GW-->>VC: signature
 ```
 
 - Consensus tolerates one faulty node out of four (`n >= 3f + 1`).
