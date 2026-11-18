@@ -733,8 +733,10 @@ fn interrupted_share_write_is_never_used() {
 
     deterministic::Runner::from(checkpoint).start(|context| async move {
         // Node 2 crashed halfway through writing its share: the secret store falls back to its
-        // previous complete state, which holds the acknowledged dealings but no share.
+        // previous complete state, which holds the acknowledged dealings but no share (they are
+        // dropped only after the share's write, so that removal is undone too).
         tear_newest_copy(&context, "node-2-secrets").await;
+        tear_newest_copy(&context, "node-2-secrets-pending").await;
         let secrets = Secrets::init(context.child("inspect"), "node-2-secrets".into(), None)
             .await
             .unwrap();

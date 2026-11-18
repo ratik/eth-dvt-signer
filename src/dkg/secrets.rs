@@ -1,19 +1,24 @@
 //! This node's secret DKG material, kept apart from the replicated state.
 //!
-//! It lives in its own `commonware-storage` [Metadata] partition. Every write is one checksummed
-//! `sync` into the older of two copies, so an interrupted write leaves the previous complete state,
-//! never a partial record; if both copies are corrupted, [Secrets::init] fails and the node refuses
-//! to start.
+//! It lives in two `commonware-storage` [Metadata] partitions of its own. Every write is one
+//! checksummed `sync` of one partition into the older of its two copies, so an interrupted write
+//! leaves the previous complete state, never a partial record; if both copies of a partition are
+//! corrupted, [Secrets::init] fails and the node refuses to start.
 //!
 //! Stored per ceremony round:
 //!
-//! - the dealer seed: lets the dealer replay the same dealing after a restart instead of dealing
-//!   fresh randomness (which would equivocate). Deleted when the ceremony ends.
-//! - the dealings this player acknowledged: needed to derive the share after a restart. Deleted
-//!   when the ceremony ends.
-//! - the final [KeyShare]: written once, never overwritten, verified against the public
-//!   polynomial before use. For an imported key, the share the node opened from its envelope and
-//!   verified against the registered commitments (`import`), stored the same way.
+//! - the dealer seed (in `<partition>-pending`): lets the dealer replay the same dealing after a
+//!   restart instead of dealing fresh randomness (which would equivocate). Deleted when the
+//!   ceremony ends.
+//! - the dealings this player acknowledged (in `<partition>-pending`): needed to derive the share
+//!   after a restart. Deleted when the ceremony ends.
+//! - the final [KeyShare] (in `<partition>`): written once, never overwritten, verified against
+//!   the public polynomial before use. For an imported key, the share the node opened from its
+//!   envelope and verified against the registered commitments (`import`), stored the same way.
+//!
+//! A `sync` rewrites its whole partition. The seeds and dealings are written several times a
+//! ceremony, so they are kept apart from the shares, whose partition grows with every key
+//! (docs/load-test.md, section 4.1).
 //!
 //! With a plain vault nothing here is encrypted at rest: protection relies on the data directory's
 //! permissions. With a sealed vault (`crate::vault`, docs/tee.md), every value is encrypted with
@@ -24,7 +29,7 @@ use super::{
     CeremonyId, MAX_PARTICIPANTS, Variant,
     ceremony::{Ceremony, Origin},
 };
-use crate::vault::Cipher;
+use crate::{encoded::Encoded, vault::Cipher};
 use bytes::BufMut;
 use commonware_codec::Buf;
 use commonware_codec::{
@@ -43,6 +48,7 @@ use commonware_cryptography::{
     sha256::Digest,
     transcript::Summary,
 };
+use commonware_runtime::Supervisor;
 use commonware_storage::{
     Context,
     metadata::{self, Config, Metadata},
@@ -325,7 +331,8 @@ const SEALED_DOMAIN: &[u8] = b"eth-mpc-signer/secrets/v1/";
 /// before sealing existed), or sealed with the vault's cipher.
 #[derive(Clone)]
 enum Stored {
-    Clear(Value),
+    /// Held encoded: a rewrite of the store copies it ([Encoded]).
+    Clear(Encoded<Value>),
     Sealed(Vec<u8>),
 }
 
@@ -347,7 +354,7 @@ impl Read for Stored {
 
     fn read_cfg(buf: &mut impl Buf, _: &()) -> Result<Self, CodecError> {
         if buf.chunk().first() != Some(&SEALED_TAG) {
-            return Value::read(buf).map(Self::Clear);
+            return Encoded::<Value>::read(buf).map(Self::Clear);
         }
         u8::read(buf)?;
         let len: u32 = UInt::read(buf)?.into();
@@ -391,17 +398,45 @@ pub enum Error {
          vault's)"
     )]
     Open,
+    #[error("secret store: a share in the partition of seeds and dealings")]
+    Misplaced,
+}
+
+/// One `Metadata` partition of the store.
+struct Part<E: Context> {
+    // `Metadata::sync` consumes the store, so it is temporarily taken out while syncing.
+    metadata: Option<Metadata<E, Key, Stored>>,
+    partition: String,
+}
+
+/// Which partition a change goes to.
+#[derive(Clone, Copy)]
+enum Which {
+    Shares,
+    Pending,
+}
+
+/// The partition of the value under `key`: shares in the main one, seeds and dealings apart.
+fn which(key: &Key) -> Which {
+    if key.prefix() == SHARE_PREFIX {
+        Which::Shares
+    } else {
+        Which::Pending
+    }
 }
 
 /// Secret material of this node, durably stored.
 pub struct Secrets<E: Context> {
-    // `Metadata::sync` consumes the store, so it is temporarily taken out while syncing.
-    metadata: Option<Metadata<E, Key, Stored>>,
+    /// `<partition>`: the final shares.
+    shares: Part<E>,
+    /// `<partition>-pending`: the seeds and acknowledged dealings of ceremonies in progress. They
+    /// are written several times a ceremony; apart from the shares, such a write does not rewrite
+    /// every share (docs/load-test.md, section 4.1).
+    pending: Part<E>,
     /// Every value, in the clear (decrypted once at start for a sealed store).
     values: BTreeMap<Key, Value>,
     /// The vault's cipher: values are sealed with it.
     cipher: Option<Cipher>,
-    partition: String,
 }
 
 /// One change of a [Secrets::commit].
@@ -410,15 +445,15 @@ enum Change {
     Remove(Key),
 }
 
-impl<E: Context> Secrets<E> {
-    /// Open (or create) the store in `partition`. Fails if no intact copy can be read, or if a
-    /// value does not open with `cipher` (or is sealed while `cipher` is `None`, or in the clear
-    /// while it is not).
-    pub async fn init(
+impl<E: Context> Part<E> {
+    /// Open the partition and read its values. Fails if no intact copy can be read, or if a value
+    /// does not open with `cipher` (or is sealed while `cipher` is `None`, or in the clear while
+    /// it is not).
+    async fn open(
         context: E,
         partition: String,
-        cipher: Option<Cipher>,
-    ) -> Result<Self, Error> {
+        cipher: &Option<Cipher>,
+    ) -> Result<(Self, BTreeMap<Key, Value>), Error> {
         let metadata: Metadata<E, Key, Stored> = Metadata::init(
             context,
             Config {
@@ -429,8 +464,10 @@ impl<E: Context> Secrets<E> {
         .await?;
         let mut values = BTreeMap::new();
         for key in metadata.keys() {
-            let value = match (metadata.get(key).expect("listed"), &cipher) {
-                (Stored::Clear(value), None) => value.clone(),
+            let value = match (metadata.get(key).expect("listed"), cipher) {
+                (Stored::Clear(value), None) => {
+                    value.decoded().expect("read from the store").clone()
+                }
                 (Stored::Clear(_), Some(_)) => return Err(Error::ClearInSealedStore),
                 (Stored::Sealed(_), None) => return Err(Error::SealedWithoutVault),
                 (Stored::Sealed(bytes), Some(cipher)) => {
@@ -443,30 +480,101 @@ impl<E: Context> Secrets<E> {
             };
             values.insert(key.clone(), value);
         }
-        Ok(Self {
+        let part = Self {
             metadata: Some(metadata),
+            partition,
+        };
+        Ok((part, values))
+    }
+}
+
+impl<E: Context + Supervisor> Secrets<E> {
+    /// Open (or create) the store in `partition` and `<partition>-pending`. Fails if no intact
+    /// copy of either can be read, or if a value does not open with `cipher` (or is sealed while
+    /// `cipher` is `None`, or in the clear while it is not).
+    ///
+    /// Seeds and dealings in `partition` (a store written before they moved) are moved to
+    /// `<partition>-pending`; those of a round whose share is stored (an interrupted
+    /// [Secrets::put_share]) are dropped.
+    pub async fn init(
+        context: E,
+        partition: String,
+        cipher: Option<Cipher>,
+    ) -> Result<Self, Error> {
+        let pending_partition = format!("{partition}-pending");
+        let (shares, mut values) = Part::open(context.child("shares"), partition, &cipher).await?;
+        let (pending, pending_values) =
+            Part::open(context.child("pending"), pending_partition, &cipher).await?;
+        if pending_values
+            .keys()
+            .any(|key| matches!(which(key), Which::Shares))
+        {
+            return Err(Error::Misplaced);
+        }
+        let legacy: Vec<Key> = values
+            .keys()
+            .filter(|key| matches!(which(key), Which::Pending))
+            .cloned()
+            .collect();
+        // What `pending` holds is newer than (or the same as) a copy left in `partition`.
+        values.extend(pending_values);
+        let mut secrets = Self {
+            shares,
+            pending,
             values,
             cipher,
-            partition,
-        })
+        };
+        if !legacy.is_empty() {
+            // Into `pending` first: an interruption leaves both copies, never none.
+            let moved = legacy
+                .iter()
+                .map(|key| Change::Put(key.clone(), secrets.values[key].clone()))
+                .collect();
+            secrets.commit(Which::Pending, moved).await?;
+            // Then out of `partition` (the values themselves stay, now in `pending`).
+            let mut metadata = secrets.shares.metadata.take().expect("metadata is present");
+            for key in &legacy {
+                metadata.remove(key);
+            }
+            secrets.shares.metadata = Some(metadata.sync().await?);
+        }
+        let finished: Vec<Change> = secrets
+            .values
+            .keys()
+            .filter(|key| {
+                matches!(which(key), Which::Pending) && secrets.share(key.value()).is_some()
+            })
+            .cloned()
+            .map(Change::Remove)
+            .collect();
+        if !finished.is_empty() {
+            secrets.commit(Which::Pending, finished).await?;
+        }
+        Ok(secrets)
     }
+}
 
+impl<E: Context> Secrets<E> {
     fn get(&self, key: Key) -> Option<&Value> {
         self.values.get(&key)
     }
 
-    /// Apply `changes` and make them durable before returning.
-    async fn commit(&mut self, changes: Vec<Change>) -> Result<(), Error> {
-        let mut metadata = self.metadata.take().expect("metadata is present");
+    /// Apply `changes` to the partition `to` and make them durable before returning.
+    async fn commit(&mut self, to: Which, changes: Vec<Change>) -> Result<(), Error> {
+        let part = match to {
+            Which::Shares => &mut self.shares,
+            Which::Pending => &mut self.pending,
+        };
+        let mut metadata = part.metadata.take().expect("metadata is present");
         for change in changes {
             match change {
                 Change::Put(key, value) => {
                     let stored = match &self.cipher {
-                        None => Stored::Clear(value.clone()),
+                        None => Stored::Clear(Encoded::new(&value)),
                         Some(cipher) => {
                             let plaintext = zeroize::Zeroizing::new(value.encode().to_vec());
                             Stored::Sealed(
-                                cipher.seal(&sealed_aad(&self.partition, &key), &plaintext),
+                                cipher.seal(&sealed_aad(&part.partition, &key), &plaintext),
                             )
                         }
                     };
@@ -479,7 +587,7 @@ impl<E: Context> Secrets<E> {
                 }
             }
         }
-        self.metadata = Some(metadata.sync().await?);
+        part.metadata = Some(metadata.sync().await?);
         Ok(())
     }
 
@@ -491,10 +599,10 @@ impl<E: Context> Secrets<E> {
     }
 
     pub async fn put_seed(&mut self, round: u64, seed: Summary) -> Result<(), Error> {
-        self.commit(vec![Change::Put(
-            Key::new(SEED_PREFIX, round),
-            Value::Seed(seed),
-        )])
+        self.commit(
+            Which::Pending,
+            vec![Change::Put(Key::new(SEED_PREFIX, round), Value::Seed(seed))],
+        )
         .await
     }
 
@@ -509,10 +617,13 @@ impl<E: Context> Secrets<E> {
         let mut dealings = self.dealings(round);
         dealings.retain(|(dealer, ..)| *dealer != dealing.0);
         dealings.push(dealing);
-        self.commit(vec![Change::Put(
-            Key::new(DEALINGS_PREFIX, round),
-            Value::Dealings(dealings),
-        )])
+        self.commit(
+            Which::Pending,
+            vec![Change::Put(
+                Key::new(DEALINGS_PREFIX, round),
+                Value::Dealings(dealings),
+            )],
+        )
         .await
     }
 
@@ -532,52 +643,67 @@ impl<E: Context> Secrets<E> {
             .collect()
     }
 
-    /// Store the final share and drop the round's seed and dealings, in one atomic write.
-    /// A stored share is never replaced.
+    /// Store the final share, then drop the round's seed and dealings. A stored share is never
+    /// replaced. Interrupted between the two writes, the seed and dealings are dropped at the
+    /// next start ([Secrets::init]): they are never needed once the share is stored.
     pub async fn put_share(&mut self, share: KeyShare) -> Result<(), Error> {
         let round = share.round;
         if self.share(round).is_some() {
             return Err(Error::ShareExists(round));
         }
-        self.commit(vec![
-            Change::Remove(Key::new(SEED_PREFIX, round)),
-            Change::Remove(Key::new(DEALINGS_PREFIX, round)),
-            Change::Put(Key::new(SHARE_PREFIX, round), Value::Share(Box::new(share))),
-        ])
-        .await
+        self.commit(
+            Which::Shares,
+            vec![Change::Put(
+                Key::new(SHARE_PREFIX, round),
+                Value::Share(Box::new(share)),
+            )],
+        )
+        .await?;
+        self.forget(round).await
     }
 
     /// Erase everything of `round`, its share included: a share generation that was retired (its
-    /// key moved to a newer one) or a reshare that was aborted. Written twice, so that neither of
-    /// the store's two copies keeps it. Erasure is best effort: what the file system or a backup
-    /// kept is out of reach.
+    /// key moved to a newer one) or a reshare that was aborted. Each partition that held some of
+    /// it is written twice, so that neither of its two copies keeps it. Erasure is best effort:
+    /// what the file system or a backup kept is out of reach.
     pub async fn erase(&mut self, round: u64) -> Result<(), Error> {
-        if self.seed(round).is_none()
-            && self.dealings(round).is_empty()
-            && self.share(round).is_none()
-        {
-            return Ok(());
-        }
+        let pending = self.seed(round).is_some() || !self.dealings(round).is_empty();
+        let share = self.share(round).is_some();
         for _ in 0..2 {
-            self.commit(vec![
-                Change::Remove(Key::new(SEED_PREFIX, round)),
-                Change::Remove(Key::new(DEALINGS_PREFIX, round)),
-                Change::Remove(Key::new(SHARE_PREFIX, round)),
-            ])
-            .await?;
+            if pending {
+                self.commit(
+                    Which::Pending,
+                    vec![
+                        Change::Remove(Key::new(SEED_PREFIX, round)),
+                        Change::Remove(Key::new(DEALINGS_PREFIX, round)),
+                    ],
+                )
+                .await?;
+            }
+            if share {
+                self.commit(
+                    Which::Shares,
+                    vec![Change::Remove(Key::new(SHARE_PREFIX, round))],
+                )
+                .await?;
+            }
         }
         Ok(())
     }
 
-    /// Drop the round's seed and dealings (the ceremony ended without a share for this node).
+    /// Drop the round's seed and dealings (the ceremony ended without a share for this node, or
+    /// its share is stored).
     pub async fn forget(&mut self, round: u64) -> Result<(), Error> {
         if self.seed(round).is_none() && self.dealings(round).is_empty() {
             return Ok(());
         }
-        self.commit(vec![
-            Change::Remove(Key::new(SEED_PREFIX, round)),
-            Change::Remove(Key::new(DEALINGS_PREFIX, round)),
-        ])
+        self.commit(
+            Which::Pending,
+            vec![
+                Change::Remove(Key::new(SEED_PREFIX, round)),
+                Change::Remove(Key::new(DEALINGS_PREFIX, round)),
+            ],
+        )
         .await
     }
 }

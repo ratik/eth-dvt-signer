@@ -21,7 +21,7 @@ A node's secrets:
 | Secret | Plain vault (`--vault plain`) | Sealed vault (`--vault gcp-tdx`) |
 | --- | --- | --- |
 | Identity (Ed25519: p2p, votes, DKG transcripts, share acknowledgments, anchor records) | `vault/identity`, owner-only | made in the vault, sealed |
-| Shares, dealer seeds, acknowledged dealings (`registry-secrets`) | in the clear | every value sealed |
+| Shares (`registry-secrets`), dealer seeds and acknowledged dealings (`registry-secrets-pending`) | in the clear | every value sealed |
 | Share-encryption key (imported keys) | `vault/share-key` or `--share-encryption-key` | made in the vault, sealed; the flag is refused |
 | mTLS server key | `vault/tls-key` | made in the vault, sealed |
 

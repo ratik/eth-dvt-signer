@@ -298,16 +298,24 @@ signatures enter blocks. The cost: **every** player must be online.
 
 ### Persistence
 
-Every node has a secret store: partition `registry-secrets` of its node directory. The node
-directory (`data/node-i`) has mode `0700`. The secret store is separate from the replicated
-state. Each write is an atomic, checksummed `Metadata` commit:
+Every node has a secret store: partitions `registry-secrets` (the shares) and
+`registry-secrets-pending` (the seeds and dealings of ceremonies in progress) of its node
+directory. The node directory (`data/node-i`) has mode `0700`. The secret store is separate from
+the replicated state. Each write is an atomic, checksummed `Metadata` commit of one partition:
 
-- the dealer seed: random, persisted before the dealer sends anything, so a restart replays the
-  same dealing;
-- every dealing the player acknowledged: persisted before the ack;
-- the final share: written once and never overwritten. It is checked against the agreed public
-  polynomial when it is loaded. It is used only after it is durably stored. Storing it drops the
-  round's seed and dealings in the same write.
+- the dealer seed (`registry-secrets-pending`): random, persisted before the dealer sends
+  anything, so a restart replays the same dealing;
+- every dealing the player acknowledged (`registry-secrets-pending`): persisted before the ack;
+- the final share (`registry-secrets`): written once and never overwritten. It is checked against
+  the agreed public polynomial when it is loaded. It is used only after it is durably stored.
+  After it is stored, the round's seed and dealings are dropped; if the node stops in between,
+  they are dropped at the next start.
+
+Every commit rewrites its whole partition. The seeds and dealings are written several times a
+ceremony, so they are kept apart from the shares, whose partition grows with every key; values in
+the clear are kept encoded, so a rewrite copies them instead of encoding them again
+([load-test.md](load-test.md), section 4.1). A store from before the split has its seeds and
+dealings moved to `registry-secrets-pending` at start.
 
 A torn write rolls back to the previous copy. If both copies are corrupt, the node refuses to
 start. In a plain vault, nothing in the store is encrypted: only directory permissions protect it.
@@ -396,7 +404,8 @@ Every storage partition name starts with `registry`.
 | Partition | Content |
 | --------- | ------- |
 | `registry-state` | the replicated state, storage format 2 (`Metadata`, two copies) |
-| `registry-secrets` | this node's secret store (DKG material and shares) |
+| `registry-secrets` | this node's secret store: its shares |
+| `registry-secrets-pending` | this node's secret store: dealer seeds and acknowledged dealings of ceremonies in progress |
 | `registry-consensus` | the consensus journal of epoch 0; epoch `e` ≥ 1 uses `registry-consensus-<e>` |
 | `registry-finalizations-*`, `registry-blocks-*` | finalized blocks and their certificates (prunable archives) |
 | `registry-marshal-*` | marshal's progress and cache |
@@ -435,7 +444,7 @@ peers. There is no state sync. Recover it by hand from a healthy node:
    the healthy one is back.
 2. Replace every partition of the lagging node's directory with the healthy node's copy, except
    its own:
-   - `registry-secrets` (its key shares);
+   - `registry-secrets` and `registry-secrets-pending` (its secret store);
    - `registry-consensus` and every `registry-consensus-<e>` (its consensus journals);
    - the `vault/` directory, if the node runs with real identities (`--peers`). A node whose
      identity is not its own in the peers file refuses to start.
