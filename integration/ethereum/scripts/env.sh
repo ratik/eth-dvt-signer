@@ -11,6 +11,9 @@
 # Usage: env.sh tools|build|validate [RUNS]|fuzz TARGET|all [SECONDS] [PARALLEL]|cargo ARGS...|
 #        tee-qemu [NODES]|up|exec CMD...|status|down
 #   IT_HOME   work directory on the host (default: ~/eth-mpc-it): bin/, target/, runs/, validation/
+#   IT_NAME   name of the environment's container, network and volume (default: eth-mpc-it); give
+#             each environment that runs at the same time on one host its own
+#   IT_VC     validator client of the run (`it.py`): lighthouse (default), teku or nimbus
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,10 +22,11 @@ repo="$(cd "$here/../../.." && pwd)"
 source "$here/../config/versions.env"
 
 IT_HOME="${IT_HOME:-$HOME/eth-mpc-it}"
-DIND=eth-mpc-it-dind
-NETWORK=eth-mpc-it-net
-VOLUME=eth-mpc-it-docker
-LABEL=eth-mpc-it=1
+IT_NAME="${IT_NAME:-eth-mpc-it}"
+DIND="$IT_NAME-dind"
+NETWORK="$IT_NAME-net"
+VOLUME="$IT_NAME-docker"
+LABEL="$IT_NAME=1"
 
 log() { printf '%s env: %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 
@@ -361,6 +365,7 @@ up) up ;;
 exec)
 	shift
 	docker exec -i -e IT_UID="$(id -u)" -e IT_GID="$(id -g)" ${IT_WORK:+-e IT_WORK="$IT_WORK"} \
+		${IT_VC:+-e IT_VC="$IT_VC"} \
 		"$DIND" "$@"
 	;;
 status)

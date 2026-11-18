@@ -2,11 +2,12 @@
 """The Ethereum devnet integration of the MPC signer (docs/ethereum-devnet.md).
 
 Runs inside the isolated environment (`scripts/env.sh`): Kurtosis and the devnet, the four signer
-nodes (containers on that environment's loopback), the gateway (`mpc-gateway`) and Lighthouse's
-validator client. Python standard library only.
+nodes (containers on that environment's loopback), the gateway (`mpc-gateway`) and a validator
+client: Lighthouse's, or Teku's or Nimbus's with `IT_VC=teku|nimbus` (`run`, `run-r2`, `run-r3`;
+the MEV, Gloas and GCP runs are Lighthouse's only). Python standard library only.
 
 Every wait is bounded and fails with its stage, so a failed run says where it failed:
-environment, dkg, activation, deposit, lighthouse, signing, beacon or timeout. Success is never
+environment, dkg, activation, deposit, validator-client, signing, beacon or timeout. Success is never
 inferred from an HTTP 200: attestations and proposals are checked in the beacon chain's state.
 
 Usage (inside the environment):
@@ -105,6 +106,13 @@ def versions():
 
 
 VERSIONS = versions()
+# The validator client that signs through the gateway (`vc_start`).
+VC_CLIENTS = {"lighthouse": ("Lighthouse", "LIGHTHOUSE_IMAGE"), "teku": ("Teku", "TEKU_IMAGE"),
+              "nimbus": ("Nimbus", "NIMBUS_VC_IMAGE")}
+VC = os.environ.get("IT_VC", "lighthouse")
+if VC not in VC_CLIENTS:
+    sys.exit(f"IT_VC={VC}: expected one of {', '.join(VC_CLIENTS)}")
+VC_LABEL, VC_IMAGE = VC_CLIENTS[VC]
 UID = os.environ.get("IT_UID") or str(os.stat(IT).st_uid)
 GID = os.environ.get("IT_GID") or str(os.stat(IT).st_gid)
 
@@ -687,7 +695,7 @@ def gateway_start(gcp=None):
          VERSIONS["RUNTIME_IMAGE"], "sh", "-c", f"exec {command}"])
     wait("the gateway", "environment", 120, 0.5,
          lambda: http("GET", f"http://127.0.0.1:{PROXY_PORT}/upcheck", timeout=3)[0] == 200)
-    log(f"gateway: serving Lighthouse on 127.0.0.1:{PROXY_PORT} ({'sealed nodes on GCP' if gcp else 'local signers'})")
+    log(f"gateway: serving {VC_LABEL} on 127.0.0.1:{PROXY_PORT} ({'sealed nodes on GCP' if gcp else 'local signers'})")
 
 
 def gateway_stop():
@@ -696,51 +704,85 @@ def gateway_stop():
 
 
 def vc_start(key, *more, builder=False, image=None):
-    """Lighthouse's validator client with remote-signer validators only: the DKG key (and, after
+    """The validator client (`IT_VC`) with remote-signer validators only: the DKG key (and, after
     the migration, the migrated key), signed by the MPC network through the gateway. Its own
-    slashing database is kept across restarts. No keystore exists in it. With `builder`, it
-    registers its validators with the builder network (`VALIDATOR_REGISTRATION`, signed by the MPC
-    network under the registration policy) and prefers builder blocks."""
+    slashing protection is on and kept across restarts. No keystore exists in it. With `builder`
+    (Lighthouse only), it registers its validators with the builder network
+    (`VALIDATOR_REGISTRATION`, signed by the MPC network under the registration policy) and
+    prefers builder blocks.
+    - Lighthouse: one `web3signer` entry per key in `validator_definitions.yml`.
+    - Teku: the keys listed on the command line (`--validators-external-signer-public-keys`).
+    - Nimbus: the keys the gateway lists (`GET /api/v1/eth2/publicKeys`, `--web3-signer-url`),
+      which are the network's activated keys; doppelganger detection off, as in the others."""
+    if builder and VC != "lighthouse":
+        raise Failure("validator-client", f"builder proposals are run with Lighthouse only, not {VC_LABEL}")
     datadir = workdir("vc")
-    workdir("vc", "validators")
     workdir("vc-home")
     keys = [(key, "DKG-generated key, signed by the MPC network")] + [
         (extra, "imported key (migrated from a local keystore), signed by the MPC network")
         for extra in more]
-    with open(f"{datadir}/validators/validator_definitions.yml", "w") as file:
-        file.write("---\n")
-        for public_key, description in keys:
-            file.write(
-                "- enabled: true\n"
-                f'  voting_public_key: "{public_key}"\n'
-                f'  description: "{description}"\n'
-                "  type: web3signer\n"
-                f'  url: "http://127.0.0.1:{PROXY_PORT}"\n'
-                "  request_timeout_ms: 12000\n")
+    devnet = endpoints()
+    signer = f"http://127.0.0.1:{PROXY_PORT}"
+    if VC == "lighthouse":
+        workdir("vc", "validators")
+        with open(f"{datadir}/validators/validator_definitions.yml", "w") as file:
+            file.write("---\n")
+            for public_key, description in keys:
+                file.write(
+                    "- enabled: true\n"
+                    f'  voting_public_key: "{public_key}"\n'
+                    f'  description: "{description}"\n'
+                    "  type: web3signer\n"
+                    f'  url: "{signer}"\n'
+                    "  request_timeout_ms: 12000\n")
+        command = (
+            f"exec lighthouse --testnet-dir {devnet['testnet_dir']} vc --datadir {datadir} "
+            f"--beacon-nodes {devnet['beacon']} --init-slashing-protection "
+            f"--suggested-fee-recipient {FUNDER_ADDRESS} --disable-auto-discover "
+            f"--metrics --metrics-address 127.0.0.1 --metrics-port {VC_METRICS_PORT} "
+            + (f"--builder-proposals --prefer-builder-proposals --gas-limit {GAS_LIMIT} " if builder else "")
+            + "--debug-level info")
+    elif VC == "teku":
+        # The chain's configuration comes from the beacon node (`--network auto`).
+        command = (
+            f"exec /opt/teku/bin/teku vc --network auto --data-path {datadir} "
+            f"--beacon-node-api-endpoint {devnet['beacon']} "
+            f"--validators-external-signer-url {signer} "
+            f"--validators-external-signer-public-keys {','.join(k for k, _ in keys)} "
+            "--validators-external-signer-timeout 12000 "
+            f"--validators-proposer-default-fee-recipient {FUNDER_ADDRESS} "
+            f"--metrics-enabled --metrics-interface 127.0.0.1 --metrics-port {VC_METRICS_PORT} "
+            "--log-destination CONSOLE --log-color-enabled false --logging INFO")
+    else:
+        # Nimbus refuses a data directory others can read, and takes options as `--name=value`.
+        os.chmod(datadir, 0o700)
+        command = (
+            f"exec /home/user/nimbus_validator_client --data-dir={datadir} --non-interactive "
+            f"--beacon-node={devnet['beacon']} --web3-signer-url={signer} "
+            f"--suggested-fee-recipient={FUNDER_ADDRESS} --doppelganger-detection=false "
+            f"--metrics --metrics-address=127.0.0.1 --metrics-port={VC_METRICS_PORT} "
+            "--log-format=nocolors --log-level=INFO")
     own(datadir)
     run(["docker", "rm", "-f", "it-vc"], check=False)
     started = len(read(f"{WORK}/logs/vc.log"))
-    devnet = endpoints()
-    command = (
-        f"exec lighthouse --testnet-dir {devnet['testnet_dir']} vc --datadir {datadir} "
-        f"--beacon-nodes {devnet['beacon']} --init-slashing-protection "
-        f"--suggested-fee-recipient {FUNDER_ADDRESS} --disable-auto-discover "
-        f"--metrics --metrics-address 127.0.0.1 --metrics-port {VC_METRICS_PORT} "
-        + (f"--builder-proposals --prefer-builder-proposals --gas-limit {GAS_LIMIT} " if builder else "")
-        + f"--debug-level info >> {WORK}/logs/vc.log 2>&1")
     run(["docker", "run", "-d", "--name", "it-vc", "--network", "host", "--user", f"{UID}:{GID}",
          "-e", f"HOME={WORK}/vc-home", "-v", f"{IT}:{IT}", "--entrypoint", "sh",
-         image or VERSIONS["LIGHTHOUSE_IMAGE"], "-c", command])
+         image or VERSIONS[VC_IMAGE], "-c", f"{command} >> {WORK}/logs/vc.log 2>&1"])
 
     def enabled():
         text = read(f"{WORK}/logs/vc.log")[started:].lower()
-        if all("enabled validator" in text and public_key[2:10] in text for public_key, _ in keys):
+        # Each client names a loaded remote key by its first hex digits (Teku by seven).
+        if VC == "lighthouse":
+            loaded = "enabled validator" in text and all(k[2:10] in text for k, _ in keys)
+        else:
+            loaded = all(k[2:9] in text for k, _ in keys)
+        if loaded:
             return True
         if not run(["docker", "inspect", "-f", "{{.State.Running}}", "it-vc"], check=False).startswith("true"):
-            raise Failure("lighthouse", "the validator client exited (logs/vc.log)")
+            raise Failure("validator-client", f"{VC_LABEL}'s validator client exited (logs/vc.log)")
         return False
-    wait("Lighthouse to enable the remote-signer validators", "lighthouse", 120, 1, enabled)
-    log(f"lighthouse: validator client running, {len(keys)} key(s) enabled as web3signer validators")
+    wait(f"{VC_LABEL} to load the remote-signer validators", "validator-client", 120, 1, enabled)
+    log(f"validator client: {VC_LABEL} running, {len(keys)} key(s) signed through the gateway")
 
 
 def vc_stop():
@@ -1649,6 +1691,13 @@ def sign_via(url, path, body):
                 timeout=30, headers={"Accept": "application/json", "User-Agent": PROBE_AGENT})
 
 
+def signature_of(response):
+    """The signature in a stored answer: JSON (`{"signature": "0x…"}`) or text (`0x…`), as the
+    client asked (`Accept`; Teku takes text)."""
+    text = response.strip()
+    return json.loads(text)["signature"] if text.startswith("{") else text
+
+
 def security_checks(key, chain, direct=2, other=3):
     """`direct`: the node asked directly for a conflicting attestation; `other`: the node asked to
     change the chain identity (both must be running)."""
@@ -1663,7 +1712,7 @@ def security_checks(key, chain, direct=2, other=3):
     attestation = recorded("ATTESTATION", key)
     if attestation:
         status, body = sign_via(proxy, attestation["path"], attestation["body"])
-        same = status == 200 and body.get("signature") == json.loads(attestation["response"])["signature"]
+        same = status == 200 and body.get("signature") == signature_of(attestation["response"])
         check("an identical retry returns the same signature", same, f"HTTP {status}")
         conflicting = json.loads(attestation["body"])
         conflicting["attestation"]["beacon_block_root"] = "0x" + "ee" * 32
@@ -1868,7 +1917,9 @@ def report(chain=None):
                       "finalized": sum(1 for p in proposals if proposed(p, index) and finalized is not None
                                        and p["slot"] < finalized * slots_per_epoch),
                       "slots": proposals},
-        "lighthouse": {
+        "validator_client": VC,
+        # Lighthouse's own log lines; another client's are not counted.
+        "lighthouse": None if VC != "lighthouse" else {
             "published_attestations": vc_log.count("Successfully published attestations"),
             # "attestation" (one aggregate) without the "s" of "attestations".
             "published_aggregates": vc_log.count("Successfully published attestation")
@@ -1887,6 +1938,12 @@ def report(chain=None):
     }
     save("report.json", result)
     lines = ["# Ethereum devnet integration report", ""]
+    # A duty type the client asked for and the network never signed: an incompatibility the beacon
+    # evidence may not show (Nimbus's AGGREGATE_AND_PROOF_V2, 2026-11-17).
+    never = sorted(kind for kind, entry in by_type.items() if entry["requested"] and not entry["signed"])
+    if never:
+        lines.append(f"- NEVER SIGNED: {', '.join(never)} (every request of these types failed)")
+    lines.append(f"- validator client: {VC_LABEL} ({VERSIONS[VC_IMAGE]})")
     lines.append(f"- validator: `{(result['validator'] or {}).get('public_key')}` "
                  f"index {(result['validator'] or {}).get('index')}")
     lines.append(f"- attestations: {result['attestations']['target_attester']} of "
@@ -1903,7 +1960,7 @@ def report(chain=None):
                      f"canonical of {period['proposals_assigned']} assigned, missed "
                      f"{period['missed_proposal_slots']}")
     if signed_blocks is not None:
-        lines.append(f"- blocks signed for Lighthouse: {signed_blocks['signed']}, canonical "
+        lines.append(f"- blocks signed for {VC_LABEL}: {signed_blocks['signed']}, canonical "
                      f"{signed_blocks['canonical']}, finalized {signed_blocks['finalized']}, not canonical "
                      f"{signed_blocks['not_canonical_slots']}")
     lines.append("")
@@ -1920,7 +1977,7 @@ def report(chain=None):
             f"{s['attestations']['missed']} of {s['attestations']['epochs']} | "
             f"{s['proposals']['canonical']} of {s['proposals']['assigned']} | {s.get('recovery_seconds', '')} |")
     lines.append("")
-    lines.append("Lighthouse's signing requests (the security checks' are not counted):")
+    lines.append(f"{VC_LABEL}'s signing requests (the security checks' are not counted):")
     lines.append("")
     lines.append("| Duty type | Requested | Signed | Retried by the gateway |")
     lines.append("| --- | --- | --- | --- |")
@@ -2199,11 +2256,11 @@ def reconfiguration_lines(r):
              f"- epoch 0 (A, B, C, D) ended with block {r['boundary']}; epoch 1 committee {r['committee']}",
              f"- submit to the first stop {p['submit_to_first_stop']} s; every voter stopped within "
              f"{p['stops_spread']} s; first stop to epoch 1's first block {p['first_stop_to_first_epoch_1_block']} s",
-             f"- Lighthouse during the switch: {d['requests']} requests, {d['failed']} failed, "
+             f"- {VC_LABEL} during the switch: {d['requests']} requests, {d['failed']} failed, "
              f"{d['retried']} retried by the gateway, slowest {d['max_ms']} ms",
              f"- without C, signer sets {r['signer_sets_without_c']}; D came back in epoch {r['d_stale_epoch']} "
              f"and followed epoch 1 after `mpc-admin resume`",
-             f"- Lighthouse requests failed: {r['lighthouse_requests_failed']}, retried by the gateway: "
+             f"- {VC_LABEL} requests failed: {r['lighthouse_requests_failed']}, retried by the gateway: "
              f"{r['lighthouse_requests_retried_by_proxy']}"]
     lines += [f"- latency end to end p50/p95 ms (n), {label}: {ms(q)}" for label, q in r["latency_ms"].items()]
     lines.append(f"- observed epochs: {r['observed_epochs']}, missed attestations {r['missed_attestations']}, "
@@ -2230,7 +2287,7 @@ def replacement_lines(r):
              f"after the activation {r['signatures_with_e_after_activation']} of "
              f"{r['signatures_after_activation']} signatures include E's share",
              f"- signatures by generation since D was lost: {r['signatures_by_generation']}",
-             f"- Lighthouse requests failed: {r['lighthouse_requests_failed']}, retried by the gateway: "
+             f"- {VC_LABEL} requests failed: {r['lighthouse_requests_failed']}, retried by the gateway: "
              f"{r['lighthouse_requests_retried_by_proxy']}"]
     lines += [f"- latency end to end p50/p95 ms (n), {label}: {ms(p)}" for label, p in r["latency_ms"].items()]
     lines += [f"- consensus authorization p50/p95 ms (n), {label}: {ms(p)}"
@@ -2256,7 +2313,7 @@ def resharing_lines(r):
     for name, t in r["timings_s"].items():
         lines.append(f"- {name}: ceremony {t['ceremony']} s, ready to activation {t['ready_to_activation']} s, "
                      f"activation to every node {t['activation_to_all_nodes']} s")
-    lines += [f"- Lighthouse requests that failed around the reshares: {r['lighthouse_requests_failed']}; "
+    lines += [f"- {VC_LABEL} requests that failed around the reshares: {r['lighthouse_requests_failed']}; "
               f"longest gap between two signatures: {r['longest_gap_between_signatures_s']} s; coordinator "
               f"retries on a generation change: {r['coordinator_generation_retries']}",
               f"- signatures by generation (signer logs, every node): {r['signatures_by_generation']}; "
@@ -2288,7 +2345,7 @@ def migration_lines(m):
              f"{m['history']['attestations']} attestations; floors {m['history']['floors']}; the network's "
              f"export afterwards: {m['export']['blocks']} blocks, {m['export']['attestations']} attestations",
              f"- original signer stopped in epoch {m['stopped_epoch']}, MPC activation in epoch "
-             f"{m['activated_epoch']} ({m['stop_to_activation_s']} s), Lighthouse signing through the MPC "
+             f"{m['activated_epoch']} ({m['stop_to_activation_s']} s), {VC_LABEL} signing through the MPC "
              f"network {m['stop_to_resumed_s']} s after the stop",
              f"- before (local keystore): {duties(m['before'])}",
              f"- during the migration: {duties(m['during'])}",
@@ -2312,11 +2369,16 @@ def migration_lines(m):
 def pull_images():
     """The images the run starts later, pulled first: a failing pull is an environment failure,
     and pull progress does not hide a later command's error."""
-    for image in ("RUNTIME_IMAGE", "LIGHTHOUSE_IMAGE", "FOUNDRY_IMAGE"):
+    for image in dict.fromkeys(("RUNTIME_IMAGE", "LIGHTHOUSE_IMAGE", VC_IMAGE, "FOUNDRY_IMAGE")):
         try:
             run(["docker", "pull", "-q", VERSIONS[image]], timeout=900)
         except RuntimeError as error:
             raise Failure("environment", f"pulling {VERSIONS[image]}: {error}") from error
+
+
+def lighthouse_only():
+    if VC != "lighthouse":
+        raise Failure("validator-client", f"this run uses Lighthouse's validator client, not IT_VC={VC}")
 
 
 def run_all(observed=3, proposal_epochs=12):
@@ -2356,7 +2418,17 @@ def run_all(observed=3, proposal_epochs=12):
     collect_evidence()
     recorder.stop()
     migrated_recorder.stop()
-    return report(chain)
+    return checked(report(chain))
+
+
+def checked(result):
+    """Fail a run whose client asked for a duty type the network never signed."""
+    never = sorted(kind for kind, entry in result["duties"].items()
+                   if entry["requested"] and not entry["signed"])
+    if never:
+        raise Failure("signing", f"{VC_LABEL}'s {', '.join(never)} requests were never signed "
+                                 "(report.md, logs/gateway.jsonl)")
+    return result
 
 
 def track_activation(key, chain):
@@ -2442,7 +2514,7 @@ def run_r2(observed=2):
     collect_evidence()
     recorder.stop()
     migrated_recorder.stop()
-    return report(chain)
+    return checked(report(chain))
 
 
 def run_r3(observed=2):
@@ -2459,7 +2531,7 @@ def run_r3(observed=2):
     collect_evidence()
     recorder.stop()
     migrated_recorder.stop()
-    return report(chain)
+    return checked(report(chain))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2629,6 +2701,7 @@ def run_mev(observed=6):
     policy approved; Lighthouse's validator client with builder proposals. The relay accepts the
     registration the MPC network signed; the validator's proposals, by the builder where the relay
     delivered a payload; the policy's refusals; the security checks; a report."""
+    lighthouse_only()
     os.makedirs(f"{WORK}/logs", exist_ok=True)
     pull_images()
     devnet_up(NETWORK_MEV_ARGS)
@@ -2857,6 +2930,7 @@ def run_gloas(after=6):
     preferences and envelopes); Lighthouse's validator client. The validator's duties before and
     after the fork, its Gloas requests, its proposals' envelopes and payloads; the security
     checks with the Gloas ones; a report."""
+    lighthouse_only()
     os.makedirs(f"{WORK}/logs", exist_ok=True)
     pull_images()
     run(["docker", "pull", "-q", GLOAS_LIGHTHOUSE], timeout=900)
@@ -2998,6 +3072,7 @@ def run_gcp(directory, observed=10):
     """Lighthouse's validator client on the devnet, signed by four sealed nodes on GCP
     Confidential VMs (booted by `gcp.sh up` after `gcp-prepare`): the DKG key's lifecycle as in
     `run`, then `observed` epochs of duties, the report, and the latency split (`gcp.json`)."""
+    lighthouse_only()
     global FOLLOWERS
     FOLLOWERS = 0
     os.makedirs(f"{WORK}/logs", exist_ok=True)

@@ -212,8 +212,10 @@ counts, times and node URLs, no key:
 - `id`, `ts`, `method`, `path`, `client` (the `User-Agent`), `status`, `ms`;
 - `attempts`, each with `backend` and `ms`; `status` if the node answered; `error` if it gave no
   answer or its answer was not used; `hedged` and `invalid_signature` when true;
-- for a signing request: `type`, `slot`, `epoch`, `validator`, `signing_root` (the client's
-  `signingRoot`) and `fork_version`.
+- for a signing request: `type`, `slot`, `epoch`, `validator`, `signing_root`, `client_signing_root`
+  and `fork_version`. `signing_root` is the root the gateway computes from the request, or the
+  client's `signingRoot` if the gateway cannot parse the request; `client_signing_root` is the
+  client's (`null` if it sent none, as Nimbus does).
 
 This is the format of the development proxy (`integration/ethereum/scripts/proxy.py`), which the
 devnet report reads.

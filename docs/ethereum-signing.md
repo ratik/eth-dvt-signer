@@ -222,11 +222,15 @@ and exits it is the epoch, and for proposer preferences the proposal slot.
 - **Blocks.** `BLOCK_V2` with `block_header` for `BELLATRIX`, `CAPELLA`, `DENEB`, `ELECTRA`,
   `FULU` and `GLOAS`. Lighthouse sends this form from Bellatrix on. A whole `block` (`PHASE0`,
   `ALTAIR`) is refused (`400`): its body root would need every body container of those forks.
-- **Aggregates.** Lighthouse sends `AGGREGATE_AND_PROOF` for every fork. From Electra on it sends
-  the Electra attestation: with `committee_bits`, and `aggregation_bits` a `Bitlist[131072]`. The
-  shape selects the container. For `AGGREGATE_AND_PROOF_V2`, the `version` selects it: `PHASE0`
-  to `DENEB` use the phase 0 container, `ELECTRA` and `FULU` the Electra container, `GLOAS` the
-  Gloas form. Any other version is refused. The node roots an unversioned Electra-shaped aggregate
+- **Aggregates.** Lighthouse and Teku send `AGGREGATE_AND_PROOF` for every fork. From Electra on
+  they send the Electra attestation: with `committee_bits`, and `aggregation_bits` a
+  `Bitlist[131072]`. The shape selects the container. Nimbus sends `AGGREGATE_AND_PROOF_V2`, where
+  the `version` selects it: `PHASE0` to `DENEB` use the phase 0 container, `ELECTRA` and `FULU` the
+  Electra container, `GLOAS` the Gloas form. Any other version is refused.
+- **Fork names in any case.** A `version` (`BLOCK_V2`, `AGGREGATE_AND_PROOF_V2`, a Gloas object)
+  is read without regard to case. Nimbus v26.10.2 sends a block as `FULU` but an aggregate as
+  `electra`; before this, every one of its aggregates was refused (`400`, devnet run Y,
+  [ethereum-devnet.md](ethereum-devnet.md#other-validator-clients-runs-x-to-z)). The node roots an unversioned Electra-shaped aggregate
   of a Gloas epoch in the Gloas form: the node's fork schedule decides ([Gloas](#gloas)).
 - **Exits.** From Deneb on, exits are signed with the Capella fork version (EIP-7044). Clients
   express this through `fork_info`. Lighthouse sends `{capella, capella, exit epoch}`, the only
@@ -758,9 +762,16 @@ What the evidence is:
   whose envelopes the MPC network signed, and Lighthouse published the PTC votes and preferences
   ([ethereum-devnet.md](ethereum-devnet.md#gloas-run-m)). No builder bid on the preferences.
 
-No other validator client (Teku, Prysm, Nimbus, Lodestar) has run against this API, and it has
-run on no public network. Compatibility is claimed for Lighthouse v8.3.2 (v8.3.3 for Gloas) on
-that devnet, and for the requests its code builds, as checked above.
+- **Two more clients.** Teku 26.10.3's and Nimbus 26.10.2's validator clients ran the same
+  devnet run as Lighthouse: the DKG key's lifecycle, every fault scenario, a migration and
+  resharing. The beacon chain accepted their attestations (27 of 27 epochs, correct head) and
+  blocks (27 of 27, 29 of 29). Every request type they sent was signed, after the fix of the
+  fork names' case for Nimbus's aggregates
+  ([ethereum-devnet.md](ethereum-devnet.md#other-validator-clients-runs-x-to-z)).
+
+Prysm's and Lodestar's validator clients have not run against this API, and it has run on no
+public network. Compatibility is claimed for Lighthouse v8.3.2 (v8.3.3 for Gloas), Teku 26.10.3
+and Nimbus 26.10.2 on that devnet, before Gloas, and for the requests their code built there.
 
 ## Performance
 

@@ -5,8 +5,8 @@ any three of them sign. No node, and no operator, ever holds the whole key. A va
 uses the network as a remote signer through the standard Web3Signer API.
 
 It is built on [commonware](https://github.com/commonwarexyz/monorepo) `2026.10.0` (consensus,
-p2p, storage, BLS12-381 DKG) and tested with a real Lighthouse validator client on a local
-devnet and with sealed nodes on GCP Confidential VMs.
+p2p, storage, BLS12-381 DKG) and tested with the stock validator clients of Lighthouse, Teku and
+Nimbus on a local devnet, and with sealed nodes on GCP Confidential VMs.
 
 **Status: not production-ready.** It has no independent audit, and some limits are still open
 (see [Limitations](#limitations)).
@@ -133,7 +133,8 @@ Details: [docs/tee.md](docs/tee.md) (GCP), [docs/ethereum-devnet.md](docs/ethere
   detects the rollback. The anchor tolerates one faulty node and lags by up to one record.
 - **Ethereum coverage.** Mainnet preset; the mainnet and Hoodi fork schedules, or a devnet's. No
   Phase 0 or Altair blocks, `BUILDER_REQUEST_AUTH`, builder bids or Heze. Voluntary exits and
-  deposits need the approvers. Only Lighthouse has been run against the API.
+  deposits need the approvers. Lighthouse, Teku and Nimbus have run against the API on a devnet;
+  Prysm and Lodestar have not.
 - **Availability costs.** Every node restarting at once (an R3 reconfiguration) costs the current
   epoch's attestations. Two nodes restarting together can stall consensus for seconds. Restart
   one node at a time.
@@ -157,7 +158,8 @@ cargo test --features test-hooks --test e2e  # real processes, real p2p and stor
 
 - The E2E tests run `target/debug/eth-mpc-signer`. Do not run them at the same time as another
   build with other features.
-- A devnet run with a real Lighthouse validator client (Kurtosis in Docker, about an hour):
+- A devnet run with a real validator client (Kurtosis in Docker, about an hour), Lighthouse's
+  or, with `IT_VC=teku` or `IT_VC=nimbus`, Teku's or Nimbus's:
   `IT_HOME=~/eth-mpc-it ./integration/ethereum/scripts/run.sh`
   ([docs/ethereum-devnet.md](docs/ethereum-devnet.md)).
 - Every check in a pinned toolchain (fmt, clippy, tests, the E2E suite three times, fuzzing):

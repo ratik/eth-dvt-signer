@@ -1,8 +1,9 @@
 # Ethereum devnet: a real validator signed by the MPC network
 
 A validator whose key comes from the network's DKG runs on a local proof-of-stake devnet.
-Lighthouse's validator client performs its duties. Its only signing backend is this signer's
-Web3Signer API, reached through `mpc-gateway`. No complete private key exists anywhere: the four
+A stock validator client performs its duties: Lighthouse's by default, Teku's or Nimbus's with
+`IT_VC` ([Other validator clients](#other-validator-clients-runs-x-to-z)). Its only signing
+backend is this signer's Web3Signer API, reached through `mpc-gateway`. No complete private key exists anywhere: the four
 nodes hold shares, and 3 of 4 sign each duty after consensus authorized it under slashing
 protection.
 
@@ -33,7 +34,7 @@ This is a development environment, not a production setup ([Limitations](#limita
 | `47100 + n` | HTTP API of signer node `n` |
 | `47200` | `mpc-gateway`: the Web3Signer URL that Lighthouse signs through |
 | `47202` | the gateway's metrics |
-| `47301` | the Lighthouse validator client's metrics |
+| `47301` | the validator client's metrics |
 
 Everything that talks to the signer stays on loopback. The signer's HTTP API keeps its
 loopback-only binding, and the integration adds no other listener. The signers, the gateway and
@@ -126,7 +127,15 @@ touch the host's other containers.
 ```bash
 IT_HOME=~/eth-mpc-it ./integration/ethereum/scripts/run.sh                  # the full run
 IT_HOME=~/eth-mpc-it IT_RUN=run-r3 ./integration/ethereum/scripts/run.sh    # another mode
+IT_HOME=~/eth-mpc-it IT_VC=teku ./integration/ethereum/scripts/run.sh       # another client
 ```
+
+- **`IT_VC`** is the validator client that signs through the gateway: `lighthouse` (default),
+  `teku` or `nimbus`, in `run`, `run-r2` and `run-r3`. `run-mev`, `run-gloas` and `run-gcp` use
+  Lighthouse only and refuse another. Images are pinned in `config/versions.env`.
+- **`IT_NAME`** names the isolated environment (its container, network and volume; default
+  `eth-mpc-it`). Two runs on one host at the same time need two names and two `IT_HOME`s, for
+  example `IT_NAME=eth-mpc-it-teku IT_HOME=~/eth-mpc-it-teku`.
 
 `run.sh` does these steps:
 
@@ -844,19 +853,67 @@ the same as in the table above.
   requests each, two rounds per version, give the same mean for both versions. The p95 of
   2026.10.0 is 10 to 30 ms higher. The cause is not known yet.
 
+### Other validator clients (runs X to Z)
+
+Runs X to Z (2026-11-17) replace Lighthouse's validator client with Teku's or Nimbus's
+(`IT_VC`), in mode `run`: the DKG key's lifecycle, every scenario, the migration of a genesis
+validator (the client restarted with both keys) and resharing. The beacon node stays Lighthouse's;
+both clients talk to it over the standard beacon API. Runs X and Y ran at the same time on one
+host, in two environments (`IT_NAME`); run Z ran alone. The rows are the DKG validator's whole
+active period; the requests are every signing request of the client through the gateway.
+
+| Run | Directory | Client | Attested epochs | Proposals canonical | Requests | p50 / p95 ms |
+| --- | --- | --- | --- | --- | --- | --- |
+| X | `20261117T213235Z` | Teku 26.10.3 | 27 of 27 | 27 of 27 | 2 487, all signed | 346 / 686 |
+| Y | `20261117T213237Z` | Nimbus 26.10.2 | 27 of 27 | 27 of 27 | 8 041, 41 refused | 348 / 671 |
+| Z | `20261117T230700Z` | Nimbus 26.10.2 | 27 of 27 | 29 of 29 | 8 079, all signed | 269 / 503 |
+
+- **Every scenario and security check passed** in each run, with the correct head in every
+  attested epoch. Teku's work directory is `~/eth-mpc-it-vc/runs/`, Nimbus's
+  `~/eth-mpc-it-vc/nimbus/runs/`.
+- **How each client takes the keys.** Teku from its command line
+  (`--validators-external-signer-public-keys`), Nimbus from the gateway
+  (`--web3-signer-url`, `GET /api/v1/eth2/publicKeys`: the network's activated keys). After the
+  migration, Nimbus attached the imported key by itself on its restart.
+- **Different requests.**
+  - Teku sends aggregates as `AGGREGATE_AND_PROOF`, as Lighthouse does. It asks for each signature
+    as text (no `Accept: application/json`), which the gateway passes on as the node gave it.
+  - Nimbus sends `AGGREGATE_AND_PROOF_V2`, with the fork name in lower case (`electra`), but a
+    `BLOCK_V2` in upper case (`FULU`). It sends no `signingRoot`. It asks for about three times as
+    many signatures as Teku: a selection proof for every sync subcommittee.
+- **Run Y: every aggregate refused.** The signer took the fork names of `AGGREGATE_AND_PROOF_V2`
+  in upper case only and refused all 41 of Nimbus's aggregates (`400 unsupported`). Attestations
+  and blocks were not affected, so the beacon evidence and the exit status (0) did not show it.
+  The signer now reads a fork name in any case ([ethereum-signing.md](ethereum-signing.md#duties)),
+  and a run fails when the client asked for a duty type the network never signed. Run Z, with the
+  fix, signed all 42 of its aggregates.
+- **Epoch 27 of the migrated validator (run Y).** Its attestation was due in slot 865, 4 to 8 s
+  into the epoch. The original client had stopped at 1.7 s, and Nimbus signed for the key from
+  21.6 s on: the duty fell into the move, as in run V. In runs X and Z the duty came after it.
+- **Latency.** Runs X and Y shared the host's CPU; run Z, alone, is close to Lighthouse's run W.
+- **Before these runs**, two attempts failed in the integration's own code, not in the signer:
+  the in-flight scenario found a retried duty in the nodes' logs by the client's `signingRoot`,
+  which Nimbus does not send (the gateway's log now holds the root it computes), and a security
+  check read a stored signature as JSON, which Teku takes as text.
+
 ## Troubleshooting
 
 - **A run fails.** `failure.json` and the end of `run.log` name the stage that failed
-  (`environment`, `dkg`, `activation`, `deposit`, `lighthouse`, `signing`, `beacon`, `timeout`, or
-  a scenario's stage).
+  (`environment`, `dkg`, `activation`, `deposit`, `validator-client`, `signing`, `beacon`,
+  `timeout`, or a scenario's stage). A run also fails when the client asked for a duty type that
+  the network never signed (`NEVER SIGNED` in the report): the beacon evidence does not show a
+  lost aggregate.
 - **`kurtosis run` fails.** Read `logs/kurtosis-run.log`. A Starlark `fail` names the parameter
   (for example the supernode requirement of Fulu).
 - **The validator never becomes active.** Check `deposit.json` (the transaction's block), then the
   validator's status (`GET /eth/v1/beacon/states/head/validators/{key}`). Deposits wait for
   finalization, and activation waits for the finalization of eligibility. If the chain does not
   finalize, the genesis validators are not attesting.
-- **Lighthouse does not enable the validator.** Read `logs/vc.log`: the definition file, the
-  testnet directory (`network-artifact`), the beacon node URL.
+- **The validator client does not load the key.** Read `logs/vc.log`: the beacon node URL, and
+  for Lighthouse the definition file and the testnet directory (`network-artifact`). The run
+  waits for the key's first hex digits in the log: Lighthouse's `enabled validator`, Teku's
+  `Loaded N Validators`, Nimbus's `Dynamic remote validator attached`. Nimbus takes options only
+  as `--name=value`.
 - **Signing errors.** Read `logs/gateway.jsonl` (the attempts per node) and `logs/gateway.log`,
   then `logs/signer-*.log` (`validator duty not signed`, with the error).
 

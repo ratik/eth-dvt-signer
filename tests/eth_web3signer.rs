@@ -80,9 +80,13 @@ fn the_attestation_shape_selects_the_aggregate_fork() {
         Duty::AggregateAndProof(AggregateAndProof::Electra(_))
     ));
     // The same objects under `AGGREGATE_AND_PROOF_V2`, versioned.
+    // The fork name in any case: Nimbus v26.10 sends `electra`.
     for (name, version, expected) in [
         ("aggregate_and_proof_phase0.json", "DENEB", &phase0),
+        ("aggregate_and_proof_phase0.json", "deneb", &phase0),
         ("aggregate_and_proof_electra.json", "FULU", &electra),
+        ("aggregate_and_proof_electra.json", "electra", &electra),
+        ("aggregate_and_proof_electra.json", "Fulu", &electra),
     ] {
         let mut value = fixture(name);
         let data = value["aggregate_and_proof"].take();
@@ -440,6 +444,21 @@ fn gloas_requests_parse() {
         parse(&aggregate).unwrap().duty,
         Duty::AggregateAndProof(AggregateAndProof::Gloas(_))
     ));
+
+    // The fork name in any case, as for the other forks.
+    block["beacon_block"]["version"] = json!("gloas");
+    assert_eq!(parse(&block).unwrap().duty.kind(), DutyKind::BlockProposal);
+    aggregate["aggregate_and_proof"]["version"] = json!("gloas");
+    assert!(matches!(
+        parse(&aggregate).unwrap().duty,
+        Duty::AggregateAndProof(AggregateAndProof::Gloas(_))
+    ));
+    let mut ptc = gloas_fixture("web3signer_payload_attestation_message.json");
+    ptc["payload_attestation_message"]["version"] = json!("gloas");
+    assert_eq!(
+        parse(&ptc).unwrap().duty.kind(),
+        DutyKind::PayloadAttestation
+    );
 }
 
 /// A Gloas object must be exactly `{"version": "GLOAS", "data": ...}`, its data exactly the
