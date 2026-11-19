@@ -9,7 +9,7 @@ use commonware_codec::Encode as _;
 use commonware_cryptography::bls12381::primitives::group::Scalar;
 use commonware_math::algebra::Random as _;
 use ctr::cipher::{KeyIvInit as _, StreamCipher as _};
-use eth_mpc_signer::import::eip2335;
+use eth_dvt_signer::import::eip2335;
 use rand::RngExt as _;
 use sha2::{Digest as _, Sha256};
 

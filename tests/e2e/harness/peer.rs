@@ -19,7 +19,7 @@ use commonware_p2p::{
 };
 use commonware_runtime::{Quota, Runner as _, Spawner as _, Supervisor as _, tokio as runtime};
 use commonware_utils::{NZU32, TryCollect as _, channel::mpsc, ordered::Map, union};
-use eth_mpc_signer::{dkg::secrets::Secrets, engine, signer::wire};
+use eth_dvt_signer::{dkg::secrets::Secrets, engine, signer::wire};
 use std::{num::NonZeroUsize, sync::mpsc as std_mpsc, thread::JoinHandle, time::Duration};
 
 /// Computes the answers to a received message: `(to node, raw bytes)`. Gets this identity's key

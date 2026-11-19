@@ -4,7 +4,7 @@
 # Run them with `integration/ethereum/scripts/env.sh fuzz <target|all> <seconds>`.
 
 [package]
-name = "eth-mpc-signer-fuzz"
+name = "eth-dvt-signer-fuzz"
 version = "0.0.0"
 edition = "2024"
 license = "MIT"
@@ -15,7 +15,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-eth-mpc-signer = { path = "..", features = ["fuzzing"] }
+eth-dvt-signer = { path = "..", features = ["fuzzing"] }
 
 # Not a member of the signer's build.
 [workspace]

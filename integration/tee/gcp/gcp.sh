@@ -112,7 +112,7 @@ setup() {
 	done
 	gcloud iam workload-identity-pools describe "$POOL" --location=global >/dev/null 2>&1 ||
 		gcloud iam workload-identity-pools create "$POOL" --location=global \
-			--display-name="eth-mpc-signer sealed nodes"
+			--display-name="eth-dvt-signer sealed nodes"
 	if ! gcloud iam workload-identity-pools providers describe "$PROVIDER" --location=global \
 		--workload-identity-pool="$POOL" >/dev/null 2>&1; then
 		gcloud iam workload-identity-pools providers create-oidc "$PROVIDER" --location=global \
@@ -129,7 +129,7 @@ setup() {
 	gcloud compute firewall-rules describe mpc-tee-api >/dev/null 2>&1 ||
 		gcloud compute firewall-rules create mpc-tee-api --network=default --direction=INGRESS \
 			--allow=tcp:8443 --source-ranges="$SERVER_IP/32" --target-tags="$TAG" \
-			--description="eth-mpc-signer sealed nodes: the mTLS API, from the test server only"
+			--description="eth-dvt-signer sealed nodes: the mTLS API, from the test server only"
 	log "setup done: bucket $BUCKET, key ring $KEYRING ($NODES keys), pool $POOL/$PROVIDER, firewall mpc-tee-api"
 }
 

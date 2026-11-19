@@ -10,7 +10,7 @@ use crate::{
     },
     signing::network_with_key,
 };
-use eth_mpc_signer::{
+use eth_dvt_signer::{
     readiness::BACKLOG_TOLERANCE,
     signer::wire::{self, Refusal},
 };

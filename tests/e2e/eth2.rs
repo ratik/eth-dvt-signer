@@ -11,7 +11,7 @@ use crate::{
     },
     rollback::CONSENSUS_JOURNAL,
 };
-use eth_mpc_signer::{
+use eth_dvt_signer::{
     eth::{
         duty::{Duty, format_root},
         network::Network,
@@ -743,7 +743,7 @@ fn e2e_eth_9_signing_requests_are_bound_to_their_authorization() {
     network.stop_node(3);
     let silent: Responder = Box::new(|_, _, _| Vec::new());
     let peer = FakePeer::start(&network, 3, &[], silent);
-    let id = |name: &str| eth_mpc_signer::dkg::CeremonyId::new(name).unwrap();
+    let id = |name: &str| eth_dvt_signer::dkg::CeremonyId::new(name).unwrap();
     let refused = |answer: wire::Message| match answer {
         wire::Message::Refused { reason, .. } => Some(reason),
         _ => None,

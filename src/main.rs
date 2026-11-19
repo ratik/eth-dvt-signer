@@ -1,8 +1,8 @@
-//! Run one node of an eth-mpc-signer network (BLS DKG and threshold signing).
+//! Run one node of an eth-dvt-signer network (BLS DKG and threshold signing).
 //!
 //! Without `--peers`, node `i` is a development node: its key is derived from the node index, it
 //! listens for peers on `127.0.0.1:<p2p-port + i>`, and it suits local networks and tests only.
-//! With `--peers`, it uses the identity in its vault (`eth-mpc-signer identity` makes it; sealed in
+//! With `--peers`, it uses the identity in its vault (`eth-dvt-signer identity` makes it; sealed in
 //! a TEE with `--vault gcp-tdx`, docs/tee.md) and the addresses of the peers file.
 //!
 //! Clients reach the node on `127.0.0.1:<http-port + i>`. This plain HTTP API is bound to loopback
@@ -31,7 +31,7 @@ use commonware_utils::{
     ordered::{Map, Set},
     union,
 };
-use eth_mpc_signer::{
+use eth_dvt_signer::{
     attestation::{Attester, Keys, Statement},
     engine::{self, Channels},
     eth::horizon::Horizon,
@@ -53,11 +53,11 @@ use std::{
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-/// `eth-mpc-signer identity`: initialize this node's vault (its identity, share-encryption key and
+/// `eth-dvt-signer identity`: initialize this node's vault (its identity, share-encryption key and
 /// TLS key, generated inside it) and print its keys as JSON, with the platform's attestation for a
 /// sealed vault. Run once, before the first start with `--peers`; later runs print the same keys.
 #[derive(Parser)]
-#[command(name = "eth-mpc-signer identity")]
+#[command(name = "eth-dvt-signer identity")]
 struct IdentityArgs {
     /// Index of this node.
     #[arg(long)]
@@ -123,7 +123,7 @@ struct VaultArgs {
     gcp_metadata_endpoint: String,
 
     /// `sev-snp`: the guest device of the AMD secure processor.
-    #[arg(long, default_value = eth_mpc_signer::attestation::snp::device::DEFAULT_PATH)]
+    #[arg(long, default_value = eth_dvt_signer::attestation::snp::device::DEFAULT_PATH)]
     snp_device: PathBuf,
 
     /// `sev-snp`: this chip's VCEK (DER, from AMD's KDS), attached to the node's evidence so that
@@ -139,13 +139,13 @@ struct VaultArgs {
 impl VaultArgs {
     fn snp_device(
         &self,
-    ) -> Result<std::sync::Arc<dyn eth_mpc_signer::attestation::snp::device::Device>, String> {
-        use eth_mpc_signer::attestation::snp::device::GuestDevice;
+    ) -> Result<std::sync::Arc<dyn eth_dvt_signer::attestation::snp::device::Device>, String> {
+        use eth_dvt_signer::attestation::snp::device::GuestDevice;
         match self.snp_fake_chip {
             None => Ok(std::sync::Arc::new(GuestDevice::new(&self.snp_device))),
             #[cfg(feature = "test-hooks")]
             Some(id) => Ok(std::sync::Arc::new(
-                eth_mpc_signer::attestation::snp::fake::Chip::new(id, [0x5E; 48]),
+                eth_dvt_signer::attestation::snp::fake::Chip::new(id, [0x5E; 48]),
             )),
             #[cfg(not(feature = "test-hooks"))]
             Some(_) => Err("--snp-fake-chip: only in a test build (feature test-hooks)".into()),
@@ -198,8 +198,8 @@ impl VaultArgs {
 
 #[derive(Parser)]
 #[command(
-    about = "Run a node of eth-mpc-signer (BLS DKG and threshold signing)",
-    after_help = "`eth-mpc-signer identity --help`: initialize the node's vault and print its keys."
+    about = "Run a node of eth-dvt-signer (BLS DKG and threshold signing)",
+    after_help = "`eth-dvt-signer identity --help`: initialize the node's vault and print its keys."
 )]
 struct Args {
     /// Index of this node; without `--peers`, also the seed of its (development) key.
@@ -207,7 +207,7 @@ struct Args {
     id: u64,
 
     /// The peers file (every node's identity and p2p address, in index order; `src/peers.rs`).
-    /// With it the node runs with the identity in its vault (`eth-mpc-signer identity`); without
+    /// With it the node runs with the identity in its vault (`eth-dvt-signer identity`); without
     /// it, with development keys on loopback.
     #[arg(long)]
     peers: Option<PathBuf>,
@@ -306,7 +306,7 @@ struct Args {
     approved_reshares: Option<PathBuf>,
 
     #[command(flatten)]
-    eth: eth_mpc_signer::eth::network::NetworkArgs,
+    eth: eth_dvt_signer::eth::network::NetworkArgs,
 
     /// The approvers of protected operations (`docs/administration.md`): a JSON file
     /// `{"threshold": M, "approvers": ["0x<ed25519 public key>", ...]}`, the same on every node.
@@ -344,31 +344,31 @@ struct Args {
 /// The exit status of a start refusal: 77 for a rollback the anchor shows, 1 for anything else.
 fn start_exit(err: &engine::StartError) -> i32 {
     match err {
-        engine::StartError::RolledBack(_) => eth_mpc_signer::anchor::EXIT_ROLLED_BACK,
+        engine::StartError::RolledBack(_) => eth_dvt_signer::anchor::EXIT_ROLLED_BACK,
         _ => 1,
     }
 }
 
 /// Load the approver file.
-fn load_approvers(path: &std::path::Path) -> Result<eth_mpc_signer::admin::Approvers, String> {
+fn load_approvers(path: &std::path::Path) -> Result<eth_dvt_signer::admin::Approvers, String> {
     let text = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
-    eth_mpc_signer::admin::Approvers::from_json(&text)
+    eth_dvt_signer::admin::Approvers::from_json(&text)
         .map_err(|err| format!("{}: {err}", path.display()))
 }
 
 /// Load an acknowledgment of a rollback (checked against the approvers at start).
 fn load_acknowledgment(
     path: &std::path::Path,
-) -> Result<eth_mpc_signer::anchor::AcknowledgmentDocument, String> {
+) -> Result<eth_dvt_signer::anchor::AcknowledgmentDocument, String> {
     let text = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
-    eth_mpc_signer::anchor::AcknowledgmentDocument::from_json(&text)
+    eth_dvt_signer::anchor::AcknowledgmentDocument::from_json(&text)
         .map_err(|err| format!("{}: {err}", path.display()))
 }
 
 /// Load the share-encryption key: owner-only permissions, or the node refuses to start.
 fn load_share_key(
     path: &std::path::Path,
-) -> Result<eth_mpc_signer::import::envelope::ShareKey, String> {
+) -> Result<eth_dvt_signer::import::envelope::ShareKey, String> {
     let metadata = std::fs::metadata(path).map_err(|err| format!("{}: {err}", path.display()))?;
     if metadata.permissions().mode() & 0o077 != 0 {
         return Err(format!(
@@ -377,7 +377,7 @@ fn load_share_key(
         ));
     }
     let text = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
-    eth_mpc_signer::import::envelope::ShareKey::from_file(&text)
+    eth_dvt_signer::import::envelope::ShareKey::from_file(&text)
         .map_err(|err| format!("{}: {err}", path.display()))
 }
 
@@ -392,7 +392,7 @@ fn vault_dir(data_dir: &std::path::Path, id: u64) -> PathBuf {
     data_dir.join(format!("node-{id}")).join("vault")
 }
 
-/// `eth-mpc-signer identity`: prints the node's [Statement].
+/// `eth-dvt-signer identity`: prints the node's [Statement].
 fn identity(args: IdentityArgs) -> ! {
     let kind = args.vault.kind().unwrap_or_else(|err| refuse(err));
     let runtime = ::tokio::runtime::Builder::new_current_thread()
@@ -416,7 +416,7 @@ fn identity(args: IdentityArgs) -> ! {
             .tls(Some(&args.tls_names))
             .map_err(|err| err.to_string())?
             .expect("created");
-        let spki = eth_mpc_signer::tls::spki(&tls_key)?;
+        let spki = eth_dvt_signer::tls::spki(&tls_key)?;
         let keys = Keys::new(
             &identity.public_key(),
             Some(share_key.public()),
@@ -438,19 +438,19 @@ fn identity(args: IdentityArgs) -> ! {
     }
 }
 
-/// `eth-mpc-signer snp-host-data`: print the `HOST_DATA` this SEV-SNP guest was launched with (hex),
+/// `eth-dvt-signer snp-host-data`: print the `HOST_DATA` this SEV-SNP guest was launched with (hex),
 /// from a fresh report of its secure processor. The image compares it with its configuration's
 /// digest before it starts the node (integration/tee/image, `config`).
 #[derive(Parser)]
-#[command(name = "eth-mpc-signer snp-host-data")]
+#[command(name = "eth-dvt-signer snp-host-data")]
 struct SnpHostDataArgs {
     /// The guest device of the AMD secure processor.
-    #[arg(long, default_value = eth_mpc_signer::attestation::snp::device::DEFAULT_PATH)]
+    #[arg(long, default_value = eth_dvt_signer::attestation::snp::device::DEFAULT_PATH)]
     snp_device: PathBuf,
 }
 
 fn snp_host_data(args: SnpHostDataArgs) -> ! {
-    use eth_mpc_signer::attestation::snp::{
+    use eth_dvt_signer::attestation::snp::{
         device::{Device as _, GuestDevice},
         report::Report,
     };
@@ -503,9 +503,9 @@ async fn node_keys(args: &Args, kind: &vault::Kind, peers: Option<&Peers>) -> No
     if &signer.public_key() != expected {
         refuse(format!(
             "this node's identity {} is not node {}'s in the peers file ({})",
-            eth_mpc_signer::admin::format_key(&signer.public_key()),
+            eth_dvt_signer::admin::format_key(&signer.public_key()),
             args.id,
-            eth_mpc_signer::admin::format_key(expected),
+            eth_dvt_signer::admin::format_key(expected),
         ));
     }
     let share_key = match file_share_key {
@@ -514,7 +514,7 @@ async fn node_keys(args: &Args, kind: &vault::Kind, peers: Option<&Peers>) -> No
     };
     let tls = vault.tls(None).unwrap_or_else(|err| refuse(err));
     if args.https_listen.is_some() && tls.is_none() {
-        refuse("--https-listen: the vault has no TLS key (run `eth-mpc-signer identity`)");
+        refuse("--https-listen: the vault has no TLS key (run `eth-dvt-signer identity`)");
     }
     NodeKeys {
         signer,
@@ -545,7 +545,7 @@ fn main() {
         .with_env_filter(filter())
         .with_ansi(std::io::stdout().is_terminal())
         .init();
-    eth_mpc_signer::hooks::exit_on_stdin_eof();
+    eth_dvt_signer::hooks::exit_on_stdin_eof();
     assert!(
         args.id < args.participants + args.followers,
         "id must be below participants + followers"
@@ -639,7 +639,7 @@ fn main() {
     };
     let administration = match args.approvers.as_deref().map(load_approvers).transpose() {
         // Approvals are bound to the network too (P0.3).
-        Ok(Some(approvers)) => Some(eth_mpc_signer::admin::Administration::with_network(
+        Ok(Some(approvers)) => Some(eth_dvt_signer::admin::Administration::with_network(
             approvers,
             &participants,
             horizon.network().map(|network| network.identity()),
@@ -678,7 +678,7 @@ fn main() {
     let roughtime = args.roughtime.as_ref().map(|path| {
         let text = std::fs::read_to_string(path)
             .unwrap_or_else(|err| refuse(format!("--roughtime {}: {err}", path.display())));
-        eth_mpc_signer::clock::Config::from_json(&text)
+        eth_dvt_signer::clock::Config::from_json(&text)
             .unwrap_or_else(|err| refuse(format!("--roughtime {}: {err}", path.display())))
     });
     if roughtime.is_none() && kind.is_sealed() {
@@ -693,7 +693,7 @@ fn main() {
         // The trusted clock: synced before anything time-bound starts (the restart floor is
         // computed from its first sync), then kept in sync.
         if let Some(config) = roughtime {
-            let clock = std::sync::Arc::new(eth_mpc_signer::clock::Clock::new(config));
+            let clock = std::sync::Arc::new(eth_dvt_signer::clock::Clock::new(config));
             let mut wait = std::time::Duration::from_secs(1);
             loop {
                 match clock.sync().await {
@@ -712,7 +712,7 @@ fn main() {
                     }
                 }
             }
-            eth_mpc_signer::clock::install(clock.clone()).unwrap_or_else(|err| refuse(err));
+            eth_dvt_signer::clock::install(clock.clone()).unwrap_or_else(|err| refuse(err));
             ::tokio::spawn(clock.keep_synced());
         }
         let NodeKeys {
@@ -725,7 +725,7 @@ fn main() {
         let share_key_public = share_key.as_ref().map(|key| *key.public());
         let tls_spki = tls
             .as_ref()
-            .map(|(key, _)| eth_mpc_signer::tls::spki(key))
+            .map(|(key, _)| eth_dvt_signer::tls::spki(key))
             .transpose()
             .unwrap_or_else(|err| refuse(err));
         // The mTLS listener's configuration, checked before anything starts.
@@ -735,17 +735,17 @@ fn main() {
                     .unwrap_or_else(|err| refuse(format!("{}: {err}", client_ca.display())));
                 let revoked = match &args.revoked_client_certs {
                     Some(path) => {
-                        let (revoked, reload) = eth_mpc_signer::tls::Revocations::from_file(
+                        let (revoked, reload) = eth_dvt_signer::tls::Revocations::from_file(
                             path,
-                            eth_mpc_signer::tls::REVOCATIONS_RELOAD,
+                            eth_dvt_signer::tls::REVOCATIONS_RELOAD,
                         )
                         .unwrap_or_else(|err| refuse(err));
                         ::tokio::spawn(reload);
                         revoked
                     }
-                    None => eth_mpc_signer::tls::Revocations::none(),
+                    None => eth_dvt_signer::tls::Revocations::none(),
                 };
-                let config = eth_mpc_signer::tls::server_config(key, chain, &client_ca, &revoked)
+                let config = eth_dvt_signer::tls::server_config(key, chain, &client_ca, &revoked)
                     .unwrap_or_else(|err| refuse(err));
                 Some((address, config, revoked))
             }
@@ -903,7 +903,7 @@ fn main() {
             }));
         }
         if let Some((address, config, revoked)) = https {
-            let listener = eth_mpc_signer::tls::Listener::bind(address, config, revoked)
+            let listener = eth_dvt_signer::tls::Listener::bind(address, config, revoked)
                 .await
                 .unwrap_or_else(|err| refuse(format!("--https-listen {address}: {err}")));
             info!(%address, "serving the API over mTLS");
@@ -935,7 +935,7 @@ fn main() {
                     height,
                     "the anchor shows this network was rolled back: exiting (docs/anchor.md)"
                 );
-                std::process::exit(eth_mpc_signer::anchor::EXIT_ROLLED_BACK);
+                std::process::exit(eth_dvt_signer::anchor::EXIT_ROLLED_BACK);
             }
             None => {
                 error!(?result, "node stopped");

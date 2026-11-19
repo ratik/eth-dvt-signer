@@ -20,7 +20,7 @@ use commonware_cryptography::{
 };
 use commonware_runtime::{Clock as _, IoBuf, Runner as _, deterministic};
 use commonware_utils::ordered::Quorum as _;
-use eth_mpc_signer::{
+use eth_dvt_signer::{
     dkg::{
         Variant,
         ceremony::Ceremony,

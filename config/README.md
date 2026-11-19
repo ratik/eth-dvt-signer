@@ -1,4 +1,4 @@
-`roughtime.json`: the trusted clock's default configuration (`eth-mpc-signer --roughtime`,
+`roughtime.json`: the trusted clock's default configuration (`eth-dvt-signer --roughtime`,
 `src/clock`, docs/ethereum-signing.md).
 
 - **Servers:** every public Roughtime server that answered on 2026-11-13, 13 servers of 9

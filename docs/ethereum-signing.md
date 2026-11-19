@@ -20,7 +20,7 @@ validator with real stake.
 
 | Term | Meaning |
 | ---- | ------- |
-| node | One `eth-mpc-signer` process: a committee node votes in consensus, a follower only follows it. |
+| node | One `eth-dvt-signer` process: a committee node votes in consensus, a follower only follows it. |
 | leader, voter | The committee node that proposes a consensus block, and the nodes that vote on it. |
 | keyholder | A node that holds a share of a validator key and gives partial signatures. |
 | coordinator | The committee node that receives a signing request: it gets the duty authorized and collects the partials. |

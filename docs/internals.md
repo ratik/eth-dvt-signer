@@ -114,7 +114,7 @@ Each channel has a quota of 1 000 messages per second for each peer. The largest
 
 | Module | Role | commonware |
 | ------ | ---- | ---------- |
-| `src/main.rs` | CLI (`eth-mpc-signer`, `eth-mpc-signer identity`), tokio runtime, authenticated p2p, HTTP and mTLS listeners | `runtime`, `p2p` (`lookup`) |
+| `src/main.rs` | CLI (`eth-dvt-signer`, `eth-dvt-signer identity`), tokio runtime, authenticated p2p, HTTP and mTLS listeners | `runtime`, `p2p` (`lookup`) |
 | `src/engine.rs` | opens and checks durable state, then wires one node together: channels, archives, marshal, consensus, actors | `consensus::simplex`, `consensus::marshal`, `broadcast::buffered`, `storage::archive` |
 | `src/application.rs` | mempool, block proposal and verification (`propose`, `verify`) | `consensus::Application` (wrapped by marshal `Inline`) |
 | `src/executor.rs` | the state machine actor: applies finalized blocks, answers clients, hands committed authorizations to the keyholder, prunes history | |
@@ -712,7 +712,7 @@ The harness:
 - kills the nodes when the test ends; nodes also exit if the test process dies;
 - prints every node's log tail on failure.
 
-The E2E tests run `target/debug/eth-mpc-signer`. Any `cargo test` or `cargo build` with other
+The E2E tests run `target/debug/eth-dvt-signer`. Any `cargo test` or `cargo build` with other
 features replaces it. Do not run them at the same time. After a default build, run
 `touch src/main.rs` so the next `test-hooks` build relinks it ([audit.md](audit.md), T-8).
 

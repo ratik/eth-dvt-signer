@@ -22,7 +22,7 @@ use commonware_cryptography::{
     ed25519::{PrivateKey, PublicKey},
 };
 use commonware_utils::{TryCollect as _, ordered::Set};
-use eth_mpc_signer::{
+use eth_dvt_signer::{
     dkg::ceremony::Membership,
     engine,
     types::{Command, Transaction},
@@ -660,7 +660,7 @@ fn r2_e2e_4_invalid_or_stale_membership() {
                 .unwrap()
                 .try_into()
                 .unwrap(),
-            ceremony: eth_mpc_signer::dkg::CeremonyId::new("approved.validator-r2-g1").unwrap(),
+            ceremony: eth_dvt_signer::dkg::CeremonyId::new("approved.validator-r2-g1").unwrap(),
             membership: Some(Box::new(membership)),
         },
     }

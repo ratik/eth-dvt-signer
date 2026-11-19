@@ -1,7 +1,7 @@
 //! The peers file: every node's identity (Ed25519 public key) and p2p address, by index.
 //!
 //! Nodes started with `--peers` use real identities, kept in their vault (`vault`) and created by
-//! `eth-mpc-signer identity`. Without it, a node derives development keys from the node index and
+//! `eth-dvt-signer identity`. Without it, a node derives development keys from the node index and
 //! listens on loopback (local networks and tests only).
 //!
 //! ```json

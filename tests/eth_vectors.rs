@@ -2,7 +2,7 @@
 //! specification test vectors (`ssz_static`, mainnet preset), vendored from
 //! `ethereum/consensus-spec-tests` (commit in `tests/vectors/ssz_static/SOURCE_COMMIT`).
 
-use eth_mpc_signer::eth::types::*;
+use eth_dvt_signer::eth::types::*;
 use serde::de::DeserializeOwned;
 use std::path::Path;
 use tree_hash::TreeHash;
@@ -51,7 +51,7 @@ fn hash_tree_roots_match_the_specification_vectors() {
 }
 
 mod signing_roots {
-    use eth_mpc_signer::eth::{duty::*, types::*};
+    use eth_dvt_signer::eth::{duty::*, types::*};
 
     fn bytes<const N: usize>(hex: &str) -> [u8; N] {
         hex::decode(hex.trim_start_matches("0x"))

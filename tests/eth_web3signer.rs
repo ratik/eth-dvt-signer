@@ -1,7 +1,7 @@
 //! Parsing of Web3Signer signing requests (`eth::web3signer`), on fixtures shaped as Lighthouse
 //! v8.3.2 sends them (`tests/fixtures/web3signer/README.md`).
 
-use eth_mpc_signer::eth::{
+use eth_dvt_signer::eth::{
     duty::{AggregateAndProof, Duty, DutyKind, format_root},
     web3signer::{ParseError, parse_identifier, parse_request},
 };
@@ -15,7 +15,7 @@ fn fixture(name: &str) -> Value {
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
 
-fn parse(value: &Value) -> Result<eth_mpc_signer::eth::web3signer::Request, ParseError> {
+fn parse(value: &Value) -> Result<eth_dvt_signer::eth::web3signer::Request, ParseError> {
     parse_request(value.to_string().as_bytes())
 }
 
@@ -419,7 +419,7 @@ fn gloas_requests_parse() {
     let Duty::ExecutionPayloadEnvelope(summary) = &envelope.duty else {
         panic!("an envelope: {:?}", envelope.duty)
     };
-    let full: eth_mpc_signer::eth::gloas::ExecutionPayloadEnvelope =
+    let full: eth_dvt_signer::eth::gloas::ExecutionPayloadEnvelope =
         serde_json::from_value(value["execution_payload_envelope"]["data"].clone()).unwrap();
     assert_eq!(**summary, full.summary().unwrap());
     assert_eq!(summary.slot_number, 1);

@@ -1934,12 +1934,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "eth-mpc-signer"
+name = "eth-dvt-signer"
 version = "0.1.0"
 dependencies = [
  "aes",
  "anyhow",
  "aws-lc-rs",
+ "aws-lc-sys",
  "axum",
  "base64",
  "blst",
@@ -1961,6 +1962,7 @@ dependencies = [
  "commonware-stream",
  "commonware-utils",
  "ctr",
+ "ethereum_hashing",
  "ethereum_serde_utils",
  "ethereum_ssz",
  "ethereum_ssz_derive",

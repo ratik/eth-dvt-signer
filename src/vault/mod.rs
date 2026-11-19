@@ -94,7 +94,7 @@ pub enum Error {
     #[error("{0}: {1}")]
     Io(String, std::io::Error),
     #[error(
-        "the vault in {0} has no {1}: initialize it with `eth-mpc-signer identity` before starting"
+        "the vault in {0} has no {1}: initialize it with `eth-dvt-signer identity` before starting"
     )]
     Missing(String, &'static str),
     #[error(

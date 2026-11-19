@@ -5,7 +5,7 @@
 # and its HOST_DATA is zero: what it shows is the guest side (the device, the sealing key, the
 # report and the VCEK chain), not our image's launch.
 #
-#   BIN  eth-mpc-signer and mpc-admin (Linux x86-64)
+#   BIN  eth-dvt-signer and mpc-admin (Linux x86-64)
 #   RUN  a new directory for the run's files and summary
 #
 # gcloud runs in the pinned CLI image with the one-hour access token in $IT_HOME/gcp/token
@@ -44,7 +44,7 @@ gc() {
 		"$GCLOUD_IMAGE" gcloud "$@"
 }
 [ -s "$IT_HOME/gcp/token" ] || die "no access token in $IT_HOME/gcp/token (run.sh)"
-for file in eth-mpc-signer mpc-admin; do [ -x "$bin/$file" ] || die "no $bin/$file"; done
+for file in eth-dvt-signer mpc-admin; do [ -x "$bin/$file" ] || die "no $bin/$file"; done
 
 ssh-keygen -q -t ed25519 -N '' -C eth-mpc-snp-test -f "$run/id_ed25519"
 log "creating $VM ($SNP_MACHINE, SEV-SNP, $SNP_IMAGE_FAMILY) in $ZONE"
@@ -72,18 +72,18 @@ wait_ssh() {
 wait_ssh || die "no SSH to $ip"
 log "$VM at $ip"
 scp -q -i "$run/id_ed25519" -o StrictHostKeyChecking=no -o UserKnownHostsFile="$run/known_hosts" \
-	"$bin/eth-mpc-signer" "snp@$ip:"
+	"$bin/eth-dvt-signer" "snp@$ip:"
 
 # The guest: its SNP status, the device, HOST_DATA, a new vault and the same vault again.
 ssh_vm 'sudo dmesg | grep -iE "sev|snp|memory encryption" | head -20; uname -r' >"$run/guest.txt" 2>&1 || true
 ssh_vm 'sudo modprobe sev-guest; ls -l /dev/sev-guest' >>"$run/guest.txt" 2>&1 || true
 identity() {
-	ssh_vm "sudo ./eth-mpc-signer identity --id 0 --data-dir /var/lib/mpc-test --vault sev-snp" \
+	ssh_vm "sudo ./eth-dvt-signer identity --id 0 --data-dir /var/lib/mpc-test --vault sev-snp" \
 		>"$run/$1.json" 2>"$run/$1.log"
 }
 check "the guest has the SEV-SNP guest device" ssh_vm 'test -c /dev/sev-guest'
 check "snp-host-data reads HOST_DATA from a report (zero: Google sets none)" \
-	bash -c "ssh -i '$run/id_ed25519' -o UserKnownHostsFile='$run/known_hosts' -o BatchMode=yes snp@$ip 'sudo ./eth-mpc-signer snp-host-data' | tee '$run/host-data.txt' | grep -qx '0\{64\}'"
+	bash -c "ssh -i '$run/id_ed25519' -o UserKnownHostsFile='$run/known_hosts' -o BatchMode=yes snp@$ip 'sudo ./eth-dvt-signer snp-host-data' | tee '$run/host-data.txt' | grep -qx '0\{64\}'"
 check "identity makes a sealed sev-snp vault" identity first
 check "identity again opens the same vault (the same keys)" identity second
 same_keys() {
@@ -98,7 +98,7 @@ ssh_vm 'sudo cp -a /var/lib/mpc-test /var/lib/mpc-edited && sudo python3 -c "
 import json; p=\"/var/lib/mpc-edited/node-0/vault/dek.wrapped\"; w=json.load(open(p)); w[\"tcb_version\"] ^= 1; json.dump(w, open(p, \"w\"))"' \
 	>>"$run/checks.log" 2>&1 || true
 check "a vault whose wrapped key names another TCB version does not open" \
-	bash -c "! ssh -i '$run/id_ed25519' -o UserKnownHostsFile='$run/known_hosts' -o BatchMode=yes snp@$ip 'sudo ./eth-mpc-signer identity --id 0 --data-dir /var/lib/mpc-edited --vault sev-snp' >'$run/edited.json' 2>'$run/edited.log'"
+	bash -c "! ssh -i '$run/id_ed25519' -o UserKnownHostsFile='$run/known_hosts' -o BatchMode=yes snp@$ip 'sudo ./eth-dvt-signer identity --id 0 --data-dir /var/lib/mpc-edited --vault sev-snp' >'$run/edited.json' 2>'$run/edited.log'"
 
 # After a reboot the chip derives the same sealing key: the vault opens.
 log "rebooting $VM"

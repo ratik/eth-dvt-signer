@@ -8,7 +8,7 @@
 //! fails the test, so a new version of the specification cannot pass unread. The report is
 //! `docs/remote-signing-api.md`.
 
-use eth_mpc_signer::eth::{
+use eth_dvt_signer::eth::{
     duty::{Duty, DutyKind, Fork, ForkInfo, format_root},
     web3signer::{ParseError, parse_request},
 };

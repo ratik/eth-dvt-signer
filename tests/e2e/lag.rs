@@ -20,7 +20,7 @@ use crate::{
 };
 use commonware_codec::Encode as _;
 use commonware_cryptography::sha256::Digest;
-use eth_mpc_signer::{
+use eth_dvt_signer::{
     dkg::signing::Message,
     signer::wire::{self, Refusal},
 };

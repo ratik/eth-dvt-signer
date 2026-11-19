@@ -67,7 +67,7 @@ fn a_token_over_the_keys_and_nonce_verifies() {
     assert_eq!(verified.instance.as_deref(), Some(vm.instance_id.as_str()));
     assert_eq!(verified.rtmr1, vm.rtmr1);
 
-    // A nonce-less statement (`eth-mpc-signer identity`) verifies for the empty nonce.
+    // A nonce-less statement (`eth-dvt-signer identity`) verifies for the empty nonce.
     verify(
         &evidence(&issuer, &vm, &keys(), b"", |_| {}),
         &policy(&vm),

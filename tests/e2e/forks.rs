@@ -12,7 +12,7 @@ use crate::{
     failures::ask,
     harness::{NODES, TestNetwork, fork_schedule, peer::FakePeer},
 };
-use eth_mpc_signer::{
+use eth_dvt_signer::{
     dkg::CeremonyId,
     eth::duty::format_root,
     signer::wire::{Message, Refusal, Request},
@@ -170,8 +170,8 @@ fn p03_1_fork_info_follows_the_pinned_schedule() {
     // voters refuse its blocks; consensus goes on.
     let wrong = with_fork(&block(FULU + 96, 3), electra.0, electra.1, electra.2);
     let request =
-        eth_mpc_signer::eth::web3signer::parse_request(wrong.to_string().as_bytes()).unwrap();
-    let command = Command::Duty(Box::new(eth_mpc_signer::eth::duty::DutyRequest {
+        eth_dvt_signer::eth::web3signer::parse_request(wrong.to_string().as_bytes()).unwrap();
+    let command = Command::Duty(Box::new(eth_dvt_signer::eth::duty::DutyRequest {
         validator: hex::decode(key.trim_start_matches("0x"))
             .unwrap()
             .try_into()

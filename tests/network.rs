@@ -6,7 +6,7 @@ mod common;
 use common::{NODES, RETENTION, complete_dkg, id, request, start_network, wait_for_height};
 use commonware_runtime::{Clock as _, Runner as _, Storage as _, deterministic};
 use commonware_utils::NZU64;
-use eth_mpc_signer::{engine::Retention, types::Outcome};
+use eth_dvt_signer::{engine::Retention, types::Outcome};
 use futures::future::join_all;
 use std::time::Duration;
 

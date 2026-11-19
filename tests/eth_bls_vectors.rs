@@ -14,7 +14,7 @@ use commonware_cryptography::{
     ed25519::{PrivateKey, PublicKey},
 };
 use commonware_utils::{TryCollect as _, ordered::Set};
-use eth_mpc_signer::{
+use eth_dvt_signer::{
     dkg::{GroupKey, signing},
     eth::web3signer,
     import::{dealer, eip2335},

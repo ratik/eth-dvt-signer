@@ -13,7 +13,7 @@ use crate::{
 use commonware_codec::Encode as _;
 use commonware_cryptography::bls12381::primitives::variant::PartialSignature;
 use commonware_utils::Participant;
-use eth_mpc_signer::{
+use eth_dvt_signer::{
     dkg::{CeremonyId, signing::Message},
     signer::wire::{self, Refusal, Request},
 };

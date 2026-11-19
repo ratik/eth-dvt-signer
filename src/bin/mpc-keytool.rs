@@ -16,7 +16,7 @@ use clap::{Parser, Subcommand};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519::PublicKey;
 use commonware_utils::{TryCollect as _, ordered::Set};
-use eth_mpc_signer::{
+use eth_dvt_signer::{
     attestation::{
         Evidence,
         check::{Policy, verify},
@@ -43,7 +43,7 @@ use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(
-    about = "Offline key import for eth-mpc-signer: split an EIP-2335 keystore into encrypted 3-of-4 shares"
+    about = "Offline key import for eth-dvt-signer: split an EIP-2335 keystore into encrypted 3-of-4 shares"
 )]
 struct Args {
     #[command(subcommand)]
@@ -259,7 +259,7 @@ fn split(
             "--ceremony-id {}: an imported key's ceremony id must start with {} (only an \
              approved registration may start such a ceremony, so nobody can take the id first)",
             ceremony.as_str(),
-            eth_mpc_signer::dkg::RESERVED_PREFIX
+            eth_dvt_signer::dkg::RESERVED_PREFIX
         ));
     }
     // Before the keystore is even read: no share is made for keys that are not attested.

@@ -152,7 +152,7 @@ if [ -d /sys/devices/platform/sev-guest ]; then
 	modprobe -q sev-guest || log "modprobe sev-guest failed"
 	udevadm settle --timeout=10 || true
 	[ -c /dev/sev-guest ] || fail "SEV-SNP guest without /dev/sev-guest: not starting the node"
-	host_data="$(/usr/bin/eth-mpc-signer snp-host-data)" ||
+	host_data="$(/usr/bin/eth-dvt-signer snp-host-data)" ||
 		fail "SEV-SNP guest: no report from /dev/sev-guest: not starting the node"
 	if [ "$host_data" != "${digest:0:64}" ]; then
 		fail "SEV-SNP HOST_DATA $host_data is not this configuration's ${digest:0:64}: not starting the node with a configuration its attestation does not show"

@@ -10,7 +10,7 @@ use crate::{
     eth2::{activate_everywhere, attestation, signing_root},
     harness::{BINARY, NODES, TestNetwork, ethereum_verify, gcp::FakeGcp, http},
 };
-use eth_mpc_signer::{
+use eth_dvt_signer::{
     attestation::{Statement, verify::verify},
     peers::Peers,
     vault::{self, Cipher},
@@ -98,7 +98,7 @@ fn now() -> u64 {
         .as_secs()
 }
 
-/// `eth-mpc-signer identity` for node `id`: its statement.
+/// `eth-dvt-signer identity` for node `id`: its statement.
 fn identity(network: &TestNetwork, id: usize, vault: &[String]) -> Statement {
     let output = Command::new(BINARY)
         .args(["identity", "--id", &id.to_string(), "--data-dir"])
@@ -291,7 +291,7 @@ fn tee_1_sealed_nodes_attest_their_keys_sign_over_mtls_and_keep_nothing_in_the_c
         assert_eq!(verified.keys, statement.keys);
         assert_eq!(
             verified.instance,
-            Some(eth_mpc_signer::attestation::testing::instance_id(&format!(
+            Some(eth_dvt_signer::attestation::testing::instance_id(&format!(
                 "mpc-tee-{}",
                 statement.index
             )))
@@ -411,7 +411,7 @@ fn tee_2_a_restart_unseals_and_only_the_attested_image_on_its_vm_gets_the_key() 
     for (what, edit) in [
         (
             "another image",
-            (|vm: &mut eth_mpc_signer::attestation::testing::Vm| vm.rtmr1 = "ff".repeat(48))
+            (|vm: &mut eth_dvt_signer::attestation::testing::Vm| vm.rtmr1 = "ff".repeat(48))
                 as fn(&mut _),
         ),
         ("a debug VM", |vm| vm.dbgstat = "enabled".into()),
@@ -421,7 +421,7 @@ fn tee_2_a_restart_unseals_and_only_the_attested_image_on_its_vm_gets_the_key() 
         network.start_node(3);
         let status = network.wait_exit(3);
         assert_eq!(status.code(), Some(1), "{what}: {}", network.log(3));
-        let node_3 = eth_mpc_signer::attestation::testing::instance_id("mpc-tee-3");
+        let node_3 = eth_dvt_signer::attestation::testing::instance_id("mpc-tee-3");
         assert!(
             gcp.refusals()
                 .iter()
@@ -430,13 +430,13 @@ fn tee_2_a_restart_unseals_and_only_the_attested_image_on_its_vm_gets_the_key() 
             gcp.refusals()
         );
         gcp.set_vm("mpc-tee-3", |vm| {
-            *vm = eth_mpc_signer::attestation::testing::Vm::new("mpc-tee-3")
+            *vm = eth_dvt_signer::attestation::testing::Vm::new("mpc-tee-3")
         });
     }
     // A VM of the project with the release image, but not node 3's: STS admits it, and KMS
     // refuses it node 3's key (the key's IAM binding names node 3's instance ID).
     gcp.set_vm("mpc-tee-9", |_| {});
-    let other = eth_mpc_signer::attestation::testing::instance_id("mpc-tee-9");
+    let other = eth_dvt_signer::attestation::testing::instance_id("mpc-tee-9");
     let refusals = gcp.refusals().len();
     let mut args = gcp.vault_args_as(3, "mpc-tee-9");
     args.extend(network_args(&network, 3));
@@ -533,11 +533,11 @@ fn tee_5_the_mtls_api_refuses_clients_without_the_operators_certificate() {
         network.dir.join("revoked-client-certs"),
         format!(
             "{}\n",
-            hex::encode(eth_mpc_signer::tls::fingerprint(&operator.chain[0]))
+            hex::encode(eth_dvt_signer::tls::fingerprint(&operator.chain[0]))
         ),
     )
     .unwrap();
-    let deadline = std::time::Instant::now() + 4 * eth_mpc_signer::tls::REVOCATIONS_RELOAD;
+    let deadline = std::time::Instant::now() + 4 * eth_dvt_signer::tls::REVOCATIONS_RELOAD;
     while call(Operator::client(&statements[0], Some(&operator))).is_ok() {
         assert!(
             std::time::Instant::now() < deadline,
@@ -547,7 +547,7 @@ fn tee_5_the_mtls_api_refuses_clients_without_the_operators_certificate() {
     }
     // Lifted again: served again.
     std::fs::write(network.dir.join("revoked-client-certs"), "").unwrap();
-    let deadline = std::time::Instant::now() + 4 * eth_mpc_signer::tls::REVOCATIONS_RELOAD;
+    let deadline = std::time::Instant::now() + 4 * eth_dvt_signer::tls::REVOCATIONS_RELOAD;
     while call(Operator::client(&statements[0], Some(&operator))).is_err() {
         assert!(
             std::time::Instant::now() < deadline,
@@ -759,7 +759,7 @@ fn tee_3_shares_are_encrypted_only_to_keys_a_sealed_node_attested() {
 /// Once the old image is retired, a node back on it no longer gets its key.
 #[test]
 fn tee_6_an_image_upgrade_keeps_the_vault_and_retires_the_old_image() {
-    use eth_mpc_signer::attestation::{testing::Vm, verify::Policy};
+    use eth_dvt_signer::attestation::{testing::Vm, verify::Policy};
     let (network, gcp, operator, statements) = network(|_| true);
     let key = validator(&network);
     let release = Vm::new("release");
@@ -824,7 +824,7 @@ fn tee_6_an_image_upgrade_keeps_the_vault_and_retires_the_old_image() {
     network.stop_node(2);
     network.start_node(2);
     assert_eq!(network.wait_exit(2).code(), Some(1), "{}", network.log(2));
-    let node_2 = eth_mpc_signer::attestation::testing::instance_id("mpc-tee-2");
+    let node_2 = eth_dvt_signer::attestation::testing::instance_id("mpc-tee-2");
     assert!(
         gcp.refusals()[refusals..]
             .iter()
@@ -873,10 +873,10 @@ fn tee_7_sev_snp_vaults_seal_to_their_chip_and_clients_check_the_reports() {
         let evidence = statement.evidence.as_ref().expect("evidence");
         assert_eq!(evidence.platform, "sev-snp");
         assert!(evidence.vcek.is_some(), "the VCEK is attached");
-        let (report, _) = eth_mpc_signer::attestation::snp::decode(evidence).unwrap();
+        let (report, _) = eth_dvt_signer::attestation::snp::decode(evidence).unwrap();
         assert_eq!(
             report.report_data(),
-            eth_mpc_signer::attestation::snp::report_data(&statement.keys, b""),
+            eth_dvt_signer::attestation::snp::report_data(&statement.keys, b""),
             "node {id}"
         );
         let identity = std::fs::read(network.data_dir(id).join("vault").join("identity")).unwrap();

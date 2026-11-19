@@ -32,7 +32,7 @@ import urllib.error
 import urllib.request
 
 BIN = "/it/target/release"
-SIGNER, ADMIN, KEYTOOL = f"{BIN}/eth-mpc-signer", f"{BIN}/mpc-admin", f"{BIN}/mpc-keytool"
+SIGNER, ADMIN, KEYTOOL = f"{BIN}/eth-dvt-signer", f"{BIN}/mpc-admin", f"{BIN}/mpc-keytool"
 KEYSTORES = f"{BIN}/examples/load-keystores"
 NODES = 4
 HTTP = 8080

@@ -112,12 +112,12 @@ boot. So the node checks the flags before it sends the data key anywhere:
 
 ## Running sealed nodes
 
-1. **Initialize each node's vault on its VM.** `eth-mpc-signer identity` makes the identity, the
+1. **Initialize each node's vault on its VM.** `eth-dvt-signer identity` makes the identity, the
    share-encryption key and the TLS key and certificate inside the vault. It prints the node's
    statement: the public keys, the TLS chain and the platform's evidence.
 
    ```sh
-   eth-mpc-signer identity --id 2 --data-dir /data \
+   eth-dvt-signer identity --id 2 --data-dir /data \
      --vault gcp-tdx \
      --gcp-kms-key projects/P/locations/L/keyRings/R/cryptoKeys/node-2 \
      --gcp-wif-provider projects/NUMBER/locations/global/workloadIdentityPools/POOL/providers/PROVIDER \
@@ -333,7 +333,7 @@ the E2E tests with a fake chip (TEE-7); the image's direct boot under QEMU witho
 server we control), so its measured boot, HOST_DATA and the four-node cluster on SNP are untested.
 
 - **On GCP** (`integration/tee/gcp/snp-guest.sh BIN RUN`, run of 2026-11-17, 12 checks pass).
-  An N2D SEV-SNP VM (AMD Milan, Ubuntu 26.04, Linux 7.0) runs the release `eth-mpc-signer` as
+  An N2D SEV-SNP VM (AMD Milan, Ubuntu 26.04, Linux 7.0) runs the release `eth-dvt-signer` as
   root. Google launches this guest, so its measurement is Google's firmware's and its HOST_DATA is
   zero; what it shows is the guest side on real hardware:
   - the guest runs at VMPL 0 with `/dev/sev-guest`; `snp-host-data` reads HOST_DATA from a report;
@@ -361,7 +361,7 @@ server we control), so its measured boot, HOST_DATA and the four-node cluster on
   `launch.sh` launches the guest with the first 32 bytes of the configuration's digest as
   `HOST_DATA` (`attestation::config::host_data`; `mpc-admin config-rtmr3` prints it as
   `host_data`). Every report carries `HOST_DATA`. The image's `config` asks the device for a
-  report (`eth-mpc-signer snp-host-data`) and does not start the node unless its `HOST_DATA` is
+  report (`eth-dvt-signer snp-host-data`) and does not start the node unless its `HOST_DATA` is
   the configuration's digest. A client that pins a node's `host_data` thus pins its
   configuration, as `rtmr3` does on TDX. The device is the node's (udev:
   `60-eth-mpc-sev-guest.rules`).

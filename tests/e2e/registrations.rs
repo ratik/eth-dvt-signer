@@ -15,7 +15,7 @@ use crate::{
     failures::ask,
     harness::{NODES, TestNetwork, ethereum_verify, peer::FakePeer},
 };
-use eth_mpc_signer::{
+use eth_dvt_signer::{
     dkg::CeremonyId,
     eth::{
         duty::{Duty, DutyRequest, format_root},

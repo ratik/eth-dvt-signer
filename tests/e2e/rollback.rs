@@ -15,7 +15,7 @@ use crate::{
         root, unhex,
     },
 };
-use eth_mpc_signer::signer::wire::{self, Refusal};
+use eth_dvt_signer::signer::wire::{self, Refusal};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 

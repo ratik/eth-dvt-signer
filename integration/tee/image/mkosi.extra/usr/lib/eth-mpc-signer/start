@@ -10,7 +10,7 @@ set -euo pipefail
 mapfile -d '' -t args </run/eth-mpc-signer/argv
 case "${args[0]}" in
 identity)
-	statement="$(/usr/bin/eth-mpc-signer identity --data-dir /var/lib/mpc "${args[@]:1}")"
+	statement="$(/usr/bin/eth-dvt-signer identity --data-dir /var/lib/mpc "${args[@]:1}")"
 	line="eth-mpc-identity: $(printf '%s' "$statement" | base64 -w0) sha256 $(printf '%s' "$statement" | sha256sum | cut -d' ' -f1)"
 	# Twice: a reader takes the first copy whose SHA-256 holds.
 	echo "$line"
@@ -32,4 +32,4 @@ measure)
 	exec sleep infinity
 	;;
 esac
-exec /usr/bin/eth-mpc-signer --data-dir /var/lib/mpc "${args[@]}"
+exec /usr/bin/eth-dvt-signer --data-dir /var/lib/mpc "${args[@]}"

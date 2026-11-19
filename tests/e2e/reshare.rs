@@ -13,7 +13,7 @@ use crate::{
 };
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey, sha256::Digest};
-use eth_mpc_signer::{
+use eth_dvt_signer::{
     dkg::ceremony::ReadyAck,
     engine,
     types::{Command, Transaction},

@@ -53,7 +53,7 @@ build() {
 		-v "$IT_HOME:/it" -v "$repo:/it/src:ro" \
 		-e CARGO_HOME=/it/cargo-home -w /it/src \
 		"$RUST_IMAGE" cargo build --locked --release --features test-hooks \
-		--bin eth-mpc-signer --bin mpc-keytool --bin mpc-admin --bin mpc-gateway --target-dir /it/target
+		--bin eth-dvt-signer --bin mpc-keytool --bin mpc-admin --bin mpc-gateway --target-dir /it/target
 }
 
 fuzz_tools() {
@@ -74,7 +74,7 @@ fuzz_tools() {
 }
 
 fuzz_targets() {
-	sed -n 's/^name = "\(.*\)"$/\1/p' "$repo/fuzz/Cargo.toml" | grep -vx eth-mpc-signer-fuzz
+	sed -n 's/^name = "\(.*\)"$/\1/p' "$repo/fuzz/Cargo.toml" | grep -vx eth-dvt-signer-fuzz
 }
 
 fuzz() {
@@ -196,7 +196,7 @@ tee_qemu() {
 	# The signer and its token helper (`tee-token`, run by root on the image), default features
 	# (no test hooks, no dev API). The second build compiles from scratch into a throwaway volume
 	# at the same path, so equal binaries mean reproducible ones.
-	local target bins=(--bin eth-mpc-signer) copies="eth-mpc-signer"
+	local target bins=(--bin eth-dvt-signer) copies="eth-dvt-signer"
 	if [ -f "$repo/src/bin/tee-token.rs" ]; then
 		bins+=(--bin tee-token)
 		copies+=" tee-token"
@@ -242,9 +242,9 @@ tee_qemu() {
 	docker run --rm -u "$(id -u):$(id -g)" -v "$IT_HOME/cargo-home:/it/cargo-home" \
 		-v "$IT_HOME/tee/target-fake:/it/tee/target" -v "$repo:/it/src:ro" -v "$run:/it/out" \
 		-e CARGO_HOME=/it/cargo-home -w /it/src "$RUST_IMAGE" sh -c "
-			cargo build --locked --release --features fake-gcp --bin eth-mpc-signer \
+			cargo build --locked --release --features fake-gcp --bin eth-dvt-signer \
 				--target-dir /it/tee/target &&
-			cp /it/tee/target/release/eth-mpc-signer /it/out/eth-mpc-signer-fake" \
+			cp /it/tee/target/release/eth-dvt-signer /it/out/eth-dvt-signer-fake" \
 		>"$run/cargo-fake.log" 2>&1 || {
 		tail -n 30 "$run/cargo-fake.log" >&2
 		log "the fake-gcp signer build failed: $run/cargo-fake.log"
@@ -285,7 +285,7 @@ tee_qemu() {
 			-e TEE_SNAPSHOT="$TEE_SNAPSHOT" -e TEE_SOURCE_DATE_EPOCH="$TEE_SOURCE_DATE_EPOCH" \
 			-e TEE_IMAGE_VERSION="${TEE_IMAGE_VERSION:-}" \
 			-e TEE_SNP_VCPUS="$TEE_SNP_VCPUS" -e TEE_SNP_VCPU_TYPE="$TEE_SNP_VCPU_TYPE" \
-			-e BINARY="/it/out/eth-mpc-signer-$binary" "${helpers[@]}" \
+			-e BINARY="/it/out/eth-dvt-signer-$binary" "${helpers[@]}" \
 			-e OWNER="$(id -u):$(id -g)" "$tools" \
 			bash /it/src/integration/tee/qemu.sh build "${build%-*}" "/it/out/$build" || return 1
 	done

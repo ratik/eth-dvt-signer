@@ -51,7 +51,7 @@ tools' build, four image builds (about 2 minutes each with a warm package cache)
    (repart, ukify, stub), GRUB 2.12 (`grub-mkimage`, the x86_64-efi modules), QEMU 10, OVMF,
    swtpm, OpenSSL, Go 1.26; for SEV-SNP, Ubuntu's AmdSev OVMF and virtee's `sev-snp-measure`
    (each by SHA-256, `versions.env`).
-2. **Signer.** In `RUST_IMAGE` it builds `eth-mpc-signer` and `tee-token` with default features,
+2. **Signer.** In `RUST_IMAGE` it builds `eth-dvt-signer` and `tee-token` with default features,
    twice: first into the kept target directory, then from scratch into a tmpfs at the same path.
    - It builds `tee-fake-gcp`, `mpc-admin` and `mpc-keytool` with `test-hooks`, for the harness.
    - It builds the signer once more with `fake-gcp`, for the cluster's VMs. Only that build takes
@@ -174,7 +174,7 @@ tools' build, four image builds (about 2 minutes each with a warm package cache)
   enters emergency mode, and `systemctl default` after it starts a getty on the serial console.
 - **Root.** Debian trixie from the same snapshot, with systemd 257, networkd (DHCP, the lease's
   MTU), resolved and timesyncd. It holds:
-  - the signer at `/usr/bin/eth-mpc-signer`;
+  - the signer at `/usr/bin/eth-dvt-signer`;
   - its token helper at `/usr/bin/tee-token`;
   - go-tpm-tools' `gotpm` at `/usr/lib/eth-mpc-signer/gotpm`.
 
@@ -254,7 +254,7 @@ only when there is no TPM, so on GCE they stay in the vTPM.
 | `eth-mpc-data.service` | Finds the data disk: the ext4 file system labeled `mpc-data`, checked with `e2fsck`. On first boot it formats the one blank disk (≥ 1 GiB, no signature). Two candidates or none stop the node. |
 | `var-lib-mpc.mount` | Mounts the data disk at `/var/lib/mpc` (`nodev,nosuid,noexec`). The node's directory is `/var/lib/mpc/node-<id>`. |
 | `eth-mpc-config.service` | Reads the configuration and logs its files and digest. On TDX it loads `tdx_guest` and extends RTMR3 with the digest (`/sys/class/misc/tdx_guest/measurements/rtmr3:sha384`). It refuses to go on without that interface; elsewhere it logs that it skipped. In measure mode it prints the CCEL table, the event log and the TPM's event log. |
-| `eth-mpc-signer.service` | Runs the node as user `mpc` with the configured flags and `--data-dir /var/lib/mpc`. It restarts on failure, every 5 s, except on exit 77 (rollback). With `identity` as the first argument it runs `eth-mpc-signer identity` instead and prints the statement on the console twice, a second apart: `eth-mpc-identity: <base64> sha256 <hex>`. A reader takes the first copy whose SHA-256 holds. |
+| `eth-mpc-signer.service` | Runs the node as user `mpc` with the configured flags and `--data-dir /var/lib/mpc`. It restarts on failure, every 5 s, except on exit 77 (rollback). With `identity` as the first argument it runs `eth-dvt-signer identity` instead and prints the statement on the console twice, a second apart: `eth-mpc-identity: <base64> sha256 <hex>`. A reader takes the first copy whose SHA-256 holds. |
 | `eth-mpc-token.socket`, `eth-mpc-token@.service` | The token helper: `/run/eth-mpc-signer/token.sock` (root, group `mpc`, 0660), one root process per connection, `tee-token --gotpm /usr/lib/eth-mpc-signer/gotpm`. It answers one request line `{"audience", "nonces"}` with a token, or `error: ...`. The node (`--gcp-token-socket`) needs root for the TDX report and the vTPM, and gets nothing more. |
 | `eth-mpc-http-bridge.socket` | Only for a node with development keys (no `--peers`, nothing secret): it bridges the loopback HTTP API to port 9000. The harness runs sealed nodes (mTLS) and does not use it; it can go. |
 
@@ -264,7 +264,7 @@ The configuration is a set of small files:
 - `args`: the node's flags, one argument per line. Blank lines and `#` lines are skipped.
   - `--data-dir` is the image's and is refused.
   - `identity` as the first line makes the vault instead of running the node. The flags of
-    `eth-mpc-signer identity` follow.
+    `eth-dvt-signer identity` follow.
   - `measure` as the first line prints the platform's measurements (below) and idles.
 - any file a flag names, at `/run/eth-mpc-signer/config/<name>`: the peers file, the client CA,
   the approvers. Names match `[a-z0-9][a-z0-9-]*`, and each file is at most 1 MiB.

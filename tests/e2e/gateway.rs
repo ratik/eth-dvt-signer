@@ -12,7 +12,7 @@ use crate::{
     harness::{NODES, TestNetwork, ethereum_verify, fork_schedule, gcp::FakeGcp, http},
     tee::{Operator, network_with, validator},
 };
-use eth_mpc_signer::attestation::{testing::Vm, verify::Policy};
+use eth_dvt_signer::attestation::{testing::Vm, verify::Policy};
 use rustls::{
     ClientConfig, RootCertStore,
     crypto::aws_lc_rs,
@@ -302,7 +302,7 @@ fn gateway_2_hedges_a_slow_node_and_never_passes_on_a_wrong_signature() {
         ]
     };
     let settle =
-        || std::thread::sleep(eth_mpc_signer::gateway::nodes::DOWN_FOR + Duration::from_secs(1));
+        || std::thread::sleep(eth_dvt_signer::gateway::nodes::DOWN_FOR + Duration::from_secs(1));
     let pinned = policy(&gcp, release_rtmr3);
 
     // Node 0 holds every request it coordinates: after 300 ms the gateway asks the next node too,
@@ -466,7 +466,7 @@ fn client(
 #[test]
 fn gateway_4_validator_clients_need_a_certificate_of_its_client_ca() {
     let (network, gcp, operator, _) = network_with(|_| true, |_| Vec::new());
-    let server = eth_mpc_signer::tls::make(&["127.0.0.1".into()]).unwrap();
+    let server = eth_dvt_signer::tls::make(&["127.0.0.1".into()]).unwrap();
     let key_path = network.dir.join("gateway-server-key.pem");
     std::fs::write(
         &key_path,
@@ -562,11 +562,11 @@ fn gateway_4_validator_clients_need_a_certificate_of_its_client_ca() {
         &revoked,
         format!(
             "{}\n",
-            hex::encode(eth_mpc_signer::tls::fingerprint(&vc.chain[0]))
+            hex::encode(eth_dvt_signer::tls::fingerprint(&vc.chain[0]))
         ),
     )
     .unwrap();
-    let deadline = std::time::Instant::now() + 4 * eth_mpc_signer::tls::REVOCATIONS_RELOAD;
+    let deadline = std::time::Instant::now() + 4 * eth_dvt_signer::tls::REVOCATIONS_RELOAD;
     while upcheck(&gateway, client(&ca, Some(&vc), false)).is_ok() {
         assert!(
             std::time::Instant::now() < deadline,

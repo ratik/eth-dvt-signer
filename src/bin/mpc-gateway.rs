@@ -5,7 +5,7 @@
 //! computes itself under its pinned chain. It holds no key and no slashing state.
 
 use clap::Parser;
-use eth_mpc_signer::{
+use eth_dvt_signer::{
     attestation::{check::Policy, verify::Jwks},
     eth::network::NetworkArgs,
     gateway::{Config, Gateway, route::hedge_delay},

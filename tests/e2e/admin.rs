@@ -14,7 +14,7 @@ use crate::{
 };
 use commonware_codec::Encode as _;
 use commonware_cryptography::{Hasher as _, Sha256, Signer as _, ed25519::PrivateKey};
-use eth_mpc_signer::{
+use eth_dvt_signer::{
     admin::{NAMESPACE, SignedCommand},
     engine,
     types::{Approval, Authorized, Command, Reconfiguration, Transaction},

@@ -5,7 +5,7 @@
 //! cargo test --release --test eth_bench -- --ignored --nocapture
 //! ```
 
-use eth_mpc_signer::{
+use eth_dvt_signer::{
     eth::{
         duty::{Duty, DutyRequest, ForkInfo},
         types::{AttestationData, BeaconBlockHeader, Checkpoint},

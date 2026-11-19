@@ -16,7 +16,7 @@ use commonware_cryptography::{
     Signer as _,
     ed25519::{PrivateKey, PublicKey},
 };
-use eth_mpc_signer::{
+use eth_dvt_signer::{
     engine,
     types::{Command, Transaction},
 };

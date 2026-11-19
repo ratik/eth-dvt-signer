@@ -1940,14 +1940,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "eth-mpc-signer"
+name = "eth-dvt-signer"
 version = "0.1.0"
 dependencies = [
  "aes",
  "anyhow",
  "aws-lc-rs",
+ "aws-lc-sys",
  "axum",
  "base64",
+ "blst",
  "bytes",
  "chacha20poly1305",
  "clap",
@@ -1966,12 +1968,14 @@ dependencies = [
  "commonware-stream",
  "commonware-utils",
  "ctr",
+ "ethereum_hashing",
  "ethereum_serde_utils",
  "ethereum_ssz",
  "ethereum_ssz_derive",
  "futures",
  "hex",
  "hpke",
+ "libc",
  "object_store",
  "pbkdf2",
  "prometheus-client",
@@ -1996,14 +2000,15 @@ dependencies = [
  "tree_hash_derive",
  "typenum",
  "unicode-normalization",
+ "x509-parser",
  "zeroize",
 ]
 
 [[package]]
-name = "eth-mpc-signer-fuzz"
+name = "eth-dvt-signer-fuzz"
 version = "0.0.0"
 dependencies = [
- "eth-mpc-signer",
+ "eth-dvt-signer",
  "libfuzzer-sys",
 ]
 

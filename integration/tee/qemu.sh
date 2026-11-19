@@ -84,7 +84,7 @@ EOF
 
 	# The node binary, its token helper and gotpm (README: without them, no GCE token).
 	extra="$out/extra"
-	install -D -m 0755 "$BINARY" "$extra/usr/bin/eth-mpc-signer"
+	install -D -m 0755 "$BINARY" "$extra/usr/bin/eth-dvt-signer"
 	if [ -n "${TOKEN_BINARY:-}" ]; then
 		install -D -m 0755 "$TOKEN_BINARY" "$extra/usr/bin/tee-token"
 	else
@@ -176,7 +176,7 @@ measure() {
 	cmp -s "$esp/grub.cfg" "$here/image/grub/grub.cfg" || die "the ESP's grub.cfg is not image/grub/grub.cfg"
 	{
 		[ -z "${TEE_IMAGE_VERSION:-}" ] || echo "image.version $TEE_IMAGE_VERSION"
-		echo "binary.sha256 $(sha256sum "$out/extra/usr/bin/eth-mpc-signer" | cut -d' ' -f1)"
+		echo "binary.sha256 $(sha256sum "$out/extra/usr/bin/eth-dvt-signer" | cut -d' ' -f1)"
 		for file in usr/bin/tee-token usr/lib/eth-mpc-signer/gotpm; do
 			[ ! -f "$out/extra/$file" ] ||
 				echo "${file##*/}.sha256 $(sha256sum "$out/extra/$file" | cut -d' ' -f1)"
@@ -304,7 +304,7 @@ vm_config() {
 	shift 2
 	local config="$dir/config-$name" digest
 	mkdir -p "$config"
-	printf '%s\n' "# eth-mpc-signer arguments of VM $index ($name), one per line" "$@" >"$config/args"
+	printf '%s\n' "# eth-dvt-signer arguments of VM $index ($name), one per line" "$@" >"$config/args"
 	[ "${VM_SSH:-no}" = no ] || cp "$run/ssh/id_ed25519.pub" "$config/ssh-authorized-keys"
 	mkfs.vfat -C -n MPC-CONFIG "$dir/config-$name.img" 4096 >/dev/null
 	MTOOLS_SKIP_CHECK=1 mcopy -i "$dir/config-$name.img" "$config"/* ::/

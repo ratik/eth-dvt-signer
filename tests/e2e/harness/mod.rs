@@ -1,4 +1,4 @@
-//! Real-process test network: the actual `eth-mpc-signer` binary, one OS process per node, real
+//! Real-process test network: the actual `eth-dvt-signer` binary, one OS process per node, real
 //! authenticated p2p over loopback, real HTTP and real on-disk storage in a temporary directory.
 //!
 //! - Ports: a block of 32 ports per network, reserved with a lock file shared by every test process
@@ -19,7 +19,7 @@ use blst::{
     min_pk::{PublicKey as EthPublicKey, Signature as EthSignature},
 };
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
-use eth_mpc_signer::{
+use eth_dvt_signer::{
     admin::{Approvers, SignedCommand},
     dkg::signing::ETHEREUM_DST,
 };
@@ -42,7 +42,7 @@ pub const NODES: usize = 4;
 /// these 3 keys authorize a protected operation.
 /// The test chain's fork schedule (`--eth-fork-schedule`): mainnet's.
 pub fn fork_schedule() -> String {
-    eth_mpc_signer::eth::network::Network::MAINNET
+    eth_dvt_signer::eth::network::Network::MAINNET
         .forks
         .iter()
         .map(|fork| {
@@ -75,7 +75,7 @@ pub fn approvers_json() -> String {
 }
 
 /// The binary built for this test run (with the `test-hooks` feature).
-pub const BINARY: &str = env!("CARGO_BIN_EXE_eth-mpc-signer");
+pub const BINARY: &str = env!("CARGO_BIN_EXE_eth-dvt-signer");
 
 /// Seconds a coordinator waits for partial signatures (short, so failures fail fast).
 pub const SIGNING_TIMEOUT_SECS: u64 = 5;
@@ -362,7 +362,7 @@ impl TestNetwork {
             .env(
                 "RUST_LOG",
                 std::env::var("E2E_RUST_LOG")
-                    .unwrap_or_else(|_| "info,eth_mpc_signer=debug".into()),
+                    .unwrap_or_else(|_| "info,eth_dvt_signer=debug".into()),
             )
             .env("ETH_MPC_SIGNER_EXIT_ON_STDIN_EOF", "1")
             // The test chain's slots are long past (1-second slots from the Unix epoch): a
@@ -478,7 +478,7 @@ impl TestNetwork {
             // A request no command is built from: the node refuses it as it is (400).
             Err(_) => self.post(
                 via,
-                &eth_mpc_signer::admin::request_endpoint(operation, &request).unwrap(),
+                &eth_dvt_signer::admin::request_endpoint(operation, &request).unwrap(),
                 &request,
             ),
         }

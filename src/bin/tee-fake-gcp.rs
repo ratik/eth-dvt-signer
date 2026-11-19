@@ -11,7 +11,7 @@
 //! "dbgstat"}` changes what VM `i` reports from then on (another image, a debug VM).
 
 use clap::Parser;
-use eth_mpc_signer::attestation::fake::{FakeGcp, instance};
+use eth_dvt_signer::attestation::fake::{FakeGcp, instance};
 use std::{net::SocketAddr, path::PathBuf};
 
 #[derive(Parser)]

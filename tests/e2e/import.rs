@@ -7,7 +7,7 @@ use crate::{
     eth2::{CHAIN, activation, attestation, block, refused, signed, signing_root},
     harness::{NODES, TestNetwork, unhex},
 };
-use eth_mpc_signer::import::envelope::ShareKey;
+use eth_dvt_signer::import::envelope::ShareKey;
 use serde_json::{Value, json};
 use std::{
     os::unix::fs::OpenOptionsExt as _,

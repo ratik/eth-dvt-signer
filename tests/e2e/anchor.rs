@@ -22,7 +22,7 @@ use crate::{
 };
 use commonware_codec::Encode as _;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
-use eth_mpc_signer::anchor::{Marks, Record, SignedRecord};
+use eth_dvt_signer::anchor::{Marks, Record, SignedRecord};
 use serde_json::{Value, json};
 use std::{
     io::Write as _,

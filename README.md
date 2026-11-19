@@ -1,4 +1,4 @@
-# eth-mpc-signer
+# eth-dvt-signer
 
 A threshold signer for Ethereum validators. Four nodes hold shares of a validator's BLS key, and
 any three of them sign. No node, and no operator, ever holds the whole key. A validator client
@@ -76,7 +76,7 @@ Design notes: [docs/architecture.md](docs/architecture.md).
 
 | Binary | Role |
 | --- | --- |
-| `eth-mpc-signer` | The node: consensus, state, DKG, signing, the HTTP and mTLS API. `eth-mpc-signer identity` makes a node's keys in its vault. |
+| `eth-dvt-signer` | The node: consensus, state, DKG, signing, the HTTP and mTLS API. `eth-dvt-signer identity` makes a node's keys in its vault. |
 | `mpc-gateway` | The validator client's Web3Signer endpoint in front of the nodes. |
 | `mpc-admin` | Operator and approver tool: status, attestation checks, drafts and offline signatures of protected operations, anchor checks. |
 | `mpc-keytool` | Offline tool for key import: splits a keystore into encrypted shares. |
@@ -168,7 +168,7 @@ cargo test                                   # unit tests and 4-node simulations
 cargo test --features test-hooks --test e2e  # real processes, real p2p and storage (several minutes)
 ```
 
-- The E2E tests run `target/debug/eth-mpc-signer`. Do not run them at the same time as another
+- The E2E tests run `target/debug/eth-dvt-signer`. Do not run them at the same time as another
   build with other features.
 - A devnet run with a real validator client (Kurtosis in Docker, about an hour), Lighthouse's
   or, with `IT_VC=teku` or `IT_VC=nimbus`, Teku's or Nimbus's:

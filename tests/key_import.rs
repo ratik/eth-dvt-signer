@@ -10,7 +10,7 @@ use commonware_cryptography::{
 };
 use commonware_utils::{Participant, TryCollect as _, ordered::Set};
 use ctr::cipher::{KeyIvInit as _, StreamCipher as _};
-use eth_mpc_signer::{
+use eth_dvt_signer::{
     dkg::{CeremonyId, PROTOCOL_VERSION, signing},
     import::{
         dealer,
@@ -531,7 +531,7 @@ fn keytool_splits_a_keystore_into_four_encrypted_shares() {
     assert!(inspected.status.success(), "{inspected:?}");
 
     // Each node opens its own share with its own key.
-    let manifest: eth_mpc_signer::import::manifest::ManifestJson =
+    let manifest: eth_dvt_signer::import::manifest::ManifestJson =
         serde_json::from_slice(&std::fs::read(shares.join("manifest.json")).unwrap()).unwrap();
     let manifest = Manifest::from_json(&manifest).unwrap();
     let sharing = manifest.check(&committee()).unwrap();

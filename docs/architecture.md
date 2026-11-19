@@ -126,7 +126,7 @@ Kurtosis devnet (ethereum-package): geth + Lighthouse beacon node + genesis vali
 Lighthouse validator client v8.3.2: web3signer validators only, no keystore (the DKG key;
                                     after the migration scenario, also a genesis key)
           │ Web3Signer HTTP API
-mpc-gateway (docs/gateway.md)  ──>  4 eth-mpc-signer nodes (this repository)
+mpc-gateway (docs/gateway.md)  ──>  4 eth-dvt-signer nodes (this repository)
 ```
 
 The Gloas devnet runs Lighthouse v8.3.3 (`integration/ethereum/kurtosis/network-gloas.yaml`). The

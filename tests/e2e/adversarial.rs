@@ -13,7 +13,7 @@ use crate::{
 };
 use blst::min_pk::Signature as EthSignature;
 use commonware_codec::Encode as _;
-use eth_mpc_signer::{
+use eth_dvt_signer::{
     dkg::{CeremonyId, parked::PER_PEER, signing::Message},
     signer::wire::{self, Refusal, Request},
 };

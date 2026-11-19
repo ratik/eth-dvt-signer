@@ -21,7 +21,7 @@ build)
 	docker run --rm --name eth-mpc-load-build -u "$(id -u):$(id -g)" \
 		-v "$IT_HOME:/it" -v "$repo:/it/src:ro" -e CARGO_HOME=/it/cargo-home -w /it/src \
 		"$RUST_IMAGE" cargo build --locked --release --target-dir /it/target \
-		--bin eth-mpc-signer --bin mpc-admin --bin mpc-keytool --example load-keystores
+		--bin eth-dvt-signer --bin mpc-admin --bin mpc-keytool --example load-keystores
 	;;
 run)
 	name="${2:?usage: run-keys.sh run NAME ARGS...}"

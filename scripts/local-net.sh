@@ -16,7 +16,7 @@ pids=()
 trap 'kill "${pids[@]}" 2>/dev/null; wait' EXIT INT TERM
 
 for ((i = 0; i < NODES; i++)); do
-  ./target/release/eth-mpc-signer --id "$i" --participants "$NODES" --data-dir "$DATA_DIR" \
+  ./target/release/eth-dvt-signer --id "$i" --participants "$NODES" --data-dir "$DATA_DIR" \
     ${ETH_NETWORK:+--eth-network "$ETH_NETWORK"} ${APPROVERS:+--approvers "$APPROVERS"} \
     >"$DATA_DIR/node-$i.log" 2>&1 &
   pids+=($!)

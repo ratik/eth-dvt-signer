@@ -1,7 +1,7 @@
 //! The mTLS listener (`--https-listen`, docs/tee.md): the node's API over TLS 1.3, to clients that
 //! present a certificate from the operator's CA (`--client-ca`).
 //!
-//! The server's key and certificates are made in the node's vault by `eth-mpc-signer identity`:
+//! The server's key and certificates are made in the node's vault by `eth-dvt-signer identity`:
 //! - a node CA (self-signed; its key is used once and dropped);
 //! - a server certificate it signs for the names given with `--tls-san`.
 //!

@@ -42,7 +42,7 @@
 //! mpc-admin anchor acknowledge --anchor s3://bucket/prefix --cluster 0x.. \
 //!     --approvers approvers.json --output acknowledgment.json
 //! mpc-admin sign --command acknowledgment.json --key approver.key --output acknowledgment-1.json
-//! eth-mpc-signer ... --anchor s3://bucket/prefix --anchor-acknowledgment acknowledgment-signed.json
+//! eth-dvt-signer ... --anchor s3://bucket/prefix --anchor-acknowledgment acknowledgment-signed.json
 //! ```
 //!
 //! Nothing the tool does decides safety: every voter checks the approvals and the nonce of a
@@ -58,7 +58,7 @@ use commonware_cryptography::{
     Hasher as _, Sha256, Signer as _, ed25519::PrivateKey, sha256::Digest,
 };
 use commonware_math::algebra::Random as _;
-use eth_mpc_signer::{
+use eth_dvt_signer::{
     admin::{
         Approvers, SignedCommand, duty_overview, duty_request, format_key, history_overview,
         signed_message,
@@ -152,7 +152,7 @@ enum Command {
     /// configuration no client should pin: the sealed vault's test endpoints, or a file flag that
     /// names a file outside the configuration (`attestation::config::check_args`).
     ConfigRtmr3 { dir: PathBuf },
-    /// Check a node's statement (`eth-mpc-signer identity` output, or a saved
+    /// Check a node's statement (`eth-dvt-signer identity` output, or a saved
     /// `GET /attestation` answer) against a policy, without asking the node: its evidence binds
     /// its keys (and the nonce it answered). Prints what the evidence shows: the measurement, the
     /// configuration and the machine (an SEV-SNP chip ID), to write a policy from. An SEV-SNP
@@ -397,7 +397,7 @@ fn main() -> ExitCode {
             )
         }),
         Command::ConfigRtmr3 { dir } => {
-            use eth_mpc_signer::attestation::config;
+            use eth_dvt_signer::attestation::config;
             config::read_dir(&dir)
                 .and_then(|files| {
                     config::check_args(&files).and_then(|()| config::digest_of(&files))
@@ -1964,7 +1964,7 @@ fn tls_client(args: &Args, attesting: bool) -> Result<Option<Arc<rustls::ClientC
         // `attest` then requires the key that answered to be the attested one.
         (_, true) => builder
             .dangerous()
-            .with_custom_certificate_verifier(eth_mpc_signer::tls::AnyServerKey::new()),
+            .with_custom_certificate_verifier(eth_dvt_signer::tls::AnyServerKey::new()),
         (Some(path), false) => {
             let mut roots = rustls::RootCertStore::empty();
             for certificate in CertificateDer::pem_slice_iter(&read(path)?) {
@@ -2009,7 +2009,7 @@ fn last_certificate(chain: &str) -> Option<String> {
 }
 
 fn check_statement(statement: &Path, policy: &Path, jwks: Option<&Path>) -> Result<(), String> {
-    use eth_mpc_signer::attestation::{
+    use eth_dvt_signer::attestation::{
         Statement,
         check::{Policy, VcekCache, attach_vcek, verify},
         verify::{Jwks, fetch_google_jwks},
@@ -2039,9 +2039,9 @@ fn check_statement(statement: &Path, policy: &Path, jwks: Option<&Path>) -> Resu
     }
     let nonce = match evidence.nonce.as_str() {
         "" => Vec::new(),
-        nonce => eth_mpc_signer::import::unhex(nonce).ok_or("evidence: the nonce is not hex")?,
+        nonce => eth_dvt_signer::import::unhex(nonce).ok_or("evidence: the nonce is not hex")?,
     };
-    if let Ok((report, _)) = eth_mpc_signer::attestation::snp::decode(&evidence) {
+    if let Ok((report, _)) = eth_dvt_signer::attestation::snp::decode(&evidence) {
         // What the report says before any check: to write a policy from (never to trust).
         println!(
             "report (not checked yet): version {}, measurement {}, host_data {}, chip {}, \
@@ -2091,7 +2091,7 @@ fn attest(
     committee: Option<&Path>,
     certificates: Option<&Path>,
 ) -> Result<(), String> {
-    use eth_mpc_signer::attestation::{
+    use eth_dvt_signer::attestation::{
         Statement,
         check::{Policy, VcekCache, attach_vcek, verify},
         verify::{Jwks, fetch_google_jwks},

@@ -22,7 +22,7 @@ use axum::{
 use commonware_cryptography::{
     Hasher as _, Sha256, Signer as _, ed25519::PrivateKey, sha256::Digest,
 };
-use eth_mpc_signer::anchor::{
+use eth_dvt_signer::anchor::{
     Acknowledgment, AcknowledgmentDocument, AnchorError, AnchorStore, Marks, Record, SignedRecord,
 };
 use std::{

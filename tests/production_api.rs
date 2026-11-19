@@ -52,7 +52,7 @@ impl Node {
         std::fs::create_dir_all(&dir).unwrap();
         let (p2p, http) = (free_port(), free_port());
         let log = std::fs::File::create(dir.join("node.log")).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_eth-mpc-signer"))
+        let child = Command::new(env!("CARGO_BIN_EXE_eth-dvt-signer"))
             .args(["--id", "0", "--participants", "4"])
             .args(["--p2p-port", &p2p.to_string()])
             .args(["--http-port", &http.to_string()])

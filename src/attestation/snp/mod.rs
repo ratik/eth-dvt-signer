@@ -10,7 +10,7 @@
 //!   has no migration agent, with a measurement and a TCB version the [Policy] allows, on the chip
 //!   and TCB version the VCEK names.
 //! - **No freshness but the nonce.** A report carries no time. A client that needs a fresh one
-//!   sends a nonce; evidence without one (`eth-mpc-signer identity`) proves which keys the image
+//!   sends a nonce; evidence without one (`eth-dvt-signer identity`) proves which keys the image
 //!   made, not that it still runs.
 
 pub mod certs;

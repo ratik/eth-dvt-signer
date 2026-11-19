@@ -105,7 +105,7 @@ pub struct Evidence {
 pub const MAX_NONCE: usize = 64;
 
 /// A node's keys and, for a sealed vault, its platform's evidence: what `GET /attestation`
-/// answers and `eth-mpc-signer identity` prints.
+/// answers and `eth-dvt-signer identity` prints.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Statement {

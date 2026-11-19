@@ -15,7 +15,7 @@ use commonware_runtime::{
     Blob as _, Clock as _, Handle, IoBuf, Quota, Storage as _, Supervisor as _, deterministic,
 };
 use commonware_utils::{NZU32, NZU64, NZUsize, TryCollect as _, ordered::Set, probability};
-use eth_mpc_signer::{
+use eth_dvt_signer::{
     admin::{Administration, Approvers, Endorsement},
     dkg::{self, CeremonyId, DkgStatus, actor::ShareStatus, ceremony::Ceremony},
     engine::{self, Channels, Retention},
@@ -257,7 +257,7 @@ pub async fn start_network_with(
                 approved_reshares: None,
                 // Simulated time starts at the Unix epoch, and these tests name several chains:
                 // the horizon has its own unit and end-to-end tests.
-                horizon: eth_mpc_signer::eth::horizon::Horizon::unbounded(),
+                horizon: eth_dvt_signer::eth::horizon::Horizon::unbounded(),
                 administration: Some(administration(&participants)),
                 anchor: None,
             },

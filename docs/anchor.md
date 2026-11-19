@@ -142,7 +142,7 @@ record (a forged height, digest or marks) can neither satisfy nor block any of t
 ## Configuration
 
 ```sh
-eth-mpc-signer ... --approvers approvers.json --anchor s3://anchor-bucket/eth-mpc \
+eth-dvt-signer ... --approvers approvers.json --anchor s3://anchor-bucket/eth-mpc \
     [--anchor-heartbeat-secs 600] [--anchor-acknowledgment acknowledgment.json]
 ```
 
@@ -288,7 +288,7 @@ Every node stops. Supervisors must not restart them in a loop. Then:
    mpc-admin sign --command acknowledgment.json --key approver.key --output acknowledgment-1.json
    # The next approver signs acknowledgment-1.json, and so on. Start every node with the copy
    # that has a threshold of approvals:
-   eth-mpc-signer ... --anchor <url> --anchor-acknowledgment acknowledgment-2.json
+   eth-dvt-signer ... --anchor <url> --anchor-acknowledgment acknowledgment-2.json
    ```
 
    - The acknowledgment names the next generation, the gate height and the block given up, and the

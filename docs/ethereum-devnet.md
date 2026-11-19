@@ -140,7 +140,7 @@ IT_HOME=~/eth-mpc-it IT_VC=teku ./integration/ethereum/scripts/run.sh       # an
 `run.sh` does these steps:
 
 1. `env.sh tools`: downloads the Kurtosis CLI into `$IT_HOME/bin` and checks its SHA-256.
-2. `env.sh build`: builds `eth-mpc-signer` (with `test-hooks`, which includes `dev-api`),
+2. `env.sh build`: builds `eth-dvt-signer` (with `test-hooks`, which includes `dev-api`),
    `mpc-keytool`, `mpc-admin` and `mpc-gateway`, release, in the pinned Rust image.
 3. `env.sh up`: starts the isolated environment and the Kurtosis engine inside it.
 4. `it.py $IT_RUN` inside the environment (default `run`), in `$IT_HOME/runs/<UTC time>/`.

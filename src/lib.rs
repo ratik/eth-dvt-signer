@@ -1,4 +1,4 @@
-//! eth-mpc-signer: distributed key generation of a BLS12-381 threshold key and consensus-authorized
+//! eth-dvt-signer: distributed key generation of a BLS12-381 threshold key and consensus-authorized
 //! threshold signing of Ethereum signing roots, on a 4-node commonware network.
 
 pub mod admin;

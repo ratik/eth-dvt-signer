@@ -21,7 +21,7 @@ use commonware_cryptography::{
 };
 use commonware_math::algebra::Random as _;
 use commonware_runtime::{Clock as _, IoBuf, Runner as _, Supervisor as _, deterministic};
-use eth_mpc_signer::{
+use eth_dvt_signer::{
     dkg::{
         CeremonyId, DkgStatus, Faults, Unsupported, Variant,
         actor::ShareStatus,

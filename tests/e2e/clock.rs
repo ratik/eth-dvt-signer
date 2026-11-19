@@ -5,7 +5,7 @@ use crate::{
     eth2::{VALIDATOR, activate_everywhere, block, sign, signed},
     harness::{NODES, TestNetwork},
 };
-use eth_mpc_signer::clock::fake::{self, FakeServer};
+use eth_dvt_signer::clock::fake::{self, FakeServer};
 use std::{
     sync::atomic::Ordering,
     time::{Duration, SystemTime, UNIX_EPOCH},

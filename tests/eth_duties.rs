@@ -14,7 +14,7 @@ use common::{
 };
 use commonware_codec::Encode as _;
 use commonware_runtime::{Clock as _, Runner as _, deterministic};
-use eth_mpc_signer::{
+use eth_dvt_signer::{
     dkg::{ceremony::Ceremony, signing::ETHEREUM_DST},
     eth::{
         duty::{Duty, DutyRequest, ForkInfo, ValidatorKey},
@@ -863,7 +863,7 @@ fn stale_node_cannot_authorize_another_chain() {
 /// sign; repeated, it changes nothing.
 #[test]
 fn a_batch_activation_activates_every_key_or_none() {
-    use eth_mpc_signer::{slashing::BatchActivationOutcome, types::BatchActivation};
+    use eth_dvt_signer::{slashing::BatchActivationOutcome, types::BatchActivation};
     runner(Duration::from_secs(900)).start(|context| async move {
         let cluster = start_network(&context, RETENTION).await;
         let first = inactive_validator(&context, &cluster, "batch-a").await;
