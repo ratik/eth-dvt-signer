@@ -789,6 +789,25 @@ enum Waiter {
     Abort(oneshot::Sender<AbortReceipt>),
 }
 
+impl Waiter {
+    /// Its client stopped waiting (it gave up, or its request ended).
+    fn is_closed(&self) -> bool {
+        match self {
+            Self::Sign(sender) => sender.is_closed(),
+            Self::Start(sender) => sender.is_closed(),
+            Self::Duty(sender) => sender.is_closed(),
+            Self::Activate(sender) => sender.is_closed(),
+            Self::ActivateBatch(sender) => sender.is_closed(),
+            Self::Register(sender) => sender.is_closed(),
+            Self::RegisterBatch(sender) => sender.is_closed(),
+            Self::History(sender) => sender.is_closed(),
+            Self::Reshare(sender) => sender.is_closed(),
+            Self::Generation(sender) => sender.is_closed(),
+            Self::Abort(sender) => sender.is_closed(),
+        }
+    }
+}
+
 /// The rounds of each validator key's completed reshares.
 type ReshareRounds = HashMap<ValidatorKey, Vec<u64>>;
 
@@ -1539,6 +1558,9 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
             );
         }
 
+        // A transaction the leaders dropped (beyond the horizon, a registration past its window)
+        // never lands: its waiter goes once its client stops waiting.
+        self.waiters.retain(|_, waiter| !waiter.is_closed());
         for (transaction, effect) in block.transactions.iter().zip(applied.effects) {
             let waiter = self.waiters.remove(&transaction.id);
             // An approved protected command has the command's own effect.
