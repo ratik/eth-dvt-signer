@@ -537,6 +537,9 @@ keep (`eth::horizon::RestartFloor`).
   - Detection: the state stays rolled back, and a non-slashable duty may be signed twice.
 
   The WORM anchor covers these ([below](#the-worm-anchor)).
+- **Open finding (BUG-10).** A duty authorized after the rollback and refused by the floor is
+  loaded at the next restart, and loaded duties pass the floor
+  ([formal.md](formal.md#f-1-the-restart-floor-exempts-what-a-rollback-authorized)).
 - **Tests.**
   - `floor::floor_1`: the reproducer's rollback with the floor, on the test chain's current slots.
     Every keyholder refuses; later slots sign.
