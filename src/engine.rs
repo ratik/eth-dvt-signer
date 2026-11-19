@@ -271,15 +271,19 @@ async fn read_anchor<E: Clock>(
         generation = generation.max(acknowledgment.generation);
         floor = floor.max(acknowledgment.marks);
     }
-    for document in store.acknowledgments().await? {
-        match document.verify(administration.approvers(), cluster) {
-            Ok(acknowledgment) => {
-                generation = generation.max(acknowledgment.generation);
-                floor = floor.max(acknowledgment.marks);
-            }
-            Err(err) => warn!(%err, "anchor: ignoring an acknowledgment"),
+    // A deadline of their own: anyone who writes to the anchor can file objects under
+    // `acknowledgments/`, and WORM keeps them, so a flood of them must not cost the whole read
+    // at every start. Without the stored ones, a node after an acknowledged rollback sees a
+    // newer generation and stops (exit 77) until it is given `--anchor-acknowledgment`.
+    let acknowledgments = async {
+        select! {
+            documents = store.acknowledgments() => documents,
+            _ = context.sleep(ANCHOR_NODE_TIMEOUT) => {
+                warn!(timeout = ?ANCHOR_NODE_TIMEOUT, "anchor: acknowledgments not read in time; only this node's own counts");
+                Ok(Vec::new())
+            },
         }
-    }
+    };
     // Every node at once, each with its own deadline: one node whose records hang, or whose
     // place in the store a faulty writer filled, must not cost the anchor for everyone.
     let reads = nodes.iter().map(|node| async move {
@@ -289,9 +293,19 @@ async fn read_anchor<E: Clock>(
         };
         (node, read)
     });
+    let (documents, reads) = futures::join!(acknowledgments, futures::future::join_all(reads));
+    for document in documents? {
+        match document.verify(administration.approvers(), cluster) {
+            Ok(acknowledgment) => {
+                generation = generation.max(acknowledgment.generation);
+                floor = floor.max(acknowledgment.marks);
+            }
+            Err(err) => warn!(%err, "anchor: ignoring an acknowledgment"),
+        }
+    }
     let mut records = Vec::new();
     let mut own = None;
-    for (node, read) in futures::future::join_all(reads).await {
+    for (node, read) in reads {
         match read {
             Ok(Some(record)) if record.record.cluster == *cluster => {
                 if node == me {

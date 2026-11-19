@@ -41,7 +41,7 @@ use commonware_consensus::{
     marshal::{core::Mailbox as Marshal, standard::Standard},
     types::Height,
 };
-use commonware_cryptography::{Digestible as _, sha256::Digest};
+use commonware_cryptography::{Digestible as _, ed25519::PublicKey, sha256::Digest};
 use commonware_macros::select;
 use commonware_p2p::{Receiver, Recipients, Sender};
 use commonware_runtime::{ContextCell, Handle, Spawner, spawn_cell};
@@ -1756,11 +1756,11 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
 }
 
 /// Add transactions gossiped by peers to the local mempool.
-pub async fn receive_gossip(mut receiver: impl Receiver, mempool: Mempool) {
+pub async fn receive_gossip(mut receiver: impl Receiver<PublicKey = PublicKey>, mempool: Mempool) {
     while let Ok((peer, message)) = receiver.recv().await {
         match Transaction::decode(message) {
             Ok(transaction) => {
-                mempool.insert(transaction);
+                mempool.insert_from(Some(peer), transaction);
             }
             Err(err) => warn!(?peer, ?err, "invalid mempool message"),
         }

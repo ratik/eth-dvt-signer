@@ -225,7 +225,7 @@ impl Node {
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
-        let body = response.bytes().await.map_err(failure)?;
+        let body = capped(response).await?;
         Ok(Answer {
             status,
             content_type,
@@ -283,13 +283,16 @@ impl Node {
                 if !response.status().is_success() {
                     return Err(format!("attestation: HTTP {}", response.status()));
                 }
-                let body = response
-                    .bytes()
+                let body = capped(response)
                     .await
                     .map_err(|err| format!("attestation: {err}"))?;
                 let statement: Statement =
                     serde_json::from_slice(&body).map_err(|err| format!("attestation: {err}"))?;
                 match (&statement.evidence, policy) {
+                    // The evidence attests its own keys: the statement's are pinned below.
+                    (Some(evidence), _) if evidence.keys != statement.keys => {
+                        return Err("the evidence names other keys than the statement".into());
+                    }
                     (Some(evidence), Some(policy)) if jwks.is_some() || !policy.needs_jwks() => {
                         let mut evidence = evidence.clone();
                         attach_vcek(&mut evidence, policy, vceks).await?;
@@ -341,8 +344,7 @@ impl Node {
         if !response.status().is_success() {
             return Err(format!("network: HTTP {}", response.status()));
         }
-        let body = response
-            .bytes()
+        let body = capped(response)
             .await
             .map_err(|err| format!("network: {err}"))?;
         let theirs: NetworkJson =
@@ -364,6 +366,28 @@ pub struct Checked {
     pub measurement: Option<String>,
     /// The attested configuration (`rtmr3`, or the SEV-SNP `HOST_DATA`).
     pub configuration: Option<String>,
+}
+
+/// Largest answer read from a node: a signature, a statement or `publicKeys` of tens of thousands
+/// of validators fit. A faulty node's larger body is refused before it is held in memory.
+pub const MAX_ANSWER_BYTES: usize = 4 * 1024 * 1024;
+
+/// `response`'s body, at most [MAX_ANSWER_BYTES].
+async fn capped(mut response: reqwest::Response) -> Result<Bytes, Failure> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_ANSWER_BYTES as u64)
+    {
+        return Err(Failure::Error("answer too large".into()));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(failure)? {
+        if body.len() + chunk.len() > MAX_ANSWER_BYTES {
+            return Err(Failure::Error("answer too large".into()));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.into())
 }
 
 fn failure(err: reqwest::Error) -> Failure {

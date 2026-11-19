@@ -835,6 +835,33 @@ mod acknowledgment_tests {
         assert!(View::new(1, old).records().is_empty());
     }
 
+    /// Anyone who writes to the anchor can file objects under `acknowledgments/`: one too large,
+    /// or not named `<generation>-<hash>`, is never downloaded, and the real one is still read.
+    #[test]
+    fn junk_under_acknowledgments_is_left_out() {
+        let store = AnchorStore::in_memory(&cluster());
+        block_on(async {
+            let document = signed(1, &[0, 1]);
+            store.put_acknowledgment(&document).await.unwrap();
+            let large = format!("{:020}-{}", 2, "a".repeat(64));
+            let json = document.to_json();
+            let padded = format!(
+                "{json}{}",
+                " ".repeat(store::MAX_ACKNOWLEDGMENT_BYTES as usize)
+            );
+            store
+                .put_raw_acknowledgment(&large, padded.into_bytes())
+                .await;
+            store
+                .put_raw_acknowledgment("not-a-name", json.clone().into_bytes())
+                .await;
+            store
+                .put_raw_acknowledgment(&format!("{:020}-{}", 3, "b".repeat(64)), b"{".to_vec())
+                .await;
+            assert_eq!(store.acknowledgments().await.unwrap(), vec![document]);
+        });
+    }
+
     #[test]
     fn the_store_writes_an_acknowledgment_once() {
         let store = AnchorStore::in_memory(&cluster());

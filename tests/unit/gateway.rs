@@ -26,6 +26,8 @@ enum Behaviour {
     Status(u16),
     /// Answer this status the first time, then sign.
     StatusThenSign(u16),
+    /// Answer a body larger than `nodes::MAX_ANSWER_BYTES`.
+    Huge,
 }
 
 struct Fake {
@@ -74,6 +76,9 @@ async fn fake(behaviour: Behaviour, network: NetworkJson) -> Fake {
                             tokio::time::sleep(Duration::from_millis(delay)).await;
                         }
                         Behaviour::WrongSignature => root[0] ^= 1,
+                        Behaviour::Huge => {
+                            return vec![b' '; nodes::MAX_ANSWER_BYTES + 1].into_response();
+                        }
                         Behaviour::StatusThenSign(_) if earlier > 0 => {}
                         Behaviour::Status(status) | Behaviour::StatusThenSign(status) => {
                             return (
@@ -216,6 +221,27 @@ fn one_node_refusing_everything_cannot_lose_a_duty() {
         assert!(signed(&answer));
         assert_eq!(attempts.len(), 1, "an honest node is asked first");
         assert_eq!(faulty.requests.load(Ordering::SeqCst), 1);
+    });
+}
+
+/// A node that answers more than `nodes::MAX_ANSWER_BYTES` is not read to the end: the next
+/// node signs.
+#[test]
+fn an_oversized_answer_fails_over() {
+    run(async {
+        let network = Network::MAINNET.to_json();
+        let (faulty, honest) = (
+            fake(Behaviour::Huge, network.clone()).await,
+            fake(Behaviour::Sign(0), network).await,
+        );
+        let gateway = start(&[&faulty, &honest], Duration::from_secs(1)).await;
+        let (answer, attempts) = sign(&gateway).await;
+        assert!(signed(&answer), "the honest node's signature");
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(
+            attempts[0].status, None,
+            "the oversized answer is a failure"
+        );
     });
 }
 

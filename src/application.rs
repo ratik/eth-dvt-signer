@@ -58,7 +58,7 @@ use commonware_utils::ordered::Set;
 use futures::StreamExt as _;
 use rand_core::Rng;
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -88,7 +88,18 @@ struct Pending {
     known: HashSet<Digest>,
     /// Builder registrations in `queue`.
     registrations: usize,
+    /// The peer that gossiped each pending transaction (this node's own have none).
+    origins: HashMap<Digest, PublicKey>,
+    /// Transactions and bytes pending per gossiping peer.
+    per_peer: HashMap<PublicKey, (usize, usize)>,
 }
+
+/// Most transactions one peer's gossip keeps pending: a faulty peer can delay the others by about
+/// one block, never fill the queue.
+pub const MAX_PENDING_PER_PEER: usize = MAX_TRANSACTIONS_PER_BLOCK;
+
+/// Most bytes one peer's gossip keeps pending: two blocks' worth.
+pub const MAX_PENDING_BYTES_PER_PEER: usize = 2 * MAX_BLOCK_BYTES;
 
 impl Pending {
     fn recount(&mut self) {
@@ -97,6 +108,22 @@ impl Pending {
             .iter()
             .filter(|(_, transaction)| transaction.command.is_registration())
             .count();
+        let Pending {
+            queue,
+            known,
+            origins,
+            per_peer,
+            ..
+        } = self;
+        origins.retain(|digest, _| known.contains(digest));
+        per_peer.clear();
+        for (digest, transaction) in queue.iter() {
+            if let Some(peer) = origins.get(digest) {
+                let (count, bytes) = per_peer.entry(peer.clone()).or_default();
+                *count += 1;
+                *bytes += transaction.encode_size();
+            }
+        }
     }
 }
 
@@ -104,14 +131,33 @@ impl Mempool {
     /// Returns true if the transaction was added: it was not already pending, and if it is a
     /// builder registration, fewer than [MAX_PENDING_REGISTRATIONS] are.
     pub fn insert(&self, transaction: Transaction) -> bool {
+        self.insert_from(None, transaction)
+    }
+
+    /// [Mempool::insert] for a transaction `peer` gossiped: also refused once that peer has
+    /// [MAX_PENDING_PER_PEER] transactions or [MAX_PENDING_BYTES_PER_PEER] bytes pending.
+    pub fn insert_from(&self, peer: Option<PublicKey>, transaction: Transaction) -> bool {
         let digest = transaction.digest();
         let registration = transaction.command.is_registration();
+        let size = transaction.encode_size();
         let mut pending = self.0.lock().unwrap();
         if registration && pending.registrations >= MAX_PENDING_REGISTRATIONS {
             return false;
         }
+        if let Some(peer) = &peer {
+            let (count, bytes) = pending.per_peer.get(peer).copied().unwrap_or_default();
+            if count >= MAX_PENDING_PER_PEER || bytes + size > MAX_PENDING_BYTES_PER_PEER {
+                return false;
+            }
+        }
         if !pending.known.insert(digest) {
             return false;
+        }
+        if let Some(peer) = peer {
+            let (count, bytes) = pending.per_peer.entry(peer.clone()).or_default();
+            *count += 1;
+            *bytes += size;
+            pending.origins.insert(digest, peer);
         }
         pending.queue.push_back((digest, transaction));
         pending.registrations += usize::from(registration);

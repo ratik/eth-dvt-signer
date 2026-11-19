@@ -2145,6 +2145,10 @@ fn attest(
                 "no evidence (vault {}): pass --allow-unattested to accept it",
                 statement.vault
             )),
+            // The evidence attests its own keys: the statement's are taken only if they are those.
+            Some(evidence) if evidence.keys != statement.keys => {
+                Err("the evidence names other keys than the statement".to_string())
+            }
             Some(evidence) => {
                 // An SEV-SNP node's VCEK, from AMD if it did not attach it: the committee keeps
                 // it, so that `mpc-keytool split` checks the evidence offline.
