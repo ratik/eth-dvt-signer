@@ -9,7 +9,7 @@ cd "$(dirname "$0")/.."
 # FEATURES=dev-api enables the development signing API (`POST /sign`).
 # ETH_NETWORK=hoodi (or mainnet): the Ethereum network whose clock bounds duties (none: no duty signs).
 # APPROVERS=approvers.json: the approvers of protected operations (none: no activation, docs/administration.md).
-cargo build --release ${FEATURES:+--features "$FEATURES"}
+cargo build --locked --release ${FEATURES:+--features "$FEATURES"}
 mkdir -p "$DATA_DIR"
 
 pids=()
