@@ -3,34 +3,42 @@
 ## Layers
 
 ```
-HTTP API                src/rpc.rs              Web3Signer API (src/eth/web3signer parses typed
-                                                duties); operations; the development API
-                                                (`dev-api` builds only).
-        │ DutyRequest {validator, fork, duty} / SignRequest {ceremony, nonce, payload_hash}
-Coordinator             src/signer/coordinator  authorization (consensus if needed), partial
-                                                collection, recovery, verification. Knows nothing
-                                                about HTTP.
-        │ executor messages / signing p2p channel
-Consensus               src/application,        blocks from the mempool, simplex voting; marshal
-                        src/engine, src/epochs  hands finalized blocks to the executor in order.
-        │ finalized blocks
-Replicated state        src/executor, state,    validator activations (chain identity, once);
-                        storage, slashing       duties: signing root computed from the typed duty,
-                                                activation, chain and slashing rules, record;
-                                                development requests: (ceremony, nonce) -> payload.
-                                                Committed atomically, one sync per block.
-Keyholder               src/dkg/actor           shares; signs only committed authorizations of the
-                                                kind a request names: (validator key, root) for a
-                                                validator key's ceremony (its active share
-                                                generation only), (ceremony, nonce) for a
-                                                development key's.
-Anchor (optional)       src/anchor              append-only records on S3, GCS or a directory
-                                                outside the nodes' storage. A keyholder writes one
-                                                before it signs past its marks; a node reads them
-                                                at start; a whole-network rollback stops the nodes.
-Crypto                  src/dkg/signing         Ethereum ciphersuite over raw 32-byte roots.
-Ethereum types          src/eth                 containers, SSZ hash_tree_root, domains, roots.
+client
+  │ HTTP
+  ▼
+┌──────────────────┐
+│ HTTP API         │
+└────────┬─────────┘
+         │ DutyRequest {validator, fork, duty}
+         │ SignRequest {ceremony, nonce, payload_hash}
+         ▼
+┌──────────────────┐  partial requests / partials   ┌──────────────┐
+│ Coordinator      │ <────────────────────────────> │ Keyholder    │
+└────────┬─────────┘     (signing p2p channel)      └──┬───────▲───┘
+         │ commands (mempool)                          │       │
+         ▼                                     records │       │ committed
+┌──────────────────┐                                   ▼       │ authorizations
+│ Consensus        │                           ┌────────────┐  │
+└────────┬─────────┘                           │ Anchor     │  │
+         │ finalized blocks, in order          │ (optional) │  │
+         ▼                                     └────────────┘  │
+┌──────────────────┐                                           │
+│ Replicated state │ ──────────────────────────────────────────┘
+└──────────────────┘
+
+Shared libraries: Crypto (src/dkg/signing.rs), Ethereum types (src/eth).
 ```
+
+| Layer | Code | Role |
+| --- | --- | --- |
+| HTTP API | `src/rpc.rs` | Web3Signer API (`src/eth/web3signer.rs` parses typed duties); operations; the development API (`dev-api` builds only). |
+| Coordinator | `src/signer/coordinator.rs` | Authorization (consensus if needed), partial collection, recovery, verification. Knows nothing about HTTP. |
+| Consensus | `src/application.rs`, `src/engine.rs`, `src/epochs.rs` | Blocks from the mempool, simplex voting; marshal hands finalized blocks to the executor in order. |
+| Replicated state | `src/executor.rs`, `src/state.rs`, `src/storage.rs`, `src/slashing.rs` | Validator activations (chain identity, once); duties: signing root computed from the typed duty, activation, chain and slashing rules, record; development requests: (ceremony, nonce) -> payload. Committed atomically, one sync per block. |
+| Keyholder | `src/dkg/actor.rs` | Shares; signs only committed authorizations of the kind a request names: (validator key, root) for a validator key's ceremony (its active share generation only), (ceremony, nonce) for a development key's. |
+| Anchor (optional) | `src/anchor` | Append-only records on S3, GCS or a directory outside the nodes' storage. A keyholder writes one before it signs past its marks; a node reads them at start; a whole-network rollback stops the nodes. |
+| Crypto | `src/dkg/signing.rs` | Ethereum ciphersuite over raw 32-byte roots. |
+| Ethereum types | `src/eth` | Containers, SSZ hash_tree_root, domains, roots. |
 
 Two roles are kept apart:
 - **Voters**: the consensus committee of the current epoch. Each voter also runs a coordinator.
