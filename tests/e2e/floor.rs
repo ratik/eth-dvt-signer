@@ -7,9 +7,11 @@
 //!   restarted) no longer signs the conflicting proposal: every keyholder's floor covers its slot.
 //!   The failing reproducer `eth2::e2e_eth_l1` keeps showing that the replicated state alone
 //!   forgets it (it runs without the floor).
-//! - A restart of every node: a retry of a duty authorized before it signs again; a new duty of
-//!   the current slot or epoch does not; the next slot's block and the next epoch's attestation
-//!   do. The time until then is printed.
+//! - A whole-network rollback followed by another restart: the conflicting proposal, now loaded
+//!   from the state, is still refused (BUG-10).
+//! - A restart of every node: no duty of the current slot or epoch signs, a retry of one signed
+//!   before the restart included; the next slot's block and the next epoch's attestation do. The
+//!   time until then is printed.
 //! - A restart of one node: the other three sign every duty, the current slot's included.
 //!
 //! Elsewhere: the floor's arithmetic in `tests/unit/eth/horizon.rs`.
@@ -90,7 +92,9 @@ fn restart_every_node(network: &TestNetwork) {
 
 /// L-1 with the floor: every node is rolled back to storage from before a block proposal and
 /// restarted. The rolled-back state authorizes the conflicting proposal (it forgot the first),
-/// and every keyholder refuses it: the slot is at or below its floor. Later slots sign again.
+/// and every keyholder refuses it: the slot is at or below its floor. After a second restart of
+/// every node the keyholders load that authorization from their state, and still refuse it
+/// (BUG-10: loaded duties used to pass the floor). Later slots sign again.
 #[test]
 fn floor_1_a_whole_network_rollback_does_not_sign_a_double_proposal() {
     let (network, key) = start();
@@ -139,21 +143,31 @@ fn floor_1_a_whole_network_rollback_does_not_sign_a_double_proposal() {
             .count()
             >= 2
     });
-    wait_past(&network, *rolled_back.iter().max().unwrap());
+
+    // BUG-10: the conflicting proposal is now in every node's state, loaded at the next start.
+    restart_every_node(&network);
+    let restarted = floors(&network, &all);
+    let (status, answer) = sign(&network, 3, &key, &block(proposed, 2));
+    assert_eq!(
+        status, 412,
+        "double proposal signed after a restart that followed the rollback: {answer}"
+    );
+    assert_eq!(answer["protection"], "restart_floor", "{answer}");
+    wait_past(&network, *restarted.iter().max().unwrap());
     signed(&network, 2, &key, &block(slot(), 1));
 }
 
-/// A restart of every node (an R3 reconfiguration, a simultaneous upgrade): what was authorized
-/// before it signs again; a new block of a slot at or below the floor, or a new attestation of its
-/// epoch, does not; the next slot's block does at once, the next epoch's attestation once it
-/// starts.
+/// A restart of every node (an R3 reconfiguration, a simultaneous upgrade): a block of a slot at
+/// or below the floor, or an attestation of its epoch, is refused, a retry of one signed before
+/// the restart included (BUG-10); the next slot's block signs at once, the next epoch's
+/// attestation once it starts.
 #[test]
 fn floor_2_a_restart_of_every_node_costs_at_most_the_current_epoch() {
     let (network, key) = start();
     let all = network.all();
     wait_past(&network, *floors(&network, &all).iter().max().unwrap());
     let before = block(slot(), 1);
-    let signature = signed(&network, 0, &key, &before);
+    signed(&network, 0, &key, &before);
 
     restart_every_node(&network);
     let ready = Instant::now();
@@ -164,8 +178,11 @@ fn floor_2_a_restart_of_every_node_costs_at_most_the_current_epoch() {
     );
     // Every floor's slot has started: what follows is decided by the floors, not the horizon.
     network.wait_until(&format!("slot {highest} to start"), || slot() >= highest);
-    // Loaded at start: signed again, the same signature.
-    assert_eq!(signed(&network, 1, &key, &before), signature);
+    // Loaded at start, and at or below every floor: refused like a new one (BUG-10). Its
+    // signature, given before the restart, stays valid.
+    let (status, answer) = sign(&network, 1, &key, &before);
+    assert_eq!(status, 412, "a retry at the floor: {answer}");
+    assert_eq!(answer["protection"], "restart_floor", "{answer}");
     // New, at or below every floor: refused by the keyholders.
     let seen: Vec<usize> = all
         .iter()

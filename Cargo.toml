@@ -121,6 +121,10 @@ name = "e2e"
 path = "tests/e2e/main.rs"
 required-features = ["test-hooks"]
 
+# `cfg(kani)`: the Kani proofs of the slashing rules (formal/kani, docs/formal.md).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
 # EIP-2335 key derivation (scrypt, PBKDF2) is slow without optimizations, also in tests.
 [profile.dev.package.scrypt]
 opt-level = 3

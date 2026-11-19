@@ -557,13 +557,20 @@ impl Decision {
     }
 }
 
+/// The hasher of the validator key index. Kani (formal/kani) cannot model the OS randomness that
+/// seeds `RandomState`, so its proofs use a fixed one; nothing depends on the iteration order.
+#[cfg(not(kani))]
+type KeyHasher = std::hash::RandomState;
+#[cfg(kani)]
+type KeyHasher = std::hash::BuildHasherDefault<std::hash::DefaultHasher>;
+
 /// The slashing-protection part of the replicated state.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Protection {
     /// Ceremonies started as validator keys (their key never signs anything else).
     validator_rounds: BTreeSet<u64>,
     validators: BTreeMap<u64, Validator>,
-    by_key: HashMap<ValidatorKey, u64>,
+    by_key: HashMap<ValidatorKey, u64, KeyHasher>,
     proposals: BTreeMap<(u64, u64), Signed>,
     attestations: BTreeMap<(u64, u64), Attested>,
     bounded: BTreeMap<(u64, DutyKind, u64), Vec<Signed>>,
@@ -1705,29 +1712,62 @@ impl Protection {
             }
         }
         // The order the logarithmic attestation checks rely on (module docs).
+        match self.attestation_disorder() {
+            None => Ok(()),
+            Some(Disorder::SourceAfterTarget { id, source, target }) => Err(format!(
+                "validator {id} has an attestation with source {source} after its target {target}"
+            )),
+            Some(Disorder::Surround {
+                id,
+                previous_target,
+                target,
+            }) => Err(format!(
+                "attestations of validator {id} with targets {previous_target} and {target} \
+                 surround each other: slashing history is altered"
+            )),
+        }
+    }
+
+    /// The first stored attestation that breaks the order the logarithmic checks rely on (module
+    /// docs), if any.
+    fn attestation_disorder(&self) -> Option<Disorder> {
         let mut previous: Option<(u64, u64, u64)> = None;
         for (&(id, target), attested) in &self.attestations {
             if attested.source > target {
-                return Err(format!(
-                    "validator {id} has an attestation with source {} after its target {target}",
-                    attested.source
-                ));
+                return Some(Disorder::SourceAfterTarget {
+                    id,
+                    source: attested.source,
+                    target,
+                });
             }
             if let Some((previous_id, previous_target, previous_source)) = previous
                 && previous_id == id
                 && previous_source > attested.source
             {
-                return Err(format!(
-                    "attestations of validator {id} with targets {previous_target} and {target} \
-                     surround each other: slashing history is altered"
-                ));
+                return Some(Disorder::Surround {
+                    id,
+                    previous_target,
+                    target,
+                });
             }
             previous = Some((id, target, attested.source));
         }
-        Ok(())
+        None
     }
+}
+
+/// How a stored attestation history breaks the order of the logarithmic checks
+/// ([Protection::verify]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Disorder {
+    SourceAfterTarget { id: u64, source: u64, target: u64 },
+    Surround { id: u64, previous_target: u64, target: u64 },
 }
 
 #[cfg(test)]
 #[path = "../tests/unit/slashing.rs"]
 mod tests;
+
+#[cfg(kani)]
+#[path = "../formal/kani/slashing.rs"]
+mod proofs;
