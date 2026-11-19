@@ -1513,9 +1513,10 @@ impl Protection {
                 |((_, target), attested)| (DutyKind::Attestation, *target, attested.signing_root),
             ))
             .chain(
+                // The validator's entries only: they are contiguous, from its smallest key on.
                 self.bounded
-                    .iter()
-                    .filter(|((validator, _, _), _)| *validator == id)
+                    .range((id, DutyKind::BlockProposal, 0)..)
+                    .take_while(|((validator, _, _), _)| *validator == id)
                     .flat_map(|((_, kind, period), roots)| {
                         roots
                             .iter()
