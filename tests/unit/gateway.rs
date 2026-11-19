@@ -127,7 +127,7 @@ async fn sign(gateway: &Gateway) -> (Answer, Vec<log::Attempt>) {
     gateway
         .sign(
             &format!("/api/v1/eth2/sign/{key}"),
-            &key,
+            gateway.expected(&key, &attestation()),
             vec![("accept", "application/json".into())],
             attestation(),
         )

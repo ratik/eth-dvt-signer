@@ -24,10 +24,7 @@ use crate::{
         check::{Policy, VcekCache},
         verify::{Jwks, fetch_google_jwks},
     },
-    eth::{
-        network::{Network, NetworkJson},
-        web3signer::duty_request,
-    },
+    eth::network::{Network, NetworkJson},
 };
 use axum::{
     Router,
@@ -299,12 +296,9 @@ async fn sign(
         Some((name, value.to_string()))
     })
     .collect();
-    let (answer, attempts) = gateway
-        .sign(&path, &identifier, forwarded, body.clone())
-        .await;
-    let root = duty_request(&identifier, &body, Some(&gateway.network))
-        .ok()
-        .map(|(request, _)| request.signing_root());
+    let expected = gateway.expected(&identifier, &body);
+    let (answer, attempts) = gateway.sign(&path, expected, forwarded, body.clone()).await;
+    let root = expected.map(|(_, root)| root);
     // The label is the client's `type` only for a request that parsed (a known type): any other
     // string would add series to the metrics for good.
     let kind = root

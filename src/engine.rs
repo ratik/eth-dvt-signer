@@ -571,8 +571,8 @@ fn check_recovery<E: commonware_storage::Context>(
     for round in secrets.share_rounds() {
         let completed = store
             .ceremonies()
-            .iter()
-            .any(|ceremony| ceremony.round == round && ceremony.status == DkgStatus::Completed);
+            .by_round(round)
+            .is_some_and(|ceremony| ceremony.status == DkgStatus::Completed);
         if !completed {
             return Err(StartError::ShareWithoutCeremony { round });
         }
