@@ -545,8 +545,7 @@ fn load_key(path: &Path) -> Result<PrivateKey, String> {
     }
     let text = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
     let text = text.trim();
-    hex::decode(text.strip_prefix("0x").unwrap_or(text))
-        .ok()
+    eth_dvt_signer::import::unhex(text)
         .and_then(|bytes| PrivateKey::decode(bytes).ok())
         .ok_or_else(|| format!("{} is not an approver key", path.display()))
 }

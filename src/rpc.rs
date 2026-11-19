@@ -1483,8 +1483,7 @@ fn parse_identities(field: &str, values: &[String]) -> Result<Set<PublicKey>, St
     let keys = values
         .iter()
         .map(|value| {
-            hex::decode(value.strip_prefix("0x").unwrap_or(value))
-                .ok()
+            crate::import::unhex(value)
                 .and_then(|bytes| {
                     PublicKey::decode(commonware_codec::Copying(bytes.as_slice())).ok()
                 })
@@ -1934,8 +1933,7 @@ struct ReconfigureBody {
 }
 
 fn parse_identity(field: &str, value: &str) -> Result<PublicKey, ApiError> {
-    hex::decode(value.strip_prefix("0x").unwrap_or(value))
-        .ok()
+    crate::import::unhex(value)
         .and_then(|bytes| PublicKey::decode(commonware_codec::Copying(bytes.as_slice())).ok())
         .ok_or_else(|| {
             (

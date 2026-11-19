@@ -85,7 +85,7 @@ pub const RESERVED_PREFIX: &str = "approved.";
 /// `0x`-prefixed hex of the compressed group public key.
 pub fn format_key(key: &GroupKey) -> String {
     use commonware_codec::Encode as _;
-    format!("0x{}", hex::encode(key.encode()))
+    crate::import::hex0x(&key.encode())
 }
 
 /// Client-chosen ceremony name: 1 to 64 characters out of `[A-Za-z0-9._-]`.

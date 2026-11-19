@@ -259,14 +259,6 @@ struct CommittedState {
 }
 
 impl Committed {
-    pub fn new(height: u64, nonce: u64) -> Self {
-        Self(Arc::new(Mutex::new(CommittedState {
-            height,
-            nonce,
-            policy: None,
-        })))
-    }
-
     pub fn set(&self, height: u64, nonce: u64, policy: Option<Policy>) {
         let mut state = self.0.lock().unwrap();
         // Keep the shared copy while the policy is unchanged.
@@ -279,12 +271,6 @@ impl Committed {
             nonce,
             policy,
         };
-    }
-
-    /// `(height, nonce)`.
-    pub fn get(&self) -> (u64, u64) {
-        let state = self.0.lock().unwrap();
-        (state.height, state.nonce)
     }
 
     /// `(height, nonce, policy)`.

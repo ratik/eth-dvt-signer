@@ -1086,7 +1086,8 @@ where
             .collect();
         let mempool = Mempool::default();
         let executed = Arc::new(AtomicU64::new(0));
-        let committed = Committed::new(store.height(), store.admin().nonce);
+        // Set from the store by `Executor::new`, before anything reads it.
+        let committed = Committed::default();
         let tip = Arc::new(AtomicU64::new(0));
         let (mempool_sender, mempool_receiver) = channels.mempool;
         let (dkg_sender, dkg_mailbox) = mpsc::unbounded_channel();
