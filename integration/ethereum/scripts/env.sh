@@ -21,6 +21,14 @@ repo="$(cd "$here/../../.." && pwd)"
 # shellcheck source=../config/versions.env
 source "$here/../config/versions.env"
 
+# RUST_IMAGE must carry the toolchain of rust-toolchain.toml, or rustup downloads another one.
+toolchain="$(sed -n 's/^channel = "\(.*\)"$/\1/p' "$repo/rust-toolchain.toml")"
+image_rust="${RUST_IMAGE#rust:}"
+if [ "${image_rust%%-*}" != "$toolchain" ]; then
+	echo "env: RUST_IMAGE ($RUST_IMAGE) is not Rust $toolchain (rust-toolchain.toml)" >&2
+	exit 1
+fi
+
 IT_HOME="${IT_HOME:-$HOME/eth-mpc-it}"
 IT_NAME="${IT_NAME:-eth-mpc-it}"
 DIND="$IT_NAME-dind"

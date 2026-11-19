@@ -213,7 +213,7 @@ self-built.
 | Consensus client and validator clients | `sigp/lighthouse:v8.3.2` (`run-gloas`: `v8.3.3`) |
 | Execution client | `ethereum/client-go:v1.17.10` |
 | Foundry (`cast`, the deposit transaction) | `ghcr.io/foundry-rs/foundry:v1.8.6` |
-| Signer build | `rust:1.99.1-bookworm`, run in `debian:bookworm-slim` |
+| Signer build | `rust:1.99.1-bookworm` (the Rust of `rust-toolchain.toml`), run in `debian:bookworm-slim` |
 | Isolation | `docker:29.9.2-dind` |
 | Fuzzing only | `nightly-2026-10-25`, `cargo-fuzz` 0.13.2 |
 

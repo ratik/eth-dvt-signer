@@ -1,0 +1,8 @@
+# The Rust toolchain of every build of the signer: releases, the TEE image, tests, local builds.
+# Keep it the same as RUST_IMAGE in integration/ethereum/config/versions.env (env.sh checks this).
+# The fuzz crate uses its own nightly (FUZZ_TOOLCHAIN, given with `cargo +...`).
+# No components here: rustup would download them in every fresh build container.
+# `env.sh validate` adds rustfmt and clippy itself.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
