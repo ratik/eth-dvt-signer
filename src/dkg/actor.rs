@@ -384,8 +384,9 @@ struct Session {
 }
 
 /// An authorized duty root a keyholder knows: the duty's kind and protection period, a
-/// policy-bound duty's terms, and whether it was loaded at start (beyond the restart floor's
-/// reach) rather than learned of since.
+/// policy-bound duty's terms, and whether it was loaded at start (it needs no anchor record and
+/// passes the anchor's gate and marks; the restart floor applies to it as to any other) rather
+/// than learned of since.
 #[derive(Clone, Copy, Debug)]
 struct KnownDuty {
     kind: DutyKind,
@@ -464,11 +465,11 @@ pub struct Actor<
     validators: HashMap<ValidatorKey, u64>,
     /// Validator duty signing roots committed on this node (their slashing records), by key.
     /// Authorized duty roots of validator keys, with each duty's kind and protection period (and
-    /// a policy-bound duty's terms), and whether it was loaded at start (beyond the restart
-    /// floor's reach) rather than learned of since.
+    /// a policy-bound duty's terms), and whether it was loaded at start rather than learned of
+    /// since.
     duty_roots: HashMap<(ValidatorKey, Root), KnownDuty>,
     /// This process's restart floor (`eth::horizon`, audit L-1): no partial for a duty at or below
-    /// it learned of since the start. None without a network (or with the test hook).
+    /// it, loaded at start or not. None without a network (or with the test hook).
     restart_floor: Option<RestartFloor>,
     /// This keyholder's anchor (`anchor`, docs/anchor.md), if configured: the records it writes
     /// ahead of partials, the anchored marks and the gate it signs under.
@@ -1383,10 +1384,11 @@ impl<
                     warn!(?kind, period, %beyond, "not signing a duty beyond this node's horizon");
                     return Err(Refusal::BeyondHorizon);
                 }
-                // Not a new duty of a slot (an attestation: an epoch) this process may have signed
-                // for before it started (L-1); the peer is told so, for good.
-                if !loaded
-                    && let Some(floor) = self.restart_floor
+                // Not a duty of a slot (an attestation: an epoch) this process may have signed
+                // for before it started (L-1), even one loaded at start: after a whole-network
+                // rollback the state may hold a conflicting duty it authorized since, refused by
+                // the previous process's floor (audit BUG-10). The peer is told so, for good.
+                if let Some(floor) = self.restart_floor
                     && !floor.admits(kind, period)
                 {
                     warn!(

@@ -22,9 +22,9 @@ module slashing {
   const WHOLE_ROLLBACK: bool
   const RESTART_FLOOR: bool
   const ANCHOR: bool
-  // The keyholder signs the duties it loaded at start without the restart floor or the anchored
-  // marks (`KnownDuty::loaded` in `dkg::actor`, as the code does today).
-  const LOADED_EXEMPT: bool
+  // The restart floor exempts the duties a keyholder loaded at start (the code before the fix of
+  // BUG-10). The anchored marks always do (`KnownDuty::loaded` in `dkg::actor`).
+  const FLOOR_EXEMPTS_LOADED: bool
   const MAX_LOG: int
 
   pure val NODES = Set("n1", "n2", "n3", "n4")
@@ -132,14 +132,13 @@ module slashing {
       log[recordHeight.get(j)] != recordState.get(j)
     ).size() >= 2
 
-  def exempt(i: str, d: Duty): bool = LOADED_EXEMPT and loaded.get(i).contains(d)
-
   def floorAllows(i: str, d: Duty): bool =
-    not(RESTART_FLOOR) or exempt(i, d) or time(d) > floor.get(i)
+    not(RESTART_FLOOR) or (FLOOR_EXEMPTS_LOADED and loaded.get(i).contains(d)) or
+      time(d) > floor.get(i)
 
   def anchorAllows(i: str, d: Duty): bool = {
     val m = anchored.get(i)
-    not(ANCHOR) or exempt(i, d) or (
+    not(ANCHOR) or loaded.get(i).contains(d) or (
       if (d.block) d.slot > m.slot
       else d.target > m.target and d.source >= m.source
     )
@@ -260,25 +259,27 @@ module slashing {
   val safety = noDoubleSignature and noSurroundSignature
 }
 
+// Every configuration but `rollbackFloorExempt` is the code as it is. Removing an exemption only
+// removes steps, so a property TLC proves with FLOOR_EXEMPTS_LOADED holds without it too.
+
 // The fault model: one Byzantine node, crashes and one-node restores, no whole rollback.
 module faultModel {
   import slashing(
     BYZANTINE = Set("n4"), WHOLE_ROLLBACK = false, RESTART_FLOOR = true, ANCHOR = false,
-    LOADED_EXEMPT = true, MAX_LOG = 2,
+    FLOOR_EXEMPTS_LOADED = false, MAX_LOG = 2,
   ).*
 }
 
-// L-1 without the restart floor: a double vote is signed (the E2E reproducer).
+// L-1 without the restart floor: a double proposal is signed (the E2E reproducer).
 module rollbackNoFloor {
   import slashing(
     BYZANTINE = Set("n4"), WHOLE_ROLLBACK = true, RESTART_FLOOR = false, ANCHOR = false,
-    LOADED_EXEMPT = true, MAX_LOG = 2,
+    FLOOR_EXEMPTS_LOADED = false, MAX_LOG = 2,
   ).*
 
   pure val b1 = block(1, 0)
   pure val b1other = block(1, 1)
 
-  // A double proposal: signed, the network rolled back, the other block signed.
   run doubleProposalTest =
     init.then(tick("n1")).then(tick("n2"))
       .then(decideDuty(b1)).then(apply("n1")).then(apply("n2"))
@@ -289,12 +290,12 @@ module rollbackNoFloor {
       .expect(not(noDoubleSignature))
 }
 
-// L-1 with the restart floor, as the code is: the floor refuses the other block at first, but the
-// next restart loads it as an authorized duty, exempt from the floor, and signs it.
-module rollbackFloor {
+// BUG-10, the code before its fix: the floor refuses the other block at first, but the next
+// restart loads it as an authorized duty, exempt from the floor, and signs it.
+module rollbackFloorExempt {
   import slashing(
     BYZANTINE = Set("n4"), WHOLE_ROLLBACK = true, RESTART_FLOOR = true, ANCHOR = false,
-    LOADED_EXEMPT = true, MAX_LOG = 2,
+    FLOOR_EXEMPTS_LOADED = true, MAX_LOG = 2,
   ).*
 
   pure val b1 = block(1, 0)
@@ -314,21 +315,19 @@ module rollbackFloor {
       .expect(not(noDoubleSignature))
 }
 
-// L-1 with the restart floor and no exemption for loaded duties: no double proposal or vote; a
-// crafted surround vote is signed.
-module rollbackFloorStrict {
+// L-1 with the restart floor: no double proposal or vote; a crafted surround vote is signed.
+module rollbackFloor {
   import slashing(
     BYZANTINE = Set("n4"), WHOLE_ROLLBACK = true, RESTART_FLOOR = true, ANCHOR = false,
-    LOADED_EXEMPT = false, MAX_LOG = 2,
+    FLOOR_EXEMPTS_LOADED = false, MAX_LOG = 2,
   ).*
-
-  pure val inner = attestation(1, 1, 0)
-  pure val outer = attestation(0, 2, 0)
 
   pure val b1 = block(1, 0)
   pure val b1other = block(1, 1)
+  pure val inner = attestation(1, 1, 0)
+  pure val outer = attestation(0, 2, 0)
 
-  // The scenario `rollbackFloor` signs: the floor of the next restart still refuses.
+  // BUG-10's scenario: the floor of the next restart still refuses.
   run restartAfterRollbackStillRefusesTest =
     init.then(tick("n1")).then(tick("n2"))
       .then(decideDuty(b1)).then(apply("n1")).then(apply("n2"))
@@ -349,18 +348,18 @@ module rollbackFloorStrict {
       .expect(not(noSurroundSignature))
 }
 
-// L-1 with the restart floor and the WORM anchor (reachable, as the code is): no slashable pair.
+// L-1 with the restart floor and the WORM anchor: no slashable pair.
 module rollbackAnchor {
   import slashing(
     BYZANTINE = Set("n4"), WHOLE_ROLLBACK = true, RESTART_FLOOR = true, ANCHOR = true,
-    LOADED_EXEMPT = true, MAX_LOG = 2,
+    FLOOR_EXEMPTS_LOADED = false, MAX_LOG = 2,
   ).*
 
   pure val b1 = block(1, 0)
   pure val b1other = block(1, 1)
 
-  // The scenario `rollbackFloor` signs: the nodes stop when they apply the other block, whose
-  // height the records name with another digest (rule (b)).
+  // BUG-10's scenario under the floor's exemption would be stopped here too: the nodes stop when
+  // they apply the other block, whose height the records name with another digest (rule (b)).
   run rollbackIsDetectedTest =
     init.then(tick("n1")).then(tick("n2"))
       .then(decideDuty(b1)).then(apply("n1")).then(apply("n2"))

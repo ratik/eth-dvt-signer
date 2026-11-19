@@ -204,7 +204,10 @@ fn k1_authorized_duties_are_never_slashable() {
     for (i, a) in authorized.iter().enumerate() {
         let Some(a) = *a else { continue };
         if let Some(previous) = previous {
-            assert!(!slashable(previous, a), "slashable with the previous signer");
+            assert!(
+                !slashable(previous, a),
+                "slashable with the previous signer"
+            );
         }
         for b in authorized[i + 1..].iter().flatten() {
             assert!(!slashable(a, *b), "two authorized duties are slashable");
@@ -235,8 +238,7 @@ fn k2_the_decision_is_exactly_the_specification() {
     let history = authorized.iter().flatten();
     if history.clone().any(|&a| a == candidate) {
         assert_eq!(decision, Decision::AlreadyAccepted);
-    } else if below_floors(floors, candidate) || history.clone().any(|&a| slashable(a, candidate))
-    {
+    } else if below_floors(floors, candidate) || history.clone().any(|&a| slashable(a, candidate)) {
         assert!(matches!(decision, Decision::Refused(refusal) if refusal.is_slashing()));
     } else {
         assert_eq!(decision, Decision::Accepted);

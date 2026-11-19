@@ -71,8 +71,8 @@ The model (`formal/quint/slashing.qnt`) has 4 nodes, one of them Byzantine, and 
 | Byzantine node | Signs everything: it always counts toward a quorum. |
 | Crash, restart, restore of one node | `restart(i, h)`: the node restarts on a prefix `h` at or below its height and replays the log from its peers. |
 | Whole-network rollback (L-1) | `rollbackAll(k)`: every node restored to before command `k`; the log after `k` is lost with them. |
-| Restart floor | At each start a keyholder takes its clock's slot as its floor and refuses a new block or attestation at or below it. With `LOADED_EXEMPT` (the code today: `KnownDuty::loaded` in `dkg::actor`), the duties it loaded at start are exempt. |
-| WORM anchor | Each honest keyholder writes a record before a partial: its marks, and the block it had applied. At start a node reads the second-highest of each mark across nodes (the Byzantine record as low or as high as it can be) and refuses new duties the anchored marks refuse. It stops (exit 77) when the records of two nodes name other blocks at heights it applied, at start or as it applies blocks (rules (a) and (b) of [anchor.md](anchor.md)). Not modeled: the confirmation gate (it only refuses more) and the degraded mode. |
+| Restart floor | At each start a keyholder takes its clock's slot as its floor and refuses a block or attestation at or below it, loaded at start or not. `FLOOR_EXEMPTS_LOADED` restores the exemption of loaded duties the code had before BUG-10 (`rollbackFloorExempt` only). |
+| WORM anchor | Each honest keyholder writes a record before a partial: its marks, and the block it had applied. At start a node reads the second-highest of each mark across nodes (the Byzantine record as low or as high as it can be) and refuses the duties the anchored marks refuse, except those loaded at start (as the code does). It stops (exit 77) when the records of two nodes name other blocks at heights it applied, at start or as it applies blocks (rules (a) and (b) of [anchor.md](anchor.md)). Not modeled: the confirmation gate (it only refuses more) and the degraded mode. |
 
 The scope: blocks of slot 1 (two different ones), attestations `(0, 1)` (two different ones),
 `(1, 1)` and `(0, 2)`, which surrounds `(1, 1)`; slots and epochs 0 to 2; at most 2 decided
@@ -89,17 +89,21 @@ Two kinds of check:
 | ------------- | ------ | -------- | ---------- |
 | `faultModel` | One Byzantine node, crashes, restores of one node | Safe | TLC, both properties |
 | `rollbackNoFloor` | And a whole-network rollback, without the restart floor | A double signature (the E2E reproducer of L-1) | Scenario `doubleProposalTest`; TLC found a double vote and a surround vote by itself |
-| `rollbackFloor` | And the restart floor, as the code is | **A double proposal ([F-1](#f-1-the-restart-floor-exempts-what-a-rollback-authorized))** | Scenario `restartAfterRollbackSignsADoubleProposalTest` |
-| `rollbackFloorStrict` | The restart floor without the exemption of loaded duties | No double proposal or vote; a crafted surround vote is signed (L-1 as documented) | TLC (doubles); scenarios `restartAfterRollbackStillRefusesTest`, `surroundVoteTest` |
-| `rollbackAnchor` | The restart floor as the code is, and the WORM anchor | Safe | TLC, both properties; scenario `rollbackIsDetectedTest` |
+| `rollbackFloorExempt` | And the restart floor as it was before BUG-10 | **A double proposal ([F-1](#f-1-the-restart-floor-exempted-what-a-rollback-authorized))** | Scenario `restartAfterRollbackSignsADoubleProposalTest` |
+| `rollbackFloor` | And the restart floor | No double proposal or vote; a crafted surround vote is signed (L-1 as documented) | TLC (doubles); scenarios `restartAfterRollbackStillRefusesTest`, `surroundVoteTest` |
+| `rollbackAnchor` | And the WORM anchor | Safe | TLC, both properties; scenario `rollbackIsDetectedTest` |
+
+Removing an exemption only removes steps from the model. So a property that holds with
+`FLOOR_EXEMPTS_LOADED` holds without it: the TLC runs of `faultModel` and `rollbackAnchor` made
+with the exemption cover the code as well.
 
 ## Finding
 
-### F-1: the restart floor exempts what a rollback authorized
+### F-1: the restart floor exempted what a rollback authorized (fixed)
 
-[slashing-protection.md](slashing-protection.md#the-restart-floor) claims that after a
-whole-network rollback (L-1) the restart floor refuses a double proposal or a double vote. The
-model shows a sequence where it does not, and the code does what the model does:
+Audit BUG-10. [slashing-protection.md](slashing-protection.md#the-restart-floor) claims that after
+a whole-network rollback (L-1) the restart floor refuses a double proposal or a double vote. The
+model showed a sequence where it did not, and the code did what the model did:
 
 1. Three keyholders sign block `B` for slot `s` (the Byzantine node counts as the third).
 2. Every node is rolled back to before `B` and restarts. Each keyholder's floor is now at or above
@@ -110,11 +114,11 @@ model shows a sequence where it does not, and the code does what the model does:
 4. The nodes restart again: a plain restart, on the state they have (an operator who sees the
    refusals, a deploy, a power loss).
 5. At start each keyholder loads every authorization of its state as `loaded: true`
-   (`dkg::actor`, the `duty_roots` built from `duties`). `B'` is one of them. Loaded duties pass the
-   restart floor and the anchored marks (`if !loaded && ...`). A request for `B'` is signed: a
-   double proposal. The same holds for a double vote.
+   (`dkg::actor`, the `duty_roots` built from `duties`). `B'` is one of them. Loaded duties passed
+   the restart floor (`if !loaded && ...`). A request for `B'` was signed: a double proposal. The
+   same held for a double vote.
 
-The comment in `eth::horizon` gives the reason for the exemption: "a state restored from older
+The comment in `eth::horizon` gave the reason for the exemption: "a state restored from older
 storage never holds a record that conflicts with one it lost, since it authorized the lost ones
 itself". That holds right after the restore, not once the restored network has authorized more.
 
@@ -126,14 +130,17 @@ the nodes stop (exit 77) as soon as they apply `B'`'s block, before the second r
 (`rollbackIsDetectedTest`). A degraded anchor (unreachable) leaves the floor alone, and so the
 hole.
 
-Fix options (not applied):
+**The fix.** The restart floor applies to loaded duties too (`dkg::actor`); the anchored marks
+still exempt them, since the anchor detects the rollback. `rollbackFloor` checks the rule, and
+`floor::floor_1` runs the sequence on real processes: after the second restart the conflicting
+proposal answers `412` with `"protection": "restart_floor"`. With the old rule put back, the same
+test gets the double proposal signed (`200`). The cost: after a restart of every
+node, a retry of a duty signed just before it, in the restart's slot (attestations: its epoch),
+is refused (`floor::floor_2`). A restart of some nodes costs nothing: the others sign.
 
-- **No exemption for the bounded kinds** (`rollbackFloorStrict`, checked): a block, attestation,
-  PTC vote or envelope at or below the floor is refused even if loaded. Cost: after a restart of
-  every node, a retry of a duty signed in the restart's slot (attestations: epoch) is refused. The
-  keyholders that did not restart still sign it.
-- **Exempt only what this keyholder signed**: a durable local mark per partial, rolled back with
-  the node (a lost mark only refuses more). Costs a write per partial.
+The other option considered was to exempt only what the keyholder itself signed, with a durable
+local mark per partial. It keeps those retries, but costs a write before each partial, and a host
+that can roll back every node's storage can also write the marks for a conflicting duty.
 
 ## Results
 
@@ -144,9 +151,9 @@ State as of 2026-11-19, on the test host (12 cores, 64 GB).
 | K-5 | Proved (83 checks, under 1 s) |
 | K-1, K-2, K-4, K-6 | Running (CaDiCaL, 4 at once) |
 | K-3 | Ran out of memory next to the others; queued to run alone |
-| Scenarios (5) | All pass: the violations of `rollbackNoFloor` and `rollbackFloor`, the refusals of `rollbackFloorStrict` and `rollbackAnchor` |
+| Scenarios (5) | All pass: the violations of `rollbackNoFloor` and `rollbackFloorExempt`, the refusals of `rollbackFloor` and `rollbackAnchor` |
 | TLC `rollbackNoFloor` | Found, unguided, a double vote (13 steps) and a surround vote (15 steps, 9 M distinct states) |
-| TLC `faultModel`, `rollbackFloorStrict`, `rollbackAnchor` | Running |
+| TLC `faultModel`, `rollbackFloor`, `rollbackAnchor` | Running |
 
 Two changes to the code came with the proofs, neither visible to a node: the key index's hasher
 is a fixed one under `cfg(kani)` (Kani cannot model the OS randomness `RandomState` seeds from),
