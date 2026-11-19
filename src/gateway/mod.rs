@@ -305,8 +305,10 @@ async fn sign(
     let root = duty_request(&identifier, &body, Some(&gateway.network))
         .ok()
         .map(|(request, _)| request.signing_root());
-    let kind = serde_json::from_slice::<serde_json::Value>(&body)
-        .ok()
+    // The label is the client's `type` only for a request that parsed (a known type): any other
+    // string would add series to the metrics for good.
+    let kind = root
+        .and_then(|_| serde_json::from_slice::<serde_json::Value>(&body).ok())
         .and_then(|request| request.get("type")?.as_str().map(str::to_string))
         .unwrap_or_else(|| "unknown".into());
     gateway

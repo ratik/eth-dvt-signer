@@ -316,6 +316,32 @@ fn a_slow_node_is_hedged() {
     });
 }
 
+/// A request's `type` becomes a metrics label only when the request parsed: a client's invented
+/// types would add series for good.
+#[test]
+fn an_unknown_type_is_not_a_metrics_label() {
+    run(async {
+        let honest = fake(Behaviour::Sign(0), Network::MAINNET.to_json()).await;
+        let gateway = start(&[&honest], Duration::from_secs(1)).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let router = gateway.router();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let status = reqwest::Client::new()
+            .post(format!("{url}/api/v1/eth2/sign/{}", validator()))
+            .header("content-type", "application/json")
+            .body(r#"{"type":"INVENTED_TYPE_1"}"#)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert!(!status.is_success());
+        let metrics = gateway.metrics.encode();
+        assert!(!metrics.contains("INVENTED_TYPE_1"), "{metrics}");
+        assert!(metrics.contains(r#"type="unknown""#), "{metrics}");
+    });
+}
+
 /// A node of another chain is never used; with none left, the gateway answers 503 itself.
 #[test]
 fn a_node_of_another_chain_is_not_used() {

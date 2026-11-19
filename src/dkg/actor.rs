@@ -76,11 +76,17 @@ use commonware_utils::{
 };
 use rand_core::CryptoRng;
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+};
 use tracing::{debug, error, info, warn};
 
 /// Label of the dealer's randomness stream (derived from its persisted seed).
 const DEALER_NOISE: &[u8] = b"dealer";
+
+/// Most partials [Actor::signed] keeps: about a slot's worth of duties of a large cluster.
+const SIGNED_PARTIALS: usize = 1024;
 
 /// A submitted dealer log missing from finalized state after this many blocks is submitted again.
 const RESUBMIT_BLOCKS: u64 = 8;
@@ -494,6 +500,9 @@ pub struct Actor<
     reshares: HashMap<u64, ValidatorKey>,
     /// Share generations retired here (their share erased).
     retired: BTreeSet<u64>,
+    /// Partials already computed, by `(round, payload hash)`: a request asked again (a retry, or
+    /// a faulty peer replaying authorized roots) costs no BLS work once it passed the checks.
+    signed: RefCell<HashMap<(u64, PayloadHash), PartialSignature<Variant>>>,
 }
 
 impl<
@@ -606,6 +615,7 @@ impl<
             ready_sent: HashSet::new(),
             reshares: HashMap::new(),
             retired: BTreeSet::new(),
+            signed: RefCell::default(),
         }
     }
 
@@ -798,6 +808,7 @@ impl<
                 if ceremony.reshare().is_some() {
                     // An aborted reshare: its share, if derived, is never used.
                     self.shares.remove(&round);
+                    self.signed.get_mut().clear();
                     self.unavailable.remove(&round);
                     self.secrets
                         .erase(round)
@@ -836,6 +847,7 @@ impl<
             info!(ceremony = %ceremony.config.id, round, "share generation retired, erasing its share");
         }
         self.shares.remove(&round);
+        self.signed.get_mut().clear();
         self.unavailable.remove(&round);
         self.sessions.remove(&round);
         self.secrets
@@ -1138,6 +1150,7 @@ impl<
                 Ok(()) => {
                     info!(ceremony = %id, round, %public_key, index = stored.share.index.get(), "loaded key share");
                     self.shares.insert(round, stored.share.clone());
+                    self.signed.get_mut().clear();
                     self.acknowledge(ceremony);
                 }
                 Err(err) => {
@@ -1185,6 +1198,7 @@ impl<
             .expect("failed to persist key share");
         info!(ceremony = %id, round, %public_key, index, "dkg ceremony completed, key share stored");
         self.shares.insert(round, share);
+        self.signed.get_mut().clear();
         if ceremony.reshare().is_some() {
             // Durable and verified, then announced: never the other way round.
             crate::hooks::crash_point("reshare-after-share-stored");
@@ -1207,6 +1221,7 @@ impl<
                 Ok(()) => {
                     info!(ceremony = %id, round, index = stored.share.index.get(), "loaded imported key share");
                     self.shares.insert(round, stored.share.clone());
+                    self.signed.get_mut().clear();
                 }
                 Err(err) => {
                     error!(ceremony = %id, round, %err, "stored imported key share is unusable");
@@ -1287,6 +1302,7 @@ impl<
         info!(ceremony = %ceremony.config.id, round, index, "imported key share stored");
         self.unavailable.remove(&round);
         self.shares.insert(round, share);
+        self.signed.get_mut().clear();
         self.acknowledge(&ceremony);
         Ok(Installed { index, new: true })
     }
@@ -1358,7 +1374,7 @@ impl<
                     return Err(Refusal::BeyondHorizon);
                 }
                 // Sign what consensus authorized, as an Ethereum signing root.
-                Ok(signing::Message::Ethereum(*authorization.payload_hash()).partial_sign(share))
+                Ok(self.sign(round, payload_hash, share))
             }
             AuthorizationRef::Duty { validator } => {
                 if !validator_key {
@@ -1439,9 +1455,30 @@ impl<
                         return Err(refusal);
                     }
                 }
-                Ok(signing::Message::Ethereum(*payload_hash).partial_sign(share))
+                Ok(self.sign(round, payload_hash, share))
             }
         }
+    }
+
+    /// `payload_hash` signed with `share` of `round`, computed once while it is in
+    /// [Actor::signed]. Called only after every check of [Actor::partial].
+    fn sign(
+        &self,
+        round: u64,
+        payload_hash: &PayloadHash,
+        share: &Share,
+    ) -> PartialSignature<Variant> {
+        let key = (round, *payload_hash);
+        if let Some(partial) = self.signed.borrow().get(&key) {
+            return partial.clone();
+        }
+        let partial = signing::Message::Ethereum(*payload_hash).partial_sign(share);
+        let mut signed = self.signed.borrow_mut();
+        if signed.len() >= SIGNED_PARTIALS {
+            signed.clear();
+        }
+        signed.insert(key, partial.clone());
+        partial
     }
 
     /// Answer a peer's signing request: a partial signature or a refusal. A request whose
