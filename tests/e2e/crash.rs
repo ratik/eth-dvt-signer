@@ -55,6 +55,9 @@ fn sign_needing(network: &TestNetwork, victim: usize, frozen: usize) -> (u16, Va
 /// After the crash, node `victim` must restore `(KEY, 100) -> A`, refuse B, and sign A (it is
 /// needed: `freeze` is frozen).
 fn check_recovered_signer(network: &TestNetwork, victim: usize, freeze: usize, signed: &Value) {
+    // Ready once it applied a block since its start: its links to the others are up again, so
+    // the coordinator's requests reach it (its state alone comes from disk at once).
+    network.wait_for_ready(&[victim]);
     let index = index_of(network, victim);
     network.wait_until("the victim to restore the authorization", || {
         authorization(network, victim, 100).is_some()

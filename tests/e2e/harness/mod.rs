@@ -536,9 +536,12 @@ impl TestNetwork {
         self.nodes.lock().unwrap()[id].child.as_ref().map(Child::id)
     }
 
-    /// Freeze node `id` (SIGSTOP): its connections stay open but it answers nothing.
+    /// Freeze node `id` (SIGSTOP): its connections stay open but it answers nothing. Returns once
+    /// it has stopped, not when the signal is sent ([wait_stopped]).
     pub fn freeze(&self, id: usize) {
-        signal(self.pid(id).expect("node is running"), "-STOP");
+        let pid = self.pid(id).expect("node is running");
+        signal(pid, "-STOP");
+        wait_stopped(pid);
     }
 
     /// Resume a frozen node (SIGCONT).
@@ -901,6 +904,31 @@ impl Drop for TestNetwork {
         } else {
             let _ = fs::remove_dir_all(&self.dir);
         }
+    }
+}
+
+/// Wait until every thread of `pid` is stopped. `kill -STOP` returns once the signal is sent; the
+/// process stops only when each of its threads does, and under load a node was seen to receive,
+/// sign and answer a request in that window, so a "frozen" node's partial completed a signature.
+/// Linux only (`/proc`); elsewhere it returns at once.
+fn wait_stopped(pid: u32) {
+    let tasks = format!("/proc/{pid}/task");
+    if fs::read_dir(&tasks).is_err() {
+        return;
+    }
+    let stopped = |task: fs::DirEntry| {
+        // `pid (comm) state ...`: the state follows the last `)`.
+        fs::read_to_string(task.path().join("stat")).is_ok_and(|stat| {
+            stat.rsplit(')')
+                .next()
+                .and_then(|rest| rest.split_whitespace().next())
+                .is_some_and(|state| state == "T" || state == "t")
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fs::read_dir(&tasks).is_ok_and(|entries| entries.flatten().all(stopped)) {
+        assert!(Instant::now() < deadline, "process {pid} did not stop");
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
