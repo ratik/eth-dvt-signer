@@ -421,6 +421,26 @@ mod keeper_tests {
         assert!(!anchor.degraded());
     }
 
+    /// A partial that needs new marks while a heartbeat is in flight waits for that write. If the
+    /// heartbeat fails, the partial is given (degraded), not kept until the anchor answers again,
+    /// and its marks go into the catch-up record.
+    #[test]
+    fn a_failed_heartbeat_gives_what_waited_for_it() {
+        let mut anchor = keeper(Some((View::default(), None, true)));
+        let heartbeat = anchor
+            .due(at(0), Duration::from_secs(600))
+            .expect("a first record");
+        assert_eq!(heartbeat.marks, Marks::default());
+        let vote = keeper::needed(DutyKind::Attestation, 3, Some(2));
+        assert_eq!(anchor.step(vote, 1), (Step::Hold(None), None));
+        assert_eq!(anchor.failed(at(1), None), vec![1]);
+        assert!(anchor.degraded());
+        let job = anchor
+            .due(at(40), Duration::from_secs(600))
+            .expect("a retry");
+        assert_eq!(job.marks, vote.unwrap());
+    }
+
     #[test]
     fn a_heartbeat_while_blocks_are_applied() {
         let mut anchor = keeper(Some((View::default(), None, true)));

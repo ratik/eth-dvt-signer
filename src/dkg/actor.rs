@@ -100,8 +100,8 @@ pub enum Message {
         height: u64,
         digest: commonware_cryptography::sha256::Digest,
     },
-    /// The outcome of an anchor record write (`anchor`): `held` if partials wait for it.
-    Anchored { outcome: Anchored, held: bool },
+    /// The outcome of an anchor record write (`anchor`).
+    Anchored(Anchored),
     /// The executor confirmed this node's chain against the anchor's records.
     AnchorConfirmed,
     /// A message from a peer on the DKG channel (the sender is authenticated by p2p).
@@ -662,11 +662,11 @@ impl<
                     if let Some(anchor) = &mut self.anchor {
                         anchor.applied(height, digest);
                         if let Some(job) = anchor.due(now, heartbeat) {
-                            self.spawn_anchor_write(job, false);
+                            self.spawn_anchor_write(job);
                         }
                     }
                 }
-                Message::Anchored { outcome, held } => self.on_anchored(outcome, held),
+                Message::Anchored(outcome) => self.on_anchored(outcome),
                 Message::AnchorConfirmed => {
                     if let Some(anchor) = &mut self.anchor {
                         anchor.confirm();
@@ -1578,7 +1578,7 @@ impl<
             (keeper::Step::Give, Some(held)) => self.deliver(held),
             (keeper::Step::Hold(job), _) => {
                 if let Some(job) = job {
-                    self.spawn_anchor_write(job, true);
+                    self.spawn_anchor_write(job);
                 }
             }
             (keeper::Step::Give, None) => unreachable!("a given reply is returned"),
@@ -1600,7 +1600,7 @@ impl<
 
     /// Write the anchor record `job` asks for in a task of its own; its outcome comes back as
     /// [Message::Anchored].
-    fn spawn_anchor_write(&mut self, job: keeper::Job, held: bool) {
+    fn spawn_anchor_write(&mut self, job: keeper::Job) {
         let (Some(anchor), Some(sender)) = (&self.anchor, self.mailbox_sender.clone()) else {
             return;
         };
@@ -1634,11 +1634,11 @@ impl<
                         failed(format!("no answer within {:?}", keeper::WRITE_TIMEOUT))
                     },
                 };
-                let _ = sender.send(Message::Anchored { outcome, held });
+                let _ = sender.send(Message::Anchored(outcome));
             });
     }
 
-    fn on_anchored(&mut self, outcome: Anchored, held: bool) {
+    fn on_anchored(&mut self, outcome: Anchored) {
         let now = crate::hooks::clock(self.context.current());
         let Some(anchor) = &mut self.anchor else {
             return;
@@ -1656,7 +1656,7 @@ impl<
                     self.deliver(held);
                 }
                 if let Some(job) = next {
-                    self.spawn_anchor_write(job, true);
+                    self.spawn_anchor_write(job);
                 }
             }
             Anchored::Taken(path) => {
@@ -1675,12 +1675,10 @@ impl<
                     "anchor: record not written; degraded: signing under the restart floor alone \
                      until the anchor answers again"
                 );
-                if held {
-                    for held in anchor.failed(now, attempted) {
-                        self.deliver(held);
-                    }
-                } else {
-                    anchor.due_failed(now, attempted);
+                // Whichever write it was: a partial held while a heartbeat was in flight waits
+                // for that write too, and would otherwise wait for the anchor's return.
+                for held in anchor.failed(now, attempted) {
+                    self.deliver(held);
                 }
             }
         }
