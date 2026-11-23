@@ -1,13 +1,20 @@
-//! Kani proofs of the replicated slashing rules (`src/slashing.rs`). See docs/formal.md.
+//! Kani proofs of the replicated slashing rules (`src/slashing.rs`, `slashing::rules`). See
+//! docs/formal.md.
 //!
-//! The proofs run the real `Protection::decide_rule`, `Protection::record` and
-//! `Protection::check_surround` on symbolic duties. What they abstract:
+//! The proofs run the real `rules::proposal`, `rules::attestation`, `rules::surround`,
+//! `rules::bounded` and `Floors::merge` on symbolic duties. What they abstract:
 //!
-//! - **The signing root.** Computing it (SSZ, SHA-256) is out of scope. A duty's root here is an
-//!   injective encoding of the duty ([Msg::root]): two duties have the same root iff they are the
-//!   same duty. SHA-256 collision resistance gives the same for real roots.
-//! - **The checks before the rules.** `Protection::decide` runs `decide_rule` after checks that
-//!   only refuse (unknown or inactive key, an invalid duty, another chain, an envelope without its
+//! - **The history's container.** The rules read a validator's history through `History`. In the
+//!   node it is `Protection`'s `BTreeMap`s (`Of`: a lookup by key, and `range` for the nearest
+//!   attestation on each side); here it is [List], a few entries scanned in full, which is what
+//!   those lookups return by definition. `Of`'s lines over `BTreeMap::range` are checked by the
+//!   unit tests against an exhaustive scan (`logarithmic_checks_match_the_exhaustive_reference`).
+//! - **The signing root.** Computing it (SSZ, SHA-256) is out of scope. A duty's root here is a
+//!   symbolic tag byte and zeros ([Msg::root]), with the assumption that, among the duties of a
+//!   harness, two roots are equal iff the duties are ([Msg::any_distinct]): what SHA-256's
+//!   collision resistance gives for real roots.
+//! - **The checks before the rules.** `Protection::decide` runs the rules after checks that only
+//!   refuse (unknown or inactive key, an invalid duty, another chain, an envelope without its
 //!   block). So they cannot make the rules accept a duty. One of them is assumed here: an
 //!   attestation's source is at or below its target (`Invalid::SourceAfterTarget`).
 //! - **The previous signer of an imported key.** It signed any history whose blocks are at or
@@ -15,73 +22,114 @@
 //!   attestation floors: the imported interchanges are its complete history (docs/key-import.md)
 //!   and none is slashable with respect to itself (`eth::interchange` refuses those).
 //!
-//! Slots and epochs are full `u64`s, not small ranges. The bound is the number of duties.
+//! **Slots and epochs** are `0..=255` or `u64::MAX` ([any_epoch]). The rules use them only through
+//! `<`, `<=` and `==` (and `Of` through a range after a target), so a decision depends only on how
+//! the values involved compare. A harness involves at most 13 of them, and every way that many
+//! `u64`s can compare is realized in `0..=255`; `u64::MAX` keeps the last-epoch case. So the proofs
+//! cover every `u64`. The bound is the number of duties.
 
-use super::*;
+use super::{
+    Attested, DutyKind, Floors, History, HistorySummary, ImportedAttestation, ImportedBlock,
+    Refusal, Root, Signed, rules,
+};
 
-const ID: u64 = 0;
-const KEY: ValidatorKey = [7; 48];
+/// Duties per harness.
+const DUTIES: usize = 4;
 
-/// A slashable duty, as the consensus specification compares them.
+/// A slot or an epoch: one of `0..=255` or `u64::MAX` (module docs).
+fn any_epoch() -> u64 {
+    if kani::any() {
+        u64::MAX
+    } else {
+        u64::from(kani::any::<u8>())
+    }
+}
+
+/// A slashable duty, as the consensus specification compares them, and its signing root's tag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Msg {
     /// A block proposal; `data` stands for the rest of the header.
-    Block { slot: u64, data: u8 },
+    Block { slot: u64, data: u8, tag: u8 },
     /// An attestation; `data` stands for the rest of `AttestationData`.
-    Attestation { source: u64, target: u64, data: u8 },
+    Attestation {
+        source: u64,
+        target: u64,
+        data: u8,
+        tag: u8,
+    },
 }
 
 impl Msg {
     fn any() -> Self {
         if kani::any() {
             Self::Block {
-                slot: kani::any(),
+                slot: any_epoch(),
                 data: kani::any(),
+                tag: kani::any(),
             }
         } else {
-            let (source, target) = (kani::any(), kani::any());
+            let (source, target) = (any_epoch(), any_epoch());
             kani::assume(source <= target);
             Self::Attestation {
                 source,
                 target,
                 data: kani::any(),
+                tag: kani::any(),
             }
         }
     }
 
-    fn rule(self) -> Rule {
+    /// `n` duties whose roots are equal iff the duties are ([Msg::root]).
+    fn any_distinct<const N: usize>() -> [Self; N] {
+        let msgs: [Self; N] = core::array::from_fn(|_| Self::any());
+        for (i, a) in msgs.iter().enumerate() {
+            for b in &msgs[i + 1..] {
+                kani::assume((a.tag() == b.tag()) == a.same_duty(*b));
+            }
+        }
+        msgs
+    }
+
+    fn tag(self) -> u8 {
         match self {
-            Self::Block { slot, .. } => Rule::Proposal { slot },
-            Self::Attestation { source, target, .. } => Rule::Attestation { source, target },
+            Self::Block { tag, .. } | Self::Attestation { tag, .. } => tag,
         }
     }
 
-    fn kind(self) -> DutyKind {
-        match self {
-            Self::Block { .. } => DutyKind::BlockProposal,
-            Self::Attestation { .. } => DutyKind::Attestation,
+    /// The same duty, whatever the tags.
+    fn same_duty(self, other: Self) -> bool {
+        match (self, other) {
+            (
+                Self::Block { slot, data, .. },
+                Self::Block {
+                    slot: s, data: d, ..
+                },
+            ) => slot == s && data == d,
+            (
+                Self::Attestation {
+                    source,
+                    target,
+                    data,
+                    ..
+                },
+                Self::Attestation {
+                    source: s,
+                    target: t,
+                    data: d,
+                    ..
+                },
+            ) => source == s && target == t && data == d,
+            _ => false,
         }
     }
 
-    /// Injective: equal roots iff equal duties.
+    /// The duty's signing root: its tag, then zeros. Among the duties of a harness
+    /// ([Msg::any_distinct]) roots are equal iff the duties are, as SHA-256's collision
+    /// resistance gives for real roots; one symbolic byte, not a whole symbolic encoding, keeps
+    /// the solver's root comparisons cheap.
     fn root(self) -> Root {
         let mut root = [0; 32];
-        match self {
-            Self::Block { slot, data } => {
-                root[1..9].copy_from_slice(&slot.to_le_bytes());
-                root[17] = data;
-            }
-            Self::Attestation {
-                source,
-                target,
-                data,
-            } => {
-                root[0] = 1;
-                root[1..9].copy_from_slice(&source.to_le_bytes());
-                root[9..17].copy_from_slice(&target.to_le_bytes());
-                root[17] = data;
-            }
-        }
+        root[0] = self.tag();
         root
     }
 }
@@ -90,7 +138,7 @@ impl Msg {
 /// (`is_slashable_attestation_data`: a double vote or a surround vote), for one validator.
 fn slashable(a: Msg, b: Msg) -> bool {
     match (a, b) {
-        (Msg::Block { slot: s1, .. }, Msg::Block { slot: s2, .. }) => s1 == s2 && a != b,
+        (Msg::Block { slot: s1, .. }, Msg::Block { slot: s2, .. }) => s1 == s2 && !a.same_duty(b),
         (
             Msg::Attestation {
                 source: s1,
@@ -102,17 +150,128 @@ fn slashable(a: Msg, b: Msg) -> bool {
                 target: t2,
                 ..
             },
-        ) => (a != b && t1 == t2) || (s1 < s2 && t2 < t1) || (s2 < s1 && t1 < t2),
+        ) => (!a.same_duty(b) && t1 == t2) || (s1 < s2 && t2 < t1) || (s2 < s1 && t1 < t2),
         _ => false,
     }
+}
+
+/// A validator's history as a few entries: what `History` returns, by definition. Entry `i`
+/// holds the `i`-th duty if it was recorded. The proofs index it with constants, loop by index,
+/// and return copies: the solver follows neither symbolic indices, pointers nor iterator
+/// internals cheaply.
+#[derive(Default)]
+struct List {
+    proposals: [Option<(u64, Signed)>; DUTIES],
+    attestations: [Option<(u64, Attested)>; DUTIES],
+}
+
+impl History for List {
+    fn proposal(&self, slot: u64) -> Option<Signed> {
+        let mut found = None;
+        for i in 0..DUTIES {
+            if let Some((s, signed)) = self.proposals[i]
+                && s == slot
+            {
+                found = Some(signed);
+            }
+        }
+        found
+    }
+
+    fn attestation(&self, target: u64) -> Option<Attested> {
+        let mut found = None;
+        for i in 0..DUTIES {
+            if let Some((t, attested)) = self.attestations[i]
+                && t == target
+            {
+                found = Some(attested);
+            }
+        }
+        found
+    }
+
+    fn attestation_below(&self, target: u64) -> Option<(u64, Attested)> {
+        let mut best: Option<(u64, Attested)> = None;
+        for i in 0..DUTIES {
+            if let Some((t, attested)) = self.attestations[i]
+                && t < target
+                && best.is_none_or(|(b, _)| t > b)
+            {
+                best = Some((t, attested));
+            }
+        }
+        best
+    }
+
+    fn attestation_above(&self, target: u64) -> Option<(u64, Attested)> {
+        let mut best: Option<(u64, Attested)> = None;
+        for i in 0..DUTIES {
+            if let Some((t, attested)) = self.attestations[i]
+                && t > target
+                && best.is_none_or(|(b, _)| t < b)
+            {
+                best = Some((t, attested));
+            }
+        }
+        best
+    }
+}
+
+impl List {
+    /// Record `msg`, newly authorized, as the `i`-th duty (`Protection::record`: by slot or
+    /// target; a recorded slot or target is never recorded again, since the rules refuse it).
+    fn record(&mut self, i: usize, msg: Msg) {
+        let signing_root = msg.root();
+        let height = i as u64;
+        match msg {
+            Msg::Block { slot, .. } => {
+                self.proposals[i] = Some((
+                    slot,
+                    Signed {
+                        signing_root,
+                        height,
+                    },
+                ));
+            }
+            Msg::Attestation { source, target, .. } => {
+                self.attestations[i] = Some((
+                    target,
+                    Attested {
+                        source,
+                        signing_root,
+                        height,
+                    },
+                ));
+            }
+        }
+    }
+}
+
+/// What `Protection::decide_rule` decides for `msg`: `Ok(true)` new, `Ok(false)` a repeat.
+fn decide(history: &List, floors: Floors, msg: Msg) -> Result<bool, Refusal> {
+    match msg {
+        Msg::Block { slot, .. } => rules::proposal(history, floors, slot, &msg.root()),
+        Msg::Attestation { source, target, .. } => {
+            rules::attestation(history, floors, source, target, &msg.root())
+        }
+    }
+}
+
+/// Decide `msg`, the `i`-th duty, and record it if new (`Protection::authorize`).
+fn apply(history: &mut List, floors: Floors, i: usize, msg: Msg) -> Result<bool, Refusal> {
+    let decision = decide(history, floors, msg);
+    if decision == Ok(true) {
+        history.record(i, msg);
+    }
+    decision
 }
 
 /// Symbolic floors of an imported key, as `Floors::merge` leaves them (a source at or below its
 /// target), or none (a DKG key).
 fn any_floors() -> Floors {
-    let block = kani::any::<bool>().then(kani::any);
+    let block = kani::any::<bool>().then(any_epoch);
     let attestation = kani::any::<bool>().then(|| {
-        let (source, target) = (kani::any(), kani::any());
+        let (source, target) = (any_epoch(), any_epoch());
         kani::assume(source <= target);
         (source, target)
     });
@@ -131,49 +290,6 @@ fn any_previous(floors: Floors) -> Option<Msg> {
     possible.then_some(msg)
 }
 
-/// One validator (id 0, ceremony round 0) with `floors`. It is not in the key index (a
-/// `HashMap`, whose hashing the rules never use): `register` would put it there.
-fn protection(floors: Floors) -> Protection {
-    let mut protection = Protection::default();
-    protection.designate(0);
-    protection.validators.insert(
-        ID,
-        Validator {
-            key: KEY,
-            round: 0,
-            activation: None,
-            legacy_chain: None,
-            records: 0,
-        },
-    );
-    if floors != Floors::default() {
-        protection.imported.insert(
-            ID,
-            ImportedValidator {
-                round: 0,
-                chain: None,
-                floors,
-                imports: 1,
-                acknowledged: None,
-            },
-        );
-    }
-    protection
-}
-
-/// What `Protection::authorize` does for `msg` after its preliminary checks.
-fn apply(protection: &mut Protection, msg: Msg, height: u64) -> Decision {
-    let (rule, kind, root) = (msg.rule(), msg.kind(), msg.root());
-    match protection.decide_rule(ID, rule, kind, &root) {
-        Ok(Some(id)) => {
-            protection.record(id, rule, kind, root, height);
-            Decision::Accepted
-        }
-        Ok(None) => Decision::AlreadyAccepted,
-        Err(refusal) => Decision::Refused(refusal),
-    }
-}
-
 fn below_floors(floors: Floors, msg: Msg) -> bool {
     match msg {
         Msg::Block { slot, .. } => floors.block.is_some_and(|floor| slot <= floor),
@@ -183,22 +299,20 @@ fn below_floors(floors: Floors, msg: Msg) -> bool {
     }
 }
 
-const DUTIES: usize = 3;
-
 /// K-1. Whatever duties arrive, in any order, no two duties the rules authorize are slashable
 /// with each other, nor with anything the previous signer of an imported key may have signed.
 #[kani::proof]
-#[kani::unwind(5)]
+#[kani::unwind(6)]
 #[kani::solver(cadical)]
 fn k1_authorized_duties_are_never_slashable() {
     let floors = any_floors();
     let previous = any_previous(floors);
-    let mut protection = protection(floors);
+    let mut history = List::default();
+    let msgs = Msg::any_distinct::<DUTIES>();
     let mut authorized = [None; DUTIES];
-    for (height, slot) in authorized.iter_mut().enumerate() {
-        let msg = Msg::any();
-        if apply(&mut protection, msg, height as u64).is_authorized() {
-            *slot = Some(msg);
+    for (i, slot) in authorized.iter_mut().enumerate() {
+        if apply(&mut history, floors, i, msgs[i]).is_ok() {
+            *slot = Some(msgs[i]);
         }
     }
     for (i, a) in authorized.iter().enumerate() {
@@ -216,96 +330,126 @@ fn k1_authorized_duties_are_never_slashable() {
 }
 
 /// K-2. The rules decide exactly what the specification says, after any history they built:
-/// a repeat of an authorized duty is `AlreadyAccepted`; otherwise a duty at or below an imported
-/// floor, or slashable with an authorized one, is refused as slashing; and every other duty is
-/// accepted. So no check refuses too little (K-1) or too much, and the logarithmic surround check
+/// a repeat of an authorized duty is a repeat; otherwise a duty at or below an imported floor, or
+/// slashable with an authorized one, is refused as slashing; and every other duty is accepted.
+/// So no check refuses too little (K-1) or too much, and the nearest-neighbour surround check
 /// gives the full scan's answers.
 #[kani::proof]
-#[kani::unwind(5)]
+#[kani::unwind(6)]
 #[kani::solver(cadical)]
 fn k2_the_decision_is_exactly_the_specification() {
     let floors = any_floors();
-    let mut protection = protection(floors);
+    let mut history = List::default();
+    let msgs = Msg::any_distinct::<DUTIES>();
     let mut authorized = [None; DUTIES - 1];
-    for (height, slot) in authorized.iter_mut().enumerate() {
-        let msg = Msg::any();
-        if apply(&mut protection, msg, height as u64) == Decision::Accepted {
-            *slot = Some(msg);
+    for (i, slot) in authorized.iter_mut().enumerate() {
+        if apply(&mut history, floors, i, msgs[i]) == Ok(true) {
+            *slot = Some(msgs[i]);
         }
     }
-    let candidate = Msg::any();
-    let decision = apply(&mut protection, candidate, DUTIES as u64);
-    let history = authorized.iter().flatten();
-    if history.clone().any(|&a| a == candidate) {
-        assert_eq!(decision, Decision::AlreadyAccepted);
-    } else if below_floors(floors, candidate) || history.clone().any(|&a| slashable(a, candidate)) {
-        assert!(matches!(decision, Decision::Refused(refusal) if refusal.is_slashing()));
+    let candidate = msgs[DUTIES - 1];
+    let decision = decide(&history, floors, candidate);
+    let recorded = authorized.iter().flatten();
+    if recorded.clone().any(|&a| a.same_duty(candidate)) {
+        assert_eq!(decision, Ok(false));
+    } else if below_floors(floors, candidate) || recorded.clone().any(|&a| slashable(a, candidate))
+    {
+        assert!(matches!(decision, Err(refusal) if refusal.is_slashing()));
     } else {
-        assert_eq!(decision, Decision::Accepted);
+        assert_eq!(decision, Ok(true));
     }
 }
 
-/// K-3. The surround check is exact on any stored history whose order `Protection::verify` accepts
-/// at startup (`Protection::attestation_disorder`), not only on histories the rules built: the
-/// history of a store read from disk.
+/// K-3. The surround check is exact on any stored history whose order `Protection::verify`
+/// accepts at startup (`Protection::attestation_disorder`: no source after its target, sources
+/// never decreasing as targets increase), not only on histories the rules built: the history of
+/// a store read from disk.
 #[kani::proof]
-#[kani::unwind(5)]
+#[kani::unwind(6)]
 #[kani::solver(cadical)]
 fn k3_the_surround_check_is_exact_on_any_verified_history() {
-    let mut protection = protection(Floors::default());
-    for height in 0..DUTIES as u64 {
+    let mut history = List::default();
+    for (height, entry) in history.attestations.iter_mut().enumerate() {
         if kani::any() {
-            let (source, target) = (kani::any(), kani::any());
-            protection.attestations.insert(
-                (ID, target),
+            let (source, target) = (any_epoch(), any_epoch());
+            *entry = Some((
+                target,
                 Attested {
                     source,
                     signing_root: [0; 32],
-                    height,
+                    height: height as u64,
                 },
-            );
+            ));
         }
     }
-    // What `Protection::verify` checks of the attestations at startup.
-    kani::assume(protection.attestation_disorder().is_none());
-    let (source, target) = (kani::any(), kani::any());
+    let stored = history.attestations;
+    for (i, a) in stored.iter().enumerate() {
+        let Some((ta, a)) = a else { continue };
+        kani::assume(a.source <= *ta);
+        for (tb, b) in stored[i + 1..].iter().flatten() {
+            // A map: one entry per target. Ordered: a later target never has an earlier source.
+            kani::assume(ta != tb);
+            kani::assume(if ta < tb {
+                a.source <= b.source
+            } else {
+                b.source <= a.source
+            });
+        }
+    }
+    let (source, target) = (any_epoch(), any_epoch());
     kani::assume(source <= target);
-    let surround = protection.attestations.iter().any(|(&(_, t), a)| {
-        (source < a.source && t < target) || (a.source < source && target < t)
-    });
-    assert_eq!(
-        protection.check_surround(ID, source, target).is_err(),
-        surround
-    );
+    let surround = stored
+        .iter()
+        .flatten()
+        .any(|(t, a)| (source < a.source && *t < target) || (a.source < source && target < *t));
+    assert_eq!(rules::surround(&history, source, target).is_err(), surround);
 }
 
 /// K-4. A non-slashable kind never gets more distinct roots in one period than its limit
 /// (`DutyKind::max_roots`: one deposit message ever, one PTC vote or envelope per slot, 8 of the
-/// others), and a root is recorded once.
+/// others), and a root is recorded once. Proved as the inductive step, for every length of the
+/// recorded roots up to the limit: on distinct roots within the limit, `rules::bounded` accepts a
+/// new root only below the limit, repeats a recorded one, and refuses the rest. So, from no
+/// roots, every sequence of requests keeps the roots distinct and within the limit.
 #[kani::proof]
 #[kani::unwind(10)]
 #[kani::solver(cadical)]
 fn k4_bounded_kinds_keep_their_limit() {
+    const MAX: usize = crate::eth::duty::MAX_ROOTS_PER_PERIOD;
     let kind = DutyKind::ALL[kani::any_where(|i: &usize| *i < DutyKind::ALL.len())];
     kani::assume(!matches!(
         kind,
         DutyKind::BlockProposal | DutyKind::Attestation | DutyKind::ValidatorRegistration
     ));
-    let period = kani::any();
-    let mut protection = protection(Floors::default());
-    for height in 0..=crate::eth::duty::MAX_ROOTS_PER_PERIOD as u64 {
+    let period = any_epoch();
+    let tagged = |tag: u8| {
         let mut root = [0; 32];
-        root[0] = kani::any();
-        let rule = Rule::Bounded { period };
-        if let Ok(Some(id)) = protection.decide_rule(ID, rule, kind, &root) {
-            protection.record(id, rule, kind, root, height);
+        root[0] = tag;
+        root
+    };
+    let recorded: [Signed; MAX] = core::array::from_fn(|i| Signed {
+        signing_root: tagged(kani::any()),
+        height: i as u64,
+    });
+    let root = tagged(kani::any());
+    for n in 0..=MAX {
+        let roots = &recorded[..n];
+        let mut distinct = n <= kind.max_roots();
+        let mut known = false;
+        for i in 0..n {
+            known |= roots[i].signing_root == root;
+            for j in i + 1..n {
+                distinct &= roots[i].signing_root != roots[j].signing_root;
+            }
         }
-    }
-    let roots = protection.bounded(ID, kind, period);
-    assert!(roots.len() <= kind.max_roots());
-    for (i, a) in roots.iter().enumerate() {
-        for b in &roots[i + 1..] {
-            assert_ne!(a.signing_root, b.signing_root);
+        if !distinct {
+            continue;
+        }
+        match rules::bounded(roots, kind, period, &root) {
+            Ok(true) => assert!(!known && n < kind.max_roots()),
+            Ok(false) => assert!(known),
+            Err(Refusal::TooManyRoots { .. }) => assert!(!known && n >= kind.max_roots()),
+            Err(_) => panic!("another refusal"),
         }
     }
 }
@@ -339,23 +483,4 @@ fn k5_floors_only_rise() {
         let (ms, mt) = merged.attestation.expect("merged");
         assert!(ms >= att.source && mt >= att.target);
     }
-}
-
-/// K-6. A reshare (`Protection::move_validator`) changes no decision: the history stays with the
-/// key, not with its share generation.
-#[kani::proof]
-#[kani::unwind(5)]
-#[kani::solver(cadical)]
-fn k6_a_reshare_keeps_every_decision() {
-    let floors = any_floors();
-    let mut protection = protection(floors);
-    for height in 0..(DUTIES - 1) as u64 {
-        apply(&mut protection, Msg::any(), height);
-    }
-    let candidate = Msg::any();
-    let (rule, kind, root) = (candidate.rule(), candidate.kind(), candidate.root());
-    let before = protection.decide_rule(ID, rule, kind, &root);
-    protection.designate(1);
-    protection.move_validator(ID, 1);
-    assert_eq!(protection.decide_rule(ID, rule, kind, &root), before);
 }

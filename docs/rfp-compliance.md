@@ -37,7 +37,7 @@ Status: **Met** (done and tested), **Gap** (met, with a limit named in the row),
 | Item | Status | Evidence |
 | --- | --- | --- |
 | Threshold signing | Met | See Conditions. |
-| Formal model of the slashing-safety logic | Partial | Kani proofs that `src/slashing.rs` decides exactly the slashing specification, and a Quint model of the protocol (crashes, rollbacks, restart floor, WORM anchor) checked by TLC ([formal.md](formal.md)). Some checks still running. The model found BUG-10 (the restart floor exempted what a rollback authorized), now fixed. |
+| Formal model of the slashing-safety logic | Partial | Kani proves that the slashing rules (`slashing::rules`) decide exactly the specification (K-1 to K-5, all pass); TLC proves the protocol model safe under the fault model (one Byzantine node, crashes, one-node restores: 36.6 M states, exhaustive). Under whole-network rollbacks with the restart floor, TLC proves that no double proposal or vote is signed (1.008 G states, exhaustive); the check with the WORM anchor is still running ([formal.md](formal.md)). The model found BUG-10 (the restart floor exempted what a rollback authorized), now fixed. |
 | Remote attestation a third party can verify | Met | `mpc-admin attest`, `mpc-gateway` and `mpc-keytool split --attestation-policy` verify SNP reports (VCEK chained to pinned AMD ARK/ASK; measurement, TCB, HOST_DATA, chip_id) and TDX evidence ([tee.md](tee.md), [gateway.md](gateway.md)). |
 | Protection against cloned devices | Partial | The anchor detects a clone ([anchor.md](anchor.md)); shares are sealed to the measured image ([tee.md](tee.md)). |
 

@@ -8,7 +8,7 @@ Two layers, checked by machine:
 | The protocol | The network signs no slashable pair: consensus, the atomic record and authorization, the keyholders' signing gate, crashes, rollbacks of one node or of every node, the restart floor, the WORM anchor | [Quint](https://quint-lang.org), checked exhaustively by TLC | `formal/quint/slashing.qnt` |
 
 The Quint model's rules are the specification the Kani proofs check the code against. So the two
-layers meet at one definition: `decide` in the model, `Protection::decide_rule` in the code.
+layers meet at one definition: `decide` in the model, `slashing::rules` in the code.
 
 Results: [below](#results). Reproduce them with `formal/run.sh` ([below](#running)).
 
@@ -26,24 +26,41 @@ needs 3 partials, so a duty without 3 partials has no signature).
 
 ## Layer 1: the rules (Kani)
 
-The harnesses run the real `Protection::decide_rule`, `Protection::record`,
-`Protection::check_surround`, `Protection::verify` and `Floors::merge` on symbolic duties: every
-slot and epoch is a full `u64`, every order of duties is covered. The bound is the number of
-duties: 3 per harness (2 recorded and a candidate for K-2 and K-6), 9 for K-4.
+The rules live in `slashing::rules` (`proposal`, `attestation`, `surround`, `bounded`). They
+read a validator's history through a small trait, `History`: a proposal by slot, an attestation
+by target, and the nearest attestation below and above a target. In the node, `Of` answers from
+`Protection`'s `BTreeMap`s. The harnesses run the real rules and `Floors::merge` on symbolic
+duties, in every order, with a short list as the history.
+
+Slots and epochs are `0..=255` or `u64::MAX`. The rules only compare them, so these values
+realize every way the values of a harness can compare, the last epoch included. The bound is the
+number of duties: four for K-1, three recorded and a candidate for K-2, four stored attestations
+for K-3. K-4 is an inductive step, for every number of recorded roots up to the limit (8).
 
 | Proof | Claim |
 | ----- | ----- |
 | K-1 `k1_authorized_duties_are_never_slashable` | Whatever duties arrive, in any order, no two that the rules authorize are slashable with each other, nor with anything the previous signer of an imported key may have signed. |
-| K-2 `k2_the_decision_is_exactly_the_specification` | After any history the rules built, a duty is `AlreadyAccepted` iff it was authorized; otherwise refused as slashing iff it is at or below an imported floor or slashable with an authorized duty; otherwise accepted. So the rules refuse neither too little nor too much. |
-| K-3 `k3_the_surround_check_is_exact_on_any_verified_history` | The logarithmic surround check gives the full scan's answer on any stored history that `Protection::verify` accepts at startup, not only on histories the rules built. |
-| K-4 `k4_bounded_kinds_keep_their_limit` | A non-slashable kind never gets more distinct roots per period than `DutyKind::max_roots` (one deposit message ever; one PTC vote or envelope per slot; 8 for the others), each root once. |
+| K-2 `k2_the_decision_is_exactly_the_specification` | After any history the rules built, a duty is a repeat iff it was authorized; otherwise refused as slashing iff it is at or below an imported floor or slashable with an authorized duty; otherwise accepted. So the rules refuse neither too little nor too much. |
+| K-3 `k3_the_surround_check_is_exact_on_any_verified_history` | The nearest-neighbour surround check gives the full scan's answer on any stored history whose order `Protection::verify` accepts at startup, not only on histories the rules built. |
+| K-4 `k4_bounded_kinds_keep_their_limit` | A non-slashable kind never gets more distinct roots per period than `DutyKind::max_roots` (one deposit message ever; one PTC vote or envelope per slot; 8 for the others), each root once: on distinct roots within the limit, `rules::bounded` accepts a new root only below the limit, repeats a recorded one and refuses the rest. |
 | K-5 `k5_floors_only_rise` | Merging an import never lowers a floor, and the merged floors cover the import. |
-| K-6 `k6_a_reshare_keeps_every_decision` | Moving a key to a new share generation (`move_validator`) changes no decision. |
+
+A reshare (`move_validator`) changes only the validator's ceremony round, which the rules never
+read: their inputs are the key's history and floors.
 
 What the proofs abstract, and why it is sound:
 
-- **The signing root.** Each duty's root is an injective encoding of the duty. The real root is
-  SHA-256 of the duty and its domain: equal roots of different duties would be a collision.
+- **The history's container.** The proofs use a list scanned in full, which is what the
+  `History` lookups return by definition. Kani could not follow `BTreeMap`'s internals: two duties
+  already ran the solver out of 16 GB. The list is indexed and scanned by constant indices, since
+  an array's `into_iter` costs the solver as much. `Of`'s lookups (a `get`, and `range` for the nearest
+  attestation on each side) are not proved here; the unit tests check them against an exhaustive
+  scan (`logarithmic_checks_match_the_exhaustive_reference`, `long_histories_match_the_exhaustive_reference`).
+
+- **The signing root.** Each duty's root is a symbolic tag byte and zeros, assumed equal to
+  another duty's iff the duties are equal. The real root is SHA-256 of the duty and its domain:
+  equal roots of different duties would be a collision. A whole symbolic encoding of the duty
+  made each 32-byte comparison too costly for the solver.
 - **The checks before the rules.** `Protection::decide` runs checks before `decide_rule` that only
   refuse (an unknown or inactive key, another chain, an invalid duty, an envelope without its
   block). They cannot make the rules authorize anything. The proofs assume what one of them
@@ -144,21 +161,25 @@ that can roll back every node's storage can also write the marks for a conflicti
 
 ## Results
 
-State as of 2026-11-19, on the test host (12 cores, 64 GB).
+State as of 2026-11-20, on the test host (12 cores, 64 GB). `run.sh kani` runs all five proofs in about 6 minutes.
 
 | Check | Result |
 | ----- | ------ |
 | K-5 | Proved (83 checks, under 1 s) |
-| K-1, K-2, K-4, K-6 | Running (CaDiCaL, 4 at once) |
-| K-3 | Ran out of memory next to the others; queued to run alone |
+| K-1 | Proved (804 checks, 87 s) |
+| K-2 | Proved (878 checks, 18 s) |
+| K-3 | Proved (491 checks, 4 min) |
+| K-4 | Proved (245 checks, 24 s) |
+| Mutation | A surround check switched off (`SurroundedBySigned` never refuses): K-1 and K-2 fail |
 | Scenarios (5) | All pass: the violations of `rollbackNoFloor` and `rollbackFloorExempt`, the refusals of `rollbackFloor` and `rollbackAnchor` |
 | TLC `rollbackNoFloor` | Found, unguided, a double vote (13 steps) and a surround vote (15 steps, 9 M distinct states) |
-| TLC `faultModel`, `rollbackFloor`, `rollbackAnchor` | Running |
+| TLC `faultModel`, both properties | Hold: 36.6 M distinct states, the whole graph (depth 30); 2 h 28 min for double signatures, 1 h 59 min for surround votes |
+| TLC `rollbackFloor`, double signatures | Hold: 1.008 G distinct states, the whole graph (depth 47); 2 d 13 h |
+| TLC `rollbackAnchor`, both properties | Running |
 
-Two changes to the code came with the proofs, neither visible to a node: the key index's hasher
-is a fixed one under `cfg(kani)` (Kani cannot model the OS randomness `RandomState` seeds from),
-and `Protection::verify`'s attestation-order check is the separate `attestation_disorder`, which
-K-3 assumes.
+The proofs came with two changes to `src/slashing.rs` that a node does not see: the rules moved
+into `slashing::rules` behind `History`, and `Protection::verify`'s attestation-order check is
+the separate `attestation_disorder`.
 
 ## Running
 

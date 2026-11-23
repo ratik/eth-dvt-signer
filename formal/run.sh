@@ -6,6 +6,8 @@
 #                           property that must hold; all configurations, or one
 #
 #   FORMAL_HOME  work directory on the host (default: ~/eth-mpc-formal): cargo, rustup, target, logs
+#   KANI_JOBS    proofs at once (default 1); KANI_MEMORY  the Kani container's memory (default 16g);
+#   KANI_TIMEOUT seconds before the run is stopped (default 7200)
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,7 +22,9 @@ log() { printf '%s formal: %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 
 kani() {
 	mkdir -p "$FORMAL_HOME/cargo-home" "$FORMAL_HOME/rustup" "$FORMAL_HOME/kani-home" "$FORMAL_HOME/target"
-	local run=(docker run --rm -u "$(id -u):$(id -g)"
+	# A memory cap: a proof that outgrows it fails alone instead of swapping the host.
+	local run=(docker run --rm -u "$(id -u):$(id -g)" --memory "${KANI_MEMORY:-16g}"
+		--memory-swap "${KANI_MEMORY:-16g}"
 		-v "$FORMAL_HOME:/f" -v "$repo:/f/src:ro" -w /f/src
 		-e CARGO_HOME=/f/cargo-home -e RUSTUP_HOME=/f/rustup -e KANI_HOME=/f/kani-home
 		-e CARGO_TARGET_DIR=/f/target -e PATH=/f/cargo-home/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -35,7 +39,9 @@ kani() {
 	local harness=()
 	[ $# -gt 0 ] && harness=(--harness "$1")
 	log "cargo kani --lib ${harness[*]}"
-	"${run[@]}" cargo kani --lib -Z unstable-options --jobs "${KANI_JOBS:-4}" --output-format terse "${harness[@]}"
+	"${run[@]}" timeout "${KANI_TIMEOUT:-7200}" cargo kani --lib -Z unstable-options \
+		--jobs "${KANI_JOBS:-1}" --output-format terse "${harness[@]}" \
+		--cbmc-args --unwindset memcmp.0:33 # a signing root's comparison: 32 bytes
 }
 
 quint() {
@@ -57,12 +63,10 @@ quint() {
 		log "quint test --main=$module"
 		"${run[@]}" quint test --main="$module" /spec/slashing.qnt
 	done
-	# Exhaustive (TLC): every reachable state of the configuration, for each property that must
-	# hold there (docs/formal.md).
+	# Exhaustive (TLC): every reachable state of the configuration, for the properties that must
+	# hold there (docs/formal.md), in one search (`safety` is both).
 	local check invariant
-	for check in faultModel:noDoubleSignature faultModel:noSurroundSignature \
-		rollbackFloor:noDoubleSignature \
-		rollbackAnchor:noDoubleSignature rollbackAnchor:noSurroundSignature; do
+	for check in faultModel:safety rollbackFloor:noDoubleSignature rollbackAnchor:safety; do
 		module="${check%%:*}" invariant="${check#*:}"
 		[ $# -gt 0 ] && [ "$1" != "$module" ] && continue
 		log "quint verify --backend=tlc --main=$module --invariant=$invariant"
