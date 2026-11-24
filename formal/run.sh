@@ -58,7 +58,7 @@ quint() {
 	# The scenarios (`run ...Test`): each violation the model admits, and how the stricter
 	# configurations refuse it.
 	local module
-	for module in rollbackNoFloor rollbackFloorExempt rollbackFloor rollbackAnchor; do
+	for module in rollbackNoFloor rollbackFloorExempt rollbackFloor rollbackAnchorExempt rollbackAnchor; do
 		[ $# -gt 0 ] && [ "$1" != "$module" ] && continue
 		log "quint test --main=$module"
 		"${run[@]}" quint test --main="$module" /spec/slashing.qnt

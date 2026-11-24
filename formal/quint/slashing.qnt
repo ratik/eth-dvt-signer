@@ -23,8 +23,9 @@ module slashing {
   const RESTART_FLOOR: bool
   const ANCHOR: bool
   // The restart floor exempts the duties a keyholder loaded at start (the code before the fix of
-  // BUG-10). The anchored marks always do (`KnownDuty::loaded` in `dkg::actor`).
+  // BUG-10); the anchor exempts them (before the fix of BUG-11).
   const FLOOR_EXEMPTS_LOADED: bool
+  const ANCHOR_EXEMPTS_LOADED: bool
   const MAX_LOG: int
 
   pure val NODES = Set("n1", "n2", "n3", "n4")
@@ -138,7 +139,7 @@ module slashing {
 
   def anchorAllows(i: str, d: Duty): bool = {
     val m = anchored.get(i)
-    not(ANCHOR) or loaded.get(i).contains(d) or (
+    not(ANCHOR) or (ANCHOR_EXEMPTS_LOADED and loaded.get(i).contains(d)) or (
       if (d.block) d.slot > m.slot
       else d.target > m.target and d.source >= m.source
     )
@@ -251,6 +252,23 @@ module slashing {
     }
   }
 
+  pure val HIGH_MARKS: Marks = { slot: MAX_TIME, source: MAX_TIME, target: MAX_TIME }
+
+  // BUG-11's trace up to n2's restart with the surrounding vote loaded. Three whole-network
+  // rollbacks give n1 and n2 each a partial of (1, 1), and n1 one of (0, 2).
+  pure val inner = attestation(1, 1, 0)
+  pure val outer = attestation(0, 2, 0)
+  run loadedPastTheMarks =
+    init.then(tick("n1"))
+      .then(decideDuty(inner)).then(apply("n1")).then(sign("n1", inner))
+      .then(rollbackAll(0, NO_MARKS)).then(tick("n1"))
+      .then(decideDuty(outer)).then(apply("n1")).then(sign("n1", outer))
+      .then(rollbackAll(0, NO_MARKS)).then(tick("n2"))
+      .then(decideDuty(inner)).then(apply("n2")).then(sign("n2", inner))
+      .then(rollbackAll(0, HIGH_MARKS))
+      .then(decideDuty(outer)).then(apply("n2"))
+      .then(restart("n2", 1, HIGH_MARKS)).then(tick("n2"))
+
   // No two slashable duties both have a quorum of partials.
   val noDoubleSignature = DUTIES.forall(a => DUTIES.forall(b =>
     double(a, b) implies not(signed(a) and signed(b))))
@@ -259,14 +277,14 @@ module slashing {
   val safety = noDoubleSignature and noSurroundSignature
 }
 
-// Every configuration but `rollbackFloorExempt` is the code as it is. Removing an exemption only
-// removes steps, so a property TLC proves with FLOOR_EXEMPTS_LOADED holds without it too.
+// Every configuration but the `...Exempt` ones is the code as it is. Removing an exemption only
+// removes steps, so a property TLC proves with one holds without it too.
 
 // The fault model: one Byzantine node, crashes and one-node restores, no whole rollback.
 module faultModel {
   import slashing(
     BYZANTINE = Set("n4"), WHOLE_ROLLBACK = false, RESTART_FLOOR = true, ANCHOR = false,
-    FLOOR_EXEMPTS_LOADED = false, MAX_LOG = 2,
+    FLOOR_EXEMPTS_LOADED = false, ANCHOR_EXEMPTS_LOADED = false, MAX_LOG = 2,
   ).*
 }
 
@@ -274,7 +292,7 @@ module faultModel {
 module rollbackNoFloor {
   import slashing(
     BYZANTINE = Set("n4"), WHOLE_ROLLBACK = true, RESTART_FLOOR = false, ANCHOR = false,
-    FLOOR_EXEMPTS_LOADED = false, MAX_LOG = 2,
+    FLOOR_EXEMPTS_LOADED = false, ANCHOR_EXEMPTS_LOADED = false, MAX_LOG = 2,
   ).*
 
   pure val b1 = block(1, 0)
@@ -295,7 +313,7 @@ module rollbackNoFloor {
 module rollbackFloorExempt {
   import slashing(
     BYZANTINE = Set("n4"), WHOLE_ROLLBACK = true, RESTART_FLOOR = true, ANCHOR = false,
-    FLOOR_EXEMPTS_LOADED = true, MAX_LOG = 2,
+    FLOOR_EXEMPTS_LOADED = true, ANCHOR_EXEMPTS_LOADED = false, MAX_LOG = 2,
   ).*
 
   pure val b1 = block(1, 0)
@@ -319,13 +337,11 @@ module rollbackFloorExempt {
 module rollbackFloor {
   import slashing(
     BYZANTINE = Set("n4"), WHOLE_ROLLBACK = true, RESTART_FLOOR = true, ANCHOR = false,
-    FLOOR_EXEMPTS_LOADED = false, MAX_LOG = 2,
+    FLOOR_EXEMPTS_LOADED = false, ANCHOR_EXEMPTS_LOADED = false, MAX_LOG = 2,
   ).*
 
   pure val b1 = block(1, 0)
   pure val b1other = block(1, 1)
-  pure val inner = attestation(1, 1, 0)
-  pure val outer = attestation(0, 2, 0)
 
   // BUG-10's scenario: the floor of the next restart still refuses.
   run restartAfterRollbackStillRefusesTest =
@@ -354,7 +370,7 @@ module rollbackFloor {
 module rollbackAnchor {
   import slashing(
     BYZANTINE = Set("n4"), WHOLE_ROLLBACK = true, RESTART_FLOOR = true, ANCHOR = true,
-    FLOOR_EXEMPTS_LOADED = false, MAX_LOG = 1,
+    FLOOR_EXEMPTS_LOADED = false, ANCHOR_EXEMPTS_LOADED = false, MAX_LOG = 1,
   ).*
 
   pure val b1 = block(1, 0)
@@ -369,4 +385,22 @@ module rollbackAnchor {
       .then(rollbackAll(0, NO_MARKS))
       .then(decideDuty(b1other)).then(apply("n1")).then(apply("n2"))
       .expect(halted.get("n1") and halted.get("n2"))
+
+  // BUG-11's trace: the anchored marks refuse the loaded surrounding vote.
+  run loadedDutyIsRefusedTest =
+    loadedPastTheMarks.expect(not(anchorAllows("n2", outer)))
+}
+
+// BUG-11, the code before its fix: a duty loaded at start passed the anchored marks. TLC found
+// the trace (24 states): n2 restarts with (0, 2) loaded and signs it past marks that refuse it.
+module rollbackAnchorExempt {
+  import slashing(
+    BYZANTINE = Set("n4"), WHOLE_ROLLBACK = true, RESTART_FLOOR = true, ANCHOR = true,
+    FLOOR_EXEMPTS_LOADED = false, ANCHOR_EXEMPTS_LOADED = true, MAX_LOG = 1,
+  ).*
+
+  run loadedDutyPassesTheMarksTest =
+    loadedPastTheMarks
+      .then(sign("n2", outer))
+      .expect(not(noSurroundSignature))
 }

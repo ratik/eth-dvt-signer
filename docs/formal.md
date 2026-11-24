@@ -89,7 +89,7 @@ The model (`formal/quint/slashing.qnt`) has 4 nodes, one of them Byzantine, and 
 | Crash, restart, restore of one node | `restart(i, h)`: the node restarts on a prefix `h` at or below its height and replays the log from its peers. |
 | Whole-network rollback (L-1) | `rollbackAll(k)`: every node restored to before command `k`; the log after `k` is lost with them. |
 | Restart floor | At each start a keyholder takes its clock's slot as its floor and refuses a block or attestation at or below it, loaded at start or not. `FLOOR_EXEMPTS_LOADED` restores the exemption of loaded duties the code had before BUG-10 (`rollbackFloorExempt` only). |
-| WORM anchor | Each honest keyholder writes a record before a partial: its marks, and the block it had applied. At start a node reads the second-highest of each mark across nodes (the Byzantine record as low or as high as it can be) and refuses the duties the anchored marks refuse, except those loaded at start (as the code does). It stops (exit 77) when the records of two nodes name other blocks at heights it applied, at start or as it applies blocks (rules (a) and (b) of [anchor.md](anchor.md)). Not modeled: the confirmation gate (it only refuses more) and the degraded mode. |
+| WORM anchor | Each honest keyholder writes a record before a partial: its marks, and the block it had applied. At start a node reads the second-highest of each mark across nodes (the Byzantine record as low or as high as it can be) and refuses the duties the anchored marks refuse, loaded at start or not. `ANCHOR_EXEMPTS_LOADED` restores the exemption of loaded duties the code had before BUG-11 (`rollbackAnchorExempt` only). It stops (exit 77) when the records of two nodes name other blocks at heights it applied, at start or as it applies blocks (rules (a) and (b) of [anchor.md](anchor.md)). Not modeled: the confirmation gate (it only refuses more) and the degraded mode. |
 
 The scope: blocks of slot 1 (two different ones), attestations `(0, 1)` (two different ones),
 `(1, 1)` and `(0, 2)`, which surrounds `(1, 1)`; slots and epochs 0 to 2; at most 2 decided
@@ -110,13 +110,13 @@ Two kinds of check:
 | `rollbackNoFloor` | And a whole-network rollback, without the restart floor | A double signature (the E2E reproducer of L-1) | Scenario `doubleProposalTest`; TLC found a double vote and a surround vote by itself |
 | `rollbackFloorExempt` | And the restart floor as it was before BUG-10 | **A double proposal ([F-1](#f-1-the-restart-floor-exempted-what-a-rollback-authorized))** | Scenario `restartAfterRollbackSignsADoubleProposalTest` |
 | `rollbackFloor` | And the restart floor | No double proposal or vote; a crafted surround vote is signed (L-1 as documented) | TLC (doubles); scenarios `restartAfterRollbackStillRefusesTest`, `surroundVoteTest` |
-| `rollbackAnchor` | And the WORM anchor | Safe | TLC, both properties; scenario `rollbackIsDetectedTest` |
+| `rollbackAnchorExempt` | And the WORM anchor as it was before BUG-11 | **A surround vote ([F-2](#f-2-the-anchor-exempted-what-a-rollback-authorized))** | TLC found it; scenario `loadedDutyPassesTheMarksTest` |
+| `rollbackAnchor` | And the WORM anchor | Safe | TLC, both properties; scenarios `rollbackIsDetectedTest`, `loadedDutyIsRefusedTest` |
 
-Removing an exemption only removes steps from the model. So a property that holds with
-`FLOOR_EXEMPTS_LOADED` holds without it: the TLC runs of `faultModel` and `rollbackAnchor` made
-with the exemption cover the code as well.
+Removing an exemption only removes steps from the model. So a property that holds with an
+exemption holds without it.
 
-## Finding
+## Findings
 
 ### F-1: the restart floor exempted what a rollback authorized (fixed)
 
@@ -149,8 +149,9 @@ the nodes stop (exit 77) as soon as they apply `B'`'s block, before the second r
 (`rollbackIsDetectedTest`). A degraded anchor (unreachable) leaves the floor alone, and so the
 hole.
 
-**The fix.** The restart floor applies to loaded duties too (`dkg::actor`); the anchored marks
-still exempt them, since the anchor detects the rollback. `rollbackFloor` checks the rule, and
+**The fix.** The restart floor applies to loaded duties too (`dkg::actor`). The anchored marks
+still exempted them, on the ground that the anchor detects the rollback: F-2 shows it does not
+always. `rollbackFloor` checks the rule, and
 `floor::floor_1` runs the sequence on real processes: after the second restart the conflicting
 proposal answers `412` with `"protection": "restart_floor"`. With the old rule put back, the same
 test gets the double proposal signed (`200`). The cost: after a restart of every
@@ -161,9 +162,43 @@ The other option considered was to exempt only what the keyholder itself signed,
 local mark per partial. It keeps those retries, but costs a write before each partial, and a host
 that can roll back every node's storage can also write the marks for a conflicting duty.
 
+### F-2: the anchor exempted what a rollback authorized (fixed)
+
+Audit BUG-11. With the restart floor and the WORM anchor, a whole-network rollback should sign no
+slashable pair. TLC found a sequence of 24 states in `rollbackAnchor` that signs a surround vote
+(`loadedDutyPassesTheMarksTest`); the Byzantine node signs everything, so two honest partials make
+a quorum:
+
+1. n1 signs the attestation `(1, 1)`. Every node is rolled back. Only n1 has a record, and a node
+   reads the second-highest mark across nodes: no anchored marks.
+2. n1 signs `(0, 2)`, which surrounds `(1, 1)`, above its floor. Every node is rolled back again.
+3. n2 signs `(1, 1)`: a quorum. Every node is rolled back a third time. Now n1's and n2's records
+   anchor source 1, target 2, which refuse `(0, 2)`.
+4. Consensus authorizes `(0, 2)` again; n2 applies it and restarts. `(0, 2)` is now loaded at
+   start, and loaded duties passed the anchor's gate and marks (`if !loaded && ...` in
+   `dkg::actor`), with no record written. Its epoch is above n2's floor. n2 signs it: a quorum for
+   `(0, 2)` too.
+
+No node stops: rules (a) and (b) need the records of two honest nodes to name other blocks, and
+only n2's own record does (n1's names the `(0, 2)` block the log holds again).
+
+The exemption was there so a node could sign again, after a restart, a duty it had signed before
+it. Since F-1 the restart floor refuses those anyway: whatever the previous process signed lies at
+or below its clock, so at or below the new floor. Above the floor a loaded duty is one this process
+has not signed, and the exemption only let conflicts through.
+
+**The fix.** A loaded duty needs an anchor record and passes the gate and the anchored marks like
+any other (`dkg::actor`); `KnownDuty::loaded` is gone. `rollbackAnchor` checks the rule
+(`loadedDutyIsRefusedTest`, and TLC on every state); `rollbackAnchorExempt` keeps the old rule and
+signs the surround vote. The cost: a node not yet confirmed against the anchor after a restart
+waits before it signs a loaded duty, as for a new one.
+
+What limits it: three whole-network rollbacks (L-1, beyond the fault model), a crash of one node
+at the right point, and a client that sends the surrounding vote again.
+
 ## Results
 
-State as of 2026-11-20, on the test host (12 cores, 64 GB). `run.sh kani` runs all five proofs in about 6 minutes.
+State as of 2026-11-24, on the test host (12 cores, 64 GB). `run.sh kani` runs all five proofs in about 6 minutes.
 
 | Check | Result |
 | ----- | ------ |
@@ -173,10 +208,11 @@ State as of 2026-11-20, on the test host (12 cores, 64 GB). `run.sh kani` runs a
 | K-3 | Proved (491 checks, 4 min) |
 | K-4 | Proved (245 checks, 24 s) |
 | Mutation | A surround check switched off (`SurroundedBySigned` never refuses): K-1 and K-2 fail |
-| Scenarios (5) | All pass: the violations of `rollbackNoFloor` and `rollbackFloorExempt`, the refusals of `rollbackFloor` and `rollbackAnchor` |
+| Scenarios (7) | All pass: the violations of `rollbackNoFloor`, `rollbackFloorExempt` and `rollbackAnchorExempt`, the refusals of `rollbackFloor` and `rollbackAnchor` |
 | TLC `rollbackNoFloor` | Found, unguided, a double vote (13 steps) and a surround vote (15 steps, 9 M distinct states) |
 | TLC `faultModel`, both properties | Hold: 36.6 M distinct states, the whole graph (depth 30); 2 h 28 min for double signatures, 1 h 59 min for surround votes |
 | TLC `rollbackFloor`, double signatures | Hold: 1.008 G distinct states, the whole graph (depth 47); 2 d 13 h |
+| TLC `rollbackAnchor` before BUG-11's fix, one command per log | A surround vote (24 states, 52.6 M distinct states, 9 h): [F-2](#f-2-the-anchor-exempted-what-a-rollback-authorized) |
 | TLC `rollbackAnchor`, both properties, one command per log | Running |
 
 The proofs came with two changes to `src/slashing.rs` that a node does not see: the rules moved

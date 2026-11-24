@@ -64,10 +64,10 @@ the partial (for its own coordinator or for a peer) until the write completes.
 - **Heartbeat.** When a node applies a block, it writes a record if its applied height has moved
   and its latest record is older than `--anchor-heartbeat-secs` (default 600). So the records name
   recent blocks.
-- Some partials need no write: duties loaded at start (signed again after a restart, above the
-  restart floor), PTC votes,
-  envelopes, registrations and the other kinds. They are not slashable, or the restart floor
-  bounds them.
+- Some partials need no write: PTC votes, envelopes, registrations and the other kinds. They are
+  not slashable, or the restart floor bounds them. A duty loaded at start needs a write, and
+  passes the gate and the anchored marks, like any other (audit BUG-11): above the restart floor
+  this process has not signed it yet.
 - **Degraded.** A write that fails, or gets no answer within 2 s (`WRITE_TIMEOUT`), degrades the
   keyholder:
   - it gives the held partials, and later ones, under the restart floor alone;
