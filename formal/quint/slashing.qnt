@@ -349,10 +349,12 @@ module rollbackFloor {
 }
 
 // L-1 with the restart floor and the WORM anchor: no slashable pair.
+// One command per log: with two, the state space grows 2.3 times per level past depth 18 (beyond
+// reach). Every L-1 pair still occurs: one duty signed, the log rolled back, the other decided.
 module rollbackAnchor {
   import slashing(
     BYZANTINE = Set("n4"), WHOLE_ROLLBACK = true, RESTART_FLOOR = true, ANCHOR = true,
-    FLOOR_EXEMPTS_LOADED = false, MAX_LOG = 2,
+    FLOOR_EXEMPTS_LOADED = false, MAX_LOG = 1,
   ).*
 
   pure val b1 = block(1, 0)

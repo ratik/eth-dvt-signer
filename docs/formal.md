@@ -93,7 +93,9 @@ The model (`formal/quint/slashing.qnt`) has 4 nodes, one of them Byzantine, and 
 
 The scope: blocks of slot 1 (two different ones), attestations `(0, 1)` (two different ones),
 `(1, 1)` and `(0, 2)`, which surrounds `(1, 1)`; slots and epochs 0 to 2; at most 2 decided
-commands between rollbacks. Every kind of slashable pair occurs in it.
+commands between rollbacks (1 in `rollbackAnchor`: with 2, TLC's state space still grew 2.3 times
+per level at depth 18, beyond reach). Every kind of slashable pair occurs in it; with one command
+per log, a pair is one duty signed before a rollback and the other decided after it, which is L-1.
 
 Two kinds of check:
 
@@ -175,7 +177,7 @@ State as of 2026-11-20, on the test host (12 cores, 64 GB). `run.sh kani` runs a
 | TLC `rollbackNoFloor` | Found, unguided, a double vote (13 steps) and a surround vote (15 steps, 9 M distinct states) |
 | TLC `faultModel`, both properties | Hold: 36.6 M distinct states, the whole graph (depth 30); 2 h 28 min for double signatures, 1 h 59 min for surround votes |
 | TLC `rollbackFloor`, double signatures | Hold: 1.008 G distinct states, the whole graph (depth 47); 2 d 13 h |
-| TLC `rollbackAnchor`, both properties | Running |
+| TLC `rollbackAnchor`, both properties, one command per log | Running |
 
 The proofs came with two changes to `src/slashing.rs` that a node does not see: the rules moved
 into `slashing::rules` behind `History`, and `Protection::verify`'s attestation-order check is
