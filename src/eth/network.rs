@@ -84,8 +84,7 @@ impl NetworkArgs {
             .filter(|seconds| *seconds > 0)
             .ok_or("--eth-seconds-per-slot must be above 0")?;
         let root = self.eth_genesis_validators_root.as_deref().unwrap_or("");
-        let genesis_validators_root = hex::decode(root.strip_prefix("0x").unwrap_or(root))
-            .ok()
+        let genesis_validators_root = crate::import::unhex(root)
             .and_then(|bytes| bytes.try_into().ok())
             .ok_or("--eth-genesis-validators-root must be 32 bytes of hex")?;
         let schedule = self
@@ -326,8 +325,7 @@ impl Network {
                     .ok_or_else(|| format!("{entry}: name=0x<version>@<epoch>"))?;
                 let name = ForkName::parse(name)
                     .ok_or_else(|| format!("{name}: unknown fork (phase0 to gloas)"))?;
-                let version = hex::decode(version.strip_prefix("0x").unwrap_or(version))
-                    .ok()
+                let version = crate::import::unhex(version)
                     .and_then(|bytes| bytes.try_into().ok())
                     .ok_or_else(|| format!("{version}: a fork version is 4 bytes of hex"))?;
                 let epoch = epoch

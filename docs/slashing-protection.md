@@ -465,7 +465,7 @@ keyholders, and the other three refuse.
 | Crash after the sync, before the keyholder or the client learns | Written; on restart the block is skipped and the keyholder is seeded from disk | Signs it once restarted |
 | Torn write of the newest state copy | The previous copy is used. If the block was not yet acknowledged to marshal, it is delivered and applied again, with identical decisions. If it was, the state is behind marshal's progress and the node refuses to start (recovery.md §2) | Nothing was signed from the lost write |
 | Coordinator crash with 2 partials | Unaffected | A retry anywhere signs the same root (`EXISTING`) |
-| Restart of every node | Read from disk, verified | Same decisions as before; the restart floor refuses new duties of the current slot and epoch |
+| Restart of every node | Read from disk, verified | Same decisions as before; the restart floor refuses duties of the current slot and epoch, retries of those signed before the restart included |
 | One node restored from an older backup (consensus journal kept) | A prefix; replayed from the finalized chain | Refuses unapplied roots. It never decides from stale history alone: consensus decides a duty it submits |
 | One node restored from a healthy node's state | The healthy node's | Normal |
 | Every node rolled back (L-1) | **Lost** | Every keyholder's restart floor refuses a conflicting block or attestation of a slot or epoch before the restart. Without an anchor, **a crafted surround vote is signed**. With the WORM anchor it is refused, and every node stops (exit status 77) |
@@ -492,11 +492,12 @@ keep (`eth::horizon::RestartFloor`).
   envelope only once its slot (for an attestation: its target epoch) has started by its own clock,
   within 4 s (the time horizon). So whatever it signed before its process started is of a slot no
   later than the slot started at `start + 4 s`. That slot is its **floor**.
-- **The floor.** For the rest of the process's life, the keyholder gives no partial for a new duty
-  of these kinds at or below its floor (for an attestation: a target at or below the floor's
-  epoch). It still signs the duties it loaded at start, its state's own records. A state restored
-  from older storage never holds a record that conflicts with one it lost, since it authorized the
-  lost ones itself.
+- **The floor.** For the rest of the process's life, the keyholder gives no partial for a duty of
+  these kinds at or below its floor (for an attestation: a target at or below the floor's epoch).
+  This includes the duties it loaded at start, its state's own records: after a whole-network
+  rollback, the restored state may authorize a duty that conflicts with a lost one, and the next
+  process loads it (BUG-10, found by the formal model:
+  [formal.md](formal.md#f-1-the-restart-floor-exempted-what-a-rollback-authorized)).
 - **Why it holds.** A signature needs 3 of the 4 keyholders. So the quorum that signed a duty and
   any quorum that would sign a conflicting one share a keyholder. After a whole-network rollback,
   every process restarted. That shared keyholder's floor is at or above the duty's slot, so it
@@ -512,7 +513,8 @@ keep (`eth::horizon::RestartFloor`).
 - **What it costs.** One node restarting costs nothing: the other three sign. When every node
   restarts at once (an R3 reconfiguration, a simultaneous upgrade, a power loss), each validator
   loses the current epoch's attestation if its slot was still ahead, and a proposal only in the
-  slot or two of the restart. On mainnet that is at most 6.4 minutes of attestations, against 2 to
+  slot or two of the restart. A retry of a duty signed just before the restart, whose signature
+  the client did not get, is refused too. On mainnet that is at most 6.4 minutes of attestations, against 2 to
   3 epochs for a doppelganger wait. Devnet run N measured it: an R3 switch cost both validators the
   attestation of the switch's epoch, nothing else
   ([ethereum-devnet.md](ethereum-devnet.md#restart-floor-run-n)). No flag switches the floor off: a

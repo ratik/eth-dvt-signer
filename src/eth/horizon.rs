@@ -48,14 +48,16 @@
 //! its own clock, within [`Horizon::VOTE`]. So when its process starts, nothing it signed before
 //! can be later than the slot started at `start + VOTE`: that slot is its floor. For the rest of
 //! the process's life it gives no partial for a duty of one of these kinds at or below the floor
-//! (an attestation: a target at or below the floor's epoch) that it learns of after it started.
-//! Those it loaded at start, its state's own records, are signed as before: a state restored from
-//! older storage never holds a record that conflicts with one it lost, since it authorized the
-//! lost ones itself. A signature needs three of the four keyholders, so two quorums share one; if
-//! every node restarts on rolled-back storage (L-1), the shared keyholder refuses the conflicting
-//! duty, whatever the rolled-back state authorized, as long as its clock did not run backwards
-//! across its restart. The cost: a keyholder refuses the current epoch's new attestations and the
-//! restart slot's new blocks; the other keyholders sign them when only some nodes restart.
+//! (an attestation: a target at or below the floor's epoch), whether it loaded the duty's
+//! authorization at start or learned of it since. A loaded duty is not exempt: after a
+//! whole-network rollback (L-1) the restored state may authorize a duty that conflicts with a lost
+//! one; this process's floor refuses it, and the next process loads it (audit BUG-10). A signature
+//! needs three of the four keyholders, so two quorums share one; if every node restarts on
+//! rolled-back storage, the shared keyholder refuses the conflicting duty, whatever the
+//! rolled-back state authorized, as long as its clock did not run backwards across its restart.
+//! The cost: a keyholder refuses the current epoch's attestations and the restart slot's blocks,
+//! a retry of one it signed before the restart included; the other keyholders sign them when
+//! only some nodes restart, and a retry after a restart of every node is refused.
 
 pub use super::network::{Network, WrongFork};
 use super::{
@@ -105,7 +107,7 @@ impl RestartFloor {
     }
 
     /// Whether a duty of `kind` with protection period `period` (`Protection::period`: a slot,
-    /// or an attestation's target epoch) learned of after the start is above the floor. The kinds
+    /// or an attestation's target epoch) is above the floor, loaded at start or not. The kinds
     /// a slashing rule or a one-per-slot rule protects are bounded; every other kind passes.
     pub const fn admits(&self, kind: DutyKind, period: u64) -> bool {
         match kind {

@@ -6,6 +6,7 @@
 use super::{acknowledgment::AcknowledgmentDocument, record::SignedRecord};
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::{ed25519::PublicKey, sha256::Digest};
+use futures::{StreamExt as _, TryStreamExt as _};
 use object_store::{
     ObjectStore, ObjectStoreExt as _, PutMode, PutOptions, PutPayload,
     aws::{AmazonS3Builder, AmazonS3ConfigKey},
@@ -18,6 +19,21 @@ use std::sync::Arc;
 
 /// Where the approvers' acknowledgments of rollbacks live, under the cluster's root.
 const ACKNOWLEDGMENTS: &str = "acknowledgments";
+
+/// Largest acknowledgment document read: at most [crate::types::MAX_APPROVALS] approvals take a
+/// few KiB, so a larger object is a faulty writer's.
+pub const MAX_ACKNOWLEDGMENT_BYTES: u64 = 64 * 1024;
+
+/// `<20 digits>-<64 lowercase hex>`, the form of `AcknowledgmentDocument::name`.
+fn acknowledgment_name(name: &str) -> bool {
+    let Some((generation, hash)) = name.split_once('-') else {
+        return false;
+    };
+    generation.len() == 20
+        && generation.bytes().all(|b| b.is_ascii_digit())
+        && hash.len() == 64
+        && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
 
 /// Why the anchor could not be opened, read or written.
 #[derive(Debug, thiserror::Error)]
@@ -215,28 +231,36 @@ impl AnchorStore {
     }
 
     /// Every acknowledgment document in the anchor, by name, unverified (a faulty writer's
-    /// included): what does not parse is left out.
+    /// included): what does not parse, is not named `<generation>-<hash>`, is larger than
+    /// [MAX_ACKNOWLEDGMENT_BYTES] is left out. Read 16 at a time.
     pub async fn acknowledgments(&self) -> Result<Vec<AcknowledgmentDocument>, AnchorError> {
         if crate::hooks::anchor_unreachable() {
             return Err(AnchorError::Unreachable);
         }
         let prefix = self.root.clone().join(ACKNOWLEDGMENTS);
         let listed = self.store.list_with_delimiter(Some(&prefix)).await?;
-        let mut documents = Vec::new();
-        for object in listed.objects {
-            let bytes = match self.store.get(&object.location).await {
-                Ok(result) => result.bytes().await?,
-                Err(object_store::Error::NotFound { .. }) => continue,
-                Err(err) => return Err(err.into()),
-            };
-            if let Some(document) = std::str::from_utf8(&bytes)
-                .ok()
-                .and_then(|text| AcknowledgmentDocument::from_json(text).ok())
-            {
-                documents.push(document);
-            }
-        }
-        Ok(documents)
+        let reads = listed
+            .objects
+            .into_iter()
+            .filter(|object| {
+                object.size <= MAX_ACKNOWLEDGMENT_BYTES
+                    && object.location.filename().is_some_and(acknowledgment_name)
+            })
+            .map(|object| async move {
+                let bytes = match self.store.get(&object.location).await {
+                    Ok(result) => result.bytes().await?,
+                    Err(object_store::Error::NotFound { .. }) => return Ok(None),
+                    Err(err) => return Err(AnchorError::from(err)),
+                };
+                Ok(std::str::from_utf8(&bytes)
+                    .ok()
+                    .and_then(|text| AcknowledgmentDocument::from_json(text).ok()))
+            });
+        let read: Vec<Option<AcknowledgmentDocument>> = futures::stream::iter(reads)
+            .buffer_unordered(16)
+            .try_collect()
+            .await?;
+        Ok(read.into_iter().flatten().collect())
     }
 
     /// Every node with records in the anchor (under the cluster's root), whoever it is.
@@ -259,6 +283,17 @@ impl AnchorStore {
     pub(crate) async fn put_raw(&self, node: &PublicKey, sequence: u64, bytes: Vec<u8>) {
         self.store
             .put(&self.record_path(node, sequence), PutPayload::from(bytes))
+            .await
+            .expect("in-memory put");
+    }
+
+    /// Write raw `bytes` as `name` under `acknowledgments/` (unit tests: what a faulty writer
+    /// could).
+    #[cfg(test)]
+    pub(crate) async fn put_raw_acknowledgment(&self, name: &str, bytes: Vec<u8>) {
+        let path = self.root.clone().join(ACKNOWLEDGMENTS).join(name);
+        self.store
+            .put(&path, PutPayload::from(bytes))
             .await
             .expect("in-memory put");
     }

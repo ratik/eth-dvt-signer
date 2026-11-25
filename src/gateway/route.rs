@@ -163,17 +163,23 @@ impl Gateway {
         }
     }
 
-    /// A signing request: the answer, and every attempt.
+    /// The validator and signing root of a signing request's body, computed once per request:
+    /// the JSON parse and the SSZ root are the costly part of a large duty.
+    pub(crate) fn expected(&self, identifier: &str, body: &[u8]) -> Option<(ValidatorKey, Root)> {
+        duty_request(identifier, body, Some(&self.network))
+            .ok()
+            .map(|(request, _)| (request.validator, request.signing_root()))
+    }
+
+    /// A signing request: the answer, and every attempt. `expected` is the validator and the
+    /// signing root the gateway computed from the request ([Gateway::expected]), if it could.
     pub(crate) async fn sign(
         &self,
         path: &str,
-        identifier: &str,
+        expected: Option<(ValidatorKey, Root)>,
         headers: Vec<(&'static str, String)>,
         body: Bytes,
     ) -> (Answer, Vec<Attempt>) {
-        let expected = duty_request(identifier, &body, Some(&self.network))
-            .ok()
-            .map(|(request, _)| (request.validator, request.signing_root()));
         let order = self.order();
         if order.is_empty() {
             return (

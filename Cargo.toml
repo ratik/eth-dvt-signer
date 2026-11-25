@@ -34,13 +34,11 @@ commonware-macros = "=2026.10.0"
 commonware-math = "=2026.10.0"
 commonware-p2p = "=2026.10.0"
 commonware-parallel = "=2026.10.0"
-commonware-resolver = "=2026.10.0"
 commonware-runtime = "=2026.10.0"
 commonware-storage = { version = "=2026.10.0", features = ["std"] }
 commonware-stream = "=2026.10.0"
 commonware-utils = "=2026.10.0"
 
-anyhow = "1"
 axum = "0.8.9"
 bytes = "1.12.1"
 clap = { version = "4.6.1", features = ["derive"] }
@@ -120,6 +118,10 @@ required-features = ["test-hooks"]
 name = "e2e"
 path = "tests/e2e/main.rs"
 required-features = ["test-hooks"]
+
+# `cfg(kani)`: the Kani proofs of the slashing rules (formal/kani, docs/formal.md).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
 
 # EIP-2335 key derivation (scrypt, PBKDF2) is slow without optimizations, also in tests.
 [profile.dev.package.scrypt]

@@ -365,15 +365,6 @@ impl<R> Keeper<R> {
         self.writing = Some(marks);
         Some(self.job(marks))
     }
-
-    /// A due write failed (nothing was held for it), after sending `attempted` if it got that
-    /// far.
-    pub fn due_failed(&mut self, now: SystemTime, attempted: Option<SignedRecord>) {
-        self.lost(attempted);
-        self.writing = None;
-        self.degraded = true;
-        self.last_attempt = Some(now);
-    }
 }
 
 /// The record `job` asks for, after `head` (read first if `job.refresh`).

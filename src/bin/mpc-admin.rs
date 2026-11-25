@@ -545,8 +545,7 @@ fn load_key(path: &Path) -> Result<PrivateKey, String> {
     }
     let text = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
     let text = text.trim();
-    hex::decode(text.strip_prefix("0x").unwrap_or(text))
-        .ok()
+    eth_dvt_signer::import::unhex(text)
         .and_then(|bytes| PrivateKey::decode(bytes).ok())
         .ok_or_else(|| format!("{} is not an approver key", path.display()))
 }
@@ -2145,6 +2144,10 @@ fn attest(
                 "no evidence (vault {}): pass --allow-unattested to accept it",
                 statement.vault
             )),
+            // The evidence attests its own keys: the statement's are taken only if they are those.
+            Some(evidence) if evidence.keys != statement.keys => {
+                Err("the evidence names other keys than the statement".to_string())
+            }
             Some(evidence) => {
                 // An SEV-SNP node's VCEK, from AMD if it did not attach it: the committee keeps
                 // it, so that `mpc-keytool split` checks the evidence offline.

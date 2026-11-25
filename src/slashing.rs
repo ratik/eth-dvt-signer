@@ -884,7 +884,7 @@ impl Protection {
                 match self.attestations.get(&(id, target)) {
                     Some(signed) if Some(signed.signing_root) == root => {}
                     Some(_) => return Err(conflict(Refusal::DoubleVote { target })),
-                    None => self.check_surround(id, source, target).map_err(conflict)?,
+                    None => rules::surround(&self.history(id), source, target).map_err(conflict)?,
                 }
             }
         }
@@ -912,7 +912,7 @@ impl Protection {
                         target: attestation.target,
                     });
                 }
-                None => self.check_surround(id, attestation.source, attestation.target)?,
+                None => rules::surround(&self.history(id), attestation.source, attestation.target)?,
             }
         }
         Ok(())
@@ -1053,6 +1053,14 @@ impl Protection {
     pub fn validator_of(&self, key: &ValidatorKey) -> Option<(u64, &Validator)> {
         let id = *self.by_key.get(key)?;
         Some((id, &self.validators[&id]))
+    }
+
+    /// Validator `id`'s history, as the rules read it.
+    fn history(&self, id: u64) -> Of<'_> {
+        Of {
+            protection: self,
+            id,
+        }
     }
 
     pub fn proposal(&self, id: u64, slot: u64) -> Option<&Signed> {
@@ -1322,89 +1330,18 @@ impl Protection {
             .get(&id)
             .map(|imported| imported.floors)
             .unwrap_or_default();
-        match rule {
-            Rule::Proposal { slot } => match self.proposals.get(&(id, slot)) {
-                Some(signed) if signed.signing_root == *root => Ok(None),
-                _ if floors.block.is_some_and(|floor| slot <= floor) => {
-                    Err(Refusal::BlockAtOrBelowImported {
-                        slot,
-                        floor: floors.block.expect("checked"),
-                    })
-                }
-                Some(_) => Err(Refusal::DoubleProposal { slot }),
-                None => Ok(Some(id)),
-            },
+        let history = self.history(id);
+        let new = match rule {
+            Rule::Proposal { slot } => rules::proposal(&history, floors, slot, root)?,
             Rule::Attestation { source, target } => {
-                match self.attestations.get(&(id, target)) {
-                    Some(signed) if signed.signing_root == *root => return Ok(None),
-                    _ => {}
-                }
-                if let Some((source_floor, target_floor)) = floors.attestation {
-                    if source < source_floor {
-                        return Err(Refusal::SourceBelowImported {
-                            source_epoch: source,
-                            floor: source_floor,
-                        });
-                    }
-                    if target <= target_floor {
-                        return Err(Refusal::TargetAtOrBelowImported {
-                            target_epoch: target,
-                            floor: target_floor,
-                        });
-                    }
-                }
-                if self.attestations.contains_key(&(id, target)) {
-                    return Err(Refusal::DoubleVote { target });
-                }
-                self.check_surround(id, source, target)?;
-                Ok(Some(id))
+                rules::attestation(&history, floors, source, target, root)?
             }
             Rule::Bounded { period } => {
-                let roots = self.bounded(id, kind, period);
-                if roots.iter().any(|signed| signed.signing_root == *root) {
-                    Ok(None)
-                } else if roots.len() >= kind.max_roots() {
-                    Err(Refusal::TooManyRoots {
-                        kind,
-                        period,
-                        max: kind.max_roots(),
-                    })
-                } else {
-                    Ok(Some(id))
-                }
+                rules::bounded(self.bounded(id, kind, period), kind, period, root)?
             }
-            Rule::Registration { .. } => {
-                Ok((!self.registrations.contains_key(&(id, *root))).then_some(id))
-            }
-        }
-    }
-
-    /// Whether `(source, target)` surrounds, or is surrounded by, a signed attestation of `id`.
-    fn check_surround(&self, id: u64, source: u64, target: u64) -> Result<(), Refusal> {
-        // Sources never decrease with targets (module docs): the closest attestation on each side
-        // has the extreme source of that side.
-        // The new attestation surrounds a signed one: earlier target, later source.
-        if let Some((&(_, signed_target), signed)) =
-            self.attestations.range((id, 0)..(id, target)).next_back()
-            && signed.source > source
-        {
-            return Err(Refusal::SurroundsSigned {
-                source_epoch: signed.source,
-                target_epoch: signed_target,
-            });
-        }
-        // A signed attestation surrounds the new one: later target, earlier source.
-        if let Some(after) = target.checked_add(1)
-            && let Some((&(_, signed_target), signed)) =
-                self.attestations.range((id, after)..=(id, u64::MAX)).next()
-            && signed.source < source
-        {
-            return Err(Refusal::SurroundedBySigned {
-                source_epoch: signed.source,
-                target_epoch: signed_target,
-            });
-        }
-        Ok(())
+            Rule::Registration { .. } => !self.registrations.contains_key(&(id, *root)),
+        };
+        Ok(new.then_some(id))
     }
 
     /// The duty authorization of `root` for validator `id`, as the keyholder knows it.
@@ -1513,9 +1450,10 @@ impl Protection {
                 |((_, target), attested)| (DutyKind::Attestation, *target, attested.signing_root),
             ))
             .chain(
+                // The validator's entries only: they are contiguous, from its smallest key on.
                 self.bounded
-                    .iter()
-                    .filter(|((validator, _, _), _)| *validator == id)
+                    .range((id, DutyKind::BlockProposal, 0)..)
+                    .take_while(|((validator, _, _), _)| *validator == id)
                     .flat_map(|((_, kind, period), roots)| {
                         roots
                             .iter()
@@ -1705,29 +1643,223 @@ impl Protection {
             }
         }
         // The order the logarithmic attestation checks rely on (module docs).
+        match self.attestation_disorder() {
+            None => Ok(()),
+            Some(Disorder::SourceAfterTarget { id, source, target }) => Err(format!(
+                "validator {id} has an attestation with source {source} after its target {target}"
+            )),
+            Some(Disorder::Surround {
+                id,
+                previous_target,
+                target,
+            }) => Err(format!(
+                "attestations of validator {id} with targets {previous_target} and {target} \
+                 surround each other: slashing history is altered"
+            )),
+        }
+    }
+
+    /// The first stored attestation that breaks the order the logarithmic checks rely on (module
+    /// docs), if any.
+    fn attestation_disorder(&self) -> Option<Disorder> {
         let mut previous: Option<(u64, u64, u64)> = None;
         for (&(id, target), attested) in &self.attestations {
             if attested.source > target {
-                return Err(format!(
-                    "validator {id} has an attestation with source {} after its target {target}",
-                    attested.source
-                ));
+                return Some(Disorder::SourceAfterTarget {
+                    id,
+                    source: attested.source,
+                    target,
+                });
             }
             if let Some((previous_id, previous_target, previous_source)) = previous
                 && previous_id == id
                 && previous_source > attested.source
             {
-                return Err(format!(
-                    "attestations of validator {id} with targets {previous_target} and {target} \
-                     surround each other: slashing history is altered"
-                ));
+                return Some(Disorder::Surround {
+                    id,
+                    previous_target,
+                    target,
+                });
             }
             previous = Some((id, target, attested.source));
         }
+        None
+    }
+}
+
+/// What the slashing rules read of one validator's history: its block proposals by slot and its
+/// attestations by target. In the node, [Of] reads [Protection]'s maps; the Kani proofs
+/// (formal/kani) read a short list, since the solver cannot follow a `BTreeMap`'s internals.
+pub(crate) trait History {
+    fn proposal(&self, slot: u64) -> Option<Signed>;
+    fn attestation(&self, target: u64) -> Option<Attested>;
+    /// The attestation with the greatest target below `target`, and that target.
+    fn attestation_below(&self, target: u64) -> Option<(u64, Attested)>;
+    /// The attestation with the smallest target above `target`, and that target.
+    fn attestation_above(&self, target: u64) -> Option<(u64, Attested)>;
+}
+
+/// Validator `id`'s history in [Protection].
+struct Of<'a> {
+    protection: &'a Protection,
+    id: u64,
+}
+
+impl History for Of<'_> {
+    fn proposal(&self, slot: u64) -> Option<Signed> {
+        self.protection.proposals.get(&(self.id, slot)).copied()
+    }
+
+    fn attestation(&self, target: u64) -> Option<Attested> {
+        self.protection
+            .attestations
+            .get(&(self.id, target))
+            .copied()
+    }
+
+    fn attestation_below(&self, target: u64) -> Option<(u64, Attested)> {
+        self.protection
+            .attestations
+            .range((self.id, 0)..(self.id, target))
+            .next_back()
+            .map(|(&(_, target), attested)| (target, *attested))
+    }
+
+    fn attestation_above(&self, target: u64) -> Option<(u64, Attested)> {
+        let after = target.checked_add(1)?;
+        self.protection
+            .attestations
+            .range((self.id, after)..=(self.id, u64::MAX))
+            .next()
+            .map(|(&(_, target), attested)| (target, *attested))
+    }
+}
+
+/// The slashing rules of one validator, on what [History] gives: `Ok(true)` a new authorization,
+/// `Ok(false)` exactly this root already authorized (an idempotent retry).
+pub(crate) mod rules {
+    use super::{DutyKind, Floors, History, Refusal, Root, Signed};
+
+    /// A block proposal of `slot` with signing root `root`.
+    pub fn proposal(
+        history: &impl History,
+        floors: Floors,
+        slot: u64,
+        root: &Root,
+    ) -> Result<bool, Refusal> {
+        match history.proposal(slot) {
+            Some(signed) if signed.signing_root == *root => Ok(false),
+            _ if floors.block.is_some_and(|floor| slot <= floor) => {
+                Err(Refusal::BlockAtOrBelowImported {
+                    slot,
+                    floor: floors.block.expect("checked"),
+                })
+            }
+            Some(_) => Err(Refusal::DoubleProposal { slot }),
+            None => Ok(true),
+        }
+    }
+
+    /// An attestation `(source, target)` with signing root `root`.
+    pub fn attestation(
+        history: &impl History,
+        floors: Floors,
+        source: u64,
+        target: u64,
+        root: &Root,
+    ) -> Result<bool, Refusal> {
+        let signed = history.attestation(target);
+        if signed.is_some_and(|signed| signed.signing_root == *root) {
+            return Ok(false);
+        }
+        if let Some((source_floor, target_floor)) = floors.attestation {
+            if source < source_floor {
+                return Err(Refusal::SourceBelowImported {
+                    source_epoch: source,
+                    floor: source_floor,
+                });
+            }
+            if target <= target_floor {
+                return Err(Refusal::TargetAtOrBelowImported {
+                    target_epoch: target,
+                    floor: target_floor,
+                });
+            }
+        }
+        if signed.is_some() {
+            return Err(Refusal::DoubleVote { target });
+        }
+        surround(history, source, target)?;
+        Ok(true)
+    }
+
+    /// Whether `(source, target)` surrounds, or is surrounded by, an attestation of `history`.
+    pub fn surround(history: &impl History, source: u64, target: u64) -> Result<(), Refusal> {
+        // Sources never decrease with targets (module docs): the closest attestation on each side
+        // has the extreme source of that side.
+        // The new attestation surrounds a signed one: earlier target, later source.
+        if let Some((signed_target, signed)) = history.attestation_below(target)
+            && signed.source > source
+        {
+            return Err(Refusal::SurroundsSigned {
+                source_epoch: signed.source,
+                target_epoch: signed_target,
+            });
+        }
+        // A signed attestation surrounds the new one: later target, earlier source.
+        if let Some((signed_target, signed)) = history.attestation_above(target)
+            && signed.source < source
+        {
+            return Err(Refusal::SurroundedBySigned {
+                source_epoch: signed.source,
+                target_epoch: signed_target,
+            });
+        }
         Ok(())
     }
+
+    /// A non-slashable duty of `kind` in `period` with signing root `root`, given the roots
+    /// authorized for that kind and period.
+    pub fn bounded(
+        roots: &[Signed],
+        kind: DutyKind,
+        period: u64,
+        root: &Root,
+    ) -> Result<bool, Refusal> {
+        if roots.iter().any(|signed| signed.signing_root == *root) {
+            Ok(false)
+        } else if roots.len() >= kind.max_roots() {
+            Err(Refusal::TooManyRoots {
+                kind,
+                period,
+                max: kind.max_roots(),
+            })
+        } else {
+            Ok(true)
+        }
+    }
+}
+
+/// How a stored attestation history breaks the order of the logarithmic checks
+/// ([Protection::verify]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Disorder {
+    SourceAfterTarget {
+        id: u64,
+        source: u64,
+        target: u64,
+    },
+    Surround {
+        id: u64,
+        previous_target: u64,
+        target: u64,
+    },
 }
 
 #[cfg(test)]
 #[path = "../tests/unit/slashing.rs"]
 mod tests;
+
+#[cfg(kani)]
+#[path = "../formal/kani/slashing.rs"]
+mod proofs;

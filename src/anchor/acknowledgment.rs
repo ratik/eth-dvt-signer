@@ -13,6 +13,7 @@
 
 use super::record::Marks;
 use crate::admin::{ApprovalJson, Approvers, format_key};
+use crate::import::unhex;
 use commonware_codec::{DecodeExt as _, Encode as _, Write as _};
 use commonware_cryptography::{
     Hasher as _, Sha256, Signer as _, Verifier as _,
@@ -91,10 +92,6 @@ pub struct AcknowledgmentDocument {
     /// The exact bytes each approver signs, `0x`-hex.
     pub message: String,
     pub approvals: Vec<ApprovalJson>,
-}
-
-fn unhex(value: &str) -> Option<Vec<u8>> {
-    hex::decode(value.strip_prefix("0x").unwrap_or(value)).ok()
 }
 
 fn digest(value: &str, what: &str) -> Result<Digest, String> {

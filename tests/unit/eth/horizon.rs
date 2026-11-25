@@ -314,7 +314,10 @@ fn a_keyholder_checks_authorized_duties() {
     assert!(check(DutyKind::Attestation, 4).is_err());
     assert_eq!(check(DutyKind::SyncSelectionProof, 164), Ok(()));
     assert!(check(DutyKind::SyncSelectionProof, 192).is_err());
+    // A RANDAO reveal's period is already an epoch: refused past `FUTURE_EPOCHS`, not divided by
+    // the slots of an epoch like the other kinds (epoch 6 would pass as 0).
     assert_eq!(check(DutyKind::RandaoReveal, 5), Ok(()));
+    assert!(check(DutyKind::RandaoReveal, 6).is_err());
     assert_eq!(check(DutyKind::VoluntaryExit, u64::MAX), Ok(()));
 }
 

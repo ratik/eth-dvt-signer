@@ -1368,12 +1368,12 @@ async fn dkg_start(
             return Err((StatusCode::BAD_REQUEST, reason.to_string()));
         }
     }
-    let ceremony = api
-        .dkg
-        .ceremony(id)
-        .await
-        .map_err(unavailable)?
-        .expect("a finalized ceremony exists");
+    // The executor answers after applying the block, so the ceremony is there; a refusal, not a
+    // panic, if that ever changes.
+    let ceremony = api.dkg.ceremony(id).await.map_err(unavailable)?.ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "ceremony started but not applied here yet".to_string(),
+    ))?;
     describe(&api, ceremony).await
 }
 
@@ -1483,8 +1483,7 @@ fn parse_identities(field: &str, values: &[String]) -> Result<Set<PublicKey>, St
     let keys = values
         .iter()
         .map(|value| {
-            hex::decode(value.strip_prefix("0x").unwrap_or(value))
-                .ok()
+            crate::import::unhex(value)
                 .and_then(|bytes| {
                     PublicKey::decode(commonware_codec::Copying(bytes.as_slice())).ok()
                 })
@@ -1934,8 +1933,7 @@ struct ReconfigureBody {
 }
 
 fn parse_identity(field: &str, value: &str) -> Result<PublicKey, ApiError> {
-    hex::decode(value.strip_prefix("0x").unwrap_or(value))
-        .ok()
+    crate::import::unhex(value)
         .and_then(|bytes| PublicKey::decode(commonware_codec::Copying(bytes.as_slice())).ok())
         .ok_or_else(|| {
             (

@@ -421,6 +421,26 @@ mod keeper_tests {
         assert!(!anchor.degraded());
     }
 
+    /// A partial that needs new marks while a heartbeat is in flight waits for that write. If the
+    /// heartbeat fails, the partial is given (degraded), not kept until the anchor answers again,
+    /// and its marks go into the catch-up record.
+    #[test]
+    fn a_failed_heartbeat_gives_what_waited_for_it() {
+        let mut anchor = keeper(Some((View::default(), None, true)));
+        let heartbeat = anchor
+            .due(at(0), Duration::from_secs(600))
+            .expect("a first record");
+        assert_eq!(heartbeat.marks, Marks::default());
+        let vote = keeper::needed(DutyKind::Attestation, 3, Some(2));
+        assert_eq!(anchor.step(vote, 1), (Step::Hold(None), None));
+        assert_eq!(anchor.failed(at(1), None), vec![1]);
+        assert!(anchor.degraded());
+        let job = anchor
+            .due(at(40), Duration::from_secs(600))
+            .expect("a retry");
+        assert_eq!(job.marks, vote.unwrap());
+    }
+
     #[test]
     fn a_heartbeat_while_blocks_are_applied() {
         let mut anchor = keeper(Some((View::default(), None, true)));
@@ -833,6 +853,33 @@ mod acknowledgment_tests {
         // Records of the previous generation are not compared.
         let old = vec![record(&key(1), 0, None, 10, 1, marks(1, 1, 1))];
         assert!(View::new(1, old).records().is_empty());
+    }
+
+    /// Anyone who writes to the anchor can file objects under `acknowledgments/`: one too large,
+    /// or not named `<generation>-<hash>`, is never downloaded, and the real one is still read.
+    #[test]
+    fn junk_under_acknowledgments_is_left_out() {
+        let store = AnchorStore::in_memory(&cluster());
+        block_on(async {
+            let document = signed(1, &[0, 1]);
+            store.put_acknowledgment(&document).await.unwrap();
+            let large = format!("{:020}-{}", 2, "a".repeat(64));
+            let json = document.to_json();
+            let padded = format!(
+                "{json}{}",
+                " ".repeat(store::MAX_ACKNOWLEDGMENT_BYTES as usize)
+            );
+            store
+                .put_raw_acknowledgment(&large, padded.into_bytes())
+                .await;
+            store
+                .put_raw_acknowledgment("not-a-name", json.clone().into_bytes())
+                .await;
+            store
+                .put_raw_acknowledgment(&format!("{:020}-{}", 3, "b".repeat(64)), b"{".to_vec())
+                .await;
+            assert_eq!(store.acknowledgments().await.unwrap(), vec![document]);
+        });
     }
 
     #[test]

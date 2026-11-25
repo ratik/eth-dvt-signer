@@ -26,6 +26,7 @@
 //! reshare to new keyholders needs as well (docs/administration.md, docs/resharing.md).
 
 use crate::eth::duty::ValidatorKey;
+use crate::import::{hex0x, unhex};
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::ed25519::PublicKey;
 use commonware_utils::{TryCollect as _, ordered::Set};
@@ -87,10 +88,6 @@ impl Approvals {
     }
 }
 
-fn unhex(value: &str) -> Option<Vec<u8>> {
-    hex::decode(value.strip_prefix("0x").unwrap_or(value)).ok()
-}
-
 /// One approval line: a validator key and a recipient set.
 fn parse(line: &str) -> Result<(ValidatorKey, Set<PublicKey>), String> {
     let mut fields = line.split_whitespace();
@@ -125,9 +122,9 @@ fn parse(line: &str) -> Result<(ValidatorKey, Set<PublicKey>), String> {
 pub fn line(validator: &ValidatorKey, players: &Set<PublicKey>) -> String {
     let identities: Vec<String> = players
         .iter()
-        .map(|player| format!("0x{}", hex::encode(player.encode())))
+        .map(|player| hex0x(&player.encode()))
         .collect();
-    format!("0x{} {}", hex::encode(validator), identities.join(","))
+    format!("{} {}", hex0x(validator), identities.join(","))
 }
 
 #[cfg(test)]

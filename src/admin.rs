@@ -35,6 +35,7 @@
 //! epoch the moment its block is notarized (`epochs`): an unauthorized or stale one never gets
 //! there.
 
+use crate::import::unhex;
 use crate::{
     dkg::CeremonyId,
     dkg::ceremony::Membership,
@@ -81,10 +82,6 @@ pub struct Approvers {
 pub struct ApproversJson {
     pub threshold: u8,
     pub approvers: Vec<String>,
-}
-
-fn unhex(value: &str) -> Option<Vec<u8>> {
-    hex::decode(value.strip_prefix("0x").unwrap_or(value)).ok()
 }
 
 /// An Ed25519 public key as `0x`-hex.

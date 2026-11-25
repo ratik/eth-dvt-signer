@@ -328,8 +328,12 @@ fn three_blocks_behind_refuses_before_submission() {
     assert!(!lagging.submitted(3, 100, b), "submitted while not ready");
 
     // Applied before the lag: signable through node 3 by its keyholder, node 0's and node 1's.
+    // Node 2 frozen, so node 3's own partial is needed: the coordinator asks its peers at once and
+    // three fast peers would otherwise do without it.
     let index_3 = u64::from(index_of(network, 3));
+    network.freeze(2);
     let (status, body) = network.sign(3, KEY, APPLIED_NONCE, root(0x50));
+    network.thaw(2);
     assert_eq!(status, 200, "{body}");
     assert!(
         body["signers"]

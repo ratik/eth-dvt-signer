@@ -175,6 +175,41 @@ async fn stored_bytes(context: &deterministic::Context, partition: &str) -> Vec<
     bytes
 }
 
+/// An erased round is in neither copy of its partitions: its share (a retired generation, an
+/// aborted reshare) and its seed. A plain store, so that the bytes would be visible.
+#[test]
+fn erase_leaves_the_round_in_neither_copy() {
+    deterministic::Runner::default().start(|mut context| async move {
+        let (_, key_share) = completed(&mut context);
+        let seed = Summary::random(&mut context);
+        let mut secrets = Secrets::init(context.child("a"), PARTITION.into(), None)
+            .await
+            .unwrap();
+        secrets.put_share(key_share.clone()).await.unwrap();
+        secrets.put_seed(1, seed).await.unwrap();
+        drop(secrets);
+        let scalar = key_share.share.private.encode();
+        let seed_bytes = seed.encode();
+        let holds = |disk: &[u8], value: &[u8]| disk.windows(value.len()).any(|w| w == value);
+        assert!(holds(&stored_bytes(&context, PARTITION).await, &scalar));
+        assert!(holds(&stored_bytes(&context, PENDING).await, &seed_bytes));
+
+        let mut secrets = Secrets::init(context.child("b"), PARTITION.into(), None)
+            .await
+            .unwrap();
+        secrets.erase(0).await.unwrap();
+        secrets.erase(1).await.unwrap();
+        drop(secrets);
+        assert!(!holds(&stored_bytes(&context, PARTITION).await, &scalar));
+        assert!(!holds(&stored_bytes(&context, PENDING).await, &seed_bytes));
+        let secrets = Secrets::init(context.child("c"), PARTITION.into(), None)
+            .await
+            .unwrap();
+        assert_eq!(secrets.share(0), None);
+        assert_eq!(secrets.seed(1), None);
+    });
+}
+
 #[test]
 fn a_sealed_store_holds_no_share_in_the_clear_and_opens_only_with_its_cipher() {
     deterministic::Runner::default().start(|mut context| async move {

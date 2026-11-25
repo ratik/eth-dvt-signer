@@ -124,6 +124,26 @@ fn the_registration_queue_is_bounded() {
     assert!(mempool.insert(registration(1, NOW - 1)));
 }
 
+/// One peer's gossip keeps at most `MAX_PENDING_PER_PEER` transactions pending; other peers and
+/// this node's own transactions are not affected, and a slot frees once its transaction leaves.
+#[test]
+fn a_peer_cannot_fill_the_mempool() {
+    use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
+    let faulty = PrivateKey::from_seed(1).public_key();
+    let honest = PrivateKey::from_seed(2).public_key();
+    let mempool = Mempool::default();
+    for slot in 0..MAX_PENDING_PER_PEER as u64 {
+        assert!(mempool.insert_from(Some(faulty.clone()), attestation_slot(slot)));
+    }
+    let over = attestation_slot(MAX_PENDING_PER_PEER as u64);
+    assert!(!mempool.insert_from(Some(faulty.clone()), over.clone()));
+    assert!(mempool.insert_from(Some(honest), attestation_slot(u64::MAX)));
+    assert!(mempool.insert(attestation_slot(u64::MAX - 1)));
+    mempool.remove_all(&[attestation_slot(0)]);
+    assert!(mempool.insert_from(Some(faulty), over));
+    assert_eq!(mempool.len(), MAX_PENDING_PER_PEER + 2);
+}
+
 /// The policy in force at a registration is the one before the block, replaced by each change
 /// in the block before it: the order the state machine applies them in.
 #[test]
