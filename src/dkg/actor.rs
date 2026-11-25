@@ -76,11 +76,17 @@ use commonware_utils::{
 };
 use rand_core::CryptoRng;
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+};
 use tracing::{debug, error, info, warn};
 
 /// Label of the dealer's randomness stream (derived from its persisted seed).
 const DEALER_NOISE: &[u8] = b"dealer";
+
+/// Most partials [Actor::signed] keeps: about a slot's worth of duties of a large cluster.
+const SIGNED_PARTIALS: usize = 1024;
 
 /// A submitted dealer log missing from finalized state after this many blocks is submitted again.
 const RESUBMIT_BLOCKS: u64 = 8;
@@ -94,8 +100,8 @@ pub enum Message {
         height: u64,
         digest: commonware_cryptography::sha256::Digest,
     },
-    /// The outcome of an anchor record write (`anchor`): `held` if partials wait for it.
-    Anchored { outcome: Anchored, held: bool },
+    /// The outcome of an anchor record write (`anchor`).
+    Anchored(Anchored),
     /// The executor confirmed this node's chain against the anchor's records.
     AnchorConfirmed,
     /// A message from a peer on the DKG channel (the sender is authenticated by p2p).
@@ -492,6 +498,9 @@ pub struct Actor<
     reshares: HashMap<u64, ValidatorKey>,
     /// Share generations retired here (their share erased).
     retired: BTreeSet<u64>,
+    /// Partials already computed, by `(round, payload hash)`: a request asked again (a retry, or
+    /// a faulty peer replaying authorized roots) costs no BLS work once it passed the checks.
+    signed: RefCell<HashMap<(u64, PayloadHash), PartialSignature<Variant>>>,
 }
 
 impl<
@@ -603,6 +612,7 @@ impl<
             ready_sent: HashSet::new(),
             reshares: HashMap::new(),
             retired: BTreeSet::new(),
+            signed: RefCell::default(),
         }
     }
 
@@ -649,11 +659,11 @@ impl<
                     if let Some(anchor) = &mut self.anchor {
                         anchor.applied(height, digest);
                         if let Some(job) = anchor.due(now, heartbeat) {
-                            self.spawn_anchor_write(job, false);
+                            self.spawn_anchor_write(job);
                         }
                     }
                 }
-                Message::Anchored { outcome, held } => self.on_anchored(outcome, held),
+                Message::Anchored(outcome) => self.on_anchored(outcome),
                 Message::AnchorConfirmed => {
                     if let Some(anchor) = &mut self.anchor {
                         anchor.confirm();
@@ -789,6 +799,7 @@ impl<
                 if ceremony.reshare().is_some() {
                     // An aborted reshare: its share, if derived, is never used.
                     self.shares.remove(&round);
+                    self.signed.get_mut().clear();
                     self.unavailable.remove(&round);
                     self.secrets
                         .erase(round)
@@ -827,6 +838,7 @@ impl<
             info!(ceremony = %ceremony.config.id, round, "share generation retired, erasing its share");
         }
         self.shares.remove(&round);
+        self.signed.get_mut().clear();
         self.unavailable.remove(&round);
         self.sessions.remove(&round);
         self.secrets
@@ -1129,6 +1141,7 @@ impl<
                 Ok(()) => {
                     info!(ceremony = %id, round, %public_key, index = stored.share.index.get(), "loaded key share");
                     self.shares.insert(round, stored.share.clone());
+                    self.signed.get_mut().clear();
                     self.acknowledge(ceremony);
                 }
                 Err(err) => {
@@ -1176,6 +1189,7 @@ impl<
             .expect("failed to persist key share");
         info!(ceremony = %id, round, %public_key, index, "dkg ceremony completed, key share stored");
         self.shares.insert(round, share);
+        self.signed.get_mut().clear();
         if ceremony.reshare().is_some() {
             // Durable and verified, then announced: never the other way round.
             crate::hooks::crash_point("reshare-after-share-stored");
@@ -1198,6 +1212,7 @@ impl<
                 Ok(()) => {
                     info!(ceremony = %id, round, index = stored.share.index.get(), "loaded imported key share");
                     self.shares.insert(round, stored.share.clone());
+                    self.signed.get_mut().clear();
                 }
                 Err(err) => {
                     error!(ceremony = %id, round, %err, "stored imported key share is unusable");
@@ -1278,6 +1293,7 @@ impl<
         info!(ceremony = %ceremony.config.id, round, index, "imported key share stored");
         self.unavailable.remove(&round);
         self.shares.insert(round, share);
+        self.signed.get_mut().clear();
         self.acknowledge(&ceremony);
         Ok(Installed { index, new: true })
     }
@@ -1349,7 +1365,7 @@ impl<
                     return Err(Refusal::BeyondHorizon);
                 }
                 // Sign what consensus authorized, as an Ethereum signing root.
-                Ok(signing::Message::Ethereum(*authorization.payload_hash()).partial_sign(share))
+                Ok(self.sign(round, payload_hash, share))
             }
             AuthorizationRef::Duty { validator } => {
                 if !validator_key {
@@ -1432,9 +1448,30 @@ impl<
                         return Err(refusal);
                     }
                 }
-                Ok(signing::Message::Ethereum(*payload_hash).partial_sign(share))
+                Ok(self.sign(round, payload_hash, share))
             }
         }
+    }
+
+    /// `payload_hash` signed with `share` of `round`, computed once while it is in
+    /// [Actor::signed]. Called only after every check of [Actor::partial].
+    fn sign(
+        &self,
+        round: u64,
+        payload_hash: &PayloadHash,
+        share: &Share,
+    ) -> PartialSignature<Variant> {
+        let key = (round, *payload_hash);
+        if let Some(partial) = self.signed.borrow().get(&key) {
+            return partial.clone();
+        }
+        let partial = signing::Message::Ethereum(*payload_hash).partial_sign(share);
+        let mut signed = self.signed.borrow_mut();
+        if signed.len() >= SIGNED_PARTIALS {
+            signed.clear();
+        }
+        signed.insert(key, partial.clone());
+        partial
     }
 
     /// Answer a peer's signing request: a partial signature or a refusal. A request whose
@@ -1531,7 +1568,7 @@ impl<
             (keeper::Step::Give, Some(held)) => self.deliver(held),
             (keeper::Step::Hold(job), _) => {
                 if let Some(job) = job {
-                    self.spawn_anchor_write(job, true);
+                    self.spawn_anchor_write(job);
                 }
             }
             (keeper::Step::Give, None) => unreachable!("a given reply is returned"),
@@ -1553,7 +1590,7 @@ impl<
 
     /// Write the anchor record `job` asks for in a task of its own; its outcome comes back as
     /// [Message::Anchored].
-    fn spawn_anchor_write(&mut self, job: keeper::Job, held: bool) {
+    fn spawn_anchor_write(&mut self, job: keeper::Job) {
         let (Some(anchor), Some(sender)) = (&self.anchor, self.mailbox_sender.clone()) else {
             return;
         };
@@ -1587,11 +1624,11 @@ impl<
                         failed(format!("no answer within {:?}", keeper::WRITE_TIMEOUT))
                     },
                 };
-                let _ = sender.send(Message::Anchored { outcome, held });
+                let _ = sender.send(Message::Anchored(outcome));
             });
     }
 
-    fn on_anchored(&mut self, outcome: Anchored, held: bool) {
+    fn on_anchored(&mut self, outcome: Anchored) {
         let now = crate::hooks::clock(self.context.current());
         let Some(anchor) = &mut self.anchor else {
             return;
@@ -1609,7 +1646,7 @@ impl<
                     self.deliver(held);
                 }
                 if let Some(job) = next {
-                    self.spawn_anchor_write(job, true);
+                    self.spawn_anchor_write(job);
                 }
             }
             Anchored::Taken(path) => {
@@ -1628,12 +1665,10 @@ impl<
                     "anchor: record not written; degraded: signing under the restart floor alone \
                      until the anchor answers again"
                 );
-                if held {
-                    for held in anchor.failed(now, attempted) {
-                        self.deliver(held);
-                    }
-                } else {
-                    anchor.due_failed(now, attempted);
+                // Whichever write it was: a partial held while a heartbeat was in flight waits
+                // for that write too, and would otherwise wait for the anchor's return.
+                for held in anchor.failed(now, attempted) {
+                    self.deliver(held);
                 }
             }
         }

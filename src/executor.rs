@@ -41,7 +41,7 @@ use commonware_consensus::{
     marshal::{core::Mailbox as Marshal, standard::Standard},
     types::Height,
 };
-use commonware_cryptography::{Digestible as _, sha256::Digest};
+use commonware_cryptography::{Digestible as _, ed25519::PublicKey, sha256::Digest};
 use commonware_macros::select;
 use commonware_p2p::{Receiver, Recipients, Sender};
 use commonware_runtime::{ContextCell, Handle, Spawner, spawn_cell};
@@ -53,6 +53,7 @@ use commonware_utils::{
 };
 use rand_core::CryptoRng;
 use std::{
+    cell::{Ref, RefCell},
     collections::{BTreeMap, HashMap, VecDeque},
     sync::{
         Arc, OnceLock,
@@ -788,6 +789,28 @@ enum Waiter {
     Abort(oneshot::Sender<AbortReceipt>),
 }
 
+impl Waiter {
+    /// Its client stopped waiting (it gave up, or its request ended).
+    fn is_closed(&self) -> bool {
+        match self {
+            Self::Sign(sender) => sender.is_closed(),
+            Self::Start(sender) => sender.is_closed(),
+            Self::Duty(sender) => sender.is_closed(),
+            Self::Activate(sender) => sender.is_closed(),
+            Self::ActivateBatch(sender) => sender.is_closed(),
+            Self::Register(sender) => sender.is_closed(),
+            Self::RegisterBatch(sender) => sender.is_closed(),
+            Self::History(sender) => sender.is_closed(),
+            Self::Reshare(sender) => sender.is_closed(),
+            Self::Generation(sender) => sender.is_closed(),
+            Self::Abort(sender) => sender.is_closed(),
+        }
+    }
+}
+
+/// The rounds of each validator key's completed reshares.
+type ReshareRounds = HashMap<ValidatorKey, Vec<u64>>;
+
 pub struct Executor<E: CryptoRng + Spawner + Context, S: Sender> {
     context: ContextCell<E>,
     store: Store<E>,
@@ -819,6 +842,9 @@ pub struct Executor<E: CryptoRng + Spawner + Context, S: Sender> {
     /// The anchor's records read at start, compared with this node's chain as it applies blocks
     /// (`anchor`), until confirmed.
     anchor: Option<crate::anchor::Watch>,
+    /// The rounds of each validator key's completed reshares, at the state height it was built
+    /// at (`reshare_rounds`): a key's generation without a walk over every ceremony.
+    reshares: RefCell<(Option<u64>, ReshareRounds)>,
 }
 
 impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
@@ -863,6 +889,7 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
             close,
             stopped,
             anchor: None,
+            reshares: RefCell::default(),
         };
         let client = Client {
             sender: sender.clone(),
@@ -1246,21 +1273,41 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
         }
     }
 
+    /// [Executor::reshares], built again once the state has moved on (one walk per block, only
+    /// when asked).
+    fn reshare_rounds(&self) -> Ref<'_, ReshareRounds> {
+        let height = self.store.height();
+        if self.reshares.borrow().0 != Some(height) {
+            let mut rounds = ReshareRounds::new();
+            for ceremony in self.store.ceremonies().iter() {
+                if ceremony.status == DkgStatus::Completed
+                    && let Some(reshare) = ceremony.reshare()
+                {
+                    rounds
+                        .entry(reshare.validator)
+                        .or_default()
+                        .push(ceremony.round);
+                }
+            }
+            *self.reshares.borrow_mut() = (Some(height), rounds);
+        }
+        Ref::map(self.reshares.borrow(), |(_, rounds)| rounds)
+    }
+
     fn validator_entry(&self, validator: &Validator) -> Option<ValidatorEntry> {
         let ceremonies = self.store.ceremonies();
         let ceremony = ceremonies.by_round(validator.round)?;
         let protection = self.store.protection();
         // Every activated reshare of the key up to its active round is one generation.
-        let generation = ceremonies
-            .iter()
-            .filter(|ceremony| {
-                ceremony.round <= validator.round
-                    && ceremony.status == DkgStatus::Completed
-                    && ceremony
-                        .reshare()
-                        .is_some_and(|reshare| reshare.validator == validator.key)
-            })
-            .count() as u64;
+        let generation = self
+            .reshare_rounds()
+            .get(&validator.key)
+            .map_or(0, |rounds| {
+                rounds
+                    .iter()
+                    .filter(|round| **round <= validator.round)
+                    .count()
+            }) as u64;
         Some(ValidatorEntry {
             key: validator.key,
             ceremony: ceremony.config.id.clone(),
@@ -1511,6 +1558,9 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
             );
         }
 
+        // A transaction the leaders dropped (beyond the horizon, a registration past its window)
+        // never lands: its waiter goes once its client stops waiting.
+        self.waiters.retain(|_, waiter| !waiter.is_closed());
         for (transaction, effect) in block.transactions.iter().zip(applied.effects) {
             let waiter = self.waiters.remove(&transaction.id);
             // An approved protected command has the command's own effect.
@@ -1756,11 +1806,11 @@ impl<E: CryptoRng + Spawner + Context, S: Sender> Executor<E, S> {
 }
 
 /// Add transactions gossiped by peers to the local mempool.
-pub async fn receive_gossip(mut receiver: impl Receiver, mempool: Mempool) {
+pub async fn receive_gossip(mut receiver: impl Receiver<PublicKey = PublicKey>, mempool: Mempool) {
     while let Ok((peer, message)) = receiver.recv().await {
         match Transaction::decode(message) {
             Ok(transaction) => {
-                mempool.insert(transaction);
+                mempool.insert_from(Some(peer), transaction);
             }
             Err(err) => warn!(?peer, ?err, "invalid mempool message"),
         }

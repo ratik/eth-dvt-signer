@@ -46,6 +46,7 @@ use commonware_utils::{
     channel::{mpsc, oneshot},
     ordered::Quorum as _,
 };
+use futures::FutureExt as _;
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -974,7 +975,8 @@ async fn collect<E: Clock, S: Sender<PublicKey = PublicKey>>(
     let mut refusals: BTreeMap<u32, Refusal> = BTreeMap::new();
     let mut strikes: BTreeMap<u32, u32> = BTreeMap::new();
 
-    // Our own partial goes through the same checks as everyone else's.
+    // Our own partial goes through the same checks as everyone else's. It is awaited with the
+    // peers' answers, not before asking them: the keyholder may hold it for an anchor write.
     let (response, receiver) = oneshot::channel();
     deps.keyholder
         .send(dkg::actor::Message::Partial {
@@ -984,21 +986,12 @@ async fn collect<E: Clock, S: Sender<PublicKey = PublicKey>>(
             response,
         })
         .map_err(|_| SignError::Stopped)?;
-    let own = match receiver.await.map_err(|_| SignError::Stopped)? {
-        Ok(partial) => wire::Message::Partial {
-            request: id,
-            partial,
-        },
-        Err(reason) => wire::Message::Refused {
-            request: id,
-            reason,
-        },
-    };
+    let mut own = receiver.fuse();
 
     let mut sender = deps.sender.clone();
     let encoded = wire::Message::Request(wire_request).encode();
     let mut resend_at = started;
-    let mut next: Option<(PublicKey, wire::Message)> = Some((deps.me.clone(), own));
+    let mut next: Option<(PublicKey, wire::Message)> = None;
     loop {
         if let Some((from, response)) = next.take() {
             let Some(index) = participants.index(&from).map(|index| index.get()) else {
@@ -1125,6 +1118,19 @@ async fn collect<E: Clock, S: Sender<PublicKey = PublicKey>>(
                     Some(response) => next = Some(response),
                     None => return Err(SignError::Stopped),
                 }
+            },
+            answer = &mut own => {
+                let message = match answer.map_err(|_| SignError::Stopped)? {
+                    Ok(partial) => wire::Message::Partial {
+                        request: id,
+                        partial,
+                    },
+                    Err(reason) => wire::Message::Refused {
+                        request: id,
+                        reason,
+                    },
+                };
+                next = Some((deps.me.clone(), message));
             },
             _ = context.sleep(wait) => {},
         }

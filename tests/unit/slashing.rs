@@ -367,6 +367,43 @@ fn other_duties_are_idempotent_and_bounded() {
     );
 }
 
+/// A validator's authorized duties are its own: neither its neighbours' by id, below or above,
+/// nor any it lacks, whatever their kinds.
+#[test]
+fn duties_of_lists_one_validators_records_only() {
+    let mut p = Protection::default();
+    let keys = [[1; 48], [2; 48], [3; 48]];
+    for (id, key) in keys.iter().enumerate() {
+        p.designate(id as u64);
+        p.register(id as u64, *key);
+        assert_eq!(p.activate(key, CHAIN, 1).0, ActivationOutcome::Activated);
+    }
+    let of = |key: ValidatorKey, duty: Duty| DutyRequest {
+        validator: key,
+        ..request(duty)
+    };
+    for key in keys {
+        assert_eq!(
+            decide(&mut p, &of(key, Duty::RandaoReveal { epoch: 3 })),
+            Decision::Accepted
+        );
+        assert_eq!(
+            decide(&mut p, &of(key, Duty::AggregationSlot { slot: 3 })),
+            Decision::Accepted
+        );
+    }
+    assert_eq!(
+        decide(&mut p, &of(keys[1], Duty::RandaoReveal { epoch: 4 })),
+        Decision::Accepted
+    );
+    let duties = p.duties_of(1);
+    assert!(duties.iter().all(|duty| duty.validator == keys[1]));
+    assert_eq!(duties.len(), 3);
+    assert_eq!(p.duties_of(0).len(), 2);
+    assert_eq!(p.duties_of(2).len(), 2);
+    assert_eq!(p.authorized_duties().len(), 7);
+}
+
 /// A deposit request as the Web3Signer adapter builds it: the genesis fork version as both
 /// versions, no genesis validators root.
 fn deposit(pubkey: ValidatorKey, credentials: u8) -> DutyRequest {

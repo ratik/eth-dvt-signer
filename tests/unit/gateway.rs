@@ -26,6 +26,8 @@ enum Behaviour {
     Status(u16),
     /// Answer this status the first time, then sign.
     StatusThenSign(u16),
+    /// Answer a body larger than `nodes::MAX_ANSWER_BYTES`.
+    Huge,
 }
 
 struct Fake {
@@ -74,6 +76,9 @@ async fn fake(behaviour: Behaviour, network: NetworkJson) -> Fake {
                             tokio::time::sleep(Duration::from_millis(delay)).await;
                         }
                         Behaviour::WrongSignature => root[0] ^= 1,
+                        Behaviour::Huge => {
+                            return vec![b' '; nodes::MAX_ANSWER_BYTES + 1].into_response();
+                        }
                         Behaviour::StatusThenSign(_) if earlier > 0 => {}
                         Behaviour::Status(status) | Behaviour::StatusThenSign(status) => {
                             return (
@@ -122,7 +127,7 @@ async fn sign(gateway: &Gateway) -> (Answer, Vec<log::Attempt>) {
     gateway
         .sign(
             &format!("/api/v1/eth2/sign/{key}"),
-            &key,
+            gateway.expected(&key, &attestation()),
             vec![("accept", "application/json".into())],
             attestation(),
         )
@@ -219,6 +224,27 @@ fn one_node_refusing_everything_cannot_lose_a_duty() {
     });
 }
 
+/// A node that answers more than `nodes::MAX_ANSWER_BYTES` is not read to the end: the next
+/// node signs.
+#[test]
+fn an_oversized_answer_fails_over() {
+    run(async {
+        let network = Network::MAINNET.to_json();
+        let (faulty, honest) = (
+            fake(Behaviour::Huge, network.clone()).await,
+            fake(Behaviour::Sign(0), network).await,
+        );
+        let gateway = start(&[&faulty, &honest], Duration::from_secs(1)).await;
+        let (answer, attempts) = sign(&gateway).await;
+        assert!(signed(&answer), "the honest node's signature");
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(
+            attempts[0].status, None,
+            "the oversized answer is a failure"
+        );
+    });
+}
+
 /// Every node refuses the duty: the refusal is the answer, as soon as two nodes agree on it.
 #[test]
 fn a_refusal_two_nodes_agree_on_is_the_answer() {
@@ -287,6 +313,32 @@ fn a_slow_node_is_hedged() {
                 .encode()
                 .contains("mpc_gateway_hedges_total 1")
         );
+    });
+}
+
+/// A request's `type` becomes a metrics label only when the request parsed: a client's invented
+/// types would add series for good.
+#[test]
+fn an_unknown_type_is_not_a_metrics_label() {
+    run(async {
+        let honest = fake(Behaviour::Sign(0), Network::MAINNET.to_json()).await;
+        let gateway = start(&[&honest], Duration::from_secs(1)).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let router = gateway.router();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let status = reqwest::Client::new()
+            .post(format!("{url}/api/v1/eth2/sign/{}", validator()))
+            .header("content-type", "application/json")
+            .body(r#"{"type":"INVENTED_TYPE_1"}"#)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert!(!status.is_success());
+        let metrics = gateway.metrics.encode();
+        assert!(!metrics.contains("INVENTED_TYPE_1"), "{metrics}");
+        assert!(metrics.contains(r#"type="unknown""#), "{metrics}");
     });
 }
 

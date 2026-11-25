@@ -85,11 +85,22 @@ pub(crate) fn reshare_status(network: &TestNetwork, node: usize, name: &str) -> 
     body
 }
 
+/// [reshare_status] for a wait: `Null` while `node` has not applied the reshare's start yet (`404`),
+/// since a start through one node reaches the others a moment later.
+pub(crate) fn reshare_seen(network: &TestNetwork, node: usize, name: &str) -> Value {
+    let (status, body) = network.get(node, &format!("/validators/reshare/{name}"));
+    if status == 404 {
+        return Value::Null;
+    }
+    assert_eq!(status, 200, "{body}");
+    body
+}
+
 /// Wait until every node reports the reshare `name` in `state`.
 fn wait_reshare(network: &TestNetwork, name: &str, state: &str) {
     for node in network.all() {
         network.wait_until(&format!("reshare {name} {state} on node {node}"), || {
-            reshare_status(network, node, name)["status"] == state
+            reshare_seen(network, node, name)["status"] == state
         });
     }
 }
@@ -426,7 +437,7 @@ fn e2e_rsh_4_invalid_participants_never_activate_an_unauthorized_generation() {
     });
     for node in 1..3 {
         network.wait_until(&format!("the reshare ready on node {node}"), || {
-            reshare_status(&network, node, "validator-eth-g2")["status"] == "ready"
+            reshare_seen(&network, node, "validator-eth-g2")["status"] == "ready"
         });
     }
     let (code, activated) = generation_call(&network, 1, "activate", &key, "validator-eth-g2");
