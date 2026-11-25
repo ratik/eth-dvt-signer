@@ -12,8 +12,8 @@ use crate::{
         interchange, original_signature, split,
     },
     reshare::{
-        acknowledgement, crash_at, dkg_status, generation_call, reshare_status, session,
-        wait_generation,
+        acknowledgement, crash_at, dkg_status, generation_call, reshare_seen, reshare_status,
+        session, wait_generation,
     },
 };
 use commonware_codec::Encode as _;
@@ -245,7 +245,7 @@ impl Replacement {
         for &node in nodes {
             self.network
                 .wait_until(&format!("reshare {name} {state} on node {node}"), || {
-                    reshare_status(&self.network, node, name)["status"] == state
+                    reshare_seen(&self.network, node, name)["status"] == state
                 });
         }
     }
