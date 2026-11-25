@@ -389,9 +389,9 @@ struct Session {
     acks: BTreeMap<PublicKey, PlayerAck<PublicKey>>,
 }
 
-/// An authorized duty root a keyholder knows: the duty's kind and protection period, a
-/// policy-bound duty's terms, and whether it was loaded at start (beyond the restart floor's
-/// reach) rather than learned of since.
+/// An authorized duty root a keyholder knows: the duty's kind and protection period, and a
+/// policy-bound duty's terms. One loaded at start passes the restart floor and the anchor like any
+/// other (audit BUG-10, BUG-11).
 #[derive(Clone, Copy, Debug)]
 struct KnownDuty {
     kind: DutyKind,
@@ -399,7 +399,6 @@ struct KnownDuty {
     terms: Option<Terms>,
     /// An attestation's source epoch.
     source: Option<u64>,
-    loaded: bool,
 }
 
 /// The outcome of an anchor record write.
@@ -470,11 +469,10 @@ pub struct Actor<
     validators: HashMap<ValidatorKey, u64>,
     /// Validator duty signing roots committed on this node (their slashing records), by key.
     /// Authorized duty roots of validator keys, with each duty's kind and protection period (and
-    /// a policy-bound duty's terms), and whether it was loaded at start (beyond the restart
-    /// floor's reach) rather than learned of since.
+    /// a policy-bound duty's terms).
     duty_roots: HashMap<(ValidatorKey, Root), KnownDuty>,
     /// This process's restart floor (`eth::horizon`, audit L-1): no partial for a duty at or below
-    /// it learned of since the start. None without a network (or with the test hook).
+    /// it, loaded at start or not. None without a network (or with the test hook).
     restart_floor: Option<RestartFloor>,
     /// This keyholder's anchor (`anchor`, docs/anchor.md), if configured: the records it writes
     /// ahead of partials, the anchored marks and the gate it signs under.
@@ -597,7 +595,6 @@ impl<
                             period: duty.period,
                             terms: duty.terms,
                             source: duty.source,
-                            loaded: true,
                         },
                     )
                 })
@@ -688,11 +685,6 @@ impl<
                 Message::AuthorizedDuties(duties) => {
                     for duty in duties {
                         advance(&mut self.validators, duty.validator, duty.round);
-                        // A retry of a root loaded at start stays loaded.
-                        let loaded = self
-                            .duty_roots
-                            .get(&(duty.validator, duty.signing_root))
-                            .is_some_and(|known| known.loaded);
                         self.duty_roots.insert(
                             (duty.validator, duty.signing_root),
                             KnownDuty {
@@ -700,7 +692,6 @@ impl<
                                 period: duty.period,
                                 terms: duty.terms,
                                 source: duty.source,
-                                loaded,
                             },
                         );
                     }
@@ -1388,7 +1379,6 @@ impl<
                     period,
                     terms,
                     source,
-                    loaded,
                 } = *self
                     .duty_roots
                     .get(&(*validator, *payload_hash))
@@ -1399,10 +1389,11 @@ impl<
                     warn!(?kind, period, %beyond, "not signing a duty beyond this node's horizon");
                     return Err(Refusal::BeyondHorizon);
                 }
-                // Not a new duty of a slot (an attestation: an epoch) this process may have signed
-                // for before it started (L-1); the peer is told so, for good.
-                if !loaded
-                    && let Some(floor) = self.restart_floor
+                // Not a duty of a slot (an attestation: an epoch) this process may have signed
+                // for before it started (L-1), even one loaded at start: after a whole-network
+                // rollback the state may hold a conflicting duty it authorized since, refused by
+                // the previous process's floor (audit BUG-10). The peer is told so, for good.
+                if let Some(floor) = self.restart_floor
                     && !floor.admits(kind, period)
                 {
                     warn!(
@@ -1416,8 +1407,10 @@ impl<
                 }
                 // Nothing new before this node's chain is confirmed against the anchor (it may be
                 // soon: told as for the horizon), and no block or attestation the anchored marks
-                // refuse (a surround vote included; for good).
-                if !loaded && let Some(anchor) = self.anchor.as_ref() {
+                // refuse (a surround vote included; for good), one loaded at start included: after a
+                // whole-network rollback it may conflict with what the anchor recorded (audit
+                // BUG-11). The floor already refuses what the previous process signed.
+                if let Some(anchor) = self.anchor.as_ref() {
                     if let Some(why) = anchor.gate_refusal() {
                         warn!(?kind, period, %why, "anchor: not signing");
                         return Err(Refusal::BeyondHorizon);
@@ -1562,9 +1555,6 @@ impl<
             return None;
         };
         let known = self.duty_roots.get(&(*validator, *payload_hash))?;
-        if known.loaded {
-            return None;
-        }
         keeper::needed(known.kind, known.period, known.source)
     }
 
