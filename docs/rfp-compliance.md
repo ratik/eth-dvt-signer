@@ -2,7 +2,7 @@
 
 How eth-dvt-signer meets the appendix of the Lido RFP
 [open Ethereum validator signers for on-prem and isolated hardware](https://research.lido.fi/t/rfp-open-ethereum-validator-signers-for-on-prem-and-isolated-hardware/12209).
-State as of 2026-11-19.
+State as of 2026-11-25.
 
 Status: **Met** (done and tested), **Gap** (met, with a limit named in the row), **Partial**, **Planned**.
 
@@ -37,7 +37,7 @@ Status: **Met** (done and tested), **Gap** (met, with a limit named in the row),
 | Item | Status | Evidence |
 | --- | --- | --- |
 | Threshold signing | Met | See Conditions. |
-| Formal model of the slashing-safety logic | Partial | Kani proves that the slashing rules (`slashing::rules`) decide exactly the specification (K-1 to K-5, all pass); TLC proves the protocol model safe under the fault model (one Byzantine node, crashes, one-node restores: 36.6 M states, exhaustive). Under whole-network rollbacks with the restart floor, TLC proves that no double proposal or vote is signed (1.008 G states, exhaustive); the check with the WORM anchor is still running ([formal.md](formal.md)). The model found BUG-10 (the restart floor exempted what a rollback authorized) and BUG-11 (the anchor exempted it too), both fixed. |
+| Formal model of the slashing-safety logic | Gap | Kani proves that the slashing rules (`slashing::rules`) decide exactly the specification (K-1 to K-5, all pass); TLC proves the protocol model safe under the fault model (one Byzantine node, crashes, one-node restores: 36.6 M states, exhaustive). Under whole-network rollbacks with the restart floor, TLC proves that no double proposal or vote is signed (1.008 G states, exhaustive); with the WORM anchor, TLC proves that no slashable message is signed (128.6 M states, exhaustive, one command per log) ([formal.md](formal.md)). The limit: the models are bounded (4 nodes, short logs); larger bounds are not checked. The model found BUG-10 (the restart floor exempted what a rollback authorized) and BUG-11 (the anchor exempted it too), both fixed. |
 | Remote attestation a third party can verify | Met | `mpc-admin attest`, `mpc-gateway` and `mpc-keytool split --attestation-policy` verify SNP reports (VCEK chained to pinned AMD ARK/ASK; measurement, TCB, HOST_DATA, chip_id) and TDX evidence ([tee.md](tee.md), [gateway.md](gateway.md)). |
 | Protection against cloned devices | Partial | The anchor detects a clone ([anchor.md](anchor.md)); shares are sealed to the measured image ([tee.md](tee.md)). |
 

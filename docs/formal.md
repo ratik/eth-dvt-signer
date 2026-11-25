@@ -198,7 +198,7 @@ at the right point, and a client that sends the surrounding vote again.
 
 ## Results
 
-State as of 2026-11-24, on the test host (12 cores, 64 GB). `run.sh kani` runs all five proofs in about 6 minutes.
+State as of 2026-11-25, on the test host (12 cores, 64 GB). `run.sh kani` runs all five proofs in about 6 minutes.
 
 | Check | Result |
 | ----- | ------ |
@@ -213,7 +213,7 @@ State as of 2026-11-24, on the test host (12 cores, 64 GB). `run.sh kani` runs a
 | TLC `faultModel`, both properties | Hold: 36.6 M distinct states, the whole graph (depth 30); 2 h 28 min for double signatures, 1 h 59 min for surround votes |
 | TLC `rollbackFloor`, double signatures | Hold: 1.008 G distinct states, the whole graph (depth 47); 2 d 13 h |
 | TLC `rollbackAnchor` before BUG-11's fix, one command per log | A surround vote (24 states, 52.6 M distinct states, 9 h): [F-2](#f-2-the-anchor-exempted-what-a-rollback-authorized) |
-| TLC `rollbackAnchor`, both properties, one command per log | Running |
+| TLC `rollbackAnchor`, both properties, one command per log | Hold: 128.6 M distinct states, the whole graph (depth 38); 1 d 4 h. TLC's estimate of a fingerprint collision: 0.4 % from the actual fingerprints |
 
 The proofs came with two changes to `src/slashing.rs` that a node does not see: the rules moved
 into `slashing::rules` behind `History`, and `Protection::verify`'s attestation-order check is
