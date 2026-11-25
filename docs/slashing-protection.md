@@ -468,7 +468,7 @@ keyholders, and the other three refuse.
 | Restart of every node | Read from disk, verified | Same decisions as before; the restart floor refuses duties of the current slot and epoch, retries of those signed before the restart included |
 | One node restored from an older backup (consensus journal kept) | A prefix; replayed from the finalized chain | Refuses unapplied roots. It never decides from stale history alone: consensus decides a duty it submits |
 | One node restored from a healthy node's state | The healthy node's | Normal |
-| Every node rolled back (L-1) | **Lost** | Every keyholder's restart floor refuses a conflicting block or attestation of a slot or epoch before the restart. Without an anchor, **a crafted surround vote is signed**. With the WORM anchor it is refused, and every node stops (exit status 77) |
+| Every node rolled back (L-1) | **Lost** | Every keyholder's restart floor refuses a conflicting block or attestation of a slot or epoch before the restart. Without an anchor, **a crafted surround vote is signed**. With the WORM anchor it is refused, and every node stops (exit status 77), up to one record late. The formal model checks both cases ([formal.md](formal.md)) |
 
 ## Whole-network rollback (L-1)
 

@@ -32,7 +32,7 @@ tests for each claim, are in [security-review.md](security-review.md) and [audit
 | Root on the validator client's or the gateway's host | The gateway's client certificate, so any signature the network gives a client, for every key: duties for blocks it chooses (a lost duty, not a slashing), builder registrations within the approved policy. Before Gloas, the fee recipient of a locally built block is not checked. It can withhold or delay duties. | A slashable signature, an exit, a deposit, a registration outside the policy, a share. It cannot have a raw root signed: nodes compute every signing root from the typed duty. |
 | Root on one plain node's host | That node's share, its storage and its votes. It can roll the disk back, rewrite records, and act as a Byzantine node. | The key (one share of three needed). A slashable signature: the three other keyholders sign only what their own committed state authorizes. |
 | Root on one sealed node's host | Its storage (rollback, rewrite) and its availability; it can rewrite the configuration before boot. | The share: it is sealed to the measured image (TDX: Cloud KMS releases the data key only to that image on that VM; SNP: the chip derives the key from the measurement). Clients that pin the configuration (`rtmr3`, `host_data`) refuse a rewritten node. |
-| Roots on several hosts | Plain nodes: two shares give nothing; three shares give the key. Sealed nodes: no share. A rollback of every node's storage: without the anchor, a surround vote can be signed. | With the anchor, a rollback of every node is detected and every node stops. More than one Byzantine node is outside the model. |
+| Roots on several hosts | Plain nodes: two shares give nothing; three shares give the key. Sealed nodes: no share. A rollback of every node's storage: without the anchor, a surround vote can be signed. With the anchor, a rollback of every node signs no slashable message (checked by TLC, [formal.md](formal.md)), and is detected (every node stops), up to one record late. More than one Byzantine node is outside the model. |
 | A holder of a client certificate (mTLS API) | As the validator client's host, for every key of the network. A certificate can be revoked. | As the validator client's host. |
 | The network between nodes, gateway and clients | Delays and drops: availability only. | p2p is authenticated and encrypted, with a fixed set of peer keys. The client API is mTLS, to the attested TLS key on a sealed node. |
 | A host that moves the clock | With `--roughtime`: nothing. Without it: one node with a wrong clock costs only its votes. | A far-future duty that poisons a validator's history, unless two or more voters' clocks are wrong (without `--roughtime`). |
@@ -94,7 +94,7 @@ atomic and durable once `sync` returns.
 - A threshold of approver keys.
 - A second signer of an imported key outside the network.
 - A rollback of every node without the anchor: a crafted surround vote can be signed. The restart
-  floor still refuses double proposals and double votes.
+  floor still refuses double proposals and double votes ([formal.md](formal.md) checks both).
 - A consistent rewrite of one node's slashing records (tolerated as its one fault, L-30).
 - Client roles and rate limits: any client can spend consensus and storage (L-6).
 - Physical attacks on a sealed node's memory.

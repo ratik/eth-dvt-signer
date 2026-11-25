@@ -34,6 +34,9 @@ Nimbus on a local devnet, and with sealed nodes on GCP Confidential VMs.
   detects a rollback of the whole network and stops it.
   ([docs/slashing-protection.md](docs/slashing-protection.md#the-restart-floor),
   [docs/anchor.md](docs/anchor.md))
+- **Formal proofs of slashing protection.** Kani proves that the Rust slashing rules decide
+  exactly the specification; TLC checks a Quint model of the protocol exhaustively, with one
+  Byzantine node, crashes and whole-network rollbacks. ([docs/formal.md](docs/formal.md))
 - **Sealed nodes (optional).** A node can run in a GCP Confidential VM (Intel TDX). Its keys are
   encrypted with a data key that Cloud KMS releases only to an attested image. Or it can run as an
   AMD SEV-SNP guest on the operator's own EPYC server: the chip derives the sealing key for the
@@ -158,7 +161,8 @@ Details: [docs/tee.md](docs/tee.md) (GCP), [docs/ethereum-devnet.md](docs/ethere
   image upgrade on SEV-SNP replaces the node (R2).
 
 What the design protects and trusts, in short: [docs/threat-model.md](docs/threat-model.md). Every
-known limit and finding, with its tests: [docs/audit.md](docs/audit.md). Security review:
+known limit and finding, with its tests: [docs/audit.md](docs/audit.md). Formal proofs of
+slashing protection: [docs/formal.md](docs/formal.md). Security review:
 [docs/security-review.md](docs/security-review.md).
 
 ## Tests
@@ -190,6 +194,7 @@ What each test covers: [docs/internals.md](docs/internals.md#tests).
 | [ethereum-signing.md](docs/ethereum-signing.md) | The Web3Signer API, duties, status codes, time horizon, fork schedule |
 | [remote-signing-api.md](docs/remote-signing-api.md) | Conformance with the remote-signing API specification v1.4.0 |
 | [slashing-protection.md](docs/slashing-protection.md) | Slashing rules, the restart floor |
+| [formal.md](docs/formal.md) | Formal proofs of slashing protection (Kani, Quint and TLC) |
 | [anchor.md](docs/anchor.md) | The WORM anchor in S3 or GCS |
 | [administration.md](docs/administration.md) | Approvers and protected operations |
 | [key-import.md](docs/key-import.md) | Importing an existing validator key and its history |
